@@ -46,6 +46,12 @@ impl Rng {
     }
 }
 
+/// Generates a unique report ID by consuming two draws from the PRNG.
+/// Produces a 16-char lowercase hex string. Advances RNG state by exactly 2 steps.
+pub fn generate_report_id(rng: &mut Rng) -> String {
+    format!("{:08x}{:08x}", rng.next_u32(), rng.next_u32())
+}
+
 /// Generate a session seed from OS entropy. Call once at session start; hand the seed to
 /// `Rng::new`. This function must never touch the Mulberry32 algorithm.
 pub fn generate_seed() -> u32 {

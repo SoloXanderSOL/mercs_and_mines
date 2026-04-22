@@ -4,3 +4,4 @@
 pub mod rng;
 pub mod types;
 pub mod game_types;
+pub mod resolver;
