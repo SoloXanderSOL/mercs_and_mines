@@ -78,7 +78,7 @@ pub enum MiningHardpoint {
 // Unified 1–5 scale for equipment, Blueprints, Research Teams, and cNFTs.
 // ----------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum QualityGrade {
     Basic,
     Standard,
