@@ -41,7 +41,7 @@ jobs:
         with:
           name: mercs-server
           path: target/release/mercs-server
-          if-no-files-found: warn
+          if-no-files-found: error
 
   deploy:
     name: Deploy to DigitalOcean
