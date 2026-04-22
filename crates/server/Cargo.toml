@@ -1,0 +1,8 @@
+[package]
+name    = "mercs-server"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "mercs-server"
+path = "src/main.rs"
