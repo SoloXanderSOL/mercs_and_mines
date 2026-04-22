@@ -4,6 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::types::{ConvoyVehicle, Pack};
+pub use shared::{Coordinates, EntityVision};
 
 // ----------------------------------------------------------------
 // SPECIES — Commander / Advisor origins only.
@@ -353,19 +354,6 @@ pub struct BattleReport {
 // LOGISTICS & HEX MAP
 // Ref: Hex_Map_and_Travel.md · Helium-3.md · Detection_and_Fog_of_War.md
 // ----------------------------------------------------------------
-
-/// Axial hex grid coordinate. Both axes can be negative.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Coordinates {
-    pub q: i32,
-    pub r: i32,
-}
-
-/// Any entity (vehicle, building, unit) that actively clears Fog of War.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EntityVision {
-    pub vision_radius: u32,
-}
 
 /// Created only when the fuel gate check passes in deployConvoy().
 /// `departure_time` and `arrival_time` are Unix timestamps (seconds).

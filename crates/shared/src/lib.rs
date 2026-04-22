@@ -1,5 +1,22 @@
 use serde::{Deserialize, Serialize};
 
+pub mod hex;
+
+// ── Hex map primitives ─────────────────────────────────────────────────────────
+
+/// Axial hex grid coordinate. Both axes can be negative.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Coordinates {
+    pub q: i32,
+    pub r: i32,
+}
+
+/// Any entity (vehicle, building, unit) that actively clears Fog of War.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntityVision {
+    pub vision_radius: u32,
+}
+
 /// Sufficient to initialize and replay a game session deterministically.
 /// Stored at session creation; all input log entries reference session_id.
 #[derive(Debug, Clone, Serialize, Deserialize)]

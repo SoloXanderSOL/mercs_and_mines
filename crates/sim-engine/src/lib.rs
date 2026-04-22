@@ -5,3 +5,6 @@ pub mod rng;
 pub mod types;
 pub mod game_types;
 pub mod resolver;
+pub mod npc_types;
+pub mod detection;
+pub mod npc_ai;
