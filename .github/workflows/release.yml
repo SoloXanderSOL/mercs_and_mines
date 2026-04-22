@@ -1,0 +1,79 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  RUST_BACKTRACE: 1
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build release binary
+        # --locked enforces Cargo.lock exactly — required for build determinism.
+        # The simulation output must be identical across every build of the same commit.
+        run: cargo build --release --locked
+
+      - name: Upload server binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: mercs-server
+          path: target/release/mercs-server
+          if-no-files-found: warn
+
+  deploy:
+    name: Deploy to DigitalOcean
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download server binary
+        uses: actions/download-artifact@v4
+        with:
+          name: mercs-server
+
+      - name: Configure SSH agent
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "${{ secrets.DEV_SERVER_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "${{ secrets.DEV_SERVER_HOST }}" >> ~/.ssh/known_hosts
+          eval "$(ssh-agent -s)"
+          echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> "$GITHUB_ENV"
+          echo "SSH_AGENT_PID=$SSH_AGENT_PID"  >> "$GITHUB_ENV"
+          printf '%s\n' "${{ secrets.DEV_SERVER_SSH_PASSPHRASE }}" | ssh-add ~/.ssh/deploy_key
+
+      - name: Upload binary to server
+        run: |
+          scp \
+            mercs-server \
+            "${{ secrets.DEV_SERVER_USER }}@${{ secrets.DEV_SERVER_HOST }}:${{ secrets.DEV_SERVER_APP_PATH }}/mercs-server.new"
+
+      - name: Atomic swap and restart service
+        run: |
+          ssh "${{ secrets.DEV_SERVER_USER }}@${{ secrets.DEV_SERVER_HOST }}" \
+            "mv ${{ secrets.DEV_SERVER_APP_PATH }}/mercs-server.new \
+                ${{ secrets.DEV_SERVER_APP_PATH }}/mercs-server \
+             && sudo systemctl restart mercs-and-mines"
