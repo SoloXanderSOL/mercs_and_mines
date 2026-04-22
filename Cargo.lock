@@ -831,6 +831,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "mercs-server"
+version = "0.1.0"
+
+[[package]]
 name = "mercs_and_mines"
 version = "0.1.0"
 dependencies = [
