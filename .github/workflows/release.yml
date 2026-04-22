@@ -71,9 +71,15 @@ jobs:
             mercs-server \
             "${{ secrets.DEV_SERVER_USER }}@${{ secrets.DEV_SERVER_HOST }}:${{ secrets.DEV_SERVER_APP_PATH }}/mercs-server.new"
 
-      - name: Atomic swap and restart service
+      - name: Atomic swap and set permissions
         run: |
           ssh "${{ secrets.DEV_SERVER_USER }}@${{ secrets.DEV_SERVER_HOST }}" \
             "mv ${{ secrets.DEV_SERVER_APP_PATH }}/mercs-server.new \
                 ${{ secrets.DEV_SERVER_APP_PATH }}/mercs-server \
+             && chmod +x ${{ secrets.DEV_SERVER_APP_PATH }}/mercs-server"
+
+      - name: Restart service
+        run: |
+          ssh "${{ secrets.DEV_SERVER_USER }}@${{ secrets.DEV_SERVER_HOST }}" \
+            "sudo systemctl reset-failed mercs-and-mines \
              && sudo systemctl restart mercs-and-mines"
