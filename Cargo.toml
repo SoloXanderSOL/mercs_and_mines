@@ -4,8 +4,10 @@ members = [
     "crates/*",
 ]
 resolver = "2"
-version  = "0.1.0"
-edition  = "2021"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
 
 [workspace.dependencies]
 serde      = { version = "1.0", features = ["derive"] }
