@@ -96,6 +96,25 @@ pub enum MiningHardpoint {
 }
 
 // ----------------------------------------------------------------
+// VEHICLE CLASS — canonical 9-class fleet taxonomy.
+// Ref: Canon_Type_Reference.md §12. Director ruling 2026-04-21.
+// Fuel rule: Hauler = 10 He3/hex (Gas Guzzler trait). All other classes = 5 He3/hex.
+// ----------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum VehicleClass {
+    LightAttack,
+    Transport,
+    MediumArmor,
+    HeavySiege,
+    Recon,
+    ExtractionRig,
+    MiningSupport,
+    Hauler,
+    Engineering,
+}
+
+// ----------------------------------------------------------------
 // QUALITY GRADE — replaces Rarity. Director ruling 2026-04-21.
 // Unified 1–5 scale for equipment, Blueprints, Research Teams, and cNFTs.
 // ----------------------------------------------------------------

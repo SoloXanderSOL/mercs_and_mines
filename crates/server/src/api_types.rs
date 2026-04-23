@@ -1,24 +1,11 @@
 // Request types for all simulation endpoints.
-// VehicleClass: canonical 9-class fleet taxonomy (Canon_Type_Reference.md §12).
+// VehicleClass is canonical (game_types.rs §12) — imported from sim_engine, not redefined here.
+// convoy_vehicle_from_class is a server-layer concern: maps the enum to the resolver's ConvoyVehicle.
 // Fuel rule: Hauler = 10 He3/hex (Gas Guzzler); all other classes = 5 He3/hex.
 
 use serde::Deserialize;
+use sim_engine::game_types::{Squad, VehicleClass};
 use sim_engine::types::{CombatInitiationType, ConvoyVehicle, Pack, Section, Vehicle};
-use sim_engine::game_types::Squad;
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum VehicleClass {
-    LightAttack,
-    Transport,
-    MediumArmor,
-    HeavySiege,
-    Recon,
-    ExtractionRig,
-    MiningSupport,
-    Hauler,
-    Engineering,
-}
 
 pub fn convoy_vehicle_from_class(class: &VehicleClass) -> ConvoyVehicle {
     let (name, fuel_cost_per_hex, radar_signature) = match class {
