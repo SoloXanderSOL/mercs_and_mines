@@ -9,14 +9,13 @@
 //
 // Type gaps vs. the TS source:
 //   UnitDefinition has no `species` field — Hamster/Duck/Boar branches are unreachable.
-//   UnitArchetype::Valkyrie and Prospector exist; their ability branches are pending.
-//   Terrain has no Underground/Industrial/Urban — those mission-type bonuses are omitted.
-//   MissionCategory has no Intel or Mining — those bonuses are omitted.
+//   UnitArchetype::Valkyrie ability branch is pending.
+//   MissionEnvironment and MissionCategory ability checks are now fully wired.
 //   lootRoller.ts is a separate module; loot_drop always returns None until it is ported.
 
 use crate::game_types::{
     AdvisorBoard, BattleReport, Commander, Coordinates, ConvoyRecord,
-    DepartureRejected, MissionCategory, MissionDefinition, OutcomeType,
+    DepartureRejected, MissionCategory, MissionDefinition, MissionEnvironment, OutcomeType,
     Rewards, ScoreBreakdown, Squad, StressTier, Unit, UnitBattleResult,
     UnitArchetype, UnitStatus,
 };
@@ -119,16 +118,40 @@ fn calc_ability_bonus(squad: &Squad) -> i32 {
 fn calc_mission_type_modifier(squad: &Squad, mission: &MissionDefinition) -> i32 {
     squad.units.iter().fold(0i32, |acc, unit| {
         let bonus = match unit.definition.archetype {
-            // GhostWire: Extraction treated as one tier lower → +7% effective.
-            // Intel category not yet in canonical MissionCategory enum.
+            // GhostWire: Intel (now Sabotage) and Extraction treated as one tier lower → +7%.
             UnitArchetype::GhostWire
-                if matches!(mission.category, MissionCategory::Extraction) =>
+                if matches!(
+                    mission.category,
+                    MissionCategory::Sabotage | MissionCategory::Extraction
+                ) =>
             {
                 7
             }
-            // TunnelRunner: +8% on Underground terrain.
-            // Underground not yet in canonical Terrain enum — unreachable until extended.
-            UnitArchetype::TunnelRunner => 0,
+            // TunnelRunner: +8% in Underground environments.
+            UnitArchetype::TunnelRunner
+                if matches!(mission.environment, MissionEnvironment::Underground) =>
+            {
+                8
+            }
+            // Prospector: deep scan bonus on Extraction missions (formerly Mining).
+            UnitArchetype::Prospector
+                if matches!(mission.category, MissionCategory::Extraction) =>
+            {
+                5
+            }
+            // Pyroclast: removes -15% Industrial terrain penalty → net +15.
+            UnitArchetype::Pyroclast
+                if matches!(mission.environment, MissionEnvironment::Industrial) =>
+            {
+                15
+            }
+            // WarBoarRider: immune to Urban terrain penalties.
+            // Returns 0 — penalty immunity, not a positive bonus; urban malus system pending.
+            UnitArchetype::WarBoarRider
+                if matches!(mission.environment, MissionEnvironment::Urban) =>
+            {
+                0
+            }
             _ => 0,
         };
         acc + bonus
@@ -293,7 +316,7 @@ pub fn resolve_mission(
 
     let rewards = calc_rewards(mission, &outcome, squad, &mut rng);
 
-    let narrative_tag = format!("{:?}_{:?}_{:?}", outcome, mission.category, mission.terrain);
+    let narrative_tag = format!("{:?}_{:?}_{:?}", outcome, mission.category, mission.environment);
 
     // successThreshold = successProbability - margin = rawRoll (TS formula preserved exactly).
     let score_breakdown = ScoreBreakdown {
@@ -318,7 +341,7 @@ pub fn resolve_mission(
         mission_name:     mission.name.clone(),
         mission_category: mission.category.clone(),
         difficulty:       mission.difficulty,
-        terrain:          mission.terrain.clone(),
+        environment:      mission.environment.clone(),
         commander_name:   squad.commander.as_ref().map(|c| c.name.clone()),
         outcome,
         score_breakdown,

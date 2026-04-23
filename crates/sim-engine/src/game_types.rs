@@ -144,6 +144,21 @@ pub enum Terrain {
 }
 
 // ----------------------------------------------------------------
+// MISSION ENVIRONMENT — combat setting of a mission.
+// Director ruling 2026-04-23: separate from hex map Terrain.
+// Used by the resolver for unit ability checks.
+// ----------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum MissionEnvironment {
+    Industrial,  // factories, refineries — Pyroclast removes terrain penalty
+    Urban,       // city ruins, dense structures — WarBoarRider immune to penalty
+    Underground, // tunnels, mine shafts — TunnelRunner bonus applies
+    Wasteland,   // open badlands, ash plains — no ability bonus triggers
+    Orbital,     // space stations, void platforms — replaces legacy Space value
+}
+
+// ----------------------------------------------------------------
 // UNIT STATUS
 // ----------------------------------------------------------------
 
@@ -276,7 +291,7 @@ pub struct MissionDefinition {
     /// 1–10
     pub difficulty: u8,
     pub duration_minutes: u32,
-    pub terrain: Terrain,
+    pub environment: MissionEnvironment,
     pub credit_reward: u32,
     pub ore_reward: u32,
     /// Base percentage chance (0–100) each unit takes HP damage.
@@ -363,7 +378,7 @@ pub struct BattleReport {
     pub mission_name: String,
     pub mission_category: MissionCategory,
     pub difficulty: u8,
-    pub terrain: Terrain,
+    pub environment: MissionEnvironment,
     pub commander_name: Option<String>,
     pub outcome: OutcomeType,
     pub score_breakdown: ScoreBreakdown,
