@@ -9,7 +9,7 @@
 //
 // Type gaps vs. the TS source:
 //   UnitDefinition has no `species` field — Hamster/Duck/Boar branches are unreachable.
-//   VeterancySpec has no Valkyrie or Prospector — those branches are omitted.
+//   UnitArchetype::Valkyrie and Prospector exist; their ability branches are pending.
 //   Terrain has no Underground/Industrial/Urban — those mission-type bonuses are omitted.
 //   MissionCategory has no Intel or Mining — those bonuses are omitted.
 //   lootRoller.ts is a separate module; loot_drop always returns None until it is ported.
@@ -18,7 +18,7 @@ use crate::game_types::{
     AdvisorBoard, BattleReport, Commander, Coordinates, ConvoyRecord,
     DepartureRejected, MissionCategory, MissionDefinition, OutcomeType,
     Rewards, ScoreBreakdown, Squad, StressTier, Unit, UnitBattleResult,
-    UnitStatus, VeterancySpec,
+    UnitArchetype, UnitStatus,
 };
 use crate::rng::{generate_report_id, Rng};
 use crate::types::{
@@ -103,12 +103,12 @@ fn calc_ability_bonus(squad: &Squad) -> i32 {
     let vanguard_count = squad
         .units
         .iter()
-        .filter(|u| matches!(u.definition.veterancy_spec, VeterancySpec::Vanguard))
+        .filter(|u| matches!(u.definition.archetype, UnitArchetype::Vanguard))
         .count() as i32;
 
     squad.units.iter().fold(0i32, |acc, unit| {
         let mut bonus = acc + unit.definition.success_mod;
-        if matches!(unit.definition.veterancy_spec, VeterancySpec::Vanguard) {
+        if matches!(unit.definition.archetype, UnitArchetype::Vanguard) {
             // +2 per additional Vanguard beyond the first, capped at +6 total extra.
             bonus += ((vanguard_count - 1) * 2).min(6);
         }
@@ -118,17 +118,17 @@ fn calc_ability_bonus(squad: &Squad) -> i32 {
 
 fn calc_mission_type_modifier(squad: &Squad, mission: &MissionDefinition) -> i32 {
     squad.units.iter().fold(0i32, |acc, unit| {
-        let bonus = match unit.definition.veterancy_spec {
+        let bonus = match unit.definition.archetype {
             // GhostWire: Extraction treated as one tier lower → +7% effective.
             // Intel category not yet in canonical MissionCategory enum.
-            VeterancySpec::GhostWire
+            UnitArchetype::GhostWire
                 if matches!(mission.category, MissionCategory::Extraction) =>
             {
                 7
             }
-            // TunnelRunner (Duck equivalent): +8% on Underground terrain.
+            // TunnelRunner: +8% on Underground terrain.
             // Underground not yet in canonical Terrain enum — unreachable until extended.
-            VeterancySpec::TunnelRunner => 0,
+            UnitArchetype::TunnelRunner => 0,
             _ => 0,
         };
         acc + bonus
@@ -152,7 +152,7 @@ fn resolve_unit_damage(
     let success_mult = if is_success { 0.4_f64 } else { 1.5_f64 };
     let raw_hp_loss_chance = mission.base_hp_loss_chance as f64 * success_mult;
     let effective_hp_loss_chance = (raw_hp_loss_chance - avg_damage_shield).clamp(2.0, 95.0);
-    let unit_type = format!("{:?}", unit.definition.veterancy_spec);
+    let unit_type = format!("{:?}", unit.definition.archetype);
 
     if !rng.chance(effective_hp_loss_chance / 100.0) {
         return UnitBattleResult {
@@ -191,8 +191,8 @@ fn resolve_unit_damage(
                 status_note: "KIA → Injured (Sawbones: Trauma Protocol)".into(),
             };
         }
-        // Valkyrie RAPID EXTRACTION: VeterancySpec has no Valkyrie variant (Director ruling
-        // 2026-04-21) — this branch is unreachable in the current type system.
+        // Valkyrie RAPID EXTRACTION: guaranteed 50%+ survival on failure.
+        // Full implementation pending — no KIA path wired here yet.
         return UnitBattleResult {
             unit_id: unit.id.clone(),
             unit_name: unit.name.clone(),
@@ -281,7 +281,7 @@ pub fn resolve_mission(
     let has_sawbones = squad
         .units
         .iter()
-        .any(|u| matches!(u.definition.veterancy_spec, VeterancySpec::Sawbones));
+        .any(|u| matches!(u.definition.archetype, UnitArchetype::Sawbones));
 
     let unit_results: Vec<UnitBattleResult> = squad
         .units

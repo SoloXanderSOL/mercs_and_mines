@@ -39,8 +39,28 @@ pub enum UnitClass {
 }
 
 // ----------------------------------------------------------------
-// VETERANCY SPEC — the training/role of an individual soldier in a Section.
-// PsiOperative, Prospector, WarBoarRider, Valkyrie: removed — no canonical basis.
+// UNIT ARCHETYPE — hire-screen role of an individual merc.
+// Replaces VeterancySpec. Distinct from UnitClass (formation type).
+// ----------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum UnitArchetype {
+    Vanguard,
+    Sawbones,
+    GhostWire,
+    TunnelRunner,
+    PsiOperative,
+    Prospector,
+    Pyroclast,
+    WarBoarRider,
+    Valkyrie,
+}
+
+// ----------------------------------------------------------------
+// VETERANCY SPEC — earned specialisations for player Sections, unlocked through XP.
+// A Section carries a Vec<VeterancySpec> — multiple specs are possible simultaneously.
+// Distinct from UnitArchetype: VeterancySpec describes what a Section EARNS;
+// UnitArchetype describes what a hireable unit IS at point of hire.
 // ----------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +82,8 @@ pub enum MercHardpoint {
     Heavy,
     Armor,
     Transport,
+    Utility,
+    Psychic,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,7 +182,7 @@ pub struct Equipment {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnitDefinition {
-    pub veterancy_spec: VeterancySpec,
+    pub archetype: UnitArchetype,
     pub emoji: String,
     pub hiring_cost: u32,
     /// 1–10
