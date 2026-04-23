@@ -181,10 +181,8 @@ pub enum UnitStatus {
 pub struct Equipment {
     pub id: String,
     pub name: String,
-    pub hardpoint_type: MercHardpoint,
+    pub slot: MercHardpoint,
     pub quality_grade: QualityGrade,
-    /// 1–5
-    pub rank: u8,
     pub success_bonus: i32,
     pub damage_shield: i32,
     pub resource_yield_bonus: i32,
