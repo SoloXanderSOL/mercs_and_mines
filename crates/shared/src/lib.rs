@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod hex;
+pub mod ws_events;
 
 // ── Hex map primitives ─────────────────────────────────────────────────────────
 

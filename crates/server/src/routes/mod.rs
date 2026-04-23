@@ -1,10 +1,16 @@
-// HTTP route handlers for all six API endpoints.
+// HTTP route handlers for all API endpoints.
 // Seed handling (Director ruling): the server is the authority on time and entropy.
 //   seed_override Some(n) → passed through for deterministic replay.
 //   seed_override None    → generated from OS entropy via rng::generate_seed().
 // Timestamp is always generated server-side via chrono::Utc::now(); never accepted from client.
 
+pub mod ws_combat;
+
+use std::sync::Arc;
+use std::time::Instant;
+
 use axum::{
+    extract::State,
     http::StatusCode,
     response::{IntoResponse, Json},
     routing::{get, post},
@@ -12,6 +18,7 @@ use axum::{
 };
 use chrono::Utc;
 use serde_json::{json, Value};
+use uuid::Uuid;
 
 use sim_engine::{
     equipment::equipment,
@@ -25,6 +32,7 @@ use sim_engine::{
 use crate::api_types::{
     convoy_vehicle_from_class, CombatResolveRequest, MissionResolveRequest, PackAssaultRequest,
 };
+use crate::state::{AppState, CombatSession};
 
 type AppError = (StatusCode, Json<Value>);
 
@@ -112,14 +120,31 @@ async fn post_pack_assault(
     Json(report)
 }
 
+// ── Streaming combat session ───────────────────────────────────────────────
+
+async fn post_combat_stream_start(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CombatResolveRequest>,
+) -> impl IntoResponse {
+    let id = Uuid::new_v4();
+    state.combat_sessions.insert(id, CombatSession {
+        params: req,
+        created_at: Instant::now(),
+    });
+    Json(json!({"session_id": id.to_string()}))
+}
+
 // ── Router ─────────────────────────────────────────────────────────────────
 
-pub fn router() -> Router {
+pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
-        .route("/api/missions",            get(get_missions))
-        .route("/api/units",               get(get_units))
-        .route("/api/equipment",           get(get_equipment))
-        .route("/api/mission/resolve",     post(post_mission_resolve))
-        .route("/api/combat/resolve",      post(post_combat_resolve))
-        .route("/api/combat/pack-assault", post(post_pack_assault))
+        .route("/api/missions",                  get(get_missions))
+        .route("/api/units",                     get(get_units))
+        .route("/api/equipment",                 get(get_equipment))
+        .route("/api/mission/resolve",           post(post_mission_resolve))
+        .route("/api/combat/resolve",            post(post_combat_resolve))
+        .route("/api/combat/pack-assault",       post(post_pack_assault))
+        .route("/api/combat/stream/start",       post(post_combat_stream_start))
+        .route("/api/combat/stream/:session_id", get(ws_combat::ws_stream_handler))
+        .with_state(state)
 }

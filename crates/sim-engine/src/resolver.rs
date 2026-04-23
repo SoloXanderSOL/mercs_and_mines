@@ -906,3 +906,251 @@ pub fn check_detection(
     let detection_range = observer_vision_radius.max(target_noise_radius);
     distance_in_hexes <= detection_range
 }
+
+// ── Streaming AP vs AT combat resolver (Live Tactical Dashboard) ───────────
+//
+// Mirrors the tick loop from resolve_combat exactly — same RNG call order,
+// same damage formulas — so a replayed input log produces identical results.
+//
+// Gated on feature "streaming" to prevent pulling tokio into non-server builds
+// (e.g. the Solana BPF program that also depends on sim-engine).
+
+#[cfg(feature = "streaming")]
+pub async fn resolve_combat_streaming(
+    section: &Section,
+    vehicle: &Vehicle,
+    timestamp: &str,
+    max_ticks: u32,
+    seed_override: Option<u32>,
+    combat_initiation_type: CombatInitiationType,
+    _defending_convoy_vehicles: Vec<ConvoyVehicle>,
+    tick_tx: tokio::sync::mpsc::Sender<shared::ws_events::CombatTickEvent>,
+    mut cancel_rx: tokio::sync::oneshot::Receiver<()>,
+) {
+    use shared::ws_events::{
+        CombatOutcome as WsCombatOutcome, CombatTickEvent, UnitSnapshot,
+        UnitStatus as WsUnitStatus,
+    };
+    use std::time::Duration;
+
+    let seed = seed_override.unwrap_or_else(|| {
+        seed_from_str(&format!("{}{}{}", section.id, vehicle.id, timestamp))
+    });
+    let mut rng = Rng::new(seed);
+
+    let mut current_strength = section.current_strength;
+    let mut vehicle_hp = vehicle.hp;
+    let mut total_kia: u32 = 0;
+
+    for tick in 1..=max_ticks {
+        // ── Cancellation check (RETREAT interrupt) ─────────────────────────
+        if cancel_rx.try_recv().is_ok() {
+            let event = CombatTickEvent {
+                tick_index: tick,
+                narrative: Some(format!(
+                    "[Tick {}] RETREAT signal received — engagement terminated.",
+                    tick
+                )),
+                friendly_units: vec![UnitSnapshot {
+                    id: section.id.clone(),
+                    name: section.name.clone(),
+                    current_hp: current_strength as i32,
+                    max_hp: section.max_strength as i32,
+                    status: WsUnitStatus::Retreated,
+                }],
+                enemy_units: vec![UnitSnapshot {
+                    id: vehicle.id.clone(),
+                    name: vehicle.name.clone(),
+                    current_hp: vehicle_hp.max(0),
+                    max_hp: vehicle.max_hp,
+                    status: WsUnitStatus::Retreated,
+                }],
+                combat_ended: true,
+                outcome: Some(WsCombatOutcome::Retreated),
+            };
+            let _ = tick_tx.send(event).await;
+            return;
+        }
+
+        let is_ambush_tick1 =
+            matches!(combat_initiation_type, CombatInitiationType::Ambush) && tick == 1;
+        let strength_at_tick_start = current_strength;
+        let mut narrative_lines: Vec<String> = Vec::new();
+
+        // ── Phase 1: Vehicle fires each weapon at Section ──────────────────
+        for weapon in &vehicle.weapons {
+            if current_strength == 0 {
+                break;
+            }
+            let dice_roll = rng.roll_d100() as i32;
+            let hit_roll_total = dice_roll + weapon.accuracy - section.evasion;
+            let is_hit = hit_roll_total > 50;
+
+            if !is_hit {
+                narrative_lines.push(format!(
+                    "[Tick {}] {} fires on {} — Miss.",
+                    tick, weapon.name, section.name
+                ));
+                continue;
+            }
+
+            let is_penetration = weapon.ap >= section.armor_at;
+            if !is_penetration {
+                narrative_lines.push(format!(
+                    "[Tick {}] {} fires on {} — Hit (no penetration).",
+                    tick, weapon.name, section.name
+                ));
+                continue;
+            }
+
+            let mult = tag_multiplier(&weapon.tag, &section.armor_tag);
+            let final_damage = (weapon.base_damage as f32 * mult).floor() as i32;
+            let kill_count =
+                ((final_damage as f32 / section.individual_hp as f32).ceil() as u32)
+                    .min(current_strength);
+            current_strength -= kill_count;
+
+            narrative_lines.push(format!(
+                "[Tick {}] {} fires on {} — Hit! {} damage. {} HP: {}/{}",
+                tick,
+                weapon.name,
+                section.name,
+                final_damage,
+                section.name,
+                current_strength,
+                section.max_strength
+            ));
+            if kill_count > 0 {
+                narrative_lines.push(format!(
+                    "[Tick {}] {} is eliminated.",
+                    tick, section.name
+                ));
+            }
+        }
+
+        total_kia += strength_at_tick_start - current_strength;
+
+        // ── Phase 2: Section swarm fires at Vehicle ────────────────────────
+        //    Suppressed on Tick 1 of an AMBUSH engagement.
+        if is_ambush_tick1 {
+            narrative_lines.push(format!(
+                "[Tick {}] {} suppressed — cannot return fire.",
+                tick, section.name
+            ));
+        } else {
+            let shots_total = current_strength;
+            let sw = &section.weapon;
+            let is_pen = sw.ap >= vehicle.at;
+            let mult = tag_multiplier(&sw.tag, &vehicle.armor_tag);
+            let dmg_per_shot =
+                if is_pen { (sw.base_damage as f32 * mult).floor() as i32 } else { 0 };
+            let mut hits_total = 0u32;
+            let mut total_damage = 0i32;
+
+            for _ in 0..shots_total {
+                if vehicle_hp <= 0 {
+                    break;
+                }
+                let dice = rng.roll_d100() as i32;
+                let hit_total = dice + sw.accuracy - vehicle.evasion;
+                if hit_total > 50 {
+                    hits_total += 1;
+                    if is_pen {
+                        vehicle_hp = (vehicle_hp - dmg_per_shot).max(0);
+                        total_damage += dmg_per_shot;
+                    }
+                }
+            }
+
+            if hits_total > 0 && is_pen && total_damage > 0 {
+                narrative_lines.push(format!(
+                    "[Tick {}] {} fires on {} — Hit! {} damage. {} HP: {}/{}",
+                    tick,
+                    section.name,
+                    vehicle.name,
+                    total_damage,
+                    vehicle.name,
+                    vehicle_hp.max(0),
+                    vehicle.max_hp
+                ));
+            } else if hits_total > 0 {
+                narrative_lines.push(format!(
+                    "[Tick {}] {} fires on {} — Hit (no penetration).",
+                    tick, section.name, vehicle.name
+                ));
+            } else {
+                narrative_lines.push(format!(
+                    "[Tick {}] {} fires on {} — Miss.",
+                    tick, section.name, vehicle.name
+                ));
+            }
+        }
+
+        // ── Elimination markers ────────────────────────────────────────────
+        if vehicle_hp <= 0 {
+            narrative_lines.push(format!("[Tick {}] {} is eliminated.", tick, vehicle.name));
+        }
+
+        // ── State line ─────────────────────────────────────────────────────
+        narrative_lines.push(format!(
+            "[Tick {}] {} — {}/{} HP. {} KIA this engagement.",
+            tick, section.name, current_strength, section.max_strength, total_kia
+        ));
+
+        // ── Terminal condition ─────────────────────────────────────────────
+        let ws_outcome = if current_strength == 0 && vehicle_hp <= 0 {
+            Some(WsCombatOutcome::MutualDestruction)
+        } else if vehicle_hp <= 0 {
+            Some(WsCombatOutcome::Victory)
+        } else if current_strength == 0 {
+            Some(WsCombatOutcome::Defeat)
+        } else if tick == max_ticks {
+            Some(WsCombatOutcome::Defeat)
+        } else {
+            None
+        };
+        let combat_ended = ws_outcome.is_some();
+
+        // ── Build UnitSnapshots ────────────────────────────────────────────
+        let section_status = if current_strength == 0 {
+            WsUnitStatus::Kia
+        } else if is_ambush_tick1 {
+            WsUnitStatus::Suppressed
+        } else {
+            WsUnitStatus::Active
+        };
+        let vehicle_status =
+            if vehicle_hp <= 0 { WsUnitStatus::Kia } else { WsUnitStatus::Active };
+
+        let event = CombatTickEvent {
+            tick_index: tick,
+            narrative: Some(narrative_lines.join("\n")),
+            friendly_units: vec![UnitSnapshot {
+                id: section.id.clone(),
+                name: section.name.clone(),
+                current_hp: current_strength as i32,
+                max_hp: section.max_strength as i32,
+                status: section_status,
+            }],
+            enemy_units: vec![UnitSnapshot {
+                id: vehicle.id.clone(),
+                name: vehicle.name.clone(),
+                current_hp: vehicle_hp.max(0),
+                max_hp: vehicle.max_hp,
+                status: vehicle_status,
+            }],
+            combat_ended,
+            outcome: ws_outcome,
+        };
+
+        if tick_tx.send(event).await.is_err() {
+            return; // Receiver dropped — client disconnected
+        }
+
+        tokio::time::sleep(Duration::from_millis(750)).await;
+
+        if combat_ended {
+            return;
+        }
+    }
+}
