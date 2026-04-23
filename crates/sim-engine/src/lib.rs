@@ -11,5 +11,6 @@ pub mod npc_ai;
 pub mod loot_roller;
 pub mod units;
 pub mod missions;
+pub mod equipment;
 
 pub use game_types::UnitArchetype;

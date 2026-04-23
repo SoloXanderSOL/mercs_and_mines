@@ -2,7 +2,25 @@
 // Hardpoint mapping: Weapon → Light, HeavyWeapon → Heavy, Armour → Armor, Tool → Utility.
 // Mount and Vehicle slots removed; see per-unit overrides below.
 
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
 use crate::game_types::{MercHardpoint, Unit, UnitArchetype, UnitDefinition, UnitStatus};
+
+static UNIT_DEFINITIONS: OnceLock<HashMap<&'static str, UnitDefinition>> = OnceLock::new();
+
+/// Returns the static unit definition map. Callers use `.values()` or `.get(key)` directly.
+pub fn unit_definitions() -> &'static HashMap<&'static str, UnitDefinition> {
+    UNIT_DEFINITIONS.get_or_init(|| {
+        let keys: &[&'static str] = &[
+            "VANGUARD", "SAWBONES", "GHOST_WIRE", "TUNNEL_RUNNER",
+            "PSI_OPERATIVE", "PROSPECTOR", "PYROCLAST", "WAR_BOAR_RIDER", "VALKYRIE",
+        ];
+        keys.iter()
+            .filter_map(|&k| get_definition(k).map(|d| (k, d)))
+            .collect()
+    })
+}
 
 /// Creates a Unit from a definition key, caller-supplied ID, and optional skill override.
 /// Returns None if `def_key` is not a recognised definition.
