@@ -8,6 +8,10 @@ skip-lint = false
 [programs.localnet]
 mercs_and_mines = "7SD4qajisBhtZbe2xMRjaBpyLkGVJD5qd6vXznHF28EP"
 
+# Devnet program ID — replace after `anchor deploy --provider.cluster devnet`
+[programs.devnet]
+mercs_and_mines = "7SD4qajisBhtZbe2xMRjaBpyLkGVJD5qd6vXznHF28EP"
+
 [registry]
 url = "https://api.apr.dev"
 

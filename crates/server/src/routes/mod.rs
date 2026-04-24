@@ -17,6 +17,7 @@ use axum::{
     Router,
 };
 use chrono::Utc;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -29,6 +30,7 @@ use sim_engine::{
     units::unit_definitions,
 };
 
+use crate::auth::AuthSession;
 use crate::api_types::{
     convoy_vehicle_from_class, CombatResolveRequest, MissionResolveRequest, PackAssaultRequest,
 };
@@ -38,6 +40,20 @@ type AppError = (StatusCode, Json<Value>);
 
 fn bad_request(msg: impl Into<String>) -> AppError {
     (StatusCode::BAD_REQUEST, Json(json!({"error": msg.into()})))
+}
+
+// ── Auth request types ─────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct ChallengeRequest {
+    pub wallet_address: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct VerifyRequest {
+    pub wallet_address: String,
+    pub challenge: String,
+    pub signature: String,
 }
 
 // ── Static data endpoints ──────────────────────────────────────────────────
@@ -52,6 +68,71 @@ async fn get_units() -> Json<Value> {
 
 async fn get_equipment() -> Json<Value> {
     Json(serde_json::to_value(equipment()).unwrap())
+}
+
+// ── Auth endpoints ─────────────────────────────────────────────────────────
+
+async fn post_auth_challenge(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ChallengeRequest>,
+) -> impl IntoResponse {
+    let nonce = Uuid::new_v4().to_string();
+    let now = Utc::now().timestamp();
+    let challenge_text = crate::auth::build_challenge(&req.wallet_address, &nonce, now);
+
+    state.pending_challenges.insert(
+        req.wallet_address.clone(),
+        crate::state::PendingChallenge {
+            challenge_text: challenge_text.clone(),
+            expires_at: now + 60,
+        },
+    );
+
+    Json(json!({
+        "challenge":  challenge_text,
+        "expires_in": 60,
+    }))
+}
+
+async fn post_auth_verify(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<VerifyRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let now = Utc::now().timestamp();
+
+    // Look up and consume the pending challenge (one-time use)
+    let pending = state
+        .pending_challenges
+        .remove(&req.wallet_address)
+        .ok_or_else(|| bad_request("no pending challenge for this wallet — call /api/auth/challenge first"))?;
+
+    if now > pending.1.expires_at {
+        return Err(bad_request("challenge expired — request a new one"));
+    }
+    if req.challenge != pending.1.challenge_text {
+        return Err(bad_request("challenge mismatch"));
+    }
+
+    // Verify the Ed25519 signature
+    crate::auth::verify_wallet_signature(&req.wallet_address, &req.challenge, &req.signature)
+        .map_err(|e| bad_request(format!("signature invalid: {e}")))?;
+
+    // Issue the 2-hour session
+    let token = crate::auth::issue_session(&state, &req.wallet_address);
+
+    // Phase 0 stub: founding_courtesy CPI not yet wired (Solana client added in a future batch)
+    eprintln!(
+        "[auth] wallet {} authenticated — founding_courtesy dispatch pending (Solana client not yet wired)",
+        req.wallet_address
+    );
+
+    Ok(Json(serde_json::to_value(&token).unwrap()))
+}
+
+async fn get_auth_session(
+    AuthSession(token): AuthSession,
+) -> impl IntoResponse {
+    Json(serde_json::to_value(&token).unwrap())
 }
 
 // ── Simulation endpoints ───────────────────────────────────────────────────
@@ -233,9 +314,10 @@ async fn post_pack_assault(
     Json(report)
 }
 
-// ── Streaming combat session ───────────────────────────────────────────────
+// ── Streaming combat session (requires auth) ───────────────────────────────
 
 async fn post_combat_stream_start(
+    AuthSession(_session): AuthSession,
     State(state): State<Arc<AppState>>,
     Json(req): Json<CombatResolveRequest>,
 ) -> impl IntoResponse {
@@ -303,6 +385,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/missions",                  get(get_missions))
         .route("/api/units",                     get(get_units))
         .route("/api/equipment",                 get(get_equipment))
+        .route("/api/auth/challenge",            post(post_auth_challenge))
+        .route("/api/auth/verify",               post(post_auth_verify))
+        .route("/api/auth/session",              get(get_auth_session))
         .route("/api/mission/resolve",           post(post_mission_resolve))
         .route("/api/combat/resolve",            post(post_combat_resolve))
         .route("/api/combat/pack-assault",       post(post_pack_assault))

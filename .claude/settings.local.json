@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(wsl -e bash -c \"export PATH=\\\\$HOME/.cargo/bin:\\\\$PATH && cd ~/PROJECTS/mercs_and_mines && anchor build 2>&1\")",
+      "PowerShell(wsl -e bash -ic \"cd ~/PROJECTS/mercs_and_mines && anchor build 2>&1\")",
+      "PowerShell(wsl -e bash -ic \"cd ~/PROJECTS/mercs_and_mines && cat rust-toolchain.toml 2>/dev/null || cat rust-toolchain 2>/dev/null || echo 'no toolchain file'\")",
+      "PowerShell(wsl -e bash -ic \"rustup toolchain list\")",
+      "PowerShell(wsl -e bash -ic \"rustup run solana cargo --version 2>&1\")",
+      "PowerShell(wsl -e bash -ic \"head -3 ~/PROJECTS/mercs_and_mines/Cargo.lock\")",
+      "PowerShell(wsl -e bash -ic \"cd ~/PROJECTS/mercs_and_mines/programs && rustup run solana cargo generate-lockfile 2>&1\")",
+      "PowerShell(wsl -e bash -c \"head -3 ~/PROJECTS/mercs_and_mines/programs/Cargo.lock\")",
+      "PowerShell(wsl -e bash -ic \"rustup run 1.89.0-sbpf-solana-v1.52 cargo --version 2>&1\")",
+      "PowerShell(wsl -e bash -ic \"anchor --version 2>&1 && solana --version 2>&1\")",
+      "PowerShell(wsl -e bash -ic \"cd ~/PROJECTS/mercs_and_mines && RUSTUP_TOOLCHAIN=1.89.0-sbpf-solana-v1.52 anchor build 2>&1\")",
+      "PowerShell(wsl -e bash -ic \"cd ~/PROJECTS/mercs_and_mines/programs/mercs_and_mines && rustup run 1.89.0-sbpf-solana-v1.52 cargo build-sbf 2>&1 | head -30\")",
+      "PowerShell(wsl -e bash -ic \"which cargo-build-sbf 2>/dev/null || find ~/.local ~/.cargo -name cargo-build-sbf 2>/dev/null | head -5\")",
+      "PowerShell(wsl -e bash -ic \"head -30 ~/solana-release/bin/cargo-build-sbf 2>&1\")",
+      "PowerShell(wsl -e bash -ic \"rustup run solana cargo tree -p anchor-lang --version 0.30.1 2>&1 | grep 'blake3\\\\|cpufeatures' | head -10\")"
+    ]
+  }
+}

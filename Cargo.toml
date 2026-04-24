@@ -1,7 +1,9 @@
 [workspace]
 members = [
-    "programs/*",
     "crates/*",
+]
+exclude = [
+    "programs/*",
 ]
 resolver = "2"
 

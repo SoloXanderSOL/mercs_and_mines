@@ -8,14 +8,16 @@ name = "mercs-server"
 path = "src/main.rs"
 
 [dependencies]
-axum        = { version = "0.7", features = ["ws"] }
-tokio       = { version = "1", features = ["full"] }
-tower       = "0.4"
-tower-http  = { version = "0.5", features = ["cors"] }
-chrono      = { version = "0.4", features = ["serde"] }
-serde       = { workspace = true }
-serde_json  = { workspace = true }
-shared      = { workspace = true }
-sim-engine  = { path = "../sim-engine", features = ["streaming"] }
-dashmap     = "6"
-uuid        = { version = "1", features = ["v4", "serde"] }
+axum           = { version = "0.7", features = ["ws"] }
+tokio          = { version = "1", features = ["full"] }
+tower          = "0.4"
+tower-http     = { version = "0.5", features = ["cors"] }
+chrono         = { version = "0.4", features = ["serde"] }
+serde          = { workspace = true }
+serde_json     = { workspace = true }
+shared         = { workspace = true }
+sim-engine     = { path = "../sim-engine", features = ["streaming"] }
+dashmap        = "6"
+uuid           = { version = "1", features = ["v4", "serde"] }
+ed25519-dalek  = "2"
+bs58           = "0.5"
