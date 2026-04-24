@@ -1,4 +1,5 @@
 mod api_types;
+mod log_reader;
 mod log_writer;
 mod routes;
 mod state;

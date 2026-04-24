@@ -93,7 +93,10 @@ async fn handle_ws(
             seq: 0,
             event_type: "session_start".into(),
             player_id: None,
-            payload: params_payload,
+            payload: serde_json::json!({
+                "request":   params_payload,
+                "timestamp": &timestamp,
+            }),
             narrative_event: None,
         }).await;
     }

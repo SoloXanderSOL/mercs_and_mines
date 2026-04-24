@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Json},
     routing::{get, post},
@@ -88,7 +88,10 @@ async fn post_mission_resolve(
             tick: 0, seq: 0,
             event_type: "session_start".into(),
             player_id: None,
-            payload: req_payload,
+            payload: serde_json::json!({
+                "request":   req_payload,
+                "timestamp": &timestamp,
+            }),
             narrative_event: None,
         }).await;
         w.append(&shared::InputLogEntry {
@@ -149,7 +152,10 @@ async fn post_combat_resolve(
             tick: 0, seq: 0,
             event_type: "session_start".into(),
             player_id: None,
-            payload: req_payload,
+            payload: serde_json::json!({
+                "request":   req_payload,
+                "timestamp": &timestamp,
+            }),
             narrative_event: None,
         }).await;
         w.append(&shared::InputLogEntry {
@@ -209,7 +215,10 @@ async fn post_pack_assault(
             tick: 0, seq: 0,
             event_type: "session_start".into(),
             player_id: None,
-            payload: req_payload,
+            payload: serde_json::json!({
+                "request":   req_payload,
+                "timestamp": &timestamp,
+            }),
             narrative_event: None,
         }).await;
         w.append(&shared::InputLogEntry {
@@ -238,6 +247,55 @@ async fn post_combat_stream_start(
     Json(json!({"session_id": id.to_string()}))
 }
 
+// ── After-Action Report (deterministic replay) ────────────────────────────
+
+async fn get_combat_aar(
+    State(state): State<Arc<AppState>>,
+    Path(raw_id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    // Validate as UUID to prevent path traversal — log files are named by UUID only.
+    uuid::Uuid::parse_str(&raw_id)
+        .map_err(|_| bad_request("session_id must be a valid UUID"))?;
+
+    let session = crate::log_reader::load_combat_session(&state.log_dir, &raw_id)
+        .await
+        .map_err(|e| bad_request(format!("Could not load session log: {e}")))?;
+
+    // Reconstruct resolver inputs from the stored log.
+    // seed_override forces the exact stored seed — this is the determinism guarantee.
+    let seed = session.config.seed as u32;
+    let initiation = session
+        .request
+        .combat_initiation_type
+        .unwrap_or(CombatInitiationType::Spotted);
+    let max_ticks = session.request.max_ticks.unwrap_or(50) as u32;
+    let defending: Vec<_> = session
+        .request
+        .defending_convoy_vehicles
+        .unwrap_or_default()
+        .iter()
+        .map(convoy_vehicle_from_class)
+        .collect();
+
+    let report = resolve_combat(
+        &session.request.section,
+        &session.request.vehicle,
+        &session.timestamp,     // injected from log; never Utc::now()
+        max_ticks,
+        Some(seed),             // stored seed; guarantees deterministic output
+        initiation,
+        defending,
+    );
+
+    Ok(Json(json!({
+        "session_id":    session.config.session_id,
+        "seed":          session.config.seed,
+        "build_version": session.config.build_version,
+        "replayed_at":   Utc::now().to_rfc3339(),
+        "report":        serde_json::to_value(&report).unwrap(),
+    })))
+}
+
 // ── Router ─────────────────────────────────────────────────────────────────
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -250,5 +308,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/combat/pack-assault",       post(post_pack_assault))
         .route("/api/combat/stream/start",       post(post_combat_stream_start))
         .route("/api/combat/stream/:session_id", get(ws_combat::ws_stream_handler))
+        .route("/api/combat/aar/:session_id",    get(get_combat_aar))
         .with_state(state)
 }
