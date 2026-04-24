@@ -120,6 +120,24 @@ async fn post_auth_verify(
     // Issue the 2-hour session
     let token = crate::auth::issue_session(&state, &req.wallet_address);
 
+    // Upsert the player account (idempotent — subsequent logins preserve ledger and trust_standing).
+    // Wallet address was verified by verify_wallet_signature above, so decode cannot fail here.
+    let pubkey_bytes: [u8; 32] = bs58::decode(&req.wallet_address)
+        .into_vec()
+        .map_err(|e| bad_request(format!("wallet decode: {e}")))?
+        .try_into()
+        .map_err(|_| bad_request("wallet address must be 32 bytes"))?;
+    state
+        .account_repo
+        .upsert_account(crate::repository::PlayerAccount {
+            wallet: crate::repository::WalletAddress::from_bytes(pubkey_bytes),
+            trust_standing: 0,
+            profile: crate::repository::PlayerProfile { display_name: None, sector_id: None },
+            gcn_ledger: vec![],
+        })
+        .await
+        .map_err(|e| bad_request(format!("account upsert: {e}")))?;
+
     // Phase 0 stub: founding_courtesy CPI not yet wired (Solana client added in a future batch)
     eprintln!(
         "[auth] wallet {} authenticated — founding_courtesy dispatch pending (Solana client not yet wired)",

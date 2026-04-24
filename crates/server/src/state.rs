@@ -1,8 +1,15 @@
+#![allow(unused)]
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 use dashmap::DashMap;
 use uuid::Uuid;
 use crate::api_types::CombatResolveRequest;
+use crate::repository::{
+    AccountRepository, InMemoryAccountRepository,
+    SectorStateRepository, InMemorySectorStateRepository,
+    TimerRepository, InMemoryTimerRepository,
+};
 
 pub struct CombatSession {
     pub params: CombatResolveRequest,
@@ -24,6 +31,9 @@ pub struct AppState {
     /// Pending TEEPIN challenges, keyed by wallet_address.
     /// Expires 60s after issuance. One-time use — removed on verify.
     pub pending_challenges: DashMap<String, PendingChallenge>,
+    pub account_repo: Arc<dyn AccountRepository>,
+    pub sector_repo:  Arc<dyn SectorStateRepository>,
+    pub timer_repo:   Arc<dyn TimerRepository>,
 }
 
 impl AppState {
@@ -33,6 +43,9 @@ impl AppState {
             log_dir,
             sessions:           DashMap::new(),
             pending_challenges: DashMap::new(),
+            account_repo:       Arc::new(InMemoryAccountRepository::new()),
+            sector_repo:        Arc::new(InMemorySectorStateRepository::new()),
+            timer_repo:         Arc::new(InMemoryTimerRepository::new()),
         }
     }
 }

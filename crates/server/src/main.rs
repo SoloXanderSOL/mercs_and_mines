@@ -2,6 +2,7 @@ mod api_types;
 mod auth;
 mod log_reader;
 mod log_writer;
+mod repository;
 mod routes;
 mod state;
 

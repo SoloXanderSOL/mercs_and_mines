@@ -15,7 +15,13 @@
       "PowerShell(wsl -e bash -ic \"cd ~/PROJECTS/mercs_and_mines/programs/mercs_and_mines && rustup run 1.89.0-sbpf-solana-v1.52 cargo build-sbf 2>&1 | head -30\")",
       "PowerShell(wsl -e bash -ic \"which cargo-build-sbf 2>/dev/null || find ~/.local ~/.cargo -name cargo-build-sbf 2>/dev/null | head -5\")",
       "PowerShell(wsl -e bash -ic \"head -30 ~/solana-release/bin/cargo-build-sbf 2>&1\")",
-      "PowerShell(wsl -e bash -ic \"rustup run solana cargo tree -p anchor-lang --version 0.30.1 2>&1 | grep 'blake3\\\\|cpufeatures' | head -10\")"
+      "PowerShell(wsl -e bash -ic \"rustup run solana cargo tree -p anchor-lang --version 0.30.1 2>&1 | grep 'blake3\\\\|cpufeatures' | head -10\")",
+      "Bash(tree //wsl.localhost/Ubuntu/home/ajone/PROJECTS/mercs_and_mines/crates -L 3)",
+      "Read(///wsl.localhost/Ubuntu/home/ajone/PROJECTS/mercs_and_mines/**)",
+      "Bash(grep -E \"\\\\.\\(rs|toml\\)$\")",
+      "Bash(cargo build *)",
+      "Bash(wsl *)",
+      "Bash(CARGO_INCREMENTAL=0 cargo build *)"
     ]
   }
 }
