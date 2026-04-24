@@ -3,7 +3,7 @@
 // convoy_vehicle_from_class is a server-layer concern: maps the enum to the resolver's ConvoyVehicle.
 // Fuel rule: Hauler = 10 He3/hex (Gas Guzzler); all other classes = 5 He3/hex.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sim_engine::game_types::{Squad, VehicleClass};
 use sim_engine::types::{CombatInitiationType, ConvoyVehicle, Pack, Section, Vehicle};
 
@@ -22,14 +22,14 @@ pub fn convoy_vehicle_from_class(class: &VehicleClass) -> ConvoyVehicle {
     ConvoyVehicle { name: name.into(), fuel_cost_per_hex, radar_signature }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct MissionResolveRequest {
     pub squad: Squad,
     pub mission_id: String,
     pub seed_override: Option<u32>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct CombatResolveRequest {
     pub section: Section,
     pub vehicle: Vehicle,
@@ -39,7 +39,7 @@ pub struct CombatResolveRequest {
     pub defending_convoy_vehicles: Option<Vec<VehicleClass>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct PackAssaultRequest {
     pub section: Section,
     pub pack: Pack,

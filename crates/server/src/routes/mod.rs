@@ -57,8 +57,11 @@ async fn get_equipment() -> Json<Value> {
 // ── Simulation endpoints ───────────────────────────────────────────────────
 
 async fn post_mission_resolve(
+    State(state): State<Arc<AppState>>,
     Json(req): Json<MissionResolveRequest>,
 ) -> Result<impl IntoResponse, AppError> {
+    let req_payload = serde_json::to_value(&req).unwrap_or_default();
+
     let mission = missions()
         .get(req.mission_id.as_str())
         .ok_or_else(|| bad_request(format!("Unknown mission_id: {}", req.mission_id)))?;
@@ -66,12 +69,47 @@ async fn post_mission_resolve(
     let seed = req.seed_override.unwrap_or_else(generate_seed);
     let timestamp = Utc::now().to_rfc3339();
     let report = resolve_mission(&req.squad, mission, &timestamp, Some(seed));
+
+    let session_id = Uuid::new_v4();
+    let config = shared::SessionConfig {
+        session_id: session_id.to_string(),
+        build_version: env!("CARGO_PKG_VERSION").to_string(),
+        seed: seed as u64,
+        sector_id: "mission_session".into(),
+        campaign_id: "phase0".into(),
+        sector_tier: "Contested".into(),
+        ruleset: "standard_v1".into(),
+    };
+    if let Ok(mut w) = crate::log_writer::SessionLogWriter::create(
+        &state.log_dir, &session_id.to_string()
+    ).await {
+        w.write_header(&config).await;
+        w.append(&shared::InputLogEntry {
+            tick: 0, seq: 0,
+            event_type: "session_start".into(),
+            player_id: None,
+            payload: req_payload,
+            narrative_event: None,
+        }).await;
+        w.append(&shared::InputLogEntry {
+            tick: 1, seq: 0,
+            event_type: "combat_end".into(),
+            player_id: None,
+            payload: serde_json::to_value(&report).unwrap_or_default(),
+            narrative_event: None,
+        }).await;
+    }
+
     Ok(Json(report))
 }
 
 async fn post_combat_resolve(
+    State(state): State<Arc<AppState>>,
     Json(req): Json<CombatResolveRequest>,
 ) -> impl IntoResponse {
+    // Serialize before combat_initiation_type is consumed by unwrap_or.
+    let req_payload = serde_json::to_value(&req).unwrap_or_default();
+
     let seed = req.seed_override.unwrap_or_else(generate_seed);
     let timestamp = Utc::now().to_rfc3339();
     let initiation = req.combat_initiation_type.unwrap_or(CombatInitiationType::Spotted);
@@ -92,12 +130,47 @@ async fn post_combat_resolve(
         initiation,
         defending,
     );
+
+    let session_id = Uuid::new_v4();
+    let config = shared::SessionConfig {
+        session_id: session_id.to_string(),
+        build_version: env!("CARGO_PKG_VERSION").to_string(),
+        seed: seed as u64,
+        sector_id: "combat_session".into(),
+        campaign_id: "phase0".into(),
+        sector_tier: "Contested".into(),
+        ruleset: "standard_v1".into(),
+    };
+    if let Ok(mut w) = crate::log_writer::SessionLogWriter::create(
+        &state.log_dir, &session_id.to_string()
+    ).await {
+        w.write_header(&config).await;
+        w.append(&shared::InputLogEntry {
+            tick: 0, seq: 0,
+            event_type: "session_start".into(),
+            player_id: None,
+            payload: req_payload,
+            narrative_event: None,
+        }).await;
+        w.append(&shared::InputLogEntry {
+            tick: 1, seq: 0,
+            event_type: "combat_end".into(),
+            player_id: None,
+            payload: serde_json::to_value(&report).unwrap_or_default(),
+            narrative_event: None,
+        }).await;
+    }
+
     Json(report)
 }
 
 async fn post_pack_assault(
+    State(state): State<Arc<AppState>>,
     Json(req): Json<PackAssaultRequest>,
 ) -> impl IntoResponse {
+    // Serialize before combat_initiation_type is moved into resolve_pack_assault.
+    let req_payload = serde_json::to_value(&req).unwrap_or_default();
+
     let seed = req.seed_override.unwrap_or_else(generate_seed);
     let timestamp = Utc::now().to_rfc3339();
     let max_ticks = req.max_ticks.unwrap_or(50) as u32;
@@ -117,6 +190,37 @@ async fn post_pack_assault(
         max_ticks,
         Some(seed),
     );
+
+    let session_id = Uuid::new_v4();
+    let config = shared::SessionConfig {
+        session_id: session_id.to_string(),
+        build_version: env!("CARGO_PKG_VERSION").to_string(),
+        seed: seed as u64,
+        sector_id: "pack_assault_session".into(),
+        campaign_id: "phase0".into(),
+        sector_tier: "Contested".into(),
+        ruleset: "standard_v1".into(),
+    };
+    if let Ok(mut w) = crate::log_writer::SessionLogWriter::create(
+        &state.log_dir, &session_id.to_string()
+    ).await {
+        w.write_header(&config).await;
+        w.append(&shared::InputLogEntry {
+            tick: 0, seq: 0,
+            event_type: "session_start".into(),
+            player_id: None,
+            payload: req_payload,
+            narrative_event: None,
+        }).await;
+        w.append(&shared::InputLogEntry {
+            tick: 1, seq: 0,
+            event_type: "combat_end".into(),
+            player_id: None,
+            payload: serde_json::to_value(&report).unwrap_or_default(),
+            narrative_event: None,
+        }).await;
+    }
+
     Json(report)
 }
 
