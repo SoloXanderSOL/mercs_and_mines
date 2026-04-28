@@ -1,20 +1,11 @@
-mod api_types;
-mod auth;
-mod log_reader;
-mod log_writer;
-mod repository;
-mod routes;
-mod state;
-
 use std::sync::Arc;
-use state::AppState;
+use mercs_server::state::AppState;
 
 #[tokio::main]
 async fn main() {
-    let log_dir = std::env::var("LOG_DIR")
-        .unwrap_or_else(|_| "./logs".into());
+    let log_dir = std::env::var("LOG_DIR").unwrap_or_else(|_| "./logs".into());
     let state = Arc::new(AppState::new(std::path::PathBuf::from(log_dir)));
-    let app = routes::router(state);
+    let app = mercs_server::routes::router(state);
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
         .await
         .expect("Failed to bind 0.0.0.0:3000");

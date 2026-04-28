@@ -267,7 +267,10 @@ async fn post_combat_resolve(
         }).await;
     }
 
-    Json(report)
+    Json(serde_json::json!({
+        "session_id": session_id.to_string(),
+        "report":     serde_json::to_value(&report).unwrap(),
+    }))
 }
 
 async fn post_pack_assault(

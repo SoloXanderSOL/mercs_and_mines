@@ -7,6 +7,15 @@ edition.workspace = true
 name = "mercs-server"
 path = "src/main.rs"
 
+[lib]
+name    = "mercs_server"
+path    = "src/lib.rs"
+
+[dev-dependencies]
+tempfile        = "3"
+http-body-util  = "0.1"
+tower           = { version = "0.4", features = ["util"] }
+
 [dependencies]
 axum           = { version = "0.7", features = ["ws"] }
 tokio          = { version = "1", features = ["full"] }

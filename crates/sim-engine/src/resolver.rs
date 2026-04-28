@@ -11,8 +11,9 @@
 //   UnitDefinition has no `species` field — Hamster/Duck/Boar branches are unreachable.
 //   UnitArchetype::Valkyrie ability branch is pending.
 //   MissionEnvironment and MissionCategory ability checks are now fully wired.
-//   lootRoller.ts is a separate module; loot_drop always returns None until it is ported.
+//   loot_roller is wired into calc_rewards via roll_loot().
 
+use crate::loot_roller::roll_loot;
 use crate::game_types::{
     AdvisorBoard, BattleReport, Commander, Coordinates, ConvoyRecord,
     DepartureRejected, MissionCategory, MissionDefinition, MissionEnvironment, OutcomeType,
@@ -245,8 +246,8 @@ fn resolve_unit_damage(
 fn calc_rewards(
     mission: &MissionDefinition,
     outcome: &OutcomeType,
-    _squad: &Squad,
-    _rng: &mut Rng,
+    squad: &Squad,
+    rng: &mut Rng,
 ) -> Rewards {
     if matches!(outcome, OutcomeType::TacticalRetreat | OutcomeType::Wipeout) {
         return Rewards { credits: 0, ore: 0, loot_drop: None };
@@ -254,8 +255,12 @@ fn calc_rewards(
     let multiplier: f64 = if matches!(outcome, OutcomeType::FullSuccess) { 1.5 } else { 1.0 };
     let credits = (mission.credit_reward as f64 * multiplier).round() as u32;
     let ore     = (mission.ore_reward     as f64 * multiplier).round() as u32;
-    // rollLoot (lootRoller.ts) not yet ported — loot_drop is None until that module lands.
-    Rewards { credits, ore, loot_drop: None }
+    let total_loot_bonus: u32 = squad
+        .units
+        .iter()
+        .map(|u| u.definition.loot_bonus.max(0) as u32)
+        .sum();
+    Rewards { credits, ore, loot_drop: roll_loot(rng, total_loot_bonus, mission.difficulty) }
 }
 
 // ── Mission resolver ───────────────────────────────────────────────────────
