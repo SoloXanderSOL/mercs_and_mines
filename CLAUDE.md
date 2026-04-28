@@ -72,6 +72,11 @@ following rules:
   deployment timers. Use an append-only log store for input logs — treat log integrity as a
   financial requirement, not a DB convenience.
 
+## Frontend (`app/`)
+HTML5 / Vanilla JS / CSS only. No build step, no TypeScript, no npm.
+`@solana/web3.js` loaded via CDN. Axum serves `app/` as static files via `tower-http::ServeDir`.
+The Rust mandate does not apply to `app/`.
+
 ## 4. REFERENCE DOCUMENTS
 
 Before implementing any mechanic, read the relevant spec. Do not guess at behaviour.

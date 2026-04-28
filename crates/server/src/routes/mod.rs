@@ -16,6 +16,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use tower_http::services::ServeDir;
 use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -413,4 +414,5 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/combat/stream/:session_id", get(ws_combat::ws_stream_handler))
         .route("/api/combat/aar/:session_id",    get(get_combat_aar))
         .with_state(state)
+        .fallback_service(ServeDir::new("app").append_index_html_on_directories(true))
 }
