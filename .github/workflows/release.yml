@@ -31,6 +31,9 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
+      - name: Run tests
+        run: cargo test --locked
+
       - name: Build release binary
         # --locked enforces Cargo.lock exactly — required for build determinism.
         # The simulation output must be identical across every build of the same commit.
