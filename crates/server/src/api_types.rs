@@ -4,7 +4,7 @@
 // Fuel rule: Hauler = 10 He3/hex (Gas Guzzler); all other classes = 5 He3/hex.
 
 use serde::{Deserialize, Serialize};
-use sim_engine::game_types::{Squad, VehicleClass};
+use sim_engine::game_types::{Commander, Squad, VehicleClass};
 use sim_engine::types::{CombatInitiationType, ConvoyVehicle, Pack, Section, Vehicle};
 
 pub fn convoy_vehicle_from_class(class: &VehicleClass) -> ConvoyVehicle {
@@ -37,6 +37,7 @@ pub struct CombatResolveRequest {
     pub seed_override: Option<u32>,
     pub combat_initiation_type: Option<CombatInitiationType>,
     pub defending_convoy_vehicles: Option<Vec<VehicleClass>>,
+    pub commander: Option<Commander>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

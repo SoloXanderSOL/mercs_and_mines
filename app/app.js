@@ -87,6 +87,24 @@ const DEMO_COMBAT = {
     weapons: [{ name: 'Autocannon', ap: 3, base_damage: 14, tag: 'Slug', accuracy: 15 }],
   },
   max_ticks: 25,
+  seed_override: 42,
+  commander: {
+    id: 'commander-vane-001',
+    name: 'Colonel Vane',
+    species: 'Human (Corporate)',
+    rank: 5,
+    skill: 9,
+    success_aura: 15,
+    quality_grade: 'Superior',
+    ability: 'Precision Cadence — Section accuracy rolls made under his command are treated as if firing from prepared positions.',
+    flavor_text: 'Has outlived seventeen engagements, four court martials, and one strongly-worded HR memorandum. The HR memorandum was the most dangerous of the three.',
+    stress_level: 0,
+    is_kia: false,
+    is_shattered: false,
+    can_retreat: true,
+    passive_buffs: { accuracy: 10, evasion: 5, damage_reduction: 3 },
+    attached_unit_id: null,
+  },
 };
 
 document.getElementById('btn-start-combat').addEventListener('click', async () => {

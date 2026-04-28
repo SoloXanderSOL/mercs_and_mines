@@ -27,6 +27,35 @@ use crate::types::{
     Section, SectionFireEvent, TickLog, Vehicle, VehicleWeaponEvent, WeaponTag,
 };
 
+// ── RNG draw order (determinism contract) ──────────────────────────────────
+//
+// Reordering any draw below is a breaking change. Bump build_version and mark all
+// prior session logs as non-replayable before doing so.
+//
+// MISSION RESOLVER (resolve_mission):
+//   1. success roll         — roll_d100()
+//   2. per unit, squad order:
+//        always              — chance() [hp loss check]
+//        if damage           — roll_d100() [hp amount]
+//        if damage           — chance() [KIA check]
+//        if KIA + Sawbones   — chance() [Trauma Protocol]
+//   3. loot (FullSuccess / PartialSuccess only):
+//        always              — chance() [drop check]
+//        if drop             — next_f64() [grade], next_f64() [item name]
+//   4. report ID            — next_u32() × 2
+//
+// COMBAT RESOLVER (resolve_combat, resolve_combat_streaming):
+//   per tick:
+//     per vehicle weapon, declaration order — roll_d100() [hit]
+//     per section member, 0..strength order — roll_d100() [hit]  (skipped on Ambush tick 1)
+//   after all ticks: report ID — next_u32() × 2
+//
+// PACK ASSAULT RESOLVER (resolve_pack_assault):
+//   per tick:
+//     per pack member, 0..pack_strength order    — roll_d100() [hit]
+//     per section member, 0..sec_strength order  — roll_d100() [hit]  (skipped on Ambush tick 1)
+//   after all ticks: report ID — next_u32() × 2
+
 // ── Constants ──────────────────────────────────────────────────────────────
 
 const MIN_CHANCE: f64 = 5.0;

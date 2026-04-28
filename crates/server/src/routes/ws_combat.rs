@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use shared::ws_events::{ClientCommand, CombatTickEvent};
 use sim_engine::{
-    resolver::resolve_combat_streaming,
+    resolver::{apply_commander_buffs, resolve_combat_streaming},
     rng::generate_seed,
     types::CombatInitiationType,
 };
@@ -65,8 +65,11 @@ async fn handle_ws(
         .map(convoy_vehicle_from_class)
         .collect();
 
-    let section = params.section;
-    let vehicle = params.vehicle;
+    let mut section = params.section;
+    let vehicle     = params.vehicle;
+    if let Some(mut cmd) = params.commander {
+        apply_commander_buffs(&mut cmd, &mut section);
+    }
 
     // Open the log file. Failure is non-fatal — game session continues, error goes to stderr.
     let mut log = match crate::log_writer::SessionLogWriter::create(

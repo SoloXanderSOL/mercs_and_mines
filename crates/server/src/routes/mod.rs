@@ -25,7 +25,7 @@ use uuid::Uuid;
 use sim_engine::{
     equipment::equipment,
     missions::missions,
-    resolver::{resolve_combat, resolve_mission, resolve_pack_assault},
+    resolver::{apply_commander_buffs, resolve_combat, resolve_mission, resolve_pack_assault},
     rng::generate_seed,
     types::CombatInitiationType,
     units::unit_definitions,
@@ -224,8 +224,13 @@ async fn post_combat_resolve(
         .map(convoy_vehicle_from_class)
         .collect();
 
+    let mut section = req.section;
+    if let Some(mut cmd) = req.commander {
+        apply_commander_buffs(&mut cmd, &mut section);
+    }
+
     let report = resolve_combat(
-        &req.section,
+        &section,
         &req.vehicle,
         &timestamp,
         max_ticks,
