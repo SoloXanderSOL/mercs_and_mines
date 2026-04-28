@@ -110,4 +110,9 @@ async fn aar_replays_deterministically() {
         replayed["ticks"].as_array().map(|a| a.len()),
         "tick count mismatch"
     );
+    assert_eq!(
+        original["ticks"],
+        replayed["ticks"],
+        "tick-by-tick content mismatch — RNG stream diverged"
+    );
 }

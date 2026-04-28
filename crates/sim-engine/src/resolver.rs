@@ -950,6 +950,22 @@ pub fn check_detection(
 // (e.g. the Solana BPF program that also depends on sim-engine).
 
 #[cfg(feature = "streaming")]
+fn section_bar(current: u32, max: u32) -> String {
+    let filled = "◆".repeat(current as usize);
+    let empty  = "◇".repeat((max.saturating_sub(current)) as usize);
+    format!("{}{}", filled, empty)
+}
+
+#[cfg(feature = "streaming")]
+fn hp_bar(current: i32, max: i32) -> String {
+    const W: usize = 10;
+    let ratio  = current.max(0) as f32 / max.max(1) as f32;
+    let filled = (ratio * W as f32).round() as usize;
+    let empty  = W.saturating_sub(filled);
+    format!("{}{}", "█".repeat(filled), "░".repeat(empty))
+}
+
+#[cfg(feature = "streaming")]
 pub async fn resolve_combat_streaming(
     section: &Section,
     vehicle: &Vehicle,
@@ -974,7 +990,6 @@ pub async fn resolve_combat_streaming(
 
     let mut current_strength = section.current_strength;
     let mut vehicle_hp = vehicle.hp;
-    let mut total_kia: u32 = 0;
 
     for tick in 1..=max_ticks {
         // ── Cancellation check (RETREAT interrupt) ─────────────────────────
@@ -1008,8 +1023,13 @@ pub async fn resolve_combat_streaming(
 
         let is_ambush_tick1 =
             matches!(combat_initiation_type, CombatInitiationType::Ambush) && tick == 1;
-        let strength_at_tick_start = current_strength;
-        let mut narrative_lines: Vec<String> = Vec::new();
+        let sep = "╠══════════════════════════════════════╣";
+        let mut narrative_lines: Vec<String> = vec![
+            sep.to_string(),
+            format!("║  TICK {}", tick),
+            "║".to_string(),
+            format!("║  [ VEHICLE FIRES — {} ]", vehicle.name),
+        ];
 
         // ── Phase 1: Vehicle fires each weapon at Section ──────────────────
         for weapon in &vehicle.weapons {
@@ -1019,21 +1039,19 @@ pub async fn resolve_combat_streaming(
             let dice_roll = rng.roll_d100() as i32;
             let hit_roll_total = dice_roll + weapon.accuracy - section.evasion;
             let is_hit = hit_roll_total > 50;
+            let hit_breakdown = format!("D100({}) + {} - {} = {}",
+                dice_roll, weapon.accuracy, section.evasion, hit_roll_total);
 
             if !is_hit {
-                narrative_lines.push(format!(
-                    "[Tick {}] {} fires on {} — Miss.",
-                    tick, weapon.name, section.name
-                ));
+                narrative_lines.push(format!("║    {}  MISS  [{}]", weapon.name, hit_breakdown));
                 continue;
             }
 
             let is_penetration = weapon.ap >= section.armor_at;
+            let ap_vs_at = format!("AP {} vs AT {}", weapon.ap, section.armor_at);
             if !is_penetration {
-                narrative_lines.push(format!(
-                    "[Tick {}] {} fires on {} — Hit (no penetration).",
-                    tick, weapon.name, section.name
-                ));
+                narrative_lines.push(format!("║    {}  HIT  [{}]", weapon.name, hit_breakdown));
+                narrative_lines.push(format!("║      {} — NO PENETRATION", ap_vs_at));
                 continue;
             }
 
@@ -1044,32 +1062,17 @@ pub async fn resolve_combat_streaming(
                     .min(current_strength);
             current_strength -= kill_count;
 
-            narrative_lines.push(format!(
-                "[Tick {}] {} fires on {} — Hit! {} damage. {} HP: {}/{}",
-                tick,
-                weapon.name,
-                section.name,
-                final_damage,
-                section.name,
-                current_strength,
-                section.max_strength
-            ));
-            if kill_count > 0 {
-                narrative_lines.push(format!(
-                    "[Tick {}] {} is eliminated.",
-                    tick, section.name
-                ));
-            }
+            narrative_lines.push(format!("║    {}  HIT  [{}]", weapon.name, hit_breakdown));
+            narrative_lines.push(format!("║      {} — PENETRATION  dmg: {}  → {} KIA",
+                ap_vs_at, final_damage, kill_count));
         }
-
-        total_kia += strength_at_tick_start - current_strength;
 
         // ── Phase 2: Section swarm fires at Vehicle ────────────────────────
         //    Suppressed on Tick 1 of an AMBUSH engagement.
         if is_ambush_tick1 {
+            narrative_lines.push("║".to_string());
             narrative_lines.push(format!(
-                "[Tick {}] {} suppressed — cannot return fire.",
-                tick, section.name
+                "║  [ {} SUPPRESSED — cannot return fire ]", section.name
             ));
         } else {
             let shots_total = current_strength;
@@ -1096,40 +1099,23 @@ pub async fn resolve_combat_streaming(
                 }
             }
 
+            narrative_lines.push("║".to_string());
+            narrative_lines.push(format!("║  [ SECTION FIRES — {} ]", section.name));
             if hits_total > 0 && is_pen && total_damage > 0 {
-                narrative_lines.push(format!(
-                    "[Tick {}] {} fires on {} — Hit! {} damage. {} HP: {}/{}",
-                    tick,
-                    section.name,
-                    vehicle.name,
-                    total_damage,
-                    vehicle.name,
-                    vehicle_hp.max(0),
-                    vehicle.max_hp
-                ));
+                narrative_lines.push(format!("║    {} shots → {} hits → {} dmg",
+                    shots_total, hits_total, total_damage));
             } else if hits_total > 0 {
-                narrative_lines.push(format!(
-                    "[Tick {}] {} fires on {} — Hit (no penetration).",
-                    tick, section.name, vehicle.name
-                ));
+                narrative_lines.push(format!("║    {} shots → {} hits → NO PENETRATION",
+                    shots_total, hits_total));
             } else {
-                narrative_lines.push(format!(
-                    "[Tick {}] {} fires on {} — Miss.",
-                    tick, section.name, vehicle.name
-                ));
+                narrative_lines.push(format!("║    {} shots → 0 hits", shots_total));
             }
         }
 
         // ── Elimination markers ────────────────────────────────────────────
         if vehicle_hp <= 0 {
-            narrative_lines.push(format!("[Tick {}] {} is eliminated.", tick, vehicle.name));
+            narrative_lines.push(format!("║    {} DESTROYED.", vehicle.name));
         }
-
-        // ── State line ─────────────────────────────────────────────────────
-        narrative_lines.push(format!(
-            "[Tick {}] {} — {}/{} HP. {} KIA this engagement.",
-            tick, section.name, current_strength, section.max_strength, total_kia
-        ));
 
         // ── Terminal condition ─────────────────────────────────────────────
         let ws_outcome = if current_strength == 0 && vehicle_hp <= 0 {
@@ -1144,6 +1130,22 @@ pub async fn resolve_combat_streaming(
             None
         };
         let combat_ended = ws_outcome.is_some();
+
+        narrative_lines.push("║".to_string());
+        narrative_lines.push(format!(
+            "║  End Tick {}  │  Section: {}  {}/{}  │  Vehicle: {}  {}/{} HP",
+            tick,
+            section_bar(current_strength, section.max_strength),
+            current_strength, section.max_strength,
+            hp_bar(vehicle_hp, vehicle.max_hp),
+            vehicle_hp.max(0), vehicle.max_hp,
+        ));
+        if combat_ended {
+            if let Some(ref o) = ws_outcome {
+                narrative_lines.push(format!("║  Outcome: {:?}", o));
+            }
+            narrative_lines.push("╚══════════════════════════════════════╝".to_string());
+        }
 
         // ── Build UnitSnapshots ────────────────────────────────────────────
         let section_status = if current_strength == 0 {

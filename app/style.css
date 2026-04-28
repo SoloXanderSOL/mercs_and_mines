@@ -57,16 +57,26 @@ button:disabled { border-color: var(--dim); color: var(--dim); cursor: not-allow
 }
 #tick-feed p { margin: 0; }
 #tick-feed p.outcome { color: var(--amber); font-weight: bold; margin-top: 0.3rem; }
+#tick-feed pre {
+  margin: 0;
+  padding: 0;
+  white-space: pre;
+  font-family: inherit;
+  color: inherit;
+  line-height: 1.4;
+}
+#tick-feed pre.outcome { color: var(--amber); font-weight: bold; }
 
 #aar-content {
   background: var(--surface);
   border: 1px solid var(--border);
   padding: 1rem;
-  white-space: pre-wrap;
-  word-break: break-word;
+  white-space: pre;
+  font-family: inherit;
   font-size: 0.75rem;
   color: var(--text);
   max-height: 68vh;
   overflow-y: auto;
+  overflow-x: auto;
   margin: 1rem 0;
 }

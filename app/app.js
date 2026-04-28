@@ -120,6 +120,14 @@ document.getElementById('btn-start-combat').addEventListener('click', async () =
     feed.scrollTop = feed.scrollHeight;
   };
 
+  const addTick = (text, cls) => {
+    const pre = document.createElement('pre');
+    pre.textContent = text;
+    if (cls) pre.classList.add(cls);
+    feed.appendChild(pre);
+    feed.scrollTop = feed.scrollHeight;
+  };
+
   try {
     const { session_id } = await apiPost('/api/combat/stream/start', DEMO_COMBAT);
     sessionId = session_id;
@@ -128,11 +136,8 @@ document.getElementById('btn-start-combat').addEventListener('click', async () =
 
     ws.onmessage = ({ data }) => {
       const ev = JSON.parse(data);
-      const line = ev.narrative
-        ? `[T${ev.tick_index}] ${ev.narrative}`
-        : `[T${ev.tick_index}] tick`;
-      addLine(ev.combat_ended ? line + (ev.outcome ? ' — ' + ev.outcome.toUpperCase() : ' — ENDED') : line,
-              ev.combat_ended ? 'outcome' : null);
+      const text = ev.narrative || `[Tick ${ev.tick_index}]`;
+      addTick(text, ev.combat_ended ? 'outcome' : null);
     };
     ws.onclose = () => { document.getElementById('btn-view-aar').disabled = false; };
     ws.onerror = () => addLine('WebSocket error — check server logs.');
@@ -141,6 +146,91 @@ document.getElementById('btn-start-combat').addEventListener('click', async () =
   }
 });
 
+function formatAar(wrapper) {
+  const r   = wrapper.report;
+  const SEP = '╠══════════════════════════════════════╣';
+  const END = '╚══════════════════════════════════════╝';
+
+  function sBar(current, max) {
+    return '◆'.repeat(Math.max(0, current)) +
+           '◇'.repeat(Math.max(0, max - current));
+  }
+  function hBar(current, max) {
+    const W = 10;
+    const filled = Math.round(Math.max(0, current) / Math.max(1, max) * W);
+    return '█'.repeat(filled) + '░'.repeat(W - filled);
+  }
+
+  const lines = [
+    '╔══════════════════════════════════════╗',
+    '║  AFTER-ACTION REPORT',
+    `║  Session : ${wrapper.session_id}`,
+    `║  Seed    : ${wrapper.seed}`,
+    `║  Build   : ${wrapper.build_version}`,
+    SEP,
+  ];
+
+  for (const tick of r.ticks) {
+    lines.push(`║  TICK ${tick.tick}`);
+    lines.push('║');
+    lines.push(`║  [ VEHICLE FIRES — ${r.vehicle_name} ]`);
+
+    for (const we of tick.vehicle_events) {
+      if (!we.is_hit) {
+        lines.push(`║    ${we.weapon_name}  MISS  [${we.hit_roll_breakdown}]`);
+      } else if (!we.is_penetration) {
+        lines.push(`║    ${we.weapon_name}  HIT  [${we.hit_roll_breakdown}]`);
+        lines.push(`║      ${we.ap_vs_at} — NO PENETRATION`);
+      } else {
+        lines.push(`║    ${we.weapon_name}  HIT  [${we.hit_roll_breakdown}]`);
+        lines.push(`║      ${we.ap_vs_at} — PENETRATION  dmg: ${we.final_damage}  → ${we.kill_count} KIA`);
+      }
+    }
+
+    lines.push('║');
+    if (tick.defender_suppressed) {
+      lines.push(`║  [ ${r.section_name} SUPPRESSED — cannot return fire ]`);
+    } else if (tick.section_event) {
+      const se = tick.section_event;
+      lines.push(`║  [ SECTION FIRES — ${r.section_name} ]`);
+      if (se.hits_total > 0 && se.is_penetration) {
+        lines.push(`║    ${se.shots_total} shots → ${se.hits_total} hits → ${se.total_damage} dmg`);
+      } else if (se.hits_total > 0) {
+        lines.push(`║    ${se.shots_total} shots → ${se.hits_total} hits → NO PENETRATION`);
+      } else {
+        lines.push(`║    ${se.shots_total} shots → 0 hits`);
+      }
+    }
+
+    lines.push('║');
+    lines.push(
+      `║  End Tick ${tick.tick}` +
+      `  │  Section: ${sBar(tick.section_strength_after, r.section_max_strength)}` +
+      `  ${tick.section_strength_after}/${r.section_max_strength}` +
+      `  │  Vehicle: ${hBar(tick.vehicle_hp_after, r.vehicle_max_hp)}` +
+      `  ${Math.max(0, tick.vehicle_hp_after)}/${r.vehicle_max_hp} HP`
+    );
+    lines.push(SEP);
+  }
+
+  lines.push('║  ENGAGEMENT SUMMARY');
+  lines.push(`║  Outcome : ${r.outcome}`);
+  lines.push(`║  Ticks   : ${r.ticks.length}`);
+  lines.push(
+    `║  Section : ${sBar(r.section_final_strength, r.section_max_strength)}` +
+    `  ${r.section_final_strength}/${r.section_max_strength}`
+  );
+  lines.push(
+    `║  Vehicle : ${hBar(r.vehicle_final_hp, r.vehicle_max_hp)}` +
+    `  ${Math.max(0, r.vehicle_final_hp)}/${r.vehicle_max_hp} HP`
+  );
+  lines.push('║');
+  lines.push(`║  ${r.narrative_summary}`);
+  lines.push(END);
+
+  return lines.join('\n');
+}
+
 // ── Screen 3: after-action report ────────────────────────────────────────
 
 document.getElementById('btn-view-aar').addEventListener('click', async () => {
@@ -148,7 +238,7 @@ document.getElementById('btn-view-aar').addEventListener('click', async () => {
     const headers = token ? { 'Authorization': 'Bearer ' + token } : {};
     const r = await fetch(`/api/combat/aar/${sessionId}`, { headers });
     if (!r.ok) throw new Error(await r.text());
-    document.getElementById('aar-content').textContent = JSON.stringify(await r.json(), null, 2);
+    document.getElementById('aar-content').textContent = formatAar(await r.json());
     hide('screen-dashboard');
     show('screen-aar');
   } catch (e) {
