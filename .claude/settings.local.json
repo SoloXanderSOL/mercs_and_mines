@@ -21,7 +21,8 @@
       "Bash(grep -E \"\\\\.\\(rs|toml\\)$\")",
       "Bash(cargo build *)",
       "Bash(wsl *)",
-      "Bash(CARGO_INCREMENTAL=0 cargo build *)"
+      "Bash(CARGO_INCREMENTAL=0 cargo build *)",
+      "Bash(xargs cat *)"
     ]
   }
 }

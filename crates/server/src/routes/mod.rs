@@ -356,6 +356,32 @@ async fn post_combat_stream_start(
     Json(json!({"session_id": id.to_string()}))
 }
 
+// ── Session integrity anchor ───────────────────────────────────────────────
+
+async fn get_session_integrity(
+    State(state): State<Arc<AppState>>,
+    Path(raw_id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    uuid::Uuid::parse_str(&raw_id)
+        .map_err(|_| bad_request("session_id must be a valid UUID"))?;
+
+    let integrity = crate::integrity::compute_session_integrity(
+        &state.log_dir,
+        &raw_id,
+    )
+    .await
+    .map_err(|e| bad_request(format!("Could not compute integrity: {e}")))?;
+
+    Ok(Json(json!({
+        "session_id":    integrity.session_id,
+        "seed":          integrity.seed,
+        "build_version": integrity.build_version,
+        "log_hash":      integrity.log_hash,
+        "algorithm":     "SHA-256",
+        "note":          "Tuple (session_id, seed, log_hash) is the on-chain anchor record. Replaying the session log against this seed must produce the same log_hash.",
+    })))
+}
+
 // ── After-Action Report (deterministic replay) ────────────────────────────
 
 async fn get_combat_aar(
@@ -421,6 +447,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/combat/stream/start",       post(post_combat_stream_start))
         .route("/api/combat/stream/:session_id", get(ws_combat::ws_stream_handler))
         .route("/api/combat/aar/:session_id",    get(get_combat_aar))
+        .route("/api/session/:id/integrity",     get(get_session_integrity))
         .with_state(state)
         .fallback_service(ServeDir::new("app").append_index_html_on_directories(true))
 }
