@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
+use crate::config::SimConfig;
 use crate::game_types::{MercHardpoint, Unit, UnitArchetype, UnitDefinition, UnitStatus};
 
 static UNIT_DEFINITIONS: OnceLock<HashMap<&'static str, UnitDefinition>> = OnceLock::new();
@@ -29,6 +30,7 @@ pub fn create_unit(
     name: String,
     id: String,
     skill_override: Option<u8>,
+    cfg: &SimConfig,
 ) -> Option<Unit> {
     let def = get_definition(def_key)?;
     let skill = skill_override.unwrap_or(def.base_skill);
@@ -38,8 +40,8 @@ pub fn create_unit(
         definition: def,
         skill,
         xp: 0,
-        current_hp: 10,
-        max_hp: 10,
+        current_hp: cfg.unit_default_hp,
+        max_hp: cfg.unit_default_hp,
         status: UnitStatus::Ready,
         equipment: vec![],
     })

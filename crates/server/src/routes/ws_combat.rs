@@ -16,6 +16,8 @@ use uuid::Uuid;
 
 use shared::ws_events::{ClientCommand, CombatTickEvent};
 use sim_engine::{
+    config::SimConfig,
+    constants::TICK_CHANNEL_BUFFER,
     resolver::{apply_commander_buffs, resolve_combat_streaming},
     rng::generate_seed,
     types::CombatInitiationType,
@@ -36,13 +38,18 @@ pub async fn ws_stream_handler(
         None => return StatusCode::NOT_FOUND.into_response(),
     };
 
-    if session.created_at.elapsed() > Duration::from_secs(300) {
+    let stale_secs = state.config.server.combat_session_stale_secs;
+    if session.created_at.elapsed() > Duration::from_secs(stale_secs) {
         return StatusCode::GONE.into_response();
     }
 
     let log_dir = state.log_dir.clone();
-    ws.on_upgrade(move |socket| handle_ws(socket, session.params, session_id, log_dir))
-        .into_response()
+    let sim_cfg = state.config.sim.clone();
+    let default_max_ticks = state.config.server.default_max_ticks;
+    ws.on_upgrade(move |socket| {
+        handle_ws(socket, session.params, session_id, log_dir, sim_cfg, default_max_ticks)
+    })
+    .into_response()
 }
 
 async fn handle_ws(
@@ -50,6 +57,8 @@ async fn handle_ws(
     params: CombatResolveRequest,
     session_id: Uuid,
     log_dir: PathBuf,
+    sim_cfg: SimConfig,
+    default_max_ticks: usize,
 ) {
     // Serialize before any field is consumed by unwrap_or.
     let params_payload = serde_json::to_value(&params).unwrap_or_default();
@@ -57,7 +66,7 @@ async fn handle_ws(
     let seed = params.seed_override.unwrap_or_else(generate_seed);
     let timestamp = Utc::now().to_rfc3339();
     let initiation = params.combat_initiation_type.unwrap_or(CombatInitiationType::Spotted);
-    let max_ticks = params.max_ticks.unwrap_or(50) as u32;
+    let max_ticks = params.max_ticks.unwrap_or(default_max_ticks) as u32;
     let defending: Vec<_> = params
         .defending_convoy_vehicles
         .unwrap_or_default()
@@ -104,10 +113,10 @@ async fn handle_ws(
         }).await;
     }
 
-    let (tick_tx, mut tick_rx) = mpsc::channel::<CombatTickEvent>(32);
+    let (tick_tx, mut tick_rx) = mpsc::channel::<CombatTickEvent>(TICK_CHANNEL_BUFFER);
     let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
 
-    // Spawn resolver — section/vehicle/timestamp are moved into the async block
+    // Spawn resolver — section/vehicle/timestamp/sim_cfg are moved into the async block
     // so the future is 'static and safe for tokio::spawn.
     let resolver_handle = tokio::spawn(async move {
         resolve_combat_streaming(
@@ -120,6 +129,7 @@ async fn handle_ws(
             defending,
             tick_tx,
             cancel_rx,
+            &sim_cfg,
         )
         .await;
     });
@@ -205,8 +215,6 @@ async fn handle_ws(
     }
 
     // Ensure the resolver task is stopped before we return.
-    // If cancel_tx was already fired this is a no-op; if not, the task ends
-    // naturally when tick_tx is dropped (which happens when the task returns).
     let _ = resolver_handle.await;
     let _ = socket.close().await;
 }

@@ -2,7 +2,7 @@ use std::sync::Arc;
 use axum::body::Body;
 use http_body_util::BodyExt;
 use tower::util::ServiceExt;
-use mercs_server::{routes::router, state::AppState};
+use mercs_server::{config::Config, routes::router, state::AppState};
 
 fn alpha_vs_scout_payload() -> serde_json::Value {
     serde_json::json!({
@@ -49,7 +49,8 @@ fn alpha_vs_scout_payload() -> serde_json::Value {
 #[tokio::test]
 async fn aar_replays_deterministically() {
     let tmp = tempfile::tempdir().unwrap();
-    let state = Arc::new(AppState::new(tmp.path().to_path_buf()));
+    let config = Arc::new(Config::default());
+    let state = Arc::new(AppState::new(tmp.path().to_path_buf(), config));
     let app = router(state);
 
     // ── Step 1: resolve combat, get session_id ─────────────────────────

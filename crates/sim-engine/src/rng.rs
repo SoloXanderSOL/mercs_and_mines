@@ -5,6 +5,8 @@
 // marking all older session replays as unsupported. The input log is the Prize Pool audit
 // trail; any drift breaks dispute resolution. See Technical_Architecture_Deterministic_Simulation.md.
 
+use crate::constants::{MULBERRY32_F64_DIVISOR, MULBERRY32_INCREMENT};
+
 /// The simulation PRNG. Pass by `&mut` to every system that needs randomness.
 /// Do NOT derive Clone or Copy — accidental state duplication silently breaks determinism.
 pub struct Rng {
@@ -18,7 +20,7 @@ impl Rng {
 
     /// Mulberry32 core. Advances state and returns a u32 in [0, 2^32).
     pub fn next_u32(&mut self) -> u32 {
-        self.state = self.state.wrapping_add(0x6d2b79f5);
+        self.state = self.state.wrapping_add(MULBERRY32_INCREMENT);
         let s = self.state;
         let mut t = (s ^ (s >> 15)).wrapping_mul(1 | s);
         t ^= t.wrapping_add((t ^ (t >> 7)).wrapping_mul(61 | t));
@@ -27,7 +29,7 @@ impl Rng {
 
     /// Returns a float in [0.0, 1.0).
     pub fn next_f64(&mut self) -> f64 {
-        self.next_u32() as f64 / 4294967296.0
+        self.next_u32() as f64 / MULBERRY32_F64_DIVISOR
     }
 
     /// Returns an integer in [1, 100] inclusive.

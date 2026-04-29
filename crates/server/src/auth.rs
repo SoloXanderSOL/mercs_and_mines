@@ -71,7 +71,7 @@ pub fn issue_session(state: &Arc<AppState>, wallet_address: &str) -> SessionToke
         account_id:     wallet_address.to_string(), // Phase 0 stub — replace with DB lookup in Batch 8
         wallet_address: wallet_address.to_string(),
         issued_at:      now,
-        expires_at:     now + 7200, // 2-hour TEEPIN session window
+        expires_at:     now + state.config.server.session_duration_secs,
     };
     state.sessions.insert(token.token_id.clone(), token.clone());
     token

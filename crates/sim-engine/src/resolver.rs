@@ -13,6 +13,13 @@
 //   MissionEnvironment and MissionCategory ability checks are now fully wired.
 //   loot_roller is wired into calc_rewards via roll_loot().
 
+use crate::config::SimConfig;
+use crate::constants::{
+    COMMANDER_RETIRE_RANK, FNV1A_OFFSET_BASIS, FNV1A_PRIME, HIT_ROLL_THRESHOLD,
+    MAX_SQUAD_BONUS_UNITS, MAX_STRESS, SKILL_LEVEL_MAX,
+    STRESS_BREAKING_POINT_MAX, STRESS_BREAKING_POINT_MIN,
+    STRESS_STRAINED_BUFF_MULT, STRESS_STRAINED_MAX, STRESS_STRAINED_MIN,
+};
 use crate::loot_roller::roll_loot;
 use crate::game_types::{
     AdvisorBoard, BattleReport, Commander, Coordinates, ConvoyRecord,
@@ -67,10 +74,10 @@ const TRAVEL_MINUTES_PER_HEX: i64 = 20;
 /// FNV-1a u32 hash of a string — produces a deterministic seed from mission ID + timestamp.
 /// Matches the TypeScript generateSeed(id, timestamp) calling convention.
 fn seed_from_str(s: &str) -> u32 {
-    let mut h: u32 = 2166136261;
+    let mut h: u32 = FNV1A_OFFSET_BASIS;
     for b in s.bytes() {
         h ^= b as u32;
-        h = h.wrapping_mul(16777619);
+        h = h.wrapping_mul(FNV1A_PRIME);
     }
     h
 }
@@ -88,7 +95,7 @@ fn tag_multiplier(weapon: &WeaponTag, armor: &ArmorTag) -> f32 {
 
 // ── Score calculators ──────────────────────────────────────────────────────
 
-fn calc_base_skill_score(squad: &Squad) -> f64 {
+fn calc_base_skill_score(squad: &Squad, cfg: &SimConfig) -> f64 {
     if squad.units.is_empty() {
         return 0.0;
     }
@@ -96,12 +103,12 @@ fn calc_base_skill_score(squad: &Squad) -> f64 {
     // has no species field in the current type system. Standard average path runs always.
     let avg = squad.units.iter().map(|u| u.skill as f64).sum::<f64>()
         / squad.units.len() as f64;
-    (avg / 10.0) * 50.0
+    (avg / SKILL_LEVEL_MAX) * cfg.base_skill_score_weight
 }
 
-fn calc_squad_size_bonus(squad: &Squad) -> i32 {
-    let bonus = (squad.units.len() as i32 - 1) * 3;
-    bonus.min(4 * 3) // (MAX_SQUAD_SIZE - 1) * SQUAD_SIZE_BONUS_PER_UNIT
+fn calc_squad_size_bonus(squad: &Squad, cfg: &SimConfig) -> i32 {
+    let bonus = (squad.units.len() as i32 - 1) * cfg.squad_size_bonus_per_unit;
+    bonus.min(MAX_SQUAD_BONUS_UNITS * cfg.squad_size_bonus_per_unit)
 }
 
 fn calc_gear_bonus(squad: &Squad) -> i32 {
@@ -128,7 +135,7 @@ fn calc_total_damage_shield(squad: &Squad) -> f64 {
     total / squad.units.len() as f64
 }
 
-fn calc_ability_bonus(squad: &Squad) -> i32 {
+fn calc_ability_bonus(squad: &Squad, cfg: &SimConfig) -> i32 {
     let vanguard_count = squad
         .units
         .iter()
@@ -138,42 +145,44 @@ fn calc_ability_bonus(squad: &Squad) -> i32 {
     squad.units.iter().fold(0i32, |acc, unit| {
         let mut bonus = acc + unit.definition.success_mod;
         if matches!(unit.definition.archetype, UnitArchetype::Vanguard) {
-            // +2 per additional Vanguard beyond the first, capped at +6 total extra.
-            bonus += ((vanguard_count - 1) * 2).min(6);
+            // +cfg.vanguard_stack_bonus_per_unit per additional Vanguard beyond the first,
+            // capped at cfg.max_vanguard_stack_bonus total extra.
+            bonus += ((vanguard_count - 1) * cfg.vanguard_stack_bonus_per_unit)
+                .min(cfg.max_vanguard_stack_bonus);
         }
         bonus
     })
 }
 
-fn calc_mission_type_modifier(squad: &Squad, mission: &MissionDefinition) -> i32 {
+fn calc_mission_type_modifier(squad: &Squad, mission: &MissionDefinition, cfg: &SimConfig) -> i32 {
     squad.units.iter().fold(0i32, |acc, unit| {
         let bonus = match unit.definition.archetype {
-            // GhostWire: Intel (now Sabotage) and Extraction treated as one tier lower → +7%.
+            // GhostWire: Intel (now Sabotage) and Extraction treated as one tier lower.
             UnitArchetype::GhostWire
                 if matches!(
                     mission.category,
                     MissionCategory::Sabotage | MissionCategory::Extraction
                 ) =>
             {
-                7
+                cfg.ghost_wire_mission_bonus
             }
-            // TunnelRunner: +8% in Underground environments.
+            // TunnelRunner: bonus in Underground environments.
             UnitArchetype::TunnelRunner
                 if matches!(mission.environment, MissionEnvironment::Underground) =>
             {
-                8
+                cfg.tunnel_runner_env_bonus
             }
             // Prospector: deep scan bonus on Extraction missions (formerly Mining).
             UnitArchetype::Prospector
                 if matches!(mission.category, MissionCategory::Extraction) =>
             {
-                5
+                cfg.prospector_extraction_bonus
             }
-            // Pyroclast: removes -15% Industrial terrain penalty → net +15.
+            // Pyroclast: removes -15% Industrial terrain penalty → net positive.
             UnitArchetype::Pyroclast
                 if matches!(mission.environment, MissionEnvironment::Industrial) =>
             {
-                15
+                cfg.pyroclast_industrial_bonus
             }
             // WarBoarRider: immune to Urban terrain penalties.
             // Returns 0 — penalty immunity, not a positive bonus; urban malus system pending.
@@ -201,10 +210,12 @@ fn resolve_unit_damage(
     avg_damage_shield: f64,
     has_sawbones: bool,
     rng: &mut Rng,
+    cfg: &SimConfig,
 ) -> UnitBattleResult {
-    let success_mult = if is_success { 0.4_f64 } else { 1.5_f64 };
+    let success_mult = if is_success { cfg.hp_loss_mult_success } else { cfg.hp_loss_mult_failure };
     let raw_hp_loss_chance = mission.base_hp_loss_chance as f64 * success_mult;
-    let effective_hp_loss_chance = (raw_hp_loss_chance - avg_damage_shield).clamp(2.0, 95.0);
+    let effective_hp_loss_chance =
+        (raw_hp_loss_chance - avg_damage_shield).clamp(cfg.hp_loss_clamp_min, MAX_CHANCE);
     let unit_type = format!("{:?}", unit.definition.archetype);
 
     if !rng.chance(effective_hp_loss_chance / 100.0) {
@@ -221,18 +232,18 @@ fn resolve_unit_damage(
     }
 
     let hp_lost: i32 = if is_success {
-        if rng.roll_d100() <= 60 { 1 } else { 2 }
+        if rng.roll_d100() <= cfg.hp_roll_success_threshold { 1 } else { 2 }
     } else {
-        if rng.roll_d100() <= 40 { 2 } else { 3 }
+        if rng.roll_d100() <= cfg.hp_roll_failure_threshold { 2 } else { 3 }
     };
     let hp_remaining = (unit.current_hp - hp_lost).max(0);
 
-    let kia_base = if is_success { 10.0_f64 } else { 35.0_f64 };
+    let kia_base = if is_success { cfg.kia_base_chance_success } else { cfg.kia_base_chance_failure };
     let kia_chance = kia_base * mission.base_kia_multiplier as f64;
 
     if rng.chance(kia_chance / 100.0) {
-        // Sawbones TRAUMA PROTOCOL — 30% chance to convert KIA → Wounded.
-        if has_sawbones && rng.chance(0.30) {
+        // Sawbones TRAUMA PROTOCOL — cfg.sawbones_trauma_chance to convert KIA → Wounded.
+        if has_sawbones && rng.chance(cfg.sawbones_trauma_chance) {
             return UnitBattleResult {
                 unit_id: unit.id.clone(),
                 unit_name: unit.name.clone(),
@@ -277,11 +288,16 @@ fn calc_rewards(
     outcome: &OutcomeType,
     squad: &Squad,
     rng: &mut Rng,
+    cfg: &SimConfig,
 ) -> Rewards {
     if matches!(outcome, OutcomeType::TacticalRetreat | OutcomeType::Wipeout) {
         return Rewards { credits: 0, ore: 0, loot_drop: None };
     }
-    let multiplier: f64 = if matches!(outcome, OutcomeType::FullSuccess) { 1.5 } else { 1.0 };
+    let multiplier: f64 = if matches!(outcome, OutcomeType::FullSuccess) {
+        cfg.full_success_reward_mult
+    } else {
+        1.0
+    };
     let credits = (mission.credit_reward as f64 * multiplier).round() as u32;
     let ore     = (mission.ore_reward     as f64 * multiplier).round() as u32;
     let total_loot_bonus: u32 = squad
@@ -289,7 +305,7 @@ fn calc_rewards(
         .iter()
         .map(|u| u.definition.loot_bonus.max(0) as u32)
         .sum();
-    Rewards { credits, ore, loot_drop: roll_loot(rng, total_loot_bonus, mission.difficulty) }
+    Rewards { credits, ore, loot_drop: roll_loot(rng, total_loot_bonus, mission.difficulty, cfg) }
 }
 
 // ── Mission resolver ───────────────────────────────────────────────────────
@@ -299,19 +315,20 @@ pub fn resolve_mission(
     mission: &MissionDefinition,
     timestamp: &str,
     seed_override: Option<u32>,
+    cfg: &SimConfig,
 ) -> BattleReport {
     let seed = seed_override
         .unwrap_or_else(|| seed_from_str(&format!("{}{}", mission.id, timestamp)));
     let mut rng = Rng::new(seed);
 
-    let base_skill_score_f    = (calc_base_skill_score(squad) * 10.0).round() / 10.0;
-    let squad_size_bonus      = calc_squad_size_bonus(squad);
+    let base_skill_score_f    = (calc_base_skill_score(squad, cfg) * 10.0).round() / 10.0;
+    let squad_size_bonus      = calc_squad_size_bonus(squad, cfg);
     let gear_bonus            = calc_gear_bonus(squad);
-    let ability_bonus         = calc_ability_bonus(squad);
+    let ability_bonus         = calc_ability_bonus(squad, cfg);
     let commander_bonus       = squad.commander.as_ref().map_or(0, |c| c.success_aura);
     // Biscuit Coefficient requires a Hamster unit — no species field on UnitDefinition yet.
     let biscuit_coefficient   = 0i32;
-    let mission_type_modifier = calc_mission_type_modifier(squad, mission);
+    let mission_type_modifier = calc_mission_type_modifier(squad, mission, cfg);
     let difficulty_penalty    = calc_difficulty_penalty(mission.difficulty);
 
     let raw_total = base_skill_score_f
@@ -329,9 +346,9 @@ pub fn resolve_mission(
     let margin              = success_probability - raw_roll as f64;
 
     let outcome = if is_success {
-        if margin >= 25.0 { OutcomeType::FullSuccess } else { OutcomeType::PartialSuccess }
+        if margin >= cfg.outcome_margin_threshold { OutcomeType::FullSuccess } else { OutcomeType::PartialSuccess }
     } else {
-        if margin.abs() >= 25.0 { OutcomeType::Wipeout } else { OutcomeType::TacticalRetreat }
+        if margin.abs() >= cfg.outcome_margin_threshold { OutcomeType::Wipeout } else { OutcomeType::TacticalRetreat }
     };
 
     let avg_damage_shield = calc_total_damage_shield(squad);
@@ -344,11 +361,11 @@ pub fn resolve_mission(
         .units
         .iter()
         .map(|unit| {
-            resolve_unit_damage(unit, mission, is_success, avg_damage_shield, has_sawbones, &mut rng)
+            resolve_unit_damage(unit, mission, is_success, avg_damage_shield, has_sawbones, &mut rng, cfg)
         })
         .collect();
 
-    let rewards = calc_rewards(mission, &outcome, squad, &mut rng);
+    let rewards = calc_rewards(mission, &outcome, squad, &mut rng, cfg);
 
     let narrative_tag = format!("{:?}_{:?}_{:?}", outcome, mission.category, mission.environment);
 
@@ -395,6 +412,7 @@ pub fn resolve_combat(
     seed_override: Option<u32>,
     combat_initiation_type: CombatInitiationType,
     defending_convoy_vehicles: Vec<ConvoyVehicle>,
+    _cfg: &SimConfig,
 ) -> CombatReport {
     let seed = seed_override.unwrap_or_else(|| {
         seed_from_str(&format!("{}{}{}", section.id, vehicle.id, timestamp))
@@ -418,7 +436,7 @@ pub fn resolve_combat(
             }
             let dice_roll      = rng.roll_d100() as i32;
             let hit_roll_total = dice_roll + weapon.accuracy - section.evasion;
-            let is_hit         = hit_roll_total > 50;
+            let is_hit         = hit_roll_total > HIT_ROLL_THRESHOLD;
             let hit_breakdown  = format!(
                 "D100({}) + {} - {} = {}",
                 dice_roll, weapon.accuracy, section.evasion, hit_roll_total
@@ -497,7 +515,7 @@ pub fn resolve_combat(
                 }
                 let dice      = rng.roll_d100() as i32;
                 let hit_total = dice + sw.accuracy - vehicle.evasion;
-                if hit_total > 50 {
+                if hit_total > HIT_ROLL_THRESHOLD {
                     hits_total += 1;
                     if is_pen {
                         vehicle_hp   = (vehicle_hp - dmg_per_shot).max(0);
@@ -585,6 +603,7 @@ pub fn resolve_pack_assault(
     defending_convoy_vehicles: Vec<ConvoyVehicle>,
     max_ticks: u32,
     seed_override: Option<u32>,
+    _cfg: &SimConfig,
 ) -> PackAssaultReport {
     let seed = seed_override.unwrap_or_else(|| {
         seed_from_str(&format!("{}{}{}", section.id, pack.id, timestamp))
@@ -623,7 +642,7 @@ pub fn resolve_pack_assault(
             }
             let roll      = rng.roll_d100() as i32;
             let hit_total = roll + pw.accuracy - section.evasion;
-            if hit_total > 50 {
+            if hit_total > HIT_ROLL_THRESHOLD {
                 pack_hits   += 1;
                 pack_damage += pw_dmg;
             }
@@ -663,7 +682,7 @@ pub fn resolve_pack_assault(
                 }
                 let roll      = rng.roll_d100() as i32;
                 let hit_total = roll + sw.accuracy - pack.evasion;
-                if hit_total > 50 {
+                if hit_total > HIT_ROLL_THRESHOLD {
                     sec_hits   += 1;
                     sec_damage += sw_dmg;
                 }
@@ -768,15 +787,15 @@ pub fn resolve_pack_assault(
 /// Thresholds: 0–30 RESTED | 31–70 STRAINED | 71–99 BREAKING_POINT | 100 SHATTERED
 pub fn get_stress_tier(commander: &Commander) -> StressTier {
     match commander.stress_level {
-        100     => StressTier::Shattered,
-        71..=99 => StressTier::BreakingPoint,
-        31..=70 => StressTier::Strained,
-        _       => StressTier::Rested,
+        MAX_STRESS                                              => StressTier::Shattered,
+        STRESS_BREAKING_POINT_MIN..=STRESS_BREAKING_POINT_MAX  => StressTier::BreakingPoint,
+        STRESS_STRAINED_MIN..=STRESS_STRAINED_MAX               => StressTier::Strained,
+        _                                                       => StressTier::Rested,
     }
 }
 
 fn clamp_and_check_shattered(commander: &mut Commander) {
-    commander.stress_level = commander.stress_level.min(100);
+    commander.stress_level = commander.stress_level.min(MAX_STRESS);
     if matches!(get_stress_tier(commander), StressTier::Shattered) {
         commander.is_shattered = true;
     }
@@ -786,14 +805,14 @@ fn clamp_and_check_shattered(commander: &mut Commander) {
 ///
 /// Scaling by stress tier (Ref: Commander_Stress_System.md §2):
 ///   RESTED        → full buff  (×1.0)
-///   STRAINED      → half buff  (×0.5)
+///   STRAINED      → half buff  (×STRESS_STRAINED_BUFF_MULT)
 ///   BREAKING_POINT → inverted debuff (×−1.0); locks can_retreat = false
 ///   SHATTERED     → no effect
 pub fn apply_commander_buffs(commander: &mut Commander, section: &mut Section) {
     let multiplier = match get_stress_tier(commander) {
         StressTier::Shattered     => return,
         StressTier::Rested        => 1.0_f32,
-        StressTier::Strained      => 0.5_f32,
+        StressTier::Strained      => STRESS_STRAINED_BUFF_MULT,
         StressTier::BreakingPoint => { commander.can_retreat = false; -1.0_f32 }
     };
     let b = &commander.passive_buffs;
@@ -807,7 +826,7 @@ pub fn apply_commander_buffs_to_vehicle(commander: &mut Commander, vehicle: &mut
     let multiplier = match get_stress_tier(commander) {
         StressTier::Shattered     => return,
         StressTier::Rested        => 1.0_f32,
-        StressTier::Strained      => 0.5_f32,
+        StressTier::Strained      => STRESS_STRAINED_BUFF_MULT,
         StressTier::BreakingPoint => { commander.can_retreat = false; -1.0_f32 }
     };
     let b = &commander.passive_buffs;
@@ -815,21 +834,21 @@ pub fn apply_commander_buffs_to_vehicle(commander: &mut Commander, vehicle: &mut
     vehicle.at      += (b.damage_reduction as f32 * multiplier) as i32;
 }
 
-/// Applies the one-time deployment stress penalty at mission start (+10).
+/// Applies the one-time deployment stress penalty at mission start.
 /// Call exactly once per deployment before combat begins.
 /// NOTE: is_kia is never touched here.
-pub fn apply_deployment_penalty(commander: &mut Commander) {
+pub fn apply_deployment_penalty(commander: &mut Commander, cfg: &SimConfig) {
     commander.stress_level =
-        (commander.stress_level as u32 + 10).min(100) as u8;
+        (commander.stress_level as u32 + cfg.deployment_stress_penalty).min(MAX_STRESS as u32) as u8;
     clamp_and_check_shattered(commander);
 }
 
-/// Applies mid-battle casualty stress (+5 per casualty).
+/// Applies mid-battle casualty stress (+cfg.casualty_stress_penalty per casualty).
 /// Call once per casualty event. Removing from the active roster is the caller's responsibility.
 /// NOTE: is_kia is never touched here.
-pub fn resolve_commander_stress(commander: &mut Commander, casualties: u32) {
+pub fn resolve_commander_stress(commander: &mut Commander, casualties: u32, cfg: &SimConfig) {
     commander.stress_level =
-        (commander.stress_level as u32 + casualties * 5).min(100) as u8;
+        (commander.stress_level as u32 + casualties * cfg.casualty_stress_penalty).min(MAX_STRESS as u32) as u8;
     clamp_and_check_shattered(commander);
 }
 
@@ -848,7 +867,7 @@ pub fn retire_commander(
     commander: Commander,
     advisor_board: &mut AdvisorBoard,
 ) -> Result<(), String> {
-    if commander.rank < 5 {
+    if commander.rank < COMMANDER_RETIRE_RANK {
         return Err("Commander has not reached the rank required for retirement.".into());
     }
     advisor_board.push(commander);
@@ -976,6 +995,7 @@ pub async fn resolve_combat_streaming(
     _defending_convoy_vehicles: Vec<ConvoyVehicle>,
     tick_tx: tokio::sync::mpsc::Sender<shared::ws_events::CombatTickEvent>,
     mut cancel_rx: tokio::sync::oneshot::Receiver<()>,
+    cfg: &SimConfig,
 ) {
     use shared::ws_events::{
         CombatOutcome as WsCombatOutcome, CombatTickEvent, UnitSnapshot,
@@ -1038,7 +1058,7 @@ pub async fn resolve_combat_streaming(
             }
             let dice_roll = rng.roll_d100() as i32;
             let hit_roll_total = dice_roll + weapon.accuracy - section.evasion;
-            let is_hit = hit_roll_total > 50;
+            let is_hit = hit_roll_total > HIT_ROLL_THRESHOLD;
             let hit_breakdown = format!("D100({}) + {} - {} = {}",
                 dice_roll, weapon.accuracy, section.evasion, hit_roll_total);
 
@@ -1090,7 +1110,7 @@ pub async fn resolve_combat_streaming(
                 }
                 let dice = rng.roll_d100() as i32;
                 let hit_total = dice + sw.accuracy - vehicle.evasion;
-                if hit_total > 50 {
+                if hit_total > HIT_ROLL_THRESHOLD {
                     hits_total += 1;
                     if is_pen {
                         vehicle_hp = (vehicle_hp - dmg_per_shot).max(0);
@@ -1183,7 +1203,7 @@ pub async fn resolve_combat_streaming(
             return; // Receiver dropped — client disconnected
         }
 
-        tokio::time::sleep(Duration::from_millis(750)).await;
+        tokio::time::sleep(Duration::from_millis(cfg.tick_stream_delay_ms)).await;
 
         if combat_ended {
             return;

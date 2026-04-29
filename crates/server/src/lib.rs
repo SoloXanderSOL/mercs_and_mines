@@ -1,3 +1,4 @@
+pub mod config;
 pub mod api_types;
 pub mod auth;
 pub mod integrity;

@@ -80,18 +80,19 @@ async fn post_auth_challenge(
     let nonce = Uuid::new_v4().to_string();
     let now = Utc::now().timestamp();
     let challenge_text = crate::auth::build_challenge(&req.wallet_address, &nonce, now);
+    let expiry_secs = state.config.server.challenge_expiry_secs;
 
     state.pending_challenges.insert(
         req.wallet_address.clone(),
         crate::state::PendingChallenge {
             challenge_text: challenge_text.clone(),
-            expires_at: now + 60,
+            expires_at: now + expiry_secs,
         },
     );
 
     Json(json!({
         "challenge":  challenge_text,
-        "expires_in": 60,
+        "expires_in": expiry_secs,
     }))
 }
 
@@ -168,7 +169,7 @@ async fn post_mission_resolve(
 
     let seed = req.seed_override.unwrap_or_else(generate_seed);
     let timestamp = Utc::now().to_rfc3339();
-    let report = resolve_mission(&req.squad, mission, &timestamp, Some(seed));
+    let report = resolve_mission(&req.squad, mission, &timestamp, Some(seed), &state.config.sim);
 
     let session_id = Uuid::new_v4();
     let config = shared::SessionConfig {
@@ -216,7 +217,7 @@ async fn post_combat_resolve(
     let seed = req.seed_override.unwrap_or_else(generate_seed);
     let timestamp = Utc::now().to_rfc3339();
     let initiation = req.combat_initiation_type.unwrap_or(CombatInitiationType::Spotted);
-    let max_ticks = req.max_ticks.unwrap_or(50) as u32;
+    let max_ticks = req.max_ticks.unwrap_or(state.config.server.default_max_ticks) as u32;
     let defending = req
         .defending_convoy_vehicles
         .unwrap_or_default()
@@ -237,6 +238,7 @@ async fn post_combat_resolve(
         Some(seed),
         initiation,
         defending,
+        &state.config.sim,
     );
 
     let session_id = Uuid::new_v4();
@@ -287,7 +289,7 @@ async fn post_pack_assault(
 
     let seed = req.seed_override.unwrap_or_else(generate_seed);
     let timestamp = Utc::now().to_rfc3339();
-    let max_ticks = req.max_ticks.unwrap_or(50) as u32;
+    let max_ticks = req.max_ticks.unwrap_or(state.config.server.default_max_ticks) as u32;
     let defending = req
         .defending_convoy_vehicles
         .unwrap_or_default()
@@ -303,6 +305,7 @@ async fn post_pack_assault(
         defending,
         max_ticks,
         Some(seed),
+        &state.config.sim,
     );
 
     let session_id = Uuid::new_v4();
@@ -403,7 +406,7 @@ async fn get_combat_aar(
         .request
         .combat_initiation_type
         .unwrap_or(CombatInitiationType::Spotted);
-    let max_ticks = session.request.max_ticks.unwrap_or(50) as u32;
+    let max_ticks = session.request.max_ticks.unwrap_or(state.config.server.default_max_ticks) as u32;
     let defending: Vec<_> = session
         .request
         .defending_convoy_vehicles
@@ -420,6 +423,7 @@ async fn get_combat_aar(
         Some(seed),             // stored seed; guarantees deterministic output
         initiation,
         defending,
+        &state.config.sim,
     );
 
     Ok(Json(json!({

@@ -1,8 +1,9 @@
 // Loot table roller.
-// Loot Find bonus drains from Basic at 1.5× and redistributes
-// upward, capped at +50 total to prevent Elite spam
+// Loot Find bonus drains from Basic at cfg.loot_drain_multiplier× and redistributes
+// upward, capped at cfg.max_loot_bonus_cap to prevent Elite spam
 // (which would crater the cNFT market — we're not animals)
 
+use crate::config::SimConfig;
 use crate::game_types::{LootDrop, QualityGrade};
 use crate::rng::Rng;
 
@@ -50,18 +51,17 @@ const POOL_ELITE: &[&str] = &[
 type WeightTable = [(QualityGrade, f64); 5];
 
 /// Adjusts grade weights based on the squad's total loot bonus.
-/// loot_bonus is capped at 50 to prevent cNFT market flooding.
-fn build_weight_table(total_loot_bonus: u32) -> WeightTable {
-    let bonus = total_loot_bonus.min(50) as f64;
-    let drain  = bonus * 1.5; // drained from Basic
-    let uplift = bonus;       // distributed upward
+fn build_weight_table(total_loot_bonus: u32, cfg: &SimConfig) -> WeightTable {
+    let bonus  = total_loot_bonus.min(cfg.max_loot_bonus_cap) as f64;
+    let drain  = bonus * cfg.loot_drain_multiplier;
+    let uplift = bonus;
 
     [
-        (QualityGrade::Basic,       (WEIGHT_BASIC - drain).max(5.0)),
-        (QualityGrade::Standard,    WEIGHT_STANDARD    + uplift * 0.4),
-        (QualityGrade::Specialized, WEIGHT_SPECIALIZED + uplift * 0.3),
-        (QualityGrade::Superior,    WEIGHT_SUPERIOR    + uplift * 0.2),
-        (QualityGrade::Elite,       WEIGHT_ELITE       + uplift * 0.1),
+        (QualityGrade::Basic,       (WEIGHT_BASIC - drain).max(cfg.loot_basic_weight_min)),
+        (QualityGrade::Standard,    WEIGHT_STANDARD    + uplift * cfg.loot_standard_uplift_frac),
+        (QualityGrade::Specialized, WEIGHT_SPECIALIZED + uplift * cfg.loot_specialized_uplift_frac),
+        (QualityGrade::Superior,    WEIGHT_SUPERIOR    + uplift * cfg.loot_superior_uplift_frac),
+        (QualityGrade::Elite,       WEIGHT_ELITE       + uplift * cfg.loot_elite_uplift_frac),
     ]
 }
 
@@ -96,13 +96,13 @@ fn pick_item_name(rng: &mut Rng, grade: &QualityGrade) -> String {
 /// Returns None if the loot roll itself fails — not every success drops loot.
 ///
 /// Drop chance scales with difficulty: 44% at D1, 80% at D10.
-pub fn roll_loot(rng: &mut Rng, total_loot_bonus: u32, mission_difficulty: u8) -> Option<LootDrop> {
-    let drop_chance = (40 + mission_difficulty as u32 * 4) as f64 / 100.0;
+pub fn roll_loot(rng: &mut Rng, total_loot_bonus: u32, mission_difficulty: u8, cfg: &SimConfig) -> Option<LootDrop> {
+    let drop_chance = (cfg.loot_drop_chance_base + mission_difficulty as u32 * cfg.loot_drop_chance_per_diff) as f64 / 100.0;
     if !rng.chance(drop_chance) {
         return None;
     }
 
-    let table     = build_weight_table(total_loot_bonus);
+    let table     = build_weight_table(total_loot_bonus, cfg);
     let grade     = pick_quality_grade(rng, &table);
     let item_name = pick_item_name(rng, &grade);
 
