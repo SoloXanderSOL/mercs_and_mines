@@ -34,3 +34,8 @@ async-trait    = "0.1"
 thiserror      = "1"
 sha2           = "0.10"
 dotenvy        = "0.15"
+anyhow         = "1"
+solana-sdk     = "2.1"
+reqwest        = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+bincode        = "1"
+base64         = "0.22"

@@ -66,6 +66,10 @@ pub struct ServerConfig {
     pub combat_session_stale_secs: u64,
     /// Default max-ticks cap when the client does not supply one.
     pub default_max_ticks: usize,
+    /// Solana JSON-RPC endpoint (e.g. Helius devnet).
+    pub rpc_url: String,
+    /// Path to the treasury keypair JSON file used to pay for on-chain transactions.
+    pub treasury_keypair_path: String,
 }
 
 impl Default for ServerConfig {
@@ -76,6 +80,8 @@ impl Default for ServerConfig {
             challenge_expiry_secs:      60,
             combat_session_stale_secs:  300,
             default_max_ticks:          50,
+            rpc_url:                    "https://api.devnet.solana.com".to_string(),
+            treasury_keypair_path:      "/home/ajone/.config/solana/id.json".to_string(),
         }
     }
 }
@@ -88,6 +94,8 @@ impl ServerConfig {
             challenge_expiry_secs:      env_i64  ("CHALLENGE_EXPIRY_SECS",       60),
             combat_session_stale_secs:  env_u64  ("COMBAT_SESSION_STALE_SECS",   300),
             default_max_ticks:          env_usize("DEFAULT_MAX_TICKS",           50),
+            rpc_url:                    env_str  ("SOLANA_RPC_URL",              "https://api.devnet.solana.com"),
+            treasury_keypair_path:      env_str  ("TREASURY_KEYPAIR_PATH",       "/home/ajone/.config/solana/id.json"),
         }
     }
 }
