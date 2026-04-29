@@ -6,17 +6,17 @@ resolution = true
 skip-lint = false
 
 [programs.localnet]
-mercs_and_mines = "7SD4qajisBhtZbe2xMRjaBpyLkGVJD5qd6vXznHF28EP"
+mercs_and_mines = "2f4NRu39hkNgDMvNhuLFk4E7aCgDRVExGrfc3zNW6m7G"
 
 # Devnet program ID — replace after `anchor deploy --provider.cluster devnet`
 [programs.devnet]
-mercs_and_mines = "7SD4qajisBhtZbe2xMRjaBpyLkGVJD5qd6vXznHF28EP"
+mercs_and_mines = "2f4NRu39hkNgDMvNhuLFk4E7aCgDRVExGrfc3zNW6m7G"
 
 [registry]
 url = "https://api.apr.dev"
 
 [provider]
-cluster = "Localnet"
+cluster = "Devnet"
 wallet = "~/.config/solana/id.json"
 
 [scripts]
