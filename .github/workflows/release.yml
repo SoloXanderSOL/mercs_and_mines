@@ -46,6 +46,13 @@ jobs:
           path: target/release/mercs-server
           if-no-files-found: error
 
+      - name: Upload app directory
+        uses: actions/upload-artifact@v4
+        with:
+          name: app
+          path: app/
+          if-no-files-found: error
+
   deploy:
     name: Deploy to DigitalOcean
     needs: build
@@ -55,6 +62,12 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: mercs-server
+
+      - name: Download app directory
+        uses: actions/download-artifact@v4
+        with:
+          name: app
+          path: app/
 
       - name: Configure SSH agent
         run: |
@@ -80,6 +93,12 @@ jobs:
             "mv ${{ secrets.DEV_SERVER_APP_PATH }}/mercs-server.new \
                 ${{ secrets.DEV_SERVER_APP_PATH }}/mercs-server \
              && chmod +x ${{ secrets.DEV_SERVER_APP_PATH }}/mercs-server"
+
+      - name: Upload app directory to server
+        run: |
+          scp -r \
+            app/ \
+            "${{ secrets.DEV_SERVER_USER }}@${{ secrets.DEV_SERVER_HOST }}:${{ secrets.DEV_SERVER_APP_PATH }}/app"
 
       - name: Restart service
         run: |
