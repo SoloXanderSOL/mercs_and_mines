@@ -42,7 +42,6 @@ body {
   font-family: 'Barlow', system-ui, sans-serif;
   font-size: 16px;
   line-height: 1.6;
-  min-width: 1024px;
   overflow-x: hidden;
 }
 
@@ -1155,4 +1154,121 @@ section { position: relative; z-index: 2; }
 @keyframes dot-pulse {
   0%, 100% { opacity: 1;   box-shadow: 0 0 6px var(--green-sys); }
   50%       { opacity: 0.55; box-shadow: 0 0 2px var(--green-sys); }
+}
+
+
+/* ═══════════════════════════════════════════════════════════════
+   RESPONSIVE — TABLET (max-width: 768px) and PHONE (max-width: 480px)
+═══════════════════════════════════════════════════════════════ */
+
+@media (max-width: 768px) {
+  :root { --nav-h: 96px; }
+
+  body { min-width: 0; }
+
+  /* ─── NAV: brand row + links row ─── */
+  .site-nav {
+    height: auto;
+    flex-wrap: wrap;
+    padding: 0.65rem 1.25rem;
+    gap: 0;
+  }
+  .nav-left  { flex: 1 0 auto; }
+  .nav-status { display: none; }
+  .nav-links {
+    flex-basis: 100%;
+    order: 3;
+    justify-content: flex-start;
+    padding: 0.4rem 0 0.3rem;
+    border-top: 1px solid var(--border-dim);
+    margin-top: 0.5rem;
+  }
+  .nav-links li + li::before { padding: 0 0.55rem; }
+
+  /* ─── SECTIONS ─── */
+  .section-inner  { padding: 2.75rem 1.25rem; }
+  .section-heading { font-size: clamp(1.75rem, 6vw, 3rem); }
+
+  /* ─── HERO ─── */
+  .hero {
+    min-height: auto;
+    padding: 5.5rem 1.25rem 3rem;
+  }
+  .pitch-hero {
+    min-height: auto;
+    padding: 5.5rem 1.25rem 3rem;
+  }
+
+  /* ─── CTA BUTTONS: full-width on mobile ─── */
+  .hero-cta-wrap .btn,
+  .seeker-cta .btn {
+    width: 100%;
+    justify-content: center;
+  }
+  .pitch-btn-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .pitch-btn-row .btn { justify-content: center; }
+
+  /* ─── GRIDS → single column ─── */
+  .card-grid-2,
+  .card-grid-3  { grid-template-columns: 1fr; }
+  .col-2        { grid-template-columns: 1fr; }
+
+  /* card-grid-4 is already 2-col; keep it on tablet */
+
+  /* ─── FEATURE ROWS ─── */
+  .feature-row {
+    grid-template-columns: 36px 1fr;
+    gap: 1rem;
+    padding: 1.25rem;
+  }
+  .feature-row-num { font-size: 1.75rem; }
+
+  /* ─── FLOW DIAGRAM: vertical stack ─── */
+  .flow-diagram   { flex-direction: column; gap: 0; padding: 1rem; }
+  .flow-node      { padding: 0.6rem 1rem; border-top: 1px solid var(--border); }
+  .flow-node:first-child { border-top: none; }
+  .flow-arrow     { display: none; }
+
+  /* ─── DATA TABLES: horizontal scroll ─── */
+  .data-table     { display: block; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+
+  /* ─── STAT HERO ─── */
+  .stat-hero      { padding: 1.75rem 1.25rem; }
+
+  /* ─── VICTORY WATERMARK: scale down ─── */
+  .victory-watermark img { width: 120%; max-width: 120%; }
+}
+
+@media (max-width: 480px) {
+  :root { --nav-h: 90px; }
+
+  /* ─── NAV ─── */
+  .site-nav       { padding: 0.6rem 1rem; }
+  .nav-links a    { font-size: 0.7rem; }
+  .nav-links li + li::before { padding: 0 0.35rem; }
+  .nav-back       { display: none; }
+
+  /* ─── SECTIONS ─── */
+  .section-inner  { padding: 2rem 1rem; }
+  .section-heading { font-size: clamp(1.5rem, 7.5vw, 2.5rem); }
+
+  /* ─── HERO ─── */
+  .hero       { padding: 5rem 1rem 2.5rem; }
+  .pitch-hero { padding: 5rem 1rem 2.5rem; }
+
+  /* ─── HERO HEADLINE: allow tighter clamp floor ─── */
+  .hero-headline { font-size: clamp(2.25rem, 11vw, 5rem); }
+
+  /* ─── CARD GRID-4: single column on phones ─── */
+  .card-grid-4 { grid-template-columns: 1fr; }
+
+  /* ─── BUTTONS: comfortable tap target ─── */
+  .btn    { min-height: 48px; padding: 0.875rem 1.5rem; font-size: 0.9rem; }
+  .btn-lg { min-height: 52px; padding: 1rem 1.75rem; }
+
+  /* ─── STAT HERO ─── */
+  .stat-hero { padding: 1.25rem 0.875rem; }
 }
