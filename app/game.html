@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Mercs &amp; Mines — Demo</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="https://unpkg.com/@solana/web3.js@1.98.0/lib/index.iife.min.js"></script>
+</head>
+<body>
+
+  <!-- Screen 1: Login -->
+  <div id="screen-login" class="screen">
+    <h1>Mercs &amp; Mines</h1>
+    <p class="subtitle">Phase 0 — Hackathon Demo</p>
+    <p id="login-status">Connect your Phantom wallet to continue.</p>
+    <button id="btn-connect">Connect Phantom</button>
+    <button id="btn-sign" disabled>Sign &amp; Enter</button>
+  </div>
+
+  <!-- Screen 2: Combat Dashboard -->
+  <div id="screen-dashboard" class="screen hidden">
+    <h2>Live Tactical Dashboard</h2>
+    <p class="subtitle">Alpha Section vs Armored Scout — AP/AT Tick Engine</p>
+    <button id="btn-start-combat">Start Combat Session</button>
+    <div id="tick-feed"></div>
+    <button id="btn-view-aar" disabled>View After-Action Report</button>
+  </div>
+
+  <!-- Screen 3: After-Action Report -->
+  <div id="screen-aar" class="screen hidden">
+    <h2>After-Action Report</h2>
+    <p class="subtitle">Deterministic replay from input log</p>
+    <pre id="aar-content"></pre>
+    <button id="btn-back">Back to Dashboard</button>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

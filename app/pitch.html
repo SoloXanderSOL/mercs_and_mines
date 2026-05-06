@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Mercs &amp; Mines — Investor Briefing</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:ital,wght@0,400;0,600;0,700;0,800;0,900;1,400&family=Barlow:wght@400;500;600&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/landing.css">
+</head>
+<body>
+
+  <!-- Animated background curves -->
+  <div class="bg-curves" aria-hidden="true">
+    <svg viewBox="0 0 1440 900" preserveAspectRatio="xMidYMid slice" xmlns="http://www.w3.org/2000/svg">
+      <path d="M 0 800 C 480 620, 960 380, 1440 180"
+            stroke="#c2410c" stroke-width="1.5" fill="none" opacity="0.55"/>
+      <path d="M -80 900 C 400 720, 880 500, 1440 320"
+            stroke="#c2410c" stroke-width="1" fill="none" opacity="0.35"/>
+      <path d="M 80 900 C 560 740, 1040 560, 1520 400"
+            stroke="#d97706" stroke-width="0.8" fill="none" opacity="0.22"/>
+    </svg>
+  </div>
+
+  <!-- Navigation -->
+  <nav class="site-nav" role="navigation">
+    <div class="nav-left">
+      <a href="game.html" class="nav-back">← Back to Game</a>
+      <a href="/" class="nav-brand"><span class="nav-brand-dot">●</span> Mercs &amp; Mines</a>
+    </div>
+    <ul class="nav-links">
+      <li><a href="pitch.html" aria-current="page">Manifesto</a></li>
+      <li><a href="#">Armory</a></li>
+      <li><a href="#">Leaderboard</a></li>
+    </ul>
+    <div class="nav-status" aria-label="Server status: online">
+      <span class="nav-status-dot"></span>
+      System Online
+    </div>
+  </nav>
+
+  <main>
+
+    <!-- ═══════════════════════════════════════════════════
+         SECTION 1 — HERO
+    ═══════════════════════════════════════════════════ -->
+    <section class="pitch-hero bg-dark">
+      <div class="pitch-hero-inner">
+        <p class="section-tag">Solana Seeker Exclusive — Hackathon Submission 2026</p>
+        <h1 class="section-heading">A Strategy Game Built for the Hardware</h1>
+        <p class="pitch-hero-sub">
+          Mercs &amp; Mines is a 90-day mobile grand strategy campaign built natively for the
+          Solana Seeker. Real prize pools. On-chain history. Hardware-level authentication.
+          A working demo on Solana Devnet right now.
+        </p>
+        <div class="pitch-btn-row">
+          <a href="game.html" class="btn btn-lg">Play the Live Demo →</a>
+          <a href="#revenue" class="btn btn-ghost">Jump to Revenue Model ↓</a>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════
+         SECTION 2 — WHY SEEKER
+    ═══════════════════════════════════════════════════ -->
+    <section class="bg-surface">
+      <div class="section-inner">
+        <p class="section-tag">Seeker-Native Advantages</p>
+        <h2 class="section-heading">Not Just "On Solana." Built for the Device.</h2>
+        <p class="section-intro">
+          Every major friction point in mobile crypto gaming has a hardware solution on the
+          Seeker. We've designed for all of them.
+        </p>
+
+        <div class="feature-rows">
+
+          <div class="feature-row">
+            <span class="feature-row-num">01</span>
+            <div>
+              <p class="feature-row-title">Seed Vault / TEEPIN — Zero-Friction Signing</p>
+              <p class="feature-row-body">A player in a 10-minute session might issue 30+ commands.
+                Signing a Phantom pop-up each time would be unplayable. On Seeker, the player
+                authenticates with their TEEPIN once at session start. The Seed Vault issues a
+                2-hour session authorisation — every micro-transaction signs silently in the
+                background. High-value actions trigger a single confirmation tap,
+                hardware-confirmed in 0.3 seconds. The game feels like a native mobile title.
+                That's the point.</p>
+            </div>
+          </div>
+
+          <div class="feature-row">
+            <span class="feature-row-num">02</span>
+            <div>
+              <p class="feature-row-title">Seeker ID = Player Account</p>
+              <p class="feature-row-body">No sign-up form. No email. No password. The Seeker ID is
+                the player's game account. First boot links the device identity to the game profile
+                automatically. Onboarding friction is zero. The player's first voluntary action is
+                playing the game, not filling in a form.</p>
+            </div>
+          </div>
+
+          <div class="feature-row">
+            <span class="feature-row-num">03</span>
+            <div>
+              <p class="feature-row-title">SKR Token Rewards</p>
+              <p class="feature-row-body">Players earn SKR rewards at key ecosystem milestones:
+                completing the tutorial, earning their first Campaign Chronicle NFT, capturing their
+                first Badlands node. The game is a source of SKR within the Seeker ecosystem.
+                Not a consumer of it.</p>
+            </div>
+          </div>
+
+          <div class="feature-row">
+            <span class="feature-row-num">04</span>
+            <div>
+              <p class="feature-row-title">dApp Store Distribution</p>
+              <p class="feature-row-body">Launching on the Solana dApp Store eliminates the 30%
+                Apple/Google tax and bypasses both platforms' anti-NFT policies. Every dollar a
+                player spends goes further. Every NFT the game issues is permitted by design,
+                not in spite of platform rules.</p>
+            </div>
+          </div>
+
+          <div class="feature-row">
+            <span class="feature-row-num">05</span>
+            <div>
+              <p class="feature-row-title">Hardware Push Notifications</p>
+              <p class="feature-row-body">Solana messaging routes directly through the Seeker's
+                native notification layer. Lock-screen alerts, no third-party service.
+                "WARNING: Your Leviathan Land-Train is under attack in Sector 4. Estimated breach:
+                15 minutes." The kind of message that gets a player to put down whatever
+                they're doing.</p>
+            </div>
+          </div>
+
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════
+         SECTION 3 — THE ECONOMY
+    ═══════════════════════════════════════════════════ -->
+    <section class="bg-dark">
+      <div class="section-inner">
+        <p class="section-tag">Dual Economy</p>
+        <h2 class="section-heading">Why This Isn't Pay-to-Win</h2>
+        <p class="section-intro">
+          The central failure of most web3 games: the token is how you win. We've separated the
+          economy into two layers so that $GCN provides real stakes without providing
+          competitive advantage.
+        </p>
+
+        <div class="col-2">
+          <div class="col-box">
+            <p class="col-box-title">Soft Currency (Off-Chain)</p>
+            <p class="col-box-body">Credits and Magma-Ore. Daily operations — base upkeep, troop
+              wages, factory builds, standard gear. Lives on the game server. The developer can
+              rebalance freely without touching a financial market. Crypto-passive players never
+              need anything else.</p>
+          </div>
+          <div class="col-box">
+            <p class="col-box-title">Hard Currency ($GCN — On-Chain SPL Token)</p>
+            <p class="col-box-body">Earned by winning: Badlands node captures, seasonal
+              leaderboards, Commander NFT sales. Spent on collectibles, tournaments, and premium
+              cosmetics. Never required for core gameplay. Never the reason you win a battle.</p>
+          </div>
+        </div>
+
+        <div class="callout">
+          <p class="callout-title">Oracle-Pegged Pricing</p>
+          <p class="callout-body">All $GCN costs are denominated in fixed USD values via the Pyth
+            Network price feed. All costs are payable in SOL or $GCN. Paying in $GCN applies a
+            10% discount. A Commander mint is always $5.00 USD worth of SOL — or $4.50 worth of
+            $GCN. The token amount adjusts with the market. The player's real-world cost does not.
+            The game is never priced out of reach by its own tokenomics.</p>
+
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Action</th>
+                <th>Fixed USD Cost</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr><td>Commander cNFT Mint</td><td class="c-amber">$5.00</td></tr>
+              <tr><td>High-Stakes Tournament Entry</td><td class="c-amber">$10.00</td></tr>
+              <tr><td>Legendary Commander Mint</td><td class="c-amber">$20.00</td></tr>
+              <tr><td>Build Timer Skip (major)</td><td class="c-amber">$2.00</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════
+         SECTION 4 — THE PRIZE POOL
+    ═══════════════════════════════════════════════════ -->
+    <section class="bg-surface">
+      <div class="section-inner">
+        <p class="section-tag">The Planetary Prize Pool</p>
+        <h2 class="section-heading">Every $GCN Spent Feeds the War Chest</h2>
+        <p class="section-intro">
+          The Prize Pool is not a marketing promise. It's a transparent Solana smart contract.
+          The balance is displayed in real time on every player's Campaign HUD. You can watch
+          it grow while you fight for it.
+        </p>
+
+        <div class="flow-diagram" aria-label="Player spend allocation">
+          <div class="flow-node">
+            <span class="flow-node-label">Source</span>
+            <span class="flow-node-value">Player Spend</span>
+          </div>
+          <span class="flow-arrow" aria-hidden="true">→</span>
+          <div class="flow-node">
+            <span class="flow-node-label">Prize</span>
+            <span class="flow-node-value">40% Prize Vault</span>
+          </div>
+          <span class="flow-arrow" aria-hidden="true">→</span>
+          <div class="flow-node">
+            <span class="flow-node-label">Operations</span>
+            <span class="flow-node-value">30% Operations</span>
+          </div>
+          <span class="flow-arrow" aria-hidden="true">→</span>
+          <div class="flow-node">
+            <span class="flow-node-label">Burn</span>
+            <span class="flow-node-value">15% Permanent Burn</span>
+          </div>
+          <span class="flow-arrow" aria-hidden="true">→</span>
+          <div class="flow-node">
+            <span class="flow-node-label">Ecosystem</span>
+            <span class="flow-node-value">15% Ecosystem Pool</span>
+          </div>
+        </div>
+
+        <p class="section-tag" style="margin-bottom: 0.5rem;">Guaranteed Minimum Prize Floors</p>
+
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>Sector Type</th>
+              <th>Minimum Guaranteed</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td>Standard Sector</td><td class="c-amber">10,000 $GCN</td></tr>
+            <tr><td>Contested Sector</td><td class="c-amber">25,000 $GCN</td></tr>
+            <tr><td>Flagship Sector</td><td class="c-amber">100,000 $GCN</td></tr>
+          </tbody>
+        </table>
+
+        <p style="font-size: 0.8rem; color: var(--text-muted); margin-top: 0.75rem; line-height: 1.6;">
+          If player spending doesn't reach the floor by Campaign Day 30, the deficit is topped up
+          from the Prize Pool Reserve. The prize is never trivially small, even at launch. Flagship
+          Sectors are announced two weeks before Season start — a visible, massive prize pot that
+          drives new player acquisition every campaign cycle.
+        </p>
+
+        <div class="callout">
+          <p class="callout-title">The Audit Trail</p>
+          <p class="callout-body">Every combat outcome is backed by a deterministic input log. The
+            (SessionID, seed, log) tuple is the on-chain evidence — any $GCN dispute can be
+            replayed and independently verified by any party. The blockchain confirms log integrity;
+            the simulation confirms outcome inevitability. The deterministic architecture isn't just
+            a debugging convenience. It's a financial requirement.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════
+         SECTION 5 — NFT ECOSYSTEM
+    ═══════════════════════════════════════════════════ -->
+    <section class="bg-dark">
+      <div class="section-inner">
+        <p class="section-tag">On-Chain History</p>
+        <h2 class="section-heading">Your Catastrophes, Preserved Forever</h2>
+        <p class="section-intro">
+          The three core NFT types are automatic, free, and tied to events that already matter to
+          the player. The blockchain records what happened. It doesn't ask anything extra.
+        </p>
+
+        <div class="card-grid-3">
+
+          <div class="nft-card">
+            <span class="nft-label">Auto-Minted · Free · Tradeable</span>
+            <h3 class="nft-title">Gravestone NFT</h3>
+            <p class="nft-body">Minted automatically when a Rank 3+ Commander dies gloriously —
+              in a major battle, during a Story Event, or while advancing a victory ticker. The
+              cNFT burns; the Gravestone arrives. Contains the full service record, cause of death,
+              and a procedurally generated corporate HR death notice.</p>
+            <blockquote class="nft-quote">
+              "Major 'Ironjaw' Vasquez (Embezzler, Trench-Sweeper) fell at the Siege of Crater
+              Basin whilst executing what colleagues described as an 'optimistic tactical advance.'
+              She is survived by 847 Credits she never actually handed over. HR has opened a
+              recovery case. Flowers are discouraged."
+            </blockquote>
+            <p class="nft-body" style="margin-top: 0.75rem;">
+              Art tier scales with the glory of the death. A Rank 5 Regimental Colonel's Gravestone
+              is always Legendary.
+            </p>
+          </div>
+
+          <div class="nft-card">
+            <span class="nft-label">Campaign End · Surviving Commanders · Tradeable</span>
+            <h3 class="nft-title">Service Record NFT</h3>
+            <p class="nft-body">When a minted Commander survives a full 90-day Campaign, the game
+              server appends their complete service record to their existing on-chain metadata.
+              A retired veteran — a collectible whose value is derived from provable history, not
+              future deployability. A Rank 5 Colonel who served in the Campaign where the Hamster
+              God-King achieved absolute dominion is a genuinely rare artefact.</p>
+          </div>
+
+          <div class="nft-card">
+            <span class="nft-label">Auto-Minted at Campaign End · Free · All Players</span>
+            <h3 class="nft-title">Campaign Chronicle NFT</h3>
+            <p class="nft-body">When a Campaign concludes, every player in that Sector receives a
+              Chronicle cNFT. Free. No opt-in. It records which of the ten possible endings
+              triggered, the player's final faction standing, and the Sector ID — immutable
+              provenance. A Chronicle from a Campaign where the secret Great Reunification ending
+              fired will, by definition, be held only by the players who were there. It cannot be
+              faked. Most players will never own one.</p>
+          </div>
+
+        </div>
+
+        <p class="closing-note">
+          Also: Raccoon Gang Card packs (cosmetic cNFT series), and the TRASH PANDA music NFT —
+          issued to every player present when the Raccooniverse ending fires.
+          Most servers will never produce one.
+        </p>
+      </div>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════
+         SECTION 6 — REVENUE MODEL
+    ═══════════════════════════════════════════════════ -->
+    <section id="revenue" class="bg-surface">
+      <div class="section-inner">
+        <p class="section-tag">The Path to $1M ARR</p>
+        <h2 class="section-heading">Volume and Habit. Not Whale Extraction.</h2>
+
+        <div class="stat-hero">
+          <p class="stat-main">$1M+ ARR at 20,000 Monthly Active Players.</p>
+          <p class="stat-sub">
+            No single player needs to spend more than $5/month.<br>
+            That's approximately 13% of the Seeker's addressable user base.
+          </p>
+        </div>
+
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>Revenue Stream</th>
+              <th>Model</th>
+              <th>Projected Annual</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>G.U.N. Contractor Tier™ Battle Pass</td>
+              <td>$4.99/month in SOL, $4.49/month in $GCN, 40% attach rate</td>
+              <td class="c-amber">~$480,000</td>
+            </tr>
+            <tr>
+              <td>Cosmetics &amp; Direct Purchase</td>
+              <td>Avg $1.50/month per player</td>
+              <td class="c-amber">~$360,000</td>
+            </tr>
+            <tr>
+              <td>Resource Market Tax</td>
+              <td>5% P2P trade tax</td>
+              <td class="c-amber">~$80,000–$200,000</td>
+            </tr>
+            <tr>
+              <td>$GCN Ecosystem &amp; Secondary Sales</td>
+              <td>2% royalty + tournament fees</td>
+              <td class="c-amber">~$100,000–$300,000</td>
+            </tr>
+            <tr class="total">
+              <td><strong>Total</strong></td>
+              <td></td>
+              <td>$1.02M–$1.34M ARR</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="callout" style="margin-top: 2rem;">
+          <p class="callout-title">The G.U.N. Contractor Tier™</p>
+          <p class="callout-body">The Battle Pass. In-universe, it's a lore object — the compliance
+            paperwork is reportedly 47 pages. Contents: cosmetic rewards track, 3–5 exclusive
+            Contractor-Tier Story Events per Campaign unavailable to free players, early access to
+            new Raccoon Gang Card series, and a premium Corporate After-Action Report NFT at
+            Campaign end. No gameplay advantage. That's a canon design constraint,
+            not a marketing claim.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════
+         SECTION 7 — WHAT'S BUILT TODAY
+    ═══════════════════════════════════════════════════ -->
+    <section class="bg-dark">
+      <div class="section-inner">
+        <p class="section-tag">Live on Solana Devnet</p>
+        <h2 class="section-heading">This Is Not a Pitch Deck. It's a Demo.</h2>
+        <p class="section-intro">
+          The backend is in production. The Solana program is deployed and verified.
+          The demo runs today.
+        </p>
+
+        <ul class="check-list">
+          <li>
+            <span class="check-mark">✓</span>
+            <div>
+              <strong>Rust Deterministic Sim-Engine</strong>
+              Combat resolution, loot rolling, NPC AI, full data model.
+            </div>
+          </li>
+          <li>
+            <span class="check-mark">✓</span>
+            <div>
+              <strong>WebSocket Streaming Combat with AAR Replay</strong>
+              Deterministic — any session can be re-run and verified.
+            </div>
+          </li>
+          <li>
+            <span class="check-mark">✓</span>
+            <div>
+              <strong>TEEPIN Authentication</strong>
+              Challenge → ed25519 sign → verify → session token. Seed Vault flow implemented.
+            </div>
+          </li>
+          <li>
+            <span class="check-mark">✓</span>
+            <div>
+              <strong>Founding Courtesy</strong>
+              Treasury-pays-rent player account creation on Solana Devnet.
+              Player wallet never pays SOL.
+            </div>
+          </li>
+          <li>
+            <span class="check-mark">✓</span>
+            <div>
+              <strong>Full End-to-End Flow</strong>
+              Phantom wallet connect → combat stream → After-Action Report.
+            </div>
+          </li>
+          <li>
+            <span class="check-mark">✓</span>
+            <div>
+              <strong>CI/CD Pipeline</strong>
+              Auto-deploy on push. DigitalOcean production server.
+            </div>
+          </li>
+        </ul>
+
+        <div style="text-align: center;">
+          <p class="program-id">
+            Solana Program ID: 2f4NRu39hkNgDMvNhuLFk4E7aCgDRVExGrfc3zNW6m7G
+          </p>
+          <a href="game.html" class="btn btn-lg">Play the Live Demo →</a>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- Footer -->
+  <footer class="site-footer">
+    <div class="footer-legal">
+      <p class="footer-copy">© 2026 G.U.N. (Gunmetal United Nations).</p>
+      <p>All lives, extracted minerals, and residual personal effects are the legal property of the
+        licensed conglomerate. G.U.N. assumes no liability for death, dismemberment, or existential
+        despair incurred during mining operations. This disclaimer has been approved by the Office
+        of Regulatory Non-Compliance.</p>
+    </div>
+  </footer>
+
+</body>
+</html>

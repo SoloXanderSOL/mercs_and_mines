@@ -3,38 +3,256 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Mercs &amp; Mines — Demo</title>
-  <link rel="stylesheet" href="style.css">
-  <script src="https://unpkg.com/@solana/web3.js@1.98.0/lib/index.iife.min.js"></script>
+  <title>Mercs &amp; Mines — Planet Gunmetal</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:ital,wght@0,400;0,600;0,700;0,800;0,900;1,400&family=Barlow:wght@400;500;600&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/landing.css">
 </head>
 <body>
 
-  <!-- Screen 1: Login -->
-  <div id="screen-login" class="screen">
-    <h1>Mercs &amp; Mines</h1>
-    <p class="subtitle">Phase 0 — Hackathon Demo</p>
-    <p id="login-status">Connect your Phantom wallet to continue.</p>
-    <button id="btn-connect">Connect Phantom</button>
-    <button id="btn-sign" disabled>Sign &amp; Enter</button>
+  <!-- Animated background curves -->
+  <div class="bg-curves" aria-hidden="true">
+    <svg viewBox="0 0 1440 900" preserveAspectRatio="xMidYMid slice" xmlns="http://www.w3.org/2000/svg">
+      <path d="M 0 800 C 480 620, 960 380, 1440 180"
+            stroke="#c2410c" stroke-width="1.5" fill="none" opacity="0.55"/>
+      <path d="M -80 900 C 400 720, 880 500, 1440 320"
+            stroke="#c2410c" stroke-width="1" fill="none" opacity="0.35"/>
+      <path d="M 80 900 C 560 740, 1040 560, 1520 400"
+            stroke="#d97706" stroke-width="0.8" fill="none" opacity="0.22"/>
+    </svg>
   </div>
 
-  <!-- Screen 2: Combat Dashboard -->
-  <div id="screen-dashboard" class="screen hidden">
-    <h2>Live Tactical Dashboard</h2>
-    <p class="subtitle">Alpha Section vs Armored Scout — AP/AT Tick Engine</p>
-    <button id="btn-start-combat">Start Combat Session</button>
-    <div id="tick-feed"></div>
-    <button id="btn-view-aar" disabled>View After-Action Report</button>
-  </div>
+  <!-- Navigation -->
+  <nav class="site-nav" role="navigation">
+    <div class="nav-left">
+      <a href="/" class="nav-brand"><span class="nav-brand-dot">●</span> Mercs &amp; Mines</a>
+    </div>
+    <ul class="nav-links">
+      <li><a href="pitch.html">Manifesto</a></li>
+      <li><a href="#">Armory</a></li>
+      <li><a href="#">Leaderboard</a></li>
+    </ul>
+    <div class="nav-status" aria-label="Server status: online">
+      <span class="nav-status-dot"></span>
+      System Online
+    </div>
+  </nav>
 
-  <!-- Screen 3: After-Action Report -->
-  <div id="screen-aar" class="screen hidden">
-    <h2>After-Action Report</h2>
-    <p class="subtitle">Deterministic replay from input log</p>
-    <pre id="aar-content"></pre>
-    <button id="btn-back">Back to Dashboard</button>
-  </div>
+  <main>
 
-  <script src="app.js"></script>
+    <!-- ═══════════════════════════════════════════════════
+         HERO
+    ═══════════════════════════════════════════════════ -->
+    <section class="hero">
+      <div class="hero-inner">
+
+        <img src="assets/MM_title.png" alt="Mercs &amp; Mines" class="hero-title-art">
+
+        <p class="hero-warning">Warning: High Mortality Rate</p>
+
+        <h1 class="hero-headline">
+          Strip-Mine the Ash<br>
+          And Send Expendable<br>
+          Mercenaries to <span class="c-die">Die</span> For<br>
+          <span class="c-amber">Absurd Corporate</span><br>
+          <span class="c-amber-dim">Profits</span><span class="c-green-glow">$$$</span>
+        </h1>
+
+        <p class="hero-body">
+          A 90-day mobile grand strategy campaign of
+          <strong>meat-grinder tactics</strong>,
+          <strong>volatile magma-mining</strong>, and
+          <strong>corporate sabotage</strong> — while factions
+          and cults fight for control of a planet that can barely breathe.
+        </p>
+
+        <div class="hero-cta-wrap">
+          <a href="#" class="btn btn-lg">⊞ Connect Seeker Wallet</a>
+          <p class="hero-sub">Initialize neural link via web3 provider</p>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════
+         VICTORY CONDITIONS
+    ═══════════════════════════════════════════════════ -->
+    <section class="victory-section">
+
+      <!-- Raccoon logo watermark in section background -->
+      <div class="victory-watermark" aria-hidden="true">
+        <img src="assets/MM_logo_FINAL_small_fade.png" alt="">
+      </div>
+
+      <div class="section-inner">
+        <h2 class="section-heading">
+          How Will <span class="c-orange">You</span> Destroy (or Save!) Planet Gunmetal?
+        </h2>
+
+        <p class="victory-body">
+          Every server runs parallel victory tickers simultaneously — numerous possible endings
+          for the same world. Every contract you take, every story event you respond to, every
+          faction or cult you align with – nudges the server towards one of them. Did you assist
+          the Hamster God-King to enslave mankind in the planetary biscuit factory? Were you too
+          busy fighting your rivals, accidentally handing the world to the Trash Khan Raccoon
+          Horde? Nobody knows which ending is coming. Not even the player who causes it.
+        </p>
+
+        <div class="card-grid-4">
+          <div class="card">
+            <span class="card-tag incident-stamp">Incident Class: Theocratic</span>
+            <h3 class="card-title">The Hamster Throne</h3>
+            <p class="card-body">The Psychic Space Hamsters have claimed dominance over the planet.
+              Squeaker VII has expressed satisfaction — everyone is adjusting. Biscuit quotas
+              have increased significantly.</p>
+          </div>
+
+          <div class="card">
+            <span class="card-tag incident-stamp">Incident Class: Fail State</span>
+            <h3 class="card-title">The Trash-Khan's Horde</h3>
+            <p class="card-body">You underestimated the trash pandas. The Raccoon Biker Gang Horde
+              floods the map. All player bases are crushed beneath their diminutive boots.
+              There is no prize pool. There is only trash.</p>
+          </div>
+
+          <div class="card">
+            <span class="card-tag incident-stamp">Incident Class: Cooperative</span>
+            <h3 class="card-title">The Jump Gate</h3>
+            <p class="card-body">Combine your efforts to rebuild the jump gates and reconnect the
+              planet to the wider galaxy, bringing an end to the infighting and restoring order.
+              Most players consider this theoretically impossible. A few try anyway.</p>
+          </div>
+
+          <div class="card">
+            <span class="card-tag incident-stamp">Incident Class: Classified (Redacted)</span>
+            <h3 class="card-title">Emperor Bob</h3>
+            <p class="card-body">Classified — Clearance Level: Inexplicable</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════
+         BUILT FOR SEEKER
+    ═══════════════════════════════════════════════════ -->
+    <section class="seeker-section">
+      <div class="section-inner">
+        <p class="section-tag">Classified: Seeker Exclusive</p>
+        <h2 class="section-heading"><span class="c-amber">Forged on Solana.</span> Native to the Seeker.</h2>
+        <p class="section-subtext" style="max-width: 620px; margin: 0 auto 3rem;">
+          This isn't a web3 game with a Solana badge slapped on.
+          It's built from the hardware up.
+        </p>
+
+        <div class="card-grid-3">
+          <div class="seeker-card">
+            <span class="seeker-icon">⬡</span>
+            <h3 class="seeker-title">Seed Vault Authentication</h3>
+            <p class="seeker-body">Authenticate once with your TEEPIN. The Seed Vault handles every
+              in-game transaction silently for two hours. No wallet pop-ups. No friction. It plays
+              like a native title because, on Seeker, it is one.</p>
+          </div>
+
+          <div class="seeker-card">
+            <span class="seeker-icon">◈</span>
+            <h3 class="seeker-title">Real Stakes. Real Prizes.</h3>
+            <p class="seeker-body">Every 90-day Campaign runs a live $GCN Prize Pool. The vault
+              balance is displayed on your HUD the entire campaign — you can watch it grow while
+              you fight for it. At the end, the war stops and the credits are counted.</p>
+          </div>
+
+          <div class="seeker-card">
+            <span class="seeker-icon">✦</span>
+            <h3 class="seeker-title">On-Chain History</h3>
+            <p class="seeker-body">Glorious Commander deaths auto-mint as Gravestone NFTs. Free.
+              Automatic. No player action required. Your catastrophic failures live permanently on
+              the Solana blockchain. Future generations will learn from them. Probably.</p>
+          </div>
+        </div>
+
+        <div class="seeker-cta">
+          <a href="pitch.html" class="btn">Read the Full Pitch →</a>
+          <p class="seeker-cta-sub">Prize pool mechanics · $GCN tokenomics · Path to $1M ARR · Live demo</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════
+         INITIATIVE PARAMETERS
+    ═══════════════════════════════════════════════════ -->
+    <section class="initiative-section">
+      <div class="section-inner">
+        <div class="initiative-header">
+          <p class="section-tag">Initiative Parameters</p>
+        </div>
+
+        <div class="card-grid-3">
+
+          <div class="feature-card">
+            <div class="feature-icon" aria-hidden="true">↺</div>
+            <h3 class="feature-title">90-Day Wipe Cycles</h3>
+            <p class="feature-body">
+              Every season is a self-contained <span class="c-orange">apocalyptic conflict</span>.
+              No pay-to-win carryover. No veteran advantage. Everyone starts anew in the ash.
+              After 90 days, the story is over, the world as we know it ends, and the prize pool
+              pays out. A new campaign begins, and you get to see — through the choices you make —
+              how differently things could have gone on <strong>Planet Gunmetal</strong>.
+            </p>
+            <div class="feature-footer">
+              <span class="feature-label">Protocol: Reset</span>
+              <span class="feature-label feature-label-value">Active</span>
+            </div>
+          </div>
+
+          <div class="feature-card">
+            <div class="feature-icon" aria-hidden="true">✕</div>
+            <h3 class="feature-title">The Meat-Grinder</h3>
+            <p class="feature-body">
+              Equip terrified recruits with heavy ordnance and
+              <span class="c-orange">watch them die</span> to protect your mining rigs.
+              Replaceable. Expendable. <strong>Technically insured</strong>. Your Commanders,
+              however, are not replaceable. They have specialties, rank up slowly, develop trauma,
+              and can die permanently. Spend your recruits accordingly.
+            </p>
+            <div class="feature-footer">
+              <span class="feature-label">Casualty Rate:</span>
+              <span class="feature-label feature-label-value">69%</span>
+            </div>
+          </div>
+
+          <div class="feature-card">
+            <div class="feature-icon" aria-hidden="true">◈</div>
+            <h3 class="feature-title">Historical Trophies</h3>
+            <p class="feature-body">
+              Engage in campaigns to mint permanent, immutable relics of your conquests — and your
+              catastrophes! Win or lose, your history is minted on-chain. Blow yourself up
+              attacking a mining rig? Your Commander earns a Gravestone NFT, commemorating their
+              stupidity. It's not a winner's trophy cabinet. It's a verifiable record of every
+              apocalypse you helped create.
+            </p>
+            <div class="feature-footer">
+              <span class="feature-label">Asset Ledger</span>
+              <span class="feature-label feature-label-value">Immutable</span>
+            </div>
+          </div>
+
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- Footer -->
+  <footer class="site-footer">
+    <div class="footer-legal">
+      <p class="footer-copy">© 2026 G.U.N. (Gunmetal United Nations).</p>
+      <p>All lives, extracted minerals, and residual personal effects are the legal property of the
+        licensed conglomerate. G.U.N. assumes no liability for death, dismemberment, or existential
+        despair incurred during mining operations. This disclaimer has been approved by the Office
+        of Regulatory Non-Compliance.</p>
+    </div>
+  </footer>
+
 </body>
 </html>
