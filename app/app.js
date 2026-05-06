@@ -4,6 +4,10 @@ let pubkey = null;
 let token  = null;
 let sessionId = null;
 
+function isMobile() {
+  return /Android|iPhone/i.test(navigator.userAgent);
+}
+
 // Compact base58 encoder — needed to submit Phantom's Uint8Array signature to the Rust backend.
 function b58enc(bytes) {
   const ALPHA = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
@@ -35,7 +39,12 @@ async function apiPost(url, body) {
 
 document.getElementById('btn-connect').addEventListener('click', async () => {
   if (!window.solana?.isPhantom) {
-    setStatus('login-status', 'Phantom not detected. Install the Phantom browser extension.');
+    if (isMobile()) {
+      setStatus('login-status', 'On mobile? Open this page in the Phantom app browser for the best experience.');
+      document.getElementById('btn-phantom-browser').classList.remove('hidden');
+    } else {
+      setStatus('login-status', 'Phantom not detected. Install the Phantom browser extension.');
+    }
     return;
   }
   try {
