@@ -1174,7 +1174,6 @@ section { position: relative; z-index: 2; }
     gap: 0;
   }
   .nav-left  { flex: 1 0 auto; }
-  .nav-status { display: none; }
   .nav-links {
     flex-basis: 100%;
     order: 3;
