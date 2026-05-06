@@ -96,9 +96,9 @@ jobs:
 
       - name: Upload app directory to server
         run: |
-          scp -r \
+          rsync -a --delete \
             app/ \
-            "${{ secrets.DEV_SERVER_USER }}@${{ secrets.DEV_SERVER_HOST }}:${{ secrets.DEV_SERVER_APP_PATH }}/app"
+            "${{ secrets.DEV_SERVER_USER }}@${{ secrets.DEV_SERVER_HOST }}:${{ secrets.DEV_SERVER_APP_PATH }}/app/"
 
       - name: Restart service
         run: |
