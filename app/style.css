@@ -43,6 +43,8 @@ button {
 }
 button:hover:not(:disabled) { background: rgba(255, 179, 0, 0.1); }
 button:disabled { border-color: var(--dim); color: var(--dim); cursor: not-allowed; }
+.btn-home { border-color: var(--dim); color: var(--dim); font-size: 0.78rem; }
+.btn-home:hover { background: rgba(255,255,255,0.05); color: var(--text); border-color: var(--text); }
 
 #tick-feed {
   background: var(--surface);
