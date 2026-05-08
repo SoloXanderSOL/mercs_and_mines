@@ -1,0 +1,549 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Mercs &amp; Mines — Planet Gunmetal: The Lore</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:ital,wght@0,400;0,600;0,700;0,800;0,900;1,400&family=Barlow:wght@400;500;600&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/landing.css">
+  <style>
+    /* ═══════════════════════════════════════════════════════
+       LORE PAGE — Page-Specific Styles
+    ═══════════════════════════════════════════════════════ */
+
+    /* Hero top spacing accounts for fixed nav */
+    .lore-hero .section-inner {
+      padding-top: calc(var(--nav-h) + 3rem);
+    }
+
+    /* Full-width atmospheric image */
+    .lore-full-img {
+      width: 100%;
+      max-width: 100%;
+      height: auto;
+      display: block;
+      margin: 2.75rem 0;
+      border: 1px solid var(--border-dim);
+    }
+
+    /* Closing italic line — large, centred, visually distinct */
+    .lore-closing-italic {
+      font-family: 'Barlow Condensed', sans-serif;
+      font-style: italic;
+      font-weight: 700;
+      font-size: clamp(1.4rem, 3vw, 2.25rem);
+      color: var(--amber-dim);
+      text-align: center;
+      letter-spacing: 0.04em;
+      margin-top: 1.5rem;
+      padding-top: 2rem;
+      border-top: 1px solid var(--border-dim);
+    }
+
+    /* Prose blocks */
+    .lore-prose p {
+      font-size: 0.975rem;
+      color: var(--text-dim);
+      line-height: 1.85;
+    }
+    .lore-prose p + p { margin-top: 1.2em; }
+    .lore-prose strong { color: var(--text); font-weight: 600; }
+    .lore-prose em { font-style: italic; }
+
+    /* Two-column layout (Sections 2, 3, 5) */
+    .lore-two-col {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 3.5rem;
+      align-items: start;
+    }
+
+    .lore-col-img img {
+      width: 100%;
+      height: auto;
+      display: block;
+      border: 1px solid var(--border-dim);
+    }
+
+    /* S2 punchline — three final lines with breathing room */
+    .lore-punchline {
+      margin-top: 2.75rem;
+      padding-top: 2.25rem;
+      border-top: 1px solid var(--border-dim);
+    }
+    .lore-punchline p {
+      font-size: 0.975rem;
+      color: var(--text-dim);
+      line-height: 2.1;
+    }
+    .lore-punchline p + p { margin-top: 0.7em; }
+    .lore-punchline .punchline-aside { color: var(--text-muted); }
+    .lore-punchline .punchline-kicker {
+      font-style: italic;
+      font-size: 0.875rem;
+      color: var(--text-muted);
+    }
+
+    /* G.U.N. section — subtle bureaucratic grid texture */
+    .lore-gun-section { position: relative; }
+    .lore-gun-section::before {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background-image:
+        linear-gradient(rgba(80, 60, 20, 0.032) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(80, 60, 20, 0.032) 1px, transparent 1px);
+      background-size: 44px 44px;
+      pointer-events: none;
+      z-index: 0;
+    }
+    .lore-gun-section .section-inner { position: relative; z-index: 1; }
+
+    /* Official-document frame for G.U.N. heading */
+    .gun-doc-frame {
+      position: relative;
+      border: 1px solid rgba(180, 140, 60, 0.38);
+      padding: 2.25rem 2.75rem;
+      text-align: center;
+      background: rgba(8, 6, 3, 0.88);
+      margin-bottom: 2.75rem;
+    }
+    .gun-doc-frame::before {
+      content: '';
+      position: absolute;
+      inset: 6px;
+      border: 1px solid rgba(140, 110, 50, 0.18);
+      pointer-events: none;
+    }
+    .gun-doc-frame .section-heading {
+      font-size: clamp(1.4rem, 3vw, 2.25rem);
+      color: var(--text-muted);
+      margin-bottom: 0.4rem;
+    }
+    .gun-tagline {
+      font-family: 'Share Tech Mono', monospace;
+      font-size: 0.78rem;
+      letter-spacing: 0.28em;
+      color: rgba(200, 175, 90, 0.5);
+      font-style: italic;
+    }
+    .gun-form-ref {
+      position: absolute;
+      top: 0.55rem;
+      right: 0.9rem;
+      font-family: 'Share Tech Mono', monospace;
+      font-size: 0.48rem;
+      letter-spacing: 0.2em;
+      color: var(--border);
+      text-transform: uppercase;
+    }
+    .gun-classification {
+      position: absolute;
+      bottom: 0.5rem;
+      left: 0.9rem;
+      font-family: 'Share Tech Mono', monospace;
+      font-size: 0.45rem;
+      letter-spacing: 0.2em;
+      color: var(--border-dim);
+      text-transform: uppercase;
+    }
+
+    /* Inhabitants section intro */
+    .lore-inhabitants-intro {
+      font-size: 0.9rem;
+      font-style: italic;
+      color: var(--text-muted);
+      line-height: 1.75;
+      margin-bottom: 2.5rem;
+      padding-bottom: 1.75rem;
+      border-bottom: 1px solid var(--border-dim);
+    }
+
+    /* Entity cards — grid with named areas for image/text swap */
+    .entity-card {
+      display: grid;
+      gap: 2.5rem;
+      align-items: start;
+      padding: 2rem;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-left: 2px solid var(--orange-dim);
+      margin-bottom: 1.5rem;
+      transition: border-left-color 0.2s;
+    }
+    .entity-card:hover { border-left-color: var(--amber); }
+
+    .entity-card.img-left {
+      grid-template-columns: 240px 1fr;
+      grid-template-areas: "img text";
+    }
+    .entity-card.img-right {
+      grid-template-columns: 1fr 240px;
+      grid-template-areas: "text img";
+    }
+
+    .entity-img-cell  { grid-area: img; }
+    .entity-text-cell { grid-area: text; }
+
+    .entity-img-cell img {
+      width: 100%;
+      max-width: 240px;
+      height: auto;
+      display: block;
+      border: 1px solid var(--border-dim);
+    }
+
+    .entity-name {
+      font-family: 'Barlow Condensed', sans-serif;
+      font-weight: 900;
+      font-size: 1.75rem;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      color: var(--orange);
+      margin-bottom: 0.85rem;
+      line-height: 1.1;
+    }
+    .entity-text-cell p {
+      font-size: 0.9rem;
+      color: var(--text-dim);
+      line-height: 1.78;
+    }
+    .entity-text-cell p + p { margin-top: 0.95em; }
+    .entity-text-cell strong { color: var(--text); font-weight: 600; }
+    .entity-text-cell em { font-style: italic; }
+
+    /* S5 NFT note — italic, amber, visually distinct */
+    .lore-nft-note {
+      font-style: italic;
+      font-size: 1rem;
+      color: var(--amber-dim);
+      margin-top: 2rem;
+      padding-top: 1.5rem;
+      border-top: 1px solid var(--border-dim);
+      line-height: 1.7;
+    }
+
+    /* CTA section */
+    .lore-cta-img {
+      width: 100%;
+      max-width: 560px;
+      height: auto;
+      display: block;
+      margin: 0 auto 3rem;
+      border: 1px solid var(--border-dim);
+    }
+    .lore-btn-row {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 1rem;
+      flex-wrap: wrap;
+    }
+    .lore-cta-sub {
+      font-family: 'Share Tech Mono', monospace;
+      font-size: 0.6rem;
+      color: var(--text-muted);
+      letter-spacing: 0.08em;
+      text-align: center;
+      margin-top: 1.5rem;
+      font-style: italic;
+      max-width: 640px;
+      margin-left: auto;
+      margin-right: auto;
+    }
+
+    /* ─── RESPONSIVE ─── */
+    @media (max-width: 768px) {
+      .lore-hero .section-inner { padding-top: calc(var(--nav-h) + 2rem); }
+      .lore-two-col { grid-template-columns: 1fr; gap: 2rem; }
+
+      .entity-card.img-left,
+      .entity-card.img-right {
+        grid-template-columns: 1fr;
+        grid-template-areas: "img" "text";
+      }
+      .entity-img-cell img { max-width: 100%; }
+      .entity-card { padding: 1.5rem; gap: 1.5rem; }
+
+      .lore-btn-row { flex-direction: column; align-items: stretch; }
+      .lore-btn-row .btn { justify-content: center; }
+
+      .gun-doc-frame { padding: 1.75rem 1.5rem; }
+    }
+
+    @media (max-width: 480px) {
+      .lore-hero .section-inner { padding-top: calc(var(--nav-h) + 1rem); }
+      .entity-card { padding: 1.25rem; gap: 1.25rem; }
+      .gun-doc-frame { padding: 1.25rem 1rem; }
+      .gun-form-ref,
+      .gun-classification { display: none; }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Animated background curves -->
+  <div class="bg-curves" aria-hidden="true">
+    <svg viewBox="0 0 1440 900" preserveAspectRatio="xMidYMid slice" xmlns="http://www.w3.org/2000/svg">
+      <path d="M 0 800 C 480 620, 960 380, 1440 180"
+            stroke="#c2410c" stroke-width="1.5" fill="none" opacity="0.55"/>
+      <path d="M -80 900 C 400 720, 880 500, 1440 320"
+            stroke="#c2410c" stroke-width="1" fill="none" opacity="0.35"/>
+      <path d="M 80 900 C 560 740, 1040 560, 1520 400"
+            stroke="#d97706" stroke-width="0.8" fill="none" opacity="0.22"/>
+    </svg>
+  </div>
+
+  <!-- Navigation -->
+  <nav class="site-nav" role="navigation">
+    <div class="nav-left">
+      <a href="index.html" class="nav-back">← Back to Landing</a>
+      <a href="/" class="nav-brand"><span class="nav-brand-dot">●</span> Mercs &amp; Mines</a>
+    </div>
+    <ul class="nav-links">
+      <li><a href="pitch.html">Manifesto</a></li>
+      <li><a href="lore.html" aria-current="page">Lore</a></li>
+      <li><a href="#">Armory</a></li>
+      <li><a href="#">Leaderboard</a></li>
+    </ul>
+    <div class="nav-status" aria-label="Server status: online">
+      <span class="nav-status-dot"></span>
+      System Online
+    </div>
+  </nav>
+
+  <main>
+
+    <!-- ═══════════════════════════════════════════════════
+         SECTION 1 — HERO
+    ═══════════════════════════════════════════════════ -->
+    <section class="lore-hero bg-dark">
+      <div class="section-inner">
+
+        <p class="section-tag">Field Briefing — Classified: New Arrivals</p>
+        <h1 class="section-heading">Year 2334. Planet Gunmetal.</h1>
+
+        <div class="lore-prose">
+          <p>A dying world. An abandoned colony. The most valuable magma-ore deposits in the known sector — and nobody who should be in charge of it.</p>
+          <p>Before the collapse, Gunmetal was the mining capital of the Great Space Empire: a planet with fast-moving magma flows regularly depositing rich veins of exotic ore in unpredictable new locations, with competing corporations willing to do increasingly creative things to each other to reach those veins first. Sabotage. Planted explosives. Hiring mercenaries. Then hiring <em>better</em> mercenaries to deal with the first set of hired mercenaries that had gone rogue. By the time the jump lanes failed and the Great Space Empire quietly stopped answering its mail, Gunmetal was already the most heavily armed mining colony in the sector.</p>
+          <p>The Empire's departure didn't stop the flow of money. It just stopped people abiding by the rules that regulated it.</p>
+          <p>What remained: the ore, the corporations, the guns, and G.U.N. — the Gunmetal United Nations, the planetary authority that once held everything together, now mostly held together by its own corruption. The mines still flow. The factions still fight. The main difference is that now Gunmetal's mercs can no longer import their weapons — they have to reverse-engineer and manufacture them from whatever they can dig out of the ground, before their rivals do. And now, of course, there's no one left to tell them not to use what they build against each other.</p>
+        </div>
+
+        <img src="./lore_page_art/section_1_gunmetal2.png"
+             alt="Planet Gunmetal — ash deserts, volcanic plains, and the ruins of an empire"
+             class="lore-full-img">
+
+        <p class="lore-closing-italic">Someone has to become king of the ashes.</p>
+
+      </div>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════
+         SECTION 2 — THE WORLD
+    ═══════════════════════════════════════════════════ -->
+    <section class="bg-surface">
+      <div class="section-inner">
+
+        <p class="section-tag">Territorial Survey — Zones &amp; Hazards</p>
+        <h2 class="section-heading">Planet Gunmetal — A Field Guide (For Survivors)</h2>
+
+        <div class="lore-two-col">
+
+          <div>
+            <div class="lore-prose">
+              <p>The planet divides neatly into two zones, which is the only neat thing about it.</p>
+              <p><strong>The Safe Zone</strong> sits at the centre of the map — patrolled, taxed at 25% by G.U.N., and home to the surviving city-states and most of the people who still have all their original limbs. The ore here tops out at Tier 2. Perfectly adequate. Perfectly uninspiring.</p>
+              <p><strong>The Badlands</strong> is everything else. Ash deserts. Volcanic plains. The ruins of city-states that didn't make it. Tier 3 through Tier 5 ore deposits, which means more wealth than you've ever seen and less law than you've ever experienced. The Badlands is where fortunes are made, convoys disappear, and the definition of "acceptable risk" gets renegotiated by everyone involved at least twice per trip.</p>
+            </div>
+
+            <div class="lore-punchline">
+              <p>The air, incidentally, is kept breathable by a network of Atmospheric Processors. They are owned by G.U.N.</p>
+              <p class="punchline-aside">Coincidentally, nobody attacks G.U.N. directly.</p>
+              <p class="punchline-kicker">(This is not a coincidence.)</p>
+            </div>
+          </div>
+
+          <div class="lore-col-img">
+            <img src="./lore_page_art/GUNBeThankfulForYourAirAllowance.png"
+                 alt="G.U.N. public safety notice — Be Thankful For Your Air Allowance">
+          </div>
+
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════
+         SECTION 3 — G.U.N.
+    ═══════════════════════════════════════════════════ -->
+    <section class="bg-dark lore-gun-section">
+      <div class="section-inner">
+
+        <div class="gun-doc-frame">
+          <span class="gun-form-ref">Form GN-1 / Rev. 47B / Planetary Authority</span>
+          <h2 class="section-heading">G.U.N. — The Gunmetal United Nations</h2>
+          <p class="gun-tagline">"One World GUNvernment."</p>
+          <span class="gun-classification">Classification: Public Record &bull; Distribution: Mandatory</span>
+        </div>
+
+        <div class="lore-two-col">
+
+          <div class="lore-col-img">
+            <img src="./lore_page_art/GUNcorruptbureaucrat.png"
+                 alt="A G.U.N. bureaucrat — the face of planetary governance">
+          </div>
+
+          <div class="lore-prose">
+            <p>G.U.N. was once a respectable, functioning planetary authority. That was a long time ago.</p>
+            <p>Today, G.U.N. still claims legal sovereignty over every miner, mercenary, and sentient raccoon on the planet. It still issues contracts. It still has a 25% Corruption Tax on every transaction in the Safe Zone and a 40% Import Tariff on anything coming in from the Badlands. What it no longer has is the military power to enforce any of this — which it explains as <em>"an intentional policy of deregulation and laissez-faire governance."</em> Everyone can see through this. G.U.N. adopted the language of libertarian policy to disguise the fact that it is being ignored by people with bigger guns than it has.</p>
+            <p>The bribes flow upward. The pardons flow downward. The contracts pay poorly. The Corruption Tax is, by all definitions, a real tax collected by a fictional government — which is arguably an improvement on most government taxation systems.</p>
+            <p>G.U.N. has one unchallengeable lever of power: the Atmospheric Processors. Nobody dares risk the air. This is the most effective governance strategy on Gunmetal, and it was discovered by accident when an idiot intern mistakenly turned it off for five minutes. 5,000 people died that day. The planet, not realising it was an accident, thought it was done to serve as a demonstration of the power G.U.N. wielded. The corporations began paying their corruption taxes on time after that. That intern has since been promoted to head of city state regulations committee #24 — far away from the Atmospheric Processors power switch.</p>
+          </div>
+
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════
+         SECTION 4 — THE INHABITANTS
+    ═══════════════════════════════════════════════════ -->
+    <section class="bg-surface">
+      <div class="section-inner">
+
+        <p class="section-tag">Xenobiological Survey — Classified: Incomplete</p>
+        <h2 class="section-heading">The Locals — A Complete and Mostly Accurate Guide</h2>
+        <p class="lore-inhabitants-intro">Gunmetal is home to humans, and also to several things that the Space Empire's genetic engineering division created and then immediately stopped taking responsibility for.</p>
+
+        <!-- The Ducks — image left, text right -->
+        <div class="entity-card img-left">
+          <div class="entity-img-cell">
+            <img src="./lore_page_art/duck1.png" alt="An Anthropomorphic Duck — armed and underestimated">
+          </div>
+          <div class="entity-text-cell">
+            <h3 class="entity-name">The Ducks</h3>
+            <p>Three to four feet tall. Dual weapon hardpoints (one per wing... hand... thing). Berserker fury response activated by stress, mockery, or the general injustice of being consistently underestimated in a combat environment where small stature is a tactical advantage that everyone is somehow surprised by every single time.</p>
+            <p>The Anthropomorphic Ducks were engineered as a general-purpose industrial workforce. The berserker fury was listed as a design flaw. The Ducks have since produced spreadsheets demonstrating that it is, in every measurable metric, a competitive advantage, and they have submitted these spreadsheets to several G.U.N. oversight committees. They have not responded.</p>
+            <p>Unfortunately for them, it turns out beaks were not evolved particularly well for speaking English. The genetic engineers logged it as a known issue and filed it under 'acceptable'. As a result they speak with a sibilant lisp — the S-sound consistently rendered as TH, which becomes more pronounced under emotional intensity, which means the moments of greatest fury are also, unfortunately, the moments of greatest comedic potential. The Ducks are aware of this. They find it less funny than everyone else does.</p>
+          </div>
+        </div>
+
+        <!-- The Psychic Space Hamsters — text left, image right -->
+        <div class="entity-card img-right">
+          <div class="entity-img-cell">
+            <img src="./lore_page_art/hamster.png" alt="A Psychic Space Hamster — Cultivated variety">
+          </div>
+          <div class="entity-text-cell">
+            <h3 class="entity-name">The Psychic Space Hamsters</h3>
+            <p>Nobody knows why the Space Empire gave hamsters psychic powers. The historical record offers no explanation. It is one of the great unanswered questions of Gunmetal's colonial history, alongside "what was the Great Space Empire's actual name?" and "was the raccoon project really a good idea?"</p>
+            <p>The answer, in all three cases, is: it doesn't matter anymore.</p>
+            <p>There are two kinds of Psychic Hamster on Gunmetal. The <strong>Cultivated</strong> variety have, over decades of gentle background psychic influence, instilled a planet-wide cultural conviction that producing biscuits and giving them to hamsters is <em>correct and good</em>. They decline to make any direct claims about the extent of their influence. They sit on Boards of Directors. They advise military campaigns. They manage a planet-wide Biscuit Economy as what they describe as "an aligned incentive structure," which is technically accurate and deliberately incomplete.</p>
+            <p>The <strong>Wild Hamsters</strong> live in the deep Badlands, have renounced biscuits, and are seeking something their domesticated counterparts would describe as "an alarming waste of psychic potential." The Wilds call it ascension. The Domesticated hamsters have not raised it in any Board meeting.</p>
+          </div>
+        </div>
+
+        <!-- The Raccoon Biker Gangs — image left, text right -->
+        <div class="entity-card img-left">
+          <div class="entity-img-cell">
+            <img src="./lore_page_art/raccoon3chav.png" alt="A Raccoon Biker — Chav faction">
+          </div>
+          <div class="entity-text-cell">
+            <h3 class="entity-name">The Raccoon Biker Gangs</h3>
+            <p>They were meant to be mechanics.</p>
+            <p>The design brief was reasonable: create a dexterous, hands-on maintenance underclass who could build machines, fix machines, and keep machines running under industrial conditions. The Empire noted raccoons' natural aptitude for fine manipulation, their comfort in confined spaces, and their apparent compulsion to disassemble anything within reach. These seemed like useful traits.</p>
+            <p>The Empire was correct about all of them. It failed to think through the implications.</p>
+            <p>Within months of successful uplift, it had become obvious the project was a failure and needed to be terminated. The raccoons were too... anarchistic. After the decision to erase the test subjects had been reached (and before it could be implemented), the research subjects had reverse-engineered the lock mechanisms on their enclosures, disassembled two research vehicles for parts, assembled something from those parts that the lead scientist later described as "a functional if terrifyingly unsafe mode of transport" and left. Not escaped. <em>Left.</em> There is a difference. On the way out, they rearranged the pending extermination documentation into a small paper sculpture of a rude gesture.</p>
+            <p>They are now the finest practical mechanics on Gunmetal — except for the fact that they will not fix your vehicle. They may, however, steal it, modify it beyond recognition, and ride it until the engine explodes — which they consider the highest possible tribute to a well-built machine.</p>
+            <p>They divide into roaming biker gangs that cause trouble for anyone they encounter. They have numerous styles — Mod, Rocker, Goth, Punk, Rave, Disco, Chav — each with distinct colour schemes, musical identities, and deeply felt aesthetic convictions. They argue furiously with each other. About what, we aren't sure, given they do not speak English. The genetic engineers felt that trait was unnecessary. They instead communicate via hissing, growling, yapping, sticking out their tongues, making fart noises, and a surprising array of rude hand gestures. Their disunity is, broadly, a blessing. If they were ever to unite, they could surely destroy Gunmetal civilization as we know it in a wave of antisocial violent crime. Thankfully their argumentative nature makes this impossible. Definitely nothing you need to worry about.</p>
+          </div>
+        </div>
+
+        <!-- The Trust — text left, image right -->
+        <div class="entity-card img-right">
+          <div class="entity-img-cell">
+            <img src="./lore_page_art/ScienceApe1.png" alt="A Science Ape — Junior Analyst, The Trust">
+          </div>
+          <div class="entity-text-cell">
+            <h3 class="entity-name">The Trust — and the Science Apes</h3>
+            <p>The Science Apes were uplifted for superintelligence. They were given British accents. Nobody on Gunmetal in the year 2334 knows what a British accent is, or why they have it. The Apes offer no explanation. They consider the question beneath their intellectual dignity.</p>
+            <p>The bulk of the Science Apes work alongside Gunmetal's residents, serving as researchers reverse-engineering the technology Gunmetal forgot how to make — everything that had always been imported before the jump lanes collapsed. The most elite among them founded <strong>The Trust</strong> — a sovereign technocracy that floats above the clouds, literally, operating the <strong>Aero-Siphons</strong>: vast airborne refineries that harvest the only fuel capable of powering Gunmetal's heavy machinery. The Blue Blood — sapphire-coloured liquid Helium-3, condensed from the planet's toxic stratospheric particulate — is what keeps every Mega-Truck, every tank, every convoy moving.</p>
+            <p>The Trust controls all of it. G.U.N. cannot tax them. The Capitalist Bloc cannot buy them. The Socialist Union cannot democratize them. Nobody attacks them directly, because nobody wants every vehicle on the planet to simultaneously grind to a halt.</p>
+            <p>Fuel is traded in exchange for refined ores, and delivered by <strong>zeppelin</strong>. A pristine, white-hulled Atmospheric Cutter descends through the ash clouds and moors at your base, crewed by impeccably dressed Junior Science Apes in leather flight jackets. The transfer takes as long as it takes. Upon completion, you receive a <strong>Manifest and Critique</strong>: a digital receipt confirming your fuel delivery, accompanied by a procedurally generated observation about the shortcomings in your base layout, your mission reports' spotty grammar, or the frankly sub-optimal naming conventions applied to your mercenary units.</p>
+            <p>This is how The Trust communicates that it likes you. When they stop generating the critique, something has gone wrong.</p>
+          </div>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════
+         SECTION 5 — HOW IT WORKS
+    ═══════════════════════════════════════════════════ -->
+    <section class="bg-dark">
+      <div class="section-inner">
+
+        <p class="section-tag">Mission Parameters — Read Before Deploying</p>
+        <h2 class="section-heading">The Situation, Briefly</h2>
+
+        <div class="lore-two-col">
+
+          <div>
+            <div class="lore-prose">
+              <p>You run a corporation. The ore doesn't come to you — you go to the ore, you dig it out of shifting magma vents, and then you attempt to drive it home in slow, fuel-hungry convoy vehicles across a map full of raccoon bikers, war boar raiders, and other corporations who have decided your convoy is more interesting than their own mining operation.</p>
+              <p>This requires <strong>two things working at the same time</strong>: mining crews willing to enter an active volcanic vent, and mercenaries capable of keeping them alive while they do it. Neither works without the other. You cannot mine ore without protection. You cannot afford better protection without the ore. The game is this tension, for ninety days, at the end of which a smart contract distributes a prize pool based on who won. There are several ways of determining who wins and who loses. Some are more obvious than others. Most will be discovered as you play, influenced by who you align with. Choose your allies wisely. Or don't — it'll be fun either way.</p>
+              <p>Your Commanders are procedurally generated individuals with names, ranks, quirks, and fatal flaws. They level up slowly. They can die permanently. A veteran commander earned over weeks of careful play is genuinely precious. The game knows this. The Badlands knows this too.</p>
+              <p>The season ends. The map wipes. The winners collect. Everyone queues for the next Corporate Expedition.</p>
+            </div>
+
+            <p class="lore-nft-note">Some of your Commanders survived, minted as NFTs on Solana. They'll be waiting for you.</p>
+          </div>
+
+          <div class="lore-col-img">
+            <img src="./lore_page_art/thetrust1.png"
+                 alt="The Trust — Atmospheric Cutter delivering Helium-3 by zeppelin">
+          </div>
+
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════
+         SECTION 6 — CALL TO ACTION
+    ═══════════════════════════════════════════════════ -->
+    <section class="bg-surface">
+      <div class="section-inner" style="text-align: center;">
+
+        <p class="section-tag">Corporate Recruitment Drive — Positions: Open</p>
+        <h2 class="section-heading">Ready to Corporate?</h2>
+
+        <img src="./lore_page_art/raccoonwatches2.png"
+             alt="A raccoon watches your convoy from the shadows"
+             class="lore-cta-img">
+
+        <div class="lore-btn-row">
+          <a href="game.html" class="btn btn-lg">Play the Live Demo</a>
+          <a href="pitch.html" class="btn">Read the Full Pitch →</a>
+          <a href="index.html" class="btn btn-ghost">Landing Page</a>
+        </div>
+
+        <p class="lore-cta-sub">"Live on Solana Devnet. Phantom wallet. Real on-chain transactions. The raccoons are already watching your convoy."</p>
+
+      </div>
+    </section>
+
+  </main>
+
+  <!-- Footer -->
+  <footer class="site-footer">
+    <div class="footer-legal">
+      <p class="footer-copy">© 2026 G.U.N. (Gunmetal United Nations).</p>
+      <p>All lives, extracted minerals, and residual personal effects are the legal property of the
+        licensed conglomerate. G.U.N. assumes no liability for death, dismemberment, or existential
+        despair incurred during mining operations. This disclaimer has been approved by the Office
+        of Regulatory Non-Compliance.</p>
+    </div>
+  </footer>
+
+</body>
+</html>

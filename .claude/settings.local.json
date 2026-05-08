@@ -22,7 +22,9 @@
       "Bash(cargo build *)",
       "Bash(wsl *)",
       "Bash(CARGO_INCREMENTAL=0 cargo build *)",
-      "Bash(xargs cat *)"
+      "Bash(xargs cat *)",
+      "Read(//c/Users/ajone/PROJECTS/Mercs_and_Mines/lore_page_art/**)",
+      "Read(//mnt/c/Users/ajone/PROJECTS/Mercs_and_Mines/**)"
     ]
   }
 }
