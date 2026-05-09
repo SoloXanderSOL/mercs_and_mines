@@ -180,6 +180,35 @@
     .btn-retreat:hover:not(:disabled) { background: rgba(170, 35, 35, 0.30); }
     .btn-retreat:disabled { opacity: 0.35; cursor: not-allowed; }
 
+    /* ── Conclude button ── */
+    @keyframes orangeGlow {
+      0%, 100% { box-shadow: 0 0 6px 1px rgba(255, 179, 0, 0.35); }
+      50%       { box-shadow: 0 0 22px 6px rgba(255, 179, 0, 0.85); }
+    }
+    .bt-conclude-btn {
+      position: absolute;
+      bottom: calc(38vh + 3.2rem);
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 10;
+      background: rgba(255, 179, 0, 0.09);
+      border: 1px solid #ffb300;
+      color: #ffb300;
+      padding: 0.55rem 1.6rem;
+      cursor: pointer;
+      font-family: 'Courier New', monospace;
+      font-size: 0.83rem;
+      letter-spacing: 0.07em;
+      white-space: nowrap;
+      opacity: 0;
+      transition: opacity 0.4s;
+      animation: none;
+    }
+    .bt-conclude-btn.visible {
+      opacity: 1;
+      animation: orangeGlow 1.6s ease-in-out infinite;
+    }
+
     /* ── Post-Battle layout ── */
     .post-overlay {
       position: relative;
@@ -324,6 +353,7 @@
     <img src="assets/art/mid_battle.png" class="battle-art" alt="">
     <div class="bt-status" id="bt-status"></div>
     <div style="flex:1"></div>
+    <button id="btn-conclude" class="bt-conclude-btn">ENGAGEMENT CONCLUDED — READ AFTER-ACTION REPORT</button>
     <div class="bt-ticker-area">
       <div class="ticker-panel" id="ticker-panel"></div>
       <div class="bt-footer">

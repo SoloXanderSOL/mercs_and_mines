@@ -349,21 +349,35 @@ async function runTickAnimation(ticks) {
   }
 
   if (!retreated) {
-    const panel = qs('ticker-panel');
-    const sysEl = document.createElement('div');
-    sysEl.className = 't-system';
-    sysEl.textContent = '— ENGAGEMENT CONCLUDED —';
-    panel.appendChild(sysEl);
-    panel.scrollTop = panel.scrollHeight;
+    await showConcludeButton();
+  } else {
+    await delay(1500);
   }
+}
 
-  await delay(1500);
+function showConcludeButton() {
+  return new Promise(resolve => {
+    const btn = qs('btn-conclude');
+    const retreatBtn = qs('btn-retreat');
+    retreatBtn.disabled = true;
+    btn.classList.add('visible');
+    btn.onclick = () => {
+      btn.classList.remove('visible');
+      btn.onclick = null;
+      stopMusic();
+      resolve();
+    };
+  });
 }
 
 async function startBattleTicker(result, ticks) {
   resetBattleState();
   buildStatusStrip();
   qs('ticker-panel').innerHTML = '';
+
+  const concludeBtn = qs('btn-conclude');
+  concludeBtn.classList.remove('visible');
+  concludeBtn.onclick = null;
 
   showOnly('screen-battle-ticker');
   playMusic(music.battleLoop);
@@ -384,7 +398,7 @@ async function startBattleTicker(result, ticks) {
 
   await runTickAnimation(ticks);
 
-  stopMusic();
+  if (retreated) stopMusic();
   showPostBattle(result, retreated);
 }
 
