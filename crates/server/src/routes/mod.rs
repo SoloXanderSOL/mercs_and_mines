@@ -25,8 +25,10 @@ use uuid::Uuid;
 use sim_engine::{
     equipment::equipment,
     missions::missions,
+    ore_run::run_ore_run,
     resolver::{apply_commander_buffs, resolve_combat, resolve_mission, resolve_pack_assault},
     rng::generate_seed,
+    scenario::Approach,
     types::CombatInitiationType,
     units::unit_definitions,
 };
@@ -438,6 +440,28 @@ async fn get_combat_aar(
     })))
 }
 
+// ── Ore Run (hackathon demo) ───────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct OreRunRequest {
+    approach: Approach,
+    seed_override: Option<u32>,
+}
+
+async fn post_ore_run_start(
+    State(_state): State<Arc<AppState>>,
+    Json(req): Json<OreRunRequest>,
+) -> impl IntoResponse {
+    let seed = req.seed_override.unwrap_or_else(generate_seed);
+    let timestamp = Utc::now().to_rfc3339();
+    let (result, ticks) = run_ore_run(req.approach, seed, &timestamp);
+    Json(json!({
+        "result": serde_json::to_value(&result).unwrap(),
+        "ticks":  serde_json::to_value(&ticks).unwrap(),
+        "seed":   seed,
+    }))
+}
+
 // ── Router ─────────────────────────────────────────────────────────────────
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -454,6 +478,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/combat/stream/start",       post(post_combat_stream_start))
         .route("/api/combat/stream/:session_id", get(ws_combat::ws_stream_handler))
         .route("/api/combat/aar/:session_id",    get(get_combat_aar))
+        .route("/api/ore-run/start",             post(post_ore_run_start))
         .route("/api/session/:id/integrity",     get(get_session_integrity))
         .with_state(state)
         .fallback_service(ServeDir::new("app").append_index_html_on_directories(true))

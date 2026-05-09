@@ -14,5 +14,7 @@ pub mod loot_roller;
 pub mod units;
 pub mod missions;
 pub mod equipment;
+pub mod scenario;
+pub mod ore_run;
 
 pub use game_types::UnitArchetype;

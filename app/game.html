@@ -2,14 +2,268 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <title>Mercs &amp; Mines — Demo</title>
   <link rel="stylesheet" href="style.css">
   <script src="https://unpkg.com/@solana/web3.js@1.98.0/lib/index.iife.min.js"></script>
+  <style>
+    /* ── Battle screens (fixed fullscreen, above normal layout) ── */
+    .battle-screen {
+      position: fixed;
+      inset: 0;
+      z-index: 200;
+      overflow: hidden;
+      background: #0a0a0a;
+      display: flex;
+      flex-direction: column;
+    }
+    .battle-screen.hidden { display: none; }
+
+    .battle-art {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      object-position: center;
+      pointer-events: none;
+    }
+
+    /* ── Pre-Battle layout ── */
+    .pb-overlay {
+      position: relative;
+      z-index: 1;
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      justify-content: flex-end;
+      padding: 1.5rem 2rem;
+    }
+    .pb-panel {
+      background: rgba(4, 4, 4, 0.86);
+      border: 1px solid rgba(255, 179, 0, 0.38);
+      padding: 1.1rem 1.4rem 1rem;
+      max-width: 700px;
+    }
+    .pb-report {
+      color: #c0c0c0;
+      font-size: 0.82rem;
+      line-height: 1.65;
+      margin-bottom: 1rem;
+    }
+    .pb-report strong { color: #e8e8e8; }
+    .approach-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0.45rem;
+    }
+    .btn-approach {
+      background: rgba(255, 179, 0, 0.07);
+      border: 1px solid rgba(255, 179, 0, 0.48);
+      color: #ffb300;
+      padding: 0.6rem 0.85rem;
+      cursor: pointer;
+      font-family: 'Courier New', Courier, monospace;
+      font-size: 0.79rem;
+      text-align: left;
+      line-height: 1.4;
+      transition: background 0.12s;
+      width: 100%;
+      margin: 0;
+    }
+    .btn-approach:hover:not(:disabled) { background: rgba(255, 179, 0, 0.17); }
+    .btn-approach:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    /* ── Battle Ticker layout ── */
+    .bt-status {
+      position: relative;
+      z-index: 1;
+      background: rgba(4, 4, 4, 0.90);
+      border-bottom: 1px solid rgba(90, 194, 90, 0.18);
+      padding: 0.3rem 0.8rem;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 0.25rem 0.7rem;
+      font-size: 0.66rem;
+      font-family: 'Courier New', Courier, monospace;
+    }
+    .bt-sep {
+      color: rgba(255, 179, 0, 0.45);
+      padding: 0 0.2rem;
+      font-size: 0.65rem;
+    }
+    .su {
+      display: flex;
+      align-items: center;
+      gap: 0.3rem;
+      white-space: nowrap;
+    }
+    .su-name { color: #777; }
+    .su-name.active { color: #aaa; }
+    .su-name.routed { color: #555; text-decoration: line-through; }
+    .su-name.destroyed { color: #444; }
+    .su-bar {
+      display: inline-block;
+      width: 44px;
+      height: 5px;
+      background: #181818;
+      border: 1px solid #252525;
+      vertical-align: middle;
+    }
+    .su-fill {
+      height: 100%;
+      background: #5ac25a;
+      transition: width 0.3s;
+    }
+    .su-fill.amber { background: #ffb300; }
+    .su-fill.red   { background: #cc3333; }
+    .su-val { color: #888; font-size: 0.64rem; }
+    .su-val.routed { color: #444; }
+
+    .bt-ticker-area {
+      position: relative;
+      z-index: 1;
+    }
+    .ticker-panel {
+      background: rgba(4, 4, 4, 0.83);
+      border-top: 1px solid rgba(90, 194, 90, 0.13);
+      padding: 0.55rem 0.9rem;
+      height: 38vh;
+      overflow-y: auto;
+      scroll-behavior: smooth;
+    }
+    .t-mech {
+      font-family: 'Courier New', monospace;
+      font-size: 0.69rem;
+      color: #5ac25a;
+      line-height: 1.4;
+    }
+    .t-flav {
+      font-family: 'Courier New', monospace;
+      font-size: 0.79rem;
+      color: #aaaaaa;
+      font-style: italic;
+      line-height: 1.5;
+      padding-left: 1em;
+      border-left: 2px solid rgba(255, 179, 0, 0.33);
+      margin-bottom: 0.45rem;
+    }
+    .t-system {
+      font-family: 'Courier New', monospace;
+      font-size: 0.77rem;
+      color: #ffb300;
+      font-weight: bold;
+      margin: 0.5rem 0 0.3rem;
+    }
+    .bt-footer {
+      position: relative;
+      z-index: 1;
+      background: rgba(4, 4, 4, 0.90);
+      border-top: 1px solid rgba(255, 179, 0, 0.10);
+      padding: 0.4rem 0.9rem;
+      display: flex;
+      justify-content: flex-end;
+    }
+    .btn-retreat {
+      background: rgba(170, 35, 35, 0.14);
+      border: 1px solid #9a2525;
+      color: #cc4444;
+      padding: 0.38rem 1.1rem;
+      cursor: pointer;
+      font-family: 'Courier New', monospace;
+      font-size: 0.8rem;
+      letter-spacing: 0.07em;
+      transition: background 0.12s;
+      margin: 0;
+    }
+    .btn-retreat:hover:not(:disabled) { background: rgba(170, 35, 35, 0.30); }
+    .btn-retreat:disabled { opacity: 0.35; cursor: not-allowed; }
+
+    /* ── Post-Battle layout ── */
+    .post-overlay {
+      position: relative;
+      z-index: 1;
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      justify-content: flex-end;
+      padding: 1rem 1.5rem;
+    }
+    .post-panel {
+      background: rgba(4, 4, 4, 0.88);
+      border: 1px solid rgba(255, 179, 0, 0.32);
+      padding: 1rem 1.35rem;
+      max-width: 720px;
+      max-height: 68vh;
+      overflow-y: auto;
+    }
+    .post-title {
+      font-size: 1.05rem;
+      letter-spacing: 0.1em;
+      color: #ffb300;
+      margin-bottom: 0.65rem;
+    }
+    .post-title.defeat { color: #cc3333; }
+    .post-flavour {
+      color: #c0c0c0;
+      font-size: 0.81rem;
+      line-height: 1.7;
+      white-space: pre-wrap;
+      margin-bottom: 0.7rem;
+    }
+    .post-hr {
+      border: 0;
+      border-top: 1px solid rgba(255, 179, 0, 0.22);
+      margin: 0.7rem 0;
+    }
+    .post-section-head {
+      color: #ffb300;
+      font-size: 0.72rem;
+      letter-spacing: 0.1em;
+      margin-bottom: 0.45rem;
+    }
+    .post-stats-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0.2rem 1.5rem;
+      margin-bottom: 0.5rem;
+    }
+    .post-stat { font-size: 0.79rem; color: #c0c0c0; }
+    .post-stat b { color: #ffb300; }
+    .post-highlight {
+      font-size: 0.77rem;
+      color: #888;
+      line-height: 1.5;
+      padding-left: 0.7rem;
+      margin-bottom: 0.22rem;
+      border-left: 2px solid rgba(255, 179, 0, 0.28);
+    }
+    .post-footer { margin-top: 0.85rem; text-align: right; }
+    .btn-rtb {
+      background: rgba(255, 179, 0, 0.09);
+      border: 1px solid #ffb300;
+      color: #ffb300;
+      padding: 0.48rem 1.4rem;
+      cursor: pointer;
+      font-family: 'Courier New', monospace;
+      font-size: 0.83rem;
+      letter-spacing: 0.07em;
+      transition: background 0.12s;
+      margin: 0;
+    }
+    .btn-rtb:hover { background: rgba(255, 179, 0, 0.19); }
+
+    @media (max-width: 600px) {
+      .approach-grid { grid-template-columns: 1fr; }
+      .pb-overlay { padding: 1rem; }
+      .post-stats-grid { grid-template-columns: 1fr; }
+    }
+  </style>
 </head>
 <body>
 
-  <!-- Screen 1: Login -->
+  <!-- ══ Screen: Login ══════════════════════════════════════════════════════ -->
   <div id="screen-login" class="screen">
     <h1>Mercs &amp; Mines</h1>
     <p class="subtitle">Phase 0 — Hackathon Demo</p>
@@ -25,23 +279,65 @@
     <button class="btn-home" onclick="window.location.href='pitch.html'">Read the Full Pitch</button>
   </div>
 
-  <!-- Screen 2: Combat Dashboard -->
-  <div id="screen-dashboard" class="screen hidden">
-    <h2>Live Tactical Dashboard</h2>
-    <p class="subtitle">Alpha Section vs Armored Scout — AP/AT Tick Engine</p>
-    <button id="btn-start-combat">Start Combat Session</button>
+  <!-- ══ Screen: Command Hub (post-login) ══════════════════════════════════ -->
+  <div id="screen-hub" class="screen hidden">
+    <h2>Command Terminal</h2>
+    <p class="subtitle">Phase 0 — Hackathon Demo</p>
+    <button id="btn-ore-run">&#9654;&nbsp; Run: The Ore Run [DEMO]</button>
+    <br>
     <button class="btn-home" onclick="window.location.href='index.html'">&#8592; Landing Page</button>
     <button class="btn-home" onclick="window.location.href='pitch.html'">Read the Full Pitch</button>
-    <div id="tick-feed"></div>
-    <button id="btn-view-aar" disabled>View After-Action Report</button>
   </div>
 
-  <!-- Screen 3: After-Action Report -->
-  <div id="screen-aar" class="screen hidden">
-    <h2>After-Action Report</h2>
-    <p class="subtitle">Deterministic replay from input log</p>
-    <pre id="aar-content"></pre>
-    <button id="btn-back">Back to Dashboard</button>
+  <!-- ══ Screen 1: Pre-Battle ═══════════════════════════════════════════════ -->
+  <div id="screen-pre-battle" class="battle-screen hidden">
+    <img src="assets/art/pre_battle.png" class="battle-art" alt="">
+    <div class="pb-overlay">
+      <div class="pb-panel">
+        <p class="pb-report">
+          <strong>CONTACT REPORT</strong> — four packs of unidentified bikers, bearing 270, closing fast.
+          Boomboxes audible at 400 metres. Command advises that the Rhinos are carrying this month's ore
+          quota and that losing it would be, quote, 'a financial catastrophe of personal consequence to
+          everyone in this vehicle.'<br><br>
+          <strong>Your move.</strong>
+        </p>
+        <div class="approach-grid">
+          <button class="btn-approach" data-approach="AggressiveCharge">
+            Fix bayonets. No more running. We end this here.
+          </button>
+          <button class="btn-approach" data-approach="TerrainManeuver">
+            Nobody wins a fair fight. Find the high ground. Use it.
+          </button>
+          <button class="btn-approach" data-approach="MaintainRange">
+            Don't let them close. Keep firing. Conserve ammo. But mostly keep firing.
+          </button>
+          <button class="btn-approach" data-approach="EscapeRearguard">
+            Tactical withdrawal. Someone has to stay behind to hold them off. Shotgun, not it!
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══ Screen 2: Battle Ticker ════════════════════════════════════════════ -->
+  <div id="screen-battle-ticker" class="battle-screen hidden">
+    <img src="assets/art/mid_battle.png" class="battle-art" alt="">
+    <div class="bt-status" id="bt-status"></div>
+    <div style="flex:1"></div>
+    <div class="bt-ticker-area">
+      <div class="ticker-panel" id="ticker-panel"></div>
+      <div class="bt-footer">
+        <button class="btn-retreat" id="btn-retreat">RETREAT</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══ Screen 3: Post-Battle ══════════════════════════════════════════════ -->
+  <div id="screen-post-battle" class="battle-screen hidden">
+    <img id="post-art" src="" class="battle-art" alt="">
+    <div class="post-overlay">
+      <div class="post-panel" id="post-panel"></div>
+    </div>
   </div>
 
   <script src="app.js"></script>

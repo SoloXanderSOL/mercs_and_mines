@@ -1,14 +1,14 @@
 'use strict';
 
+// ── Auth state ────────────────────────────────────────────────────────────────
 let pubkey = null;
 let token  = null;
-let sessionId = null;
 
+// ── Utilities ─────────────────────────────────────────────────────────────────
 function isMobile() {
   return /Android|iPhone/i.test(navigator.userAgent);
 }
 
-// Compact base58 encoder — needed to submit Phantom's Uint8Array signature to the Rust backend.
 function b58enc(bytes) {
   const ALPHA = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
   const d = [0];
@@ -23,9 +23,15 @@ function b58enc(bytes) {
   return s;
 }
 
-function show(id) { document.getElementById(id).classList.remove('hidden'); }
-function hide(id) { document.getElementById(id).classList.add('hidden'); }
-function setStatus(id, msg) { document.getElementById(id).textContent = msg; }
+function qs(id) { return document.getElementById(id); }
+
+function showOnly(id) {
+  document.querySelectorAll('.screen, .battle-screen').forEach(el => {
+    el.classList.toggle('hidden', el.id !== id);
+  });
+}
+
+function setStatus(id, msg) { qs(id).textContent = msg; }
 
 async function apiPost(url, body) {
   const headers = { 'Content-Type': 'application/json' };
@@ -35,13 +41,77 @@ async function apiPost(url, body) {
   return r.json();
 }
 
-// ── Screen 1: wallet connect ──────────────────────────────────────────────
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
 
-document.getElementById('btn-connect').addEventListener('click', async () => {
+// ── Audio management ──────────────────────────────────────────────────────────
+const music = {
+  preBattle:  new Audio('assets/music/pre_battle.mp3'),
+  battleLoop: new Audio('assets/music/battle_loop.mp3'),
+  victory:    new Audio('assets/music/victory.mp3'),
+  defeat:     new Audio('assets/music/defeat.mp3'),
+};
+music.battleLoop.loop = true;
+
+let activeMusic = null;
+
+function playMusic(track) {
+  if (activeMusic && activeMusic !== track) {
+    activeMusic.pause();
+    activeMusic.currentTime = 0;
+  }
+  activeMusic = track;
+  track.currentTime = 0;
+  track.play().catch(() => {});
+}
+
+function stopMusic() {
+  if (activeMusic) {
+    activeMusic.pause();
+    activeMusic.currentTime = 0;
+    activeMusic = null;
+  }
+}
+
+function playSfx(name) {
+  const src = name === 'gunfire'   ? 'assets/sfx/gunfire.wav'
+            : name === 'explosion' ? 'assets/sfx/explosion.wav'
+                                   : 'assets/sfx/scatter.wav';
+  const a = new Audio(src);
+  a.play().catch(() => {});
+}
+
+// ── Scenario constants (mirrors scenario.rs static data) ─────────────────────
+const PACK_NAMES  = ['Mod Squad', 'Rocker Boyz', 'Goth Collective', 'Punk Agenda'];
+const PACK_MAX    = [14, 13, 12, 15];
+const SEC_NAMES   = ['Section 1 "Scrap Dogs"', 'Section 2 "Wage Slaves"'];
+const SEC_SHORT   = ['Scrap Dogs', 'Wage Slaves'];
+const SEC_MAX     = [8, 8];
+const VEH_SHORT   = ['Dustbreaker', 'Gadfly', 'Iron Coffin', 'Paid in Full'];
+const VEH_MAX_HP  = [800, 350, 600, 600];
+
+// ── Battle state (reset each run) ────────────────────────────────────────────
+let bs = null;  // battle state object
+let retreated = false;
+
+function resetBattleState() {
+  bs = {
+    vehHp:         [...VEH_MAX_HP],
+    secStr:        [...SEC_MAX],
+    packStr:       [...PACK_MAX],
+    packScattered: [false, false, false, false],
+    packDestroyed: [false, false, false, false],
+  };
+  retreated = false;
+}
+
+// ── Login screen ──────────────────────────────────────────────────────────────
+qs('btn-connect').addEventListener('click', async () => {
   if (!window.solana?.isPhantom) {
     if (isMobile()) {
-      setStatus('login-status', 'On mobile? Open this page in the Phantom app browser for the best experience.');
-      document.getElementById('btn-phantom-browser').classList.remove('hidden');
+      setStatus('login-status', 'On mobile? Open this page in the Phantom app browser.');
+      qs('btn-phantom-browser').classList.remove('hidden');
     } else {
       setStatus('login-status', 'Phantom not detected. Install the Phantom browser extension.');
     }
@@ -51,211 +121,381 @@ document.getElementById('btn-connect').addEventListener('click', async () => {
     const resp = await window.solana.connect();
     pubkey = resp.publicKey.toBase58();
     setStatus('login-status', 'Wallet connected: ' + pubkey.slice(0, 8) + '…');
-    document.getElementById('btn-sign').disabled = false;
+    qs('btn-sign').disabled = false;
   } catch {
     setStatus('login-status', 'Wallet connection rejected.');
   }
 });
 
-// ── Screen 1: sign challenge and authenticate ─────────────────────────────
-
-document.getElementById('btn-sign').addEventListener('click', async () => {
+qs('btn-sign').addEventListener('click', async () => {
   setStatus('login-status', 'Requesting challenge…');
   try {
     const { challenge } = await apiPost('/api/auth/challenge', { wallet_address: pubkey });
     setStatus('login-status', 'Sign the message in Phantom…');
-    const { signature } = await window.solana.signMessage(new TextEncoder().encode(challenge), 'utf8');
+    const { signature } = await window.solana.signMessage(
+      new TextEncoder().encode(challenge), 'utf8'
+    );
     setStatus('login-status', 'Verifying…');
     const result = await apiPost('/api/auth/verify', {
-      wallet_address: pubkey,
-      challenge,
-      signature: b58enc(signature),
+      wallet_address: pubkey, challenge, signature: b58enc(signature),
     });
     token = result.token_id;
     sessionStorage.setItem('token', token);
-    hide('screen-login');
-    show('screen-dashboard');
+    showOnly('screen-hub');
   } catch (e) {
     setStatus('login-status', 'Auth failed: ' + e.message);
   }
 });
 
-// ── Screen 2: start streaming combat session ──────────────────────────────
-
-const DEMO_COMBAT = {
-  section: {
-    id: 'alpha-1', name: 'Alpha Section',
-    max_strength: 4, current_strength: 4, individual_hp: 10,
-    accuracy: 55, evasion: 10,
-    weapon: { name: 'AT Launcher', ap: 6, base_damage: 20, tag: 'Missile', accuracy: 0 },
-    armor_at: 0, armor_tag: 'Unarmored',
-  },
-  vehicle: {
-    id: 'scout-1', name: 'Armored Scout',
-    hp: 50, max_hp: 50, at: 4, armor_tag: 'LightArmor', evasion: 8,
-    weapons: [{ name: 'Autocannon', ap: 3, base_damage: 14, tag: 'Slug', accuracy: 15 }],
-  },
-  max_ticks: 25,
-  seed_override: 42,
-  commander: {
-    id: 'commander-vane-001',
-    name: 'Colonel Vane',
-    species: 'Human (Corporate)',
-    rank: 5,
-    skill: 9,
-    success_aura: 15,
-    quality_grade: 'Superior',
-    ability: 'Precision Cadence — Section accuracy rolls made under his command are treated as if firing from prepared positions.',
-    flavor_text: 'Has outlived seventeen engagements, four court martials, and one strongly-worded HR memorandum. The HR memorandum was the most dangerous of the three.',
-    stress_level: 0,
-    is_kia: false,
-    is_shattered: false,
-    can_retreat: true,
-    passive_buffs: { accuracy: 10, evasion: 5, damage_reduction: 3 },
-    attached_unit_id: null,
-  },
-};
-
-document.getElementById('btn-start-combat').addEventListener('click', async () => {
-  const feed = document.getElementById('tick-feed');
-  feed.innerHTML = '';
-  document.getElementById('btn-view-aar').disabled = true;
-
-  const addLine = (text, cls) => {
-    const p = document.createElement('p');
-    p.textContent = text;
-    if (cls) p.classList.add(cls);
-    feed.appendChild(p);
-    feed.scrollTop = feed.scrollHeight;
-  };
-
-  const addTick = (text, cls) => {
-    const pre = document.createElement('pre');
-    pre.textContent = text;
-    if (cls) pre.classList.add(cls);
-    feed.appendChild(pre);
-    feed.scrollTop = feed.scrollHeight;
-  };
-
-  try {
-    const { session_id } = await apiPost('/api/combat/stream/start', DEMO_COMBAT);
-    sessionId = session_id;
-    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const ws = new WebSocket(`${proto}//${location.host}/api/combat/stream/${session_id}`);
-
-    ws.onmessage = ({ data }) => {
-      const ev = JSON.parse(data);
-      const text = ev.narrative || `[Tick ${ev.tick_index}]`;
-      addTick(text, ev.combat_ended ? 'outcome' : null);
-    };
-    ws.onclose = () => { document.getElementById('btn-view-aar').disabled = false; };
-    ws.onerror = () => addLine('WebSocket error — check server logs.');
-  } catch (e) {
-    addLine('Failed to start session: ' + e.message);
-  }
+// ── Command Hub ───────────────────────────────────────────────────────────────
+qs('btn-ore-run').addEventListener('click', () => {
+  showOnly('screen-pre-battle');
+  playMusic(music.preBattle);
 });
 
-function formatAar(wrapper) {
-  const r   = wrapper.report;
-  const SEP = '╠══════════════════════════════════════╣';
-  const END = '╚══════════════════════════════════════╝';
-
-  function sBar(current, max) {
-    return '◆'.repeat(Math.max(0, current)) +
-           '◇'.repeat(Math.max(0, max - current));
-  }
-  function hBar(current, max) {
-    const W = 10;
-    const filled = Math.round(Math.max(0, current) / Math.max(1, max) * W);
-    return '█'.repeat(filled) + '░'.repeat(W - filled);
-  }
-
-  const lines = [
-    '╔══════════════════════════════════════╗',
-    '║  AFTER-ACTION REPORT',
-    `║  Session : ${wrapper.session_id}`,
-    `║  Seed    : ${wrapper.seed}`,
-    `║  Build   : ${wrapper.build_version}`,
-    SEP,
-  ];
-
-  for (const tick of r.ticks) {
-    lines.push(`║  TICK ${tick.tick}`);
-    lines.push('║');
-    lines.push(`║  [ VEHICLE FIRES — ${r.vehicle_name} ]`);
-
-    for (const we of tick.vehicle_events) {
-      if (!we.is_hit) {
-        lines.push(`║    ${we.weapon_name}  MISS  [${we.hit_roll_breakdown}]`);
-      } else if (!we.is_penetration) {
-        lines.push(`║    ${we.weapon_name}  HIT  [${we.hit_roll_breakdown}]`);
-        lines.push(`║      ${we.ap_vs_at} — NO PENETRATION`);
-      } else {
-        lines.push(`║    ${we.weapon_name}  HIT  [${we.hit_roll_breakdown}]`);
-        lines.push(`║      ${we.ap_vs_at} — PENETRATION  dmg: ${we.final_damage}  → ${we.kill_count} KIA`);
-      }
+// ── Screen 1: Approach selection ──────────────────────────────────────────────
+document.querySelectorAll('.btn-approach').forEach(btn => {
+  btn.addEventListener('click', async () => {
+    document.querySelectorAll('.btn-approach').forEach(b => { b.disabled = true; });
+    const approach = btn.dataset.approach;
+    try {
+      const { result, ticks } = await apiPost('/api/ore-run/start', { approach });
+      stopMusic();
+      await startBattleTicker(result, ticks);
+    } catch (e) {
+      document.querySelectorAll('.btn-approach').forEach(b => { b.disabled = false; });
+      alert('Engagement failed: ' + e.message);
     }
+  });
+});
 
-    lines.push('║');
-    if (tick.defender_suppressed) {
-      lines.push(`║  [ ${r.section_name} SUPPRESSED — cannot return fire ]`);
-    } else if (tick.section_event) {
-      const se = tick.section_event;
-      lines.push(`║  [ SECTION FIRES — ${r.section_name} ]`);
-      if (se.hits_total > 0 && se.is_penetration) {
-        lines.push(`║    ${se.shots_total} shots → ${se.hits_total} hits → ${se.total_damage} dmg`);
-      } else if (se.hits_total > 0) {
-        lines.push(`║    ${se.shots_total} shots → ${se.hits_total} hits → NO PENETRATION`);
-      } else {
-        lines.push(`║    ${se.shots_total} shots → 0 hits`);
-      }
-    }
+// ── Screen 2: Battle Ticker ───────────────────────────────────────────────────
+function buildStatusStrip() {
+  const strip = qs('bt-status');
+  strip.innerHTML = '';
 
-    lines.push('║');
-    lines.push(
-      `║  End Tick ${tick.tick}` +
-      `  │  Section: ${sBar(tick.section_strength_after, r.section_max_strength)}` +
-      `  ${tick.section_strength_after}/${r.section_max_strength}` +
-      `  │  Vehicle: ${hBar(tick.vehicle_hp_after, r.vehicle_max_hp)}` +
-      `  ${Math.max(0, tick.vehicle_hp_after)}/${r.vehicle_max_hp} HP`
-    );
-    lines.push(SEP);
+  const mkSep = text => {
+    const s = document.createElement('span');
+    s.className = 'bt-sep';
+    s.textContent = text;
+    strip.appendChild(s);
+  };
+
+  mkSep('DEFENDERS:');
+
+  for (let i = 0; i < VEH_SHORT.length; i++) {
+    const su = document.createElement('div');
+    su.className = 'su';
+    su.innerHTML =
+      `<span class="su-name active" id="sv-n${i}">${VEH_SHORT[i]}</span>` +
+      `<span class="su-bar"><span class="su-fill" id="sv-f${i}" style="width:100%"></span></span>` +
+      `<span class="su-val" id="sv-v${i}">${VEH_MAX_HP[i]}/${VEH_MAX_HP[i]}</span>`;
+    strip.appendChild(su);
   }
 
-  lines.push('║  ENGAGEMENT SUMMARY');
-  lines.push(`║  Outcome : ${r.outcome}`);
-  lines.push(`║  Ticks   : ${r.ticks.length}`);
-  lines.push(
-    `║  Section : ${sBar(r.section_final_strength, r.section_max_strength)}` +
-    `  ${r.section_final_strength}/${r.section_max_strength}`
-  );
-  lines.push(
-    `║  Vehicle : ${hBar(r.vehicle_final_hp, r.vehicle_max_hp)}` +
-    `  ${Math.max(0, r.vehicle_final_hp)}/${r.vehicle_max_hp} HP`
-  );
-  lines.push('║');
-  lines.push(`║  ${r.narrative_summary}`);
-  lines.push(END);
+  for (let i = 0; i < SEC_SHORT.length; i++) {
+    const su = document.createElement('div');
+    su.className = 'su';
+    su.innerHTML =
+      `<span class="su-name active" id="ss-n${i}">${SEC_SHORT[i]}</span>` +
+      `<span class="su-val" id="ss-v${i}">${SEC_MAX[i]}/${SEC_MAX[i]}</span>`;
+    strip.appendChild(su);
+  }
 
-  return lines.join('\n');
+  mkSep('| ATTACKERS:');
+
+  for (let i = 0; i < PACK_NAMES.length; i++) {
+    const su = document.createElement('div');
+    su.className = 'su';
+    su.innerHTML =
+      `<span class="su-name active" id="sp-n${i}">${PACK_NAMES[i]}</span>` +
+      `<span class="su-val" id="sp-v${i}">${PACK_MAX[i]}/${PACK_MAX[i]}</span>`;
+    strip.appendChild(su);
+  }
 }
 
-// ── Screen 3: after-action report ────────────────────────────────────────
+function updateStatusStrip(tickLog) {
+  // Warthog HP (only vehicle that can take damage in this scenario)
+  const wHp = tickLog.warthog_hp_after;
+  bs.vehHp[0] = wHp;
+  const pct = Math.max(0, wHp) / VEH_MAX_HP[0] * 100;
+  const fill = qs('sv-f0');
+  fill.style.width = pct + '%';
+  fill.className = 'su-fill' + (pct < 30 ? ' red' : pct < 60 ? ' amber' : '');
+  qs('sv-v0').textContent = Math.max(0, wHp) + '/' + VEH_MAX_HP[0];
 
-document.getElementById('btn-view-aar').addEventListener('click', async () => {
-  try {
-    const headers = token ? { 'Authorization': 'Bearer ' + token } : {};
-    const r = await fetch(`/api/combat/aar/${sessionId}`, { headers });
-    if (!r.ok) throw new Error(await r.text());
-    document.getElementById('aar-content').textContent = formatAar(await r.json());
-    hide('screen-dashboard');
-    show('screen-aar');
-  } catch (e) {
-    alert('Failed to load AAR: ' + e.message);
+  // Section strengths
+  (tickLog.section_strengths || []).forEach((str, i) => {
+    bs.secStr[i] = str;
+    qs(`ss-v${i}`).textContent = str + '/' + SEC_MAX[i];
+    if (str === 0) qs(`ss-n${i}`).className = 'su-name destroyed';
+  });
+
+  // Pack scatter events this tick
+  (tickLog.scatter_events || []).forEach(se => {
+    const i = se.pack_index;
+    bs.packScattered[i] = true;
+    qs(`sp-n${i}`).className = 'su-name routed';
+    qs(`sp-v${i}`).className = 'su-val routed';
+  });
+
+  // Pack strengths
+  (tickLog.pack_strengths || []).forEach((str, i) => {
+    bs.packStr[i] = str;
+    if (bs.packScattered[i]) {
+      qs(`sp-v${i}`).textContent = 'ROUTED';
+    } else if (str === 0) {
+      bs.packDestroyed[i] = true;
+      qs(`sp-n${i}`).className = 'su-name destroyed';
+      qs(`sp-v${i}`).textContent = 'DESTROYED';
+    } else {
+      qs(`sp-v${i}`).textContent = str + '/' + PACK_MAX[i];
+    }
+  });
+}
+
+// Ticker line helpers
+function addLine(text, cls) {
+  const panel = qs('ticker-panel');
+  const el = document.createElement('div');
+  el.className = cls;
+  el.textContent = text;
+  panel.appendChild(el);
+  panel.scrollTop = panel.scrollHeight;
+}
+
+function mechLine(tick, unit, weapon, result, target, detail) {
+  const parts = [unit, weapon, result, target];
+  if (detail) parts.push(detail);
+  addLine(`[TICK ${tick}] ${parts.join(' — ')}`, 't-mech');
+}
+
+function flavLine(text) {
+  addLine(`"${text}"`, 't-flav');
+}
+
+async function processTickEvents(tickLog) {
+  const t = tickLog.tick;
+
+  // ── Scrap-Rocket (fires on Tick 2, always shown) ──
+  if (tickLog.scrap_rocket) {
+    const sr = tickLog.scrap_rocket;
+    if (sr.misfired) {
+      const kia = (sr.misfire_carrier_killed ? 1 : 0) + (sr.misfire_additional_casualties || 0);
+      mechLine(t, 'Punk Agenda', 'Scrap-Rocket', 'MISFIRE', 'self', kia + ' KIA (self-inflicted)');
+      playSfx('explosion'); // fires BEFORE the flavour line per spec
+      await delay(90);
+      flavLine(sr.flavour);
+    } else if (sr.hit) {
+      mechLine(t, 'Punk Agenda', 'Scrap-Rocket', 'HIT',
+        'Warthog "Dustbreaker"', sr.damage_dealt + ' dmg');
+      playSfx('explosion');
+      flavLine(sr.flavour);
+    } else {
+      mechLine(t, 'Punk Agenda', 'Scrap-Rocket', 'MISS', 'Warthog "Dustbreaker"', '');
+    }
   }
-});
 
-document.getElementById('btn-back').addEventListener('click', () => {
-  hide('screen-aar');
-  show('screen-dashboard');
-});
+  // ── Vehicle fire (hits with kills only) ──
+  for (const vf of (tickLog.vehicle_fire || [])) {
+    if (!vf.is_hit || !vf.is_penetration || vf.kills === 0) continue;
+    const pack = PACK_NAMES[vf.target_pack];
+    if (vf.weapon_name === 'Thumper GL') {
+      mechLine(t, vf.vehicle_name, 'Thumper GL', 'HIT',
+        `Pack "${pack}"`, `AoE — ${vf.kills} KIA`);
+      playSfx('explosion');
+    } else {
+      mechLine(t, vf.vehicle_name, vf.weapon_name, 'HIT',
+        `Pack "${pack}"`, vf.kills + ' KIA');
+      playSfx('gunfire');
+    }
+    if (vf.flavour) flavLine(vf.flavour);
+  }
+
+  // ── Section fire (kills only) ──
+  for (const sf of (tickLog.section_fire || [])) {
+    if (sf.kills === 0) continue;
+    const pack = PACK_NAMES[sf.target_pack];
+    mechLine(t, sf.section_name, 'Scavenged Slugger', 'HIT',
+      `Pack "${pack}"`, sf.kills + ' KIA');
+    playSfx('gunfire');
+    if (sf.flavour) flavLine(sf.flavour);
+  }
+
+  // ── Pack fire at sections (kills only, no SFX) ──
+  for (const pf of (tickLog.pack_fire || [])) {
+    if (pf.kills === 0) continue;
+    mechLine(t, pf.pack_name, 'pistols/Uzis', 'HIT',
+      SEC_NAMES[pf.target_section], pf.kills + ' KIA');
+    if (pf.flavour) flavLine(pf.flavour);
+  }
+
+  // ── Pack scatter events ──
+  for (const se of (tickLog.scatter_events || [])) {
+    mechLine(t, `Pack "${se.pack_name}"`, '—', 'ROUTED',
+      '—', se.strength_at_scatter + ' remaining, scattering');
+    playSfx('scatter');
+    flavLine(se.flavour);
+  }
+}
+
+async function runTickAnimation(ticks) {
+  for (const tickLog of ticks) {
+    if (retreated) break;
+    await processTickEvents(tickLog);
+    updateStatusStrip(tickLog);
+    if (retreated) break; // retreated during tick processing
+    await delay(1500);
+  }
+
+  if (!retreated) {
+    const panel = qs('ticker-panel');
+    const sysEl = document.createElement('div');
+    sysEl.className = 't-system';
+    sysEl.textContent = '— ENGAGEMENT CONCLUDED —';
+    panel.appendChild(sysEl);
+    panel.scrollTop = panel.scrollHeight;
+  }
+
+  await delay(1500);
+}
+
+async function startBattleTicker(result, ticks) {
+  resetBattleState();
+  buildStatusStrip();
+  qs('ticker-panel').innerHTML = '';
+
+  showOnly('screen-battle-ticker');
+  playMusic(music.battleLoop);
+
+  const retreatBtn = qs('btn-retreat');
+  retreatBtn.disabled = false;
+  retreatBtn.onclick = () => {
+    if (retreated) return;
+    retreated = true;
+    retreatBtn.disabled = true;
+    const panel = qs('ticker-panel');
+    const el = document.createElement('div');
+    el.className = 't-system';
+    el.textContent = '— RETREAT CONFIRMED —';
+    panel.appendChild(el);
+    panel.scrollTop = panel.scrollHeight;
+  };
+
+  await runTickAnimation(ticks);
+
+  stopMusic();
+  showPostBattle(result, retreated);
+}
+
+// ── Screen 3: Post-Battle ─────────────────────────────────────────────────────
+function showPostBattle(result, isRetreat) {
+  const isWin = !isRetreat && result.outcome === 'Win';
+
+  qs('post-art').src = isWin
+    ? 'assets/art/victory_player.png'
+    : 'assets/art/victory_raccoon.png';
+
+  playMusic(isWin ? music.victory : music.defeat);
+
+  const panel = qs('post-panel');
+  panel.innerHTML = '';
+
+  // Outcome title
+  const titleEl = document.createElement('div');
+  titleEl.className = 'post-title' + (isWin ? '' : ' defeat');
+  titleEl.textContent = isWin ? '▶  VICTORY' : '▶  DEFEAT';
+  panel.appendChild(titleEl);
+
+  // Flavour text
+  const flavEl = document.createElement('div');
+  flavEl.className = 'post-flavour';
+
+  if (isWin) {
+    let text =
+      `AFTER-ACTION REPORT — All ore secured. Four raccoon packs engaged; ` +
+      `${result.packs_routed} routed, ${result.packs_destroyed} destroyed at point-blank ` +
+      `range of its own Scrap-Rocket. ${result.defender_kia} personnel KIA.`;
+
+    if (result.misfire_occurred) {
+      text += `\n\nNotably: Pack 'Punk Agenda’s' Scrap-Rocket misfired. Physics was not consulted in advance.`;
+    }
+
+    text +=
+      `\n\nCommander reports the convoy is proceeding to base and requests someone send ` +
+      `a bottle of something strong ahead of arrival. The boombox is also coming. ` +
+      `Nobody knows why. Nobody is stopping it.`;
+
+    flavEl.textContent = text;
+  } else {
+    flavEl.textContent =
+      `AFTER-ACTION REPORT — Convoy lost. Ore in the possession of the Raccoon Biker Gangs. ` +
+      `${result.defender_kia} personnel KIA. ${result.defender_kia} MIA, presumed in raccoon ` +
+      `custody — fate: merciful ambiguity.\n\n` +
+      `The raccoons have been observed celebrating. The music is terrible. ` +
+      `It is, objectively, extremely loud.\n\n` +
+      `Finance has been notified. Finance has requested not to be notified again.`;
+  }
+  panel.appendChild(flavEl);
+
+  // Stats block
+  panel.appendChild(mkHr());
+
+  const statsHead = document.createElement('div');
+  statsHead.className = 'post-section-head';
+  statsHead.textContent = 'ENGAGEMENT SUMMARY';
+  panel.appendChild(statsHead);
+
+  const grid = document.createElement('div');
+  grid.className = 'post-stats-grid';
+  [
+    ['Defender KIA',      result.defender_kia],
+    ['Attacker KIA',      result.attacker_kia],
+    ['Packs Routed',      result.packs_routed],
+    ['Engagement Length', result.ticks_elapsed + ' ticks'],
+  ].forEach(([label, val]) => {
+    const el = document.createElement('div');
+    el.className = 'post-stat';
+    el.innerHTML = `${label}: <b>${val}</b>`;
+    grid.appendChild(el);
+  });
+  panel.appendChild(grid);
+
+  // Highlights block
+  if (result.highlights && result.highlights.length > 0) {
+    panel.appendChild(mkHr());
+
+    const hlHead = document.createElement('div');
+    hlHead.className = 'post-section-head';
+    hlHead.textContent = 'FIELD HIGHLIGHTS';
+    panel.appendChild(hlHead);
+
+    result.highlights.forEach(h => {
+      const el = document.createElement('div');
+      el.className = 'post-highlight';
+      el.textContent = `Tick ${h.tick}: "${h.flavour}"`;
+      panel.appendChild(el);
+    });
+  }
+
+  // Return to base
+  const footer = document.createElement('div');
+  footer.className = 'post-footer';
+  const rtbBtn = document.createElement('button');
+  rtbBtn.className = 'btn-rtb';
+  rtbBtn.textContent = 'RETURN TO BASE';
+  rtbBtn.addEventListener('click', () => {
+    stopMusic();
+    showOnly('screen-hub');
+  });
+  footer.appendChild(rtbBtn);
+  panel.appendChild(footer);
+
+  showOnly('screen-post-battle');
+}
+
+function mkHr() {
+  const hr = document.createElement('hr');
+  hr.className = 'post-hr';
+  return hr;
+}
