@@ -184,14 +184,14 @@ pub enum FlavourEvent {
 pub fn flavour_pool(event: FlavourEvent) -> &'static [&'static str] {
     match event {
         FlavourEvent::ThumperAoEHit => &[
-            "The Warthog's grenade launcher coughs once. The lead pack scatters like a broken piñata.",
-            "Thumper fires into the mass. The raccoons do not disperse gracefully.",
-            "Fourteen kilos of high explosive persuades six raccoons to reconsider their life choices.",
+            "The Warthog's grenade launcher coughs once. The internal organs of the lead pack scatter across the road like a broken meat piñata.",
+            "Thumper fires into the mass. The raccoons disperse even more chaotically than they usually do.",
+            "Fourteen kilos of high explosive persuades six raccoons to (briefly) reconsider their life choices.",
         ],
         FlavourEvent::SpitfireHit => &[
-            "The rotary gun speaks. The pack has fewer opinions.",
+            "The rotary gun speaks. The raccoons seem to have less to say now.",
             "Spitfire rakes the flank. Two raccoons go down. Their packmates don't notice yet.",
-            "Another burst, another gap in the formation. The boombox keeps playing.",
+            "Another burst of fire, another gap in the formation. The boombox keeps playing.",
         ],
         FlavourEvent::InfantrySluggerHit => &[
             "Section 1 opens up. The sluggers aren't elegant, but proximity is doing the work.",
@@ -200,21 +200,21 @@ pub fn flavour_pool(event: FlavourEvent) -> &'static [&'static str] {
         FlavourEvent::InfantryTakesCasualty => &[
             "A pistol round finds a gap in Corporal Yates's Kevlar. He is not pleased.",
             "Section 2 takes two down. They close ranks. The gap where Henriksson was feels larger than it should.",
-            "The raccoons have numbers and enthusiasm. The enthusiasm is doing more damage.",
+            "The raccoons have numbers and enthusiasm. Their enthusiasm is surprisingly effective.",
         ],
         FlavourEvent::PackScatter => &[
-            "'Rocker Boyz' hits fifty percent. They don't hold a formation meeting. They just leave.",
+            "'Rocker Boyz' hits fifty percent attrition. They turn around and run away with extreme prejudice.",
             "The Goth Collective breaks and rides — in the direction of away, specifically.",
             "Mod Squad scatters into the dust. Their revenge tour has been rescheduled indefinitely.",
             "Punk Agenda fragments. Whatever they were arguing about, they've agreed to argue elsewhere.",
         ],
         FlavourEvent::ScrapRocketHit => &[
-            "The Scrap-Rocket fires. The Warthog's armour holds. The noise is indescribable. The smell is worse.",
-            "Something very large and unstable hits the Dustbreaker's flank. She shudders. She holds. The crew will not be discussing this in detail.",
+            "The raccoons' Scrap-Rocket fires. The Warthog's armour holds. The noise is indescribable. The smell is somehow worse.",
+            "Something very large and unstable hits the Dustbreaker's flank with a loud bang. She shudders. She holds. The crew seems pleasantly surprised to still be alive.",
         ],
         FlavourEvent::ScrapRocketMisfire => &[
-            "The Scrap-Rocket misfires. Physics settles the matter in roughly 0.3 seconds. Three raccoons are immediately elsewhere. The boombox survives.",
-            "Punk Agenda's designated rocket enthusiast has achieved liftoff in an unplanned direction. The pack is three members lighter. The boombox is fine.",
+            "The Scrap-Rocket misfires, like you'd expect a firework display organised by raccoons would. Three raccoons are missing in a cloud of smoke; one seems to be clinging to the rocket as it reaches for the clouds.",
+            "Punk Agenda's designated rocket enthusiast has achieved liftoff in an unplanned direction. The pack is three members lighter. The boombox continues unconcerned.",
         ],
     }
 }

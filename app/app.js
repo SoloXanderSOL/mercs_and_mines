@@ -432,23 +432,23 @@ function showPostBattle(result, isRetreat) {
       `range of its own Scrap-Rocket. ${result.defender_kia} personnel KIA.`;
 
     if (result.misfire_occurred) {
-      text += `\n\nNotably: Pack 'Punk Agenda’s' Scrap-Rocket misfired. Physics was not consulted in advance.`;
+      text += `\n\nNotably: Pack ‘Punk Agenda’s’ Scrap-Rocket misfired. At least I assume that was a misfire, and not the intended effect. Either way, that did a lot of the work for us!`;
     }
 
     text +=
-      `\n\nCommander reports the convoy is proceeding to base and requests someone send ` +
+      `\n\nCommander reports the convoy is proceeding to base and requests someone prepare ` +
       `a bottle of something strong ahead of arrival. The boombox is also coming. ` +
-      `Nobody knows why. Nobody is stopping it.`;
+      `Frederick seems to be a fan, and is singing along badly to the Ace of Spades.`;
 
     flavEl.textContent = text;
   } else {
     flavEl.textContent =
       `AFTER-ACTION REPORT — Convoy lost. Ore in the possession of the Raccoon Biker Gangs. ` +
       `${result.defender_kia} personnel KIA. ${result.defender_kia} MIA, presumed in raccoon ` +
-      `custody — fate: merciful ambiguity.\n\n` +
-      `The raccoons have been observed celebrating. The music is terrible. ` +
-      `It is, objectively, extremely loud.\n\n` +
-      `Finance has been notified. Finance has requested not to be notified again.`;
+      `custody — fate: Let’s say, ambiguous. They’re probably fine…\n\n` +
+      `The raccoons have been observed celebrating. The music is extremely loud. ` +
+      `I think they may have deafened themselves with their rockets.\n\n` +
+      `Finance has been notified regarding the loss. Suffice to say, it didn’t go down well.`;
   }
   panel.appendChild(flavEl);
 
