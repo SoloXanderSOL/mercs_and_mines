@@ -39,11 +39,11 @@ pub const SPITFIRE_ACCURACY: i32 = 70;
 
 // ── Pack stats ──────────────────────────────────────────────────────────────
 
-pub const PACK_INDIVIDUAL_HP: i32 = 15;
+pub const PACK_INDIVIDUAL_HP: i32 = 25;
 /// Raccoon AP — beats infantry AT 10, cannot beat vehicle AT 20+.
 pub const PACK_WEAPON_AP: i32 = 12;
-pub const PACK_WEAPON_DAMAGE: i32 = 4;
-pub const PACK_WEAPON_ACCURACY: i32 = 25;
+pub const PACK_WEAPON_DAMAGE: i32 = 7;
+pub const PACK_WEAPON_ACCURACY: i32 = 40;
 pub const PACK_EVASION: i32 = 55;
 pub const PACK_ARMOR_AT: i32 = 0;
 
@@ -54,7 +54,7 @@ pub const SECTION_EVASION: i32 = 45;
 pub const SECTION_ARMOR_AT: i32 = 10; // Scavenged Kevlar
 pub const SLUGGER_AP: i32 = 12;
 pub const SLUGGER_DAMAGE: i32 = 8;
-pub const SLUGGER_ACCURACY: i32 = 55;
+pub const SLUGGER_ACCURACY: i32 = 45;
 
 // ── Max ticks before forced resolution ─────────────────────────────────────
 
