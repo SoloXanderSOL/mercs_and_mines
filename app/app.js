@@ -74,12 +74,18 @@ function stopMusic() {
   }
 }
 
-function playSfx(name) {
-  const src = name === 'gunfire'   ? 'assets/sfx/gunfire.wav'
-            : name === 'explosion' ? 'assets/sfx/explosion.wav'
-                                   : 'assets/sfx/scatter.wav';
-  const a = new Audio(src);
-  a.play().catch(() => {});
+// ── Battle SFX layer (independent of music system) ────────────────────────────
+const battleSfx = new Audio('assets/sfx/long_gunfight.wav');
+battleSfx.loop = true;
+
+function startBattleSfx() {
+  battleSfx.currentTime = 0;
+  battleSfx.play().catch(() => {});
+}
+
+function stopBattleSfx() {
+  battleSfx.pause();
+  battleSfx.currentTime = 0;
 }
 
 // ── Scenario constants (mirrors scenario.rs static data) ─────────────────────
@@ -284,13 +290,10 @@ async function processTickEvents(tickLog) {
     if (sr.misfired) {
       const kia = (sr.misfire_carrier_killed ? 1 : 0) + (sr.misfire_additional_casualties || 0);
       mechLine(t, 'Punk Agenda', 'Scrap-Rocket', 'MISFIRE', 'self', kia + ' KIA (self-inflicted)');
-      playSfx('explosion'); // fires BEFORE the flavour line per spec
-      await delay(90);
       flavLine(sr.flavour);
     } else if (sr.hit) {
       mechLine(t, 'Punk Agenda', 'Scrap-Rocket', 'HIT',
         'Warthog "Dustbreaker"', sr.damage_dealt + ' dmg');
-      playSfx('explosion');
       flavLine(sr.flavour);
     } else {
       mechLine(t, 'Punk Agenda', 'Scrap-Rocket', 'MISS', 'Warthog "Dustbreaker"', '');
@@ -304,11 +307,9 @@ async function processTickEvents(tickLog) {
     if (vf.weapon_name === 'Thumper GL') {
       mechLine(t, vf.vehicle_name, 'Thumper GL', 'HIT',
         `Pack "${pack}"`, `AoE — ${vf.kills} KIA`);
-      playSfx('explosion');
     } else {
       mechLine(t, vf.vehicle_name, vf.weapon_name, 'HIT',
         `Pack "${pack}"`, vf.kills + ' KIA');
-      playSfx('gunfire');
     }
     if (vf.flavour) flavLine(vf.flavour);
   }
@@ -319,7 +320,6 @@ async function processTickEvents(tickLog) {
     const pack = PACK_NAMES[sf.target_pack];
     mechLine(t, sf.section_name, 'Scavenged Slugger', 'HIT',
       `Pack "${pack}"`, sf.kills + ' KIA');
-    playSfx('gunfire');
     if (sf.flavour) flavLine(sf.flavour);
   }
 
@@ -335,7 +335,6 @@ async function processTickEvents(tickLog) {
   for (const se of (tickLog.scatter_events || [])) {
     mechLine(t, `Pack "${se.pack_name}"`, '—', 'ROUTED',
       '—', se.strength_at_scatter + ' remaining, scattering');
-    playSfx('scatter');
     flavLine(se.flavour);
   }
 }
@@ -366,6 +365,7 @@ function showConcludeButton() {
       btn.classList.remove('visible');
       btn.onclick = null;
       stopMusic();
+      stopBattleSfx();
       resolve();
     };
   });
@@ -382,6 +382,7 @@ async function startBattleTicker(result, ticks) {
 
   showOnly('screen-battle-ticker');
   playMusic(music.battleLoop);
+  startBattleSfx();
 
   const retreatBtn = qs('btn-retreat');
   retreatBtn.disabled = false;
@@ -400,6 +401,7 @@ async function startBattleTicker(result, ticks) {
   await runTickAnimation(ticks);
 
   if (retreated) stopMusic();
+  stopBattleSfx();
   showPostBattle(result, retreated);
 }
 
