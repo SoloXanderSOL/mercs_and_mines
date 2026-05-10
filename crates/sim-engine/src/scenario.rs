@@ -29,7 +29,7 @@ pub const RHINO_EVASION: i32 = 5;
 // ── Weapon stats ────────────────────────────────────────────────────────────
 
 /// Thumper grenade launcher — AoE tag. Kills this many pack members per hit.
-pub const THUMPER_AOE_KILLS_PER_HIT: u32 = 3;
+pub const THUMPER_AOE_KILLS_PER_HIT: u32 = 2;
 pub const THUMPER_AP: i32 = 50;
 pub const THUMPER_ACCURACY: i32 = 80;
 
@@ -261,6 +261,8 @@ pub struct EngagementResult {
     pub packs_destroyed: u32,
     pub ticks_elapsed: u32,
     pub misfire_occurred: bool,
+    /// True when the player chose EscapeRearguard — triggers escape-specific UI text and art.
+    pub was_escape_rearguard: bool,
     /// ScrapRocketMisfire + PackScatter events in tick order, for post-battle screen.
     pub highlights: Vec<HighlightEvent>,
 }
@@ -297,6 +299,8 @@ pub struct OreRunVehicle {
     /// Stable targeting: index of the pack this vehicle prefers, overridden to highest if None.
     /// None = always target the largest active pack.
     pub preferred_pack: Option<usize>,
+    /// If true, this vehicle fires on Tick 1 only (covering dismount). Silent from Tick 2 onward.
+    pub fires_tick_one_only: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -372,7 +376,8 @@ pub fn the_ore_run() -> (Vec<OreRunVehicle>, Vec<OreRunSection>, Vec<OreRunPack>
                     },
                 },
             ],
-            preferred_pack: None, // targets highest headcount each tick
+            preferred_pack: None,
+            fires_tick_one_only: false,
         },
         OreRunVehicle {
             id: 1,
@@ -389,7 +394,8 @@ pub fn the_ore_run() -> (Vec<OreRunVehicle>, Vec<OreRunSection>, Vec<OreRunPack>
                     base_damage: SPITFIRE_DAMAGE,
                 },
             }],
-            preferred_pack: None, // spec: targets highest-headcount pack each tick
+            preferred_pack: None,
+            fires_tick_one_only: false,
         },
         OreRunVehicle {
             id: 2,
@@ -407,6 +413,7 @@ pub fn the_ore_run() -> (Vec<OreRunVehicle>, Vec<OreRunSection>, Vec<OreRunPack>
                 },
             }],
             preferred_pack: None,
+            fires_tick_one_only: true, // covering dismount only; cargo thereafter
         },
         OreRunVehicle {
             id: 3,
@@ -424,6 +431,7 @@ pub fn the_ore_run() -> (Vec<OreRunVehicle>, Vec<OreRunSection>, Vec<OreRunPack>
                 },
             }],
             preferred_pack: None,
+            fires_tick_one_only: true, // covering dismount only; cargo thereafter
         },
     ];
 

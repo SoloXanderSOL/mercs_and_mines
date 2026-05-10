@@ -407,28 +407,44 @@ async function startBattleTicker(result, ticks) {
 
 // ── Screen 3: Post-Battle ─────────────────────────────────────────────────────
 function showPostBattle(result, isRetreat) {
-  const isWin = !isRetreat && result.outcome === 'Win';
+  const isEscape = result.was_escape_rearguard;
+  const isWin    = !isRetreat && !isEscape && result.outcome === ‘Win’;
 
-  qs('post-art').src = isWin
-    ? 'assets/art/victory_player.png'
-    : 'assets/art/victory_raccoon.png';
+  qs(‘post-art’).src = isEscape
+    ? ‘assets/art/escaped_sorry_tim.png’
+    : isWin
+      ? ‘assets/art/victory_player.png’
+      : ‘assets/art/victory_raccoon.png’;
 
   playMusic(isWin ? music.victory : music.defeat);
 
-  const panel = qs('post-panel');
-  panel.innerHTML = '';
+  const panel = qs(‘post-panel’);
+  panel.innerHTML = ‘’;
 
   // Outcome title
-  const titleEl = document.createElement('div');
-  titleEl.className = 'post-title' + (isWin ? '' : ' defeat');
-  titleEl.textContent = isWin ? '▶  VICTORY' : '▶  DEFEAT';
+  const titleEl = document.createElement(‘div’);
+  if (isEscape) {
+    titleEl.className = ‘post-title’;
+    titleEl.textContent = ‘▶  TACTICAL WITHDRAWAL’;
+  } else {
+    titleEl.className = ‘post-title’ + (isWin ? ‘’ : ‘ defeat’);
+    titleEl.textContent = isWin ? ‘▶  VICTORY’ : ‘▶  DEFEAT’;
+  }
   panel.appendChild(titleEl);
 
   // Flavour text
-  const flavEl = document.createElement('div');
-  flavEl.className = 'post-flavour';
+  const flavEl = document.createElement(‘div’);
+  flavEl.className = ‘post-flavour’;
 
-  if (isWin) {
+  if (isEscape) {
+    flavEl.textContent =
+      `AFTER-ACTION REPORT — Main convoy has reached the extraction point. Ore is secured. ` +
+      `Tim did not make it back.\n\n` +
+      `Bad luck, Tim.\n\n` +
+      `Rearguard held for ${result.ticks_elapsed} ticks before being overrun. ` +
+      `${result.defender_kia} personnel KIA covering the withdrawal. ` +
+      `Command has filed a formal commendation. Finance has filed a formal complaint about the ore delay.`;
+  } else if (isWin) {
     let text =
       `AFTER-ACTION REPORT — All ore secured. Four raccoon packs engaged; ` +
       `${result.packs_routed} routed, ${result.packs_destroyed} destroyed at point-blank ` +

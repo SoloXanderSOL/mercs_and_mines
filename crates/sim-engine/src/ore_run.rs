@@ -301,6 +301,9 @@ pub fn run_ore_run(
             if vehicles[v_idx].hp <= 0 {
                 continue;
             }
+            if vehicles[v_idx].fires_tick_one_only && tick > 1 {
+                continue;
+            }
             let target_idx = match largest_active_pack(&packs) {
                 Some(i) => i,
                 None => break,
@@ -510,6 +513,30 @@ pub fn run_ore_run(
         }
 
         // ═══════════════════════════════════════════════════════════════════
+        // LOSS CHECK — Section wipe before any pack routs.
+        // Checked after all firing, before scatter. If triggered the tick is
+        // logged (no scatter events) and the engagement terminates immediately.
+        // ═══════════════════════════════════════════════════════════════════
+
+        let all_sections_wiped = sections.iter().all(|s| s.current_strength == 0);
+        let any_pack_gone_pre_scatter = packs.iter().any(|p| p.scattered || p.destroyed);
+
+        if all_sections_wiped && !any_pack_gone_pre_scatter {
+            tick_logs.push(OreRunTickLog {
+                tick,
+                scrap_rocket: scrap_rocket_result,
+                vehicle_fire: veh_fire_log,
+                section_fire: sec_fire_log,
+                pack_fire: pack_fire_log,
+                scatter_events: vec![],
+                pack_strengths: packs.iter().map(|p| p.current_strength).collect(),
+                section_strengths: sections.iter().map(|s| s.current_strength).collect(),
+                warthog_hp_after: vehicles[0].hp,
+            });
+            break 'ticks;
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
         // PHASE 4 — Scatter checks (end of tick, stable pack order)
         // ═══════════════════════════════════════════════════════════════════
 
@@ -610,6 +637,7 @@ pub fn run_ore_run(
             packs_destroyed,
             ticks_elapsed,
             misfire_occurred,
+            was_escape_rearguard: player_approach == Approach::EscapeRearguard,
             highlights,
         },
         tick_logs,
