@@ -408,33 +408,33 @@ async function startBattleTicker(result, ticks) {
 // ── Screen 3: Post-Battle ─────────────────────────────────────────────────────
 function showPostBattle(result, isRetreat) {
   const isEscape = result.was_escape_rearguard;
-  const isWin    = !isRetreat && !isEscape && result.outcome === ‘Win’;
+  const isWin    = !isRetreat && !isEscape && result.outcome === 'Win';
 
-  qs(‘post-art’).src = isEscape
-    ? ‘assets/art/escaped_sorry_tim.png’
+  qs('post-art').src = isEscape
+    ? 'assets/art/escaped_sorry_tim.png'
     : isWin
-      ? ‘assets/art/victory_player.png’
-      : ‘assets/art/victory_raccoon.png’;
+      ? 'assets/art/victory_player.png'
+      : 'assets/art/victory_raccoon.png';
 
   playMusic(isWin ? music.victory : music.defeat);
 
-  const panel = qs(‘post-panel’);
-  panel.innerHTML = ‘’;
+  const panel = qs('post-panel');
+  panel.innerHTML = '';
 
   // Outcome title
-  const titleEl = document.createElement(‘div’);
+  const titleEl = document.createElement('div');
   if (isEscape) {
-    titleEl.className = ‘post-title’;
-    titleEl.textContent = ‘▶  TACTICAL WITHDRAWAL’;
+    titleEl.className = 'post-title';
+    titleEl.textContent = '▶  TACTICAL WITHDRAWAL';
   } else {
-    titleEl.className = ‘post-title’ + (isWin ? ‘’ : ‘ defeat’);
-    titleEl.textContent = isWin ? ‘▶  VICTORY’ : ‘▶  DEFEAT’;
+    titleEl.className = 'post-title' + (isWin ? '' : ' defeat');
+    titleEl.textContent = isWin ? '▶  VICTORY' : '▶  DEFEAT';
   }
   panel.appendChild(titleEl);
 
   // Flavour text
-  const flavEl = document.createElement(‘div’);
-  flavEl.className = ‘post-flavour’;
+  const flavEl = document.createElement('div');
+  flavEl.className = 'post-flavour';
 
   if (isEscape) {
     flavEl.textContent =
@@ -451,7 +451,7 @@ function showPostBattle(result, isRetreat) {
       `range of its own Scrap-Rocket. ${result.defender_kia} personnel KIA.`;
 
     if (result.misfire_occurred) {
-      text += `\n\nNotably: Pack ‘Punk Agenda’s’ Scrap-Rocket misfired. At least I assume that was a misfire, and not the intended effect. Either way, that did a lot of the work for us!`;
+      text += `\n\nNotably: Pack 'Punk Agenda's' Scrap-Rocket misfired. At least I assume that was a misfire, and not the intended effect. Either way, that did a lot of the work for us!`;
     }
 
     text +=
@@ -464,10 +464,10 @@ function showPostBattle(result, isRetreat) {
     flavEl.textContent =
       `AFTER-ACTION REPORT — Convoy lost. Ore in the possession of the Raccoon Biker Gangs. ` +
       `${result.defender_kia} personnel KIA. ${result.defender_kia} MIA, presumed in raccoon ` +
-      `custody — fate: Let’s say, ambiguous. They’re probably fine…\n\n` +
+      `custody — fate: Let's say, ambiguous. They're probably fine…\n\n` +
       `The raccoons have been observed celebrating. The music is extremely loud. ` +
       `I think they may have deafened themselves with their rockets.\n\n` +
-      `Finance has been notified regarding the loss. Suffice to say, it didn’t go down well.`;
+      `Finance has been notified regarding the loss. Suffice to say, it didn't go down well.`;
   }
   panel.appendChild(flavEl);
 
