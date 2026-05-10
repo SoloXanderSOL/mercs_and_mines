@@ -149,6 +149,7 @@ qs('btn-sign').addEventListener('click', async () => {
 
 // ── Command Hub ───────────────────────────────────────────────────────────────
 qs('btn-ore-run').addEventListener('click', () => {
+  document.querySelectorAll('.btn-approach').forEach(b => { b.disabled = false; });
   showOnly('screen-pre-battle');
   playMusic(music.preBattle);
 });
