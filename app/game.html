@@ -289,68 +289,42 @@
       .post-stats-grid { grid-template-columns: 1fr; }
     }
 
-    /* ── Portrait-mode guard ── */
-    .portrait-guard {
-      position: fixed;
-      inset: 0;
-      z-index: 400;
-      background: rgba(4, 4, 4, 0.94);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      text-align: center;
-    }
-    .portrait-guard.hidden { display: none; }
-    .portrait-guard-inner {
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      gap: 1.1rem;
-      padding: 2rem;
-    }
-    .portrait-device-icon {
-      width: 36px;
-      height: 56px;
-      border: 3px solid #ffb300;
-      border-radius: 5px;
-      position: relative;
-      animation: deviceRotate 2.6s ease-in-out infinite;
-    }
-    .portrait-device-icon::after {
-      content: '';
-      position: absolute;
-      bottom: 4px;
-      left: 50%;
-      transform: translateX(-50%);
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
-      background: rgba(255, 179, 0, 0.55);
-    }
-    @keyframes deviceRotate {
-      0%   { transform: rotate(0deg); }
-      40%  { transform: rotate(-90deg); }
-      65%  { transform: rotate(-90deg); }
-      100% { transform: rotate(0deg); }
-    }
-    .portrait-guard-title {
-      color: #ffb300;
-      font-family: 'Courier New', Courier, monospace;
-      font-size: 1.05rem;
-      letter-spacing: 0.15em;
-      font-weight: bold;
-      margin: 0;
-    }
-    .portrait-guard-msg {
-      color: #c0c0c0;
-      font-family: 'Courier New', Courier, monospace;
-      font-size: 0.81rem;
-      line-height: 1.75;
-      margin: 0;
-      max-width: 300px;
-      border-left: 2px solid rgba(255, 179, 0, 0.33);
-      padding-left: 0.9rem;
-      text-align: left;
+    /* ── Portrait: image-top, content-below for all three demo screens ── */
+    @media (orientation: portrait) {
+      /* Allow screens to scroll vertically so content below image is reachable */
+      .battle-screen {
+        overflow-y: auto;
+      }
+
+      /* Pull image out of absolute fullscreen and into the flex column at 16:9 height */
+      .battle-art {
+        position: relative;
+        height: 56.25vw; /* exact 16:9 at viewport width — no crop, full image visible */
+        flex-shrink: 0;
+      }
+
+      /* Pre-Battle: solid bg below image, panel starts at top of overlay */
+      .pb-overlay {
+        background: #0a0a0a;
+        justify-content: flex-start;
+      }
+
+      /* Battle Ticker: status strip must sit ABOVE the image (it's later in source order) */
+      #screen-battle-ticker {
+        overflow: hidden; /* content is sized to fit viewport; no scroll needed */
+      }
+      #screen-battle-ticker .bt-status {
+        order: -1;
+      }
+
+      /* Post-Battle: solid bg below image, panel starts at top of overlay */
+      .post-overlay {
+        background: #0a0a0a;
+        justify-content: flex-start;
+      }
+      .post-panel {
+        max-height: none;
+      }
     }
   </style>
 </head>
@@ -435,15 +409,6 @@
     <img id="post-art" src="" class="battle-art" alt="">
     <div class="post-overlay">
       <div class="post-panel" id="post-panel"></div>
-    </div>
-  </div>
-
-  <!-- ══ Portrait-Mode Guard (demo-only) ══════════════════════════════════════ -->
-  <div id="portrait-guard" class="portrait-guard hidden">
-    <div class="portrait-guard-inner">
-      <div class="portrait-device-icon"></div>
-      <p class="portrait-guard-title">ROTATE DEVICE</p>
-      <p class="portrait-guard-msg">This engagement requires a wider field of view.<br>Command does not fight sideways.</p>
     </div>
   </div>
 

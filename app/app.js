@@ -45,24 +45,6 @@ function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// ── Portrait-mode guard (active only during the three demo screens) ───────────
-let demoActive = false;
-
-function isPortrait() {
-  return window.innerWidth < window.innerHeight;
-}
-
-function updatePortraitGuard() {
-  const guard = qs('portrait-guard');
-  if (demoActive && isPortrait()) {
-    guard.classList.remove('hidden');
-  } else {
-    guard.classList.add('hidden');
-  }
-}
-
-window.addEventListener('resize', updatePortraitGuard);
-
 // ── Audio management ──────────────────────────────────────────────────────────
 const music = {
   preBattle:  new Audio('assets/music/pre_battle.mp3'),
@@ -173,11 +155,9 @@ qs('btn-sign').addEventListener('click', async () => {
 
 // ── Command Hub ───────────────────────────────────────────────────────────────
 qs('btn-ore-run').addEventListener('click', () => {
-  demoActive = true;
   document.querySelectorAll('.btn-approach').forEach(b => { b.disabled = false; });
   showOnly('screen-pre-battle');
   playMusic(music.preBattle);
-  updatePortraitGuard();
 });
 
 // ── Screen 1: Approach selection ──────────────────────────────────────────────
@@ -538,8 +518,6 @@ function showPostBattle(result, isRetreat) {
   rtbBtn.className = 'btn-rtb';
   rtbBtn.textContent = 'RETURN TO BASE';
   rtbBtn.addEventListener('click', () => {
-    demoActive = false;
-    updatePortraitGuard();
     stopMusic();
     showOnly('screen-hub');
   });
