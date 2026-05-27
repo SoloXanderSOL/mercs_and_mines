@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use sqlx::postgres::PgPoolOptions;
 use mercs_server::config::Config;
+use mercs_server::repository::PostgresAccountRepository;
 use mercs_server::state::AppState;
 
 #[tokio::main]
@@ -31,6 +32,7 @@ async fn main() {
     let bind_addr = config.server.bind_addr.clone();
     let log_dir = std::env::var("LOG_DIR").unwrap_or_else(|_| "./logs".into());
     let mut state = AppState::new(std::path::PathBuf::from(log_dir), config);
+    state.account_repo = Arc::new(PostgresAccountRepository::new(pool.clone()));
     state.pool = Some(pool);
     let state = Arc::new(state);
 

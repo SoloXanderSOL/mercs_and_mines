@@ -3,6 +3,7 @@
 // This suppress is scoped to the repository module — remove once the types are fully wired up.
 #![allow(unused)]
 pub mod account;
+pub mod postgres_account;
 pub mod sector;
 pub mod timer;
 
@@ -22,6 +23,7 @@ pub use account::{
     AccountRepository, GcnEventType, GcnLedgerEntry, InMemoryAccountRepository, PlayerAccount,
     PlayerProfile,
 };
+pub use postgres_account::PostgresAccountRepository;
 pub use sector::{
     InMemorySectorStateRepository, OccupationStatus, SectorId, SectorState, SectorStateRepository,
 };
