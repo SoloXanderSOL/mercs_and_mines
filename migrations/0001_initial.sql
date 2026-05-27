@@ -1,0 +1,2 @@
+-- 0001_initial.sql
+-- Migrations infrastructure verified. Game schema tables begin at 0002.

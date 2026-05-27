@@ -36,6 +36,9 @@ pub struct AppState {
     pub sector_repo:  Arc<dyn SectorStateRepository>,
     pub timer_repo:   Arc<dyn TimerRepository>,
     pub config: Arc<Config>,
+    /// Postgres connection pool. None only in unit-test contexts that use in-memory repos.
+    /// Production startup panics if DATABASE_URL is unset; pool is always Some in prod.
+    pub pool: Option<sqlx::PgPool>,
 }
 
 impl AppState {
@@ -49,6 +52,7 @@ impl AppState {
             sector_repo:        Arc::new(InMemorySectorStateRepository::new()),
             timer_repo:         Arc::new(InMemoryTimerRepository::new()),
             config,
+            pool:               None,
         }
     }
 }
