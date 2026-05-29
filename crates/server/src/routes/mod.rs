@@ -136,6 +136,7 @@ async fn post_auth_verify(
         .upsert_account(crate::repository::PlayerAccount {
             wallet: crate::repository::WalletAddress::from_bytes(pubkey_bytes),
             trust_standing: 0,
+            gcn_balance: 0,
             profile: crate::repository::PlayerProfile { display_name: None, sector_id: None },
             gcn_ledger: vec![],
         })

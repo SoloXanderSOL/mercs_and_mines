@@ -13,6 +13,7 @@ use super::RepositoryError;
 pub struct PlayerAccount {
     pub wallet: Pubkey,
     pub trust_standing: i32,
+    pub gcn_balance: i64,
     pub profile: PlayerProfile,
     pub gcn_ledger: Vec<GcnLedgerEntry>,
 }
@@ -23,23 +24,18 @@ pub struct PlayerProfile {
     pub sector_id: Option<Uuid>,
 }
 
-/// Off-chain audit trail entry for server-side $GCN token events.
-/// Canonical on-chain $GCN balance lives in the player's SPL Token account.
-/// Records game-server-originated events (prize payouts, tournament entries, burn events).
+/// Append-only audit entry for every server-side $GCN movement.
+/// `balance_after` is a snapshot for audit; `player_accounts.gcn_balance` is authoritative.
 #[derive(Clone)]
 pub struct GcnLedgerEntry {
-    pub event_type: GcnEventType,
-    /// Token base units (10^-9 $GCN, same as lamport scale).
-    pub amount: u64,
-    pub timestamp: DateTime<Utc>,
-    pub description: String,
-}
-
-#[derive(Clone)]
-pub enum GcnEventType {
-    Credit,
-    Debit,
-    Burn,
+    pub entry_id: Uuid,
+    pub wallet: Pubkey,
+    pub delta: i64,
+    pub balance_after: i64,
+    pub entry_type: String,
+    pub session_id: Option<Uuid>,
+    pub memo: Option<String>,
+    pub recorded_at: DateTime<Utc>,
 }
 
 #[async_trait]
@@ -94,11 +90,12 @@ impl AccountRepository for InMemoryAccountRepository {
         wallet: &Pubkey,
         entry: GcnLedgerEntry,
     ) -> Result<(), RepositoryError> {
-        self.0
-            .get_mut(wallet)
-            .ok_or(RepositoryError::NotFound)?
-            .gcn_ledger
-            .push(entry);
+        let mut account = self.0.get_mut(wallet).ok_or(RepositoryError::NotFound)?;
+        account.gcn_balance += entry.delta;
+        let new_balance = account.gcn_balance;
+        let mut entry = entry;
+        entry.balance_after = new_balance;
+        account.gcn_ledger.push(entry);
         Ok(())
     }
 

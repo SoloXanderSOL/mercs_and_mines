@@ -7,8 +7,8 @@
 /// `cargo test` continues to work without a database.
 use sqlx::postgres::PgPoolOptions;
 use mercs_server::repository::{
-    AccountRepository, PlayerAccount, PlayerProfile, PostgresAccountRepository, WalletAddress,
-    CampaignLifecycle, CampaignRepository, NewCampaignInstance,
+    AccountRepository, GcnLedgerEntry, PlayerAccount, PlayerProfile, PostgresAccountRepository,
+    WalletAddress, CampaignLifecycle, CampaignRepository, NewCampaignInstance,
     PostgresCampaignRepository, VictoryTickerType,
     CommanderRecord, CommanderRepository, PostgresCommanderRepository,
     SectionRecord, SectionRepository, PostgresSectionRepository,
@@ -59,6 +59,7 @@ async fn player_account_upsert_is_idempotent() {
     let account = PlayerAccount {
         wallet,
         trust_standing: 0,
+        gcn_balance: 0,
         profile: PlayerProfile { display_name: None, sector_id: None },
         gcn_ledger: vec![],
     };
@@ -316,6 +317,143 @@ async fn commander_section_crud_is_correct() {
         .execute(&pool)
         .await
         .expect("post-test campaign cleanup failed");
+    sqlx::query("DELETE FROM player_accounts WHERE wallet_address = $1")
+        .bind(&wallet_bytes)
+        .execute(&pool)
+        .await
+        .expect("post-test player_accounts cleanup failed");
+}
+
+#[tokio::test]
+async fn gcn_ledger_is_append_only_and_queryable() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => {
+            eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test");
+            return;
+        }
+    };
+
+    let repo = PostgresAccountRepository::new(pool.clone());
+    let wallet = WalletAddress([3u8; 32]);
+    let wallet_bytes = wallet.0.to_vec();
+
+    // Pre-test cleanup.
+    sqlx::query("DELETE FROM gcn_transaction_ledger WHERE wallet_address = $1")
+        .bind(&wallet_bytes)
+        .execute(&pool)
+        .await
+        .expect("pre-test ledger cleanup failed");
+    sqlx::query("DELETE FROM player_accounts WHERE wallet_address = $1")
+        .bind(&wallet_bytes)
+        .execute(&pool)
+        .await
+        .expect("pre-test player_accounts cleanup failed");
+
+    // Step 1: seed a fresh player_accounts row.
+    sqlx::query(
+        "INSERT INTO player_accounts (wallet_address, trust_standing, gcn_balance) VALUES ($1, 0, 0)"
+    )
+    .bind(&wallet_bytes)
+    .execute(&pool)
+    .await
+    .expect("player_accounts seed failed");
+
+    // Step 2: append entry A (credit 500).
+    repo.append_gcn_entry(
+        &wallet,
+        GcnLedgerEntry {
+            entry_id: uuid::Uuid::nil(),
+            wallet,
+            delta: 500,
+            balance_after: 0,
+            entry_type: "founding_courtesy".to_string(),
+            session_id: None,
+            memo: Some("Founding Courtesy He3 grant".to_string()),
+            recorded_at: chrono::Utc::now(),
+        },
+    )
+    .await
+    .expect("append entry A failed");
+
+    // Step 2: append entry B (debit 50).
+    repo.append_gcn_entry(
+        &wallet,
+        GcnLedgerEntry {
+            entry_id: uuid::Uuid::nil(),
+            wallet,
+            delta: -50,
+            balance_after: 0,
+            entry_type: "mission_payout".to_string(),
+            session_id: None,
+            memo: None,
+            recorded_at: chrono::Utc::now(),
+        },
+    )
+    .await
+    .expect("append entry B failed");
+
+    // Step 3: assert gcn_balance is 450.
+    let balance: i64 = sqlx::query_scalar(
+        "SELECT gcn_balance FROM player_accounts WHERE wallet_address = $1"
+    )
+    .bind(&wallet_bytes)
+    .fetch_one(&pool)
+    .await
+    .expect("gcn_balance query failed");
+    assert_eq!(balance, 450, "gcn_balance must be 450 after +500 and -50");
+
+    // Step 4: get_gcn_ledger — two entries, correct deltas, correct balance_after, A before B.
+    let ledger = repo.get_gcn_ledger(&wallet).await;
+    assert_eq!(ledger.len(), 2, "expected exactly two ledger entries");
+    let entry_a = &ledger[0];
+    let entry_b = &ledger[1];
+    assert_eq!(entry_a.delta, 500);
+    assert_eq!(entry_a.balance_after, 500);
+    assert_eq!(entry_a.entry_type, "founding_courtesy");
+    assert_eq!(entry_a.memo, Some("Founding Courtesy He3 grant".to_string()));
+    assert_eq!(entry_b.delta, -50);
+    assert_eq!(entry_b.balance_after, 450);
+    assert_eq!(entry_b.entry_type, "mission_payout");
+    assert!(entry_b.memo.is_none());
+    assert!(
+        entry_a.recorded_at <= entry_b.recorded_at,
+        "entry A must precede entry B in recorded_at order"
+    );
+
+    // Step 5: UPDATE must be blocked by the immutability trigger.
+    let tamper = sqlx::query(
+        "UPDATE gcn_transaction_ledger SET memo = 'TAMPERED' WHERE wallet_address = $1"
+    )
+    .bind(&wallet_bytes)
+    .execute(&pool)
+    .await;
+    assert!(tamper.is_err(), "UPDATE must be blocked by the immutability trigger");
+
+    // Step 6: DELETE must be blocked by the immutability trigger.
+    let delete = sqlx::query(
+        "DELETE FROM gcn_transaction_ledger WHERE wallet_address = $1"
+    )
+    .bind(&wallet_bytes)
+    .execute(&pool)
+    .await;
+    assert!(delete.is_err(), "DELETE must be blocked by the immutability trigger");
+
+    // Post-test cleanup: delete via truncate-style raw SQL bypassing triggers is not available;
+    // triggers block DELETE, so we use a superuser-level workaround: disable triggers for cleanup.
+    sqlx::query("ALTER TABLE gcn_transaction_ledger DISABLE TRIGGER gcn_ledger_no_delete")
+        .execute(&pool)
+        .await
+        .expect("disable trigger for cleanup failed");
+    sqlx::query("DELETE FROM gcn_transaction_ledger WHERE wallet_address = $1")
+        .bind(&wallet_bytes)
+        .execute(&pool)
+        .await
+        .expect("post-test ledger cleanup failed");
+    sqlx::query("ALTER TABLE gcn_transaction_ledger ENABLE TRIGGER gcn_ledger_no_delete")
+        .execute(&pool)
+        .await
+        .expect("re-enable trigger failed");
     sqlx::query("DELETE FROM player_accounts WHERE wallet_address = $1")
         .bind(&wallet_bytes)
         .execute(&pool)

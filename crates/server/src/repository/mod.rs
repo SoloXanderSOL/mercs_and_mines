@@ -23,7 +23,7 @@ impl WalletAddress {
 }
 
 pub use account::{
-    AccountRepository, GcnEventType, GcnLedgerEntry, InMemoryAccountRepository, PlayerAccount,
+    AccountRepository, GcnLedgerEntry, InMemoryAccountRepository, PlayerAccount,
     PlayerProfile,
 };
 pub use campaign::{
