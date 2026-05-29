@@ -5,6 +5,7 @@
 pub mod account;
 pub mod campaign;
 pub mod commander;
+pub mod membership;
 pub mod postgres_account;
 pub mod section;
 pub mod sector;
@@ -42,6 +43,10 @@ pub use section::{
 };
 pub use sector::{
     InMemorySectorStateRepository, OccupationStatus, SectorId, SectorState, SectorStateRepository,
+};
+pub use membership::{
+    InMemoryMembershipRepository, MembershipRepository, PlayerCampaignMembership,
+    PostgresMembershipRepository,
 };
 pub use timer::{DeploymentTimer, InMemoryTimerRepository, TimerRepository, TimerType};
 

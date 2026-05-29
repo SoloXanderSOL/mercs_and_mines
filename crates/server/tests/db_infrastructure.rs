@@ -11,6 +11,7 @@ use mercs_server::repository::{
     WalletAddress, CampaignLifecycle, CampaignRepository, NewCampaignInstance,
     PostgresCampaignRepository, VictoryTickerType,
     CommanderRecord, CommanderRepository, PostgresCommanderRepository,
+    MembershipRepository, PostgresMembershipRepository,
     SectionRecord, SectionRepository, PostgresSectionRepository,
 };
 
@@ -317,6 +318,111 @@ async fn commander_section_crud_is_correct() {
         .execute(&pool)
         .await
         .expect("post-test campaign cleanup failed");
+    sqlx::query("DELETE FROM player_accounts WHERE wallet_address = $1")
+        .bind(&wallet_bytes)
+        .execute(&pool)
+        .await
+        .expect("post-test player_accounts cleanup failed");
+}
+
+#[tokio::test]
+async fn player_campaign_membership_is_correct() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => {
+            eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test");
+            return;
+        }
+    };
+
+    let membership_repo = PostgresMembershipRepository::new(pool.clone());
+
+    let wallet_bytes = [7u8; 32].to_vec();
+    let sector_id = uuid::Uuid::new_v4();
+
+    // Step 1 — seed: player_accounts row + campaign_instances row.
+    sqlx::query(
+        "INSERT INTO player_accounts (wallet_address, trust_standing, gcn_balance)
+         VALUES ($1, 0, 0)
+         ON CONFLICT (wallet_address) DO NOTHING"
+    )
+    .bind(&wallet_bytes)
+    .execute(&pool)
+    .await
+    .expect("player_accounts seed failed");
+
+    let campaign_id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO campaign_instances (sector_id, map_seed, state)
+         VALUES ($1, $2, 'Pending'::sector_state)
+         RETURNING campaign_id"
+    )
+    .bind(sector_id)
+    .bind(0xFEEDFACE_i64)
+    .fetch_one(&pool)
+    .await
+    .expect("campaign_instances seed failed");
+
+    // Step 2 — add_member with no spawn hex.
+    let membership = membership_repo
+        .add_member(&wallet_bytes, campaign_id, None, None)
+        .await
+        .expect("add_member failed");
+    assert!(!membership.membership_id.is_nil(), "membership_id must not be nil");
+    assert!(membership.is_active, "is_active must be true on creation");
+    assert!(membership.spawn_hex_q.is_none(), "spawn_hex_q must be None before assignment");
+    assert!(membership.spawn_hex_r.is_none(), "spawn_hex_r must be None before assignment");
+
+    // Step 3 — get_membership: fetch by (wallet, campaign_id).
+    let fetched = membership_repo
+        .get_membership(&wallet_bytes, campaign_id)
+        .await
+        .expect("get_membership error")
+        .expect("membership not found");
+    assert_eq!(fetched.membership_id, membership.membership_id);
+    assert_eq!(fetched.campaign_id, campaign_id);
+    assert_eq!(fetched.wallet_address, wallet_bytes);
+    assert!(fetched.is_active);
+
+    // Step 4 — assign_spawn_hex.
+    membership_repo
+        .assign_spawn_hex(&wallet_bytes, campaign_id, 3, -2)
+        .await
+        .expect("assign_spawn_hex failed");
+    let after_hex = membership_repo
+        .get_membership(&wallet_bytes, campaign_id)
+        .await
+        .expect("get_membership error")
+        .expect("membership not found after hex assignment");
+    assert_eq!(after_hex.spawn_hex_q, Some(3), "spawn_hex_q must be 3");
+    assert_eq!(after_hex.spawn_hex_r, Some(-2), "spawn_hex_r must be -2");
+
+    // Step 5 — duplicate insert must be rejected by uq_player_campaign.
+    let dup = membership_repo
+        .add_member(&wallet_bytes, campaign_id, None, None)
+        .await;
+    assert!(dup.is_err(), "duplicate (wallet, campaign_id) must be rejected");
+
+    // Step 6 — list_members_by_campaign: exactly one row for this campaign.
+    let members = membership_repo
+        .list_members_by_campaign(campaign_id)
+        .await
+        .expect("list_members_by_campaign failed");
+    assert_eq!(members.len(), 1, "expected exactly one member for this campaign");
+    assert_eq!(members[0].membership_id, membership.membership_id);
+
+    // Step 7 — cascade delete: deleting the campaign row must cascade to membership.
+    sqlx::query("DELETE FROM campaign_instances WHERE campaign_id = $1")
+        .bind(campaign_id)
+        .execute(&pool)
+        .await
+        .expect("cascade delete of campaign_instances failed");
+    let after_cascade = membership_repo
+        .get_membership(&wallet_bytes, campaign_id)
+        .await
+        .expect("get_membership error after cascade");
+    assert!(after_cascade.is_none(), "membership must be None after campaign cascade delete");
+
+    // Teardown: player_accounts (campaign already gone, no restrict blocker).
     sqlx::query("DELETE FROM player_accounts WHERE wallet_address = $1")
         .bind(&wallet_bytes)
         .execute(&pool)

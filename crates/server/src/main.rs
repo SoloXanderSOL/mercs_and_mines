@@ -3,7 +3,8 @@ use sqlx::postgres::PgPoolOptions;
 use mercs_server::config::Config;
 use mercs_server::repository::{
     PostgresAccountRepository, PostgresCampaignRepository,
-    PostgresCommanderRepository, PostgresSectionRepository,
+    PostgresCommanderRepository, PostgresMembershipRepository,
+    PostgresSectionRepository,
 };
 use mercs_server::state::AppState;
 
@@ -35,10 +36,11 @@ async fn main() {
     let bind_addr = config.server.bind_addr.clone();
     let log_dir = std::env::var("LOG_DIR").unwrap_or_else(|_| "./logs".into());
     let mut state = AppState::new(std::path::PathBuf::from(log_dir), config);
-    state.account_repo   = Arc::new(PostgresAccountRepository::new(pool.clone()));
-    state.campaign_repo  = Arc::new(PostgresCampaignRepository::new(pool.clone()));
-    state.commander_repo = Arc::new(PostgresCommanderRepository::new(pool.clone()));
-    state.section_repo   = Arc::new(PostgresSectionRepository::new(pool.clone()));
+    state.account_repo    = Arc::new(PostgresAccountRepository::new(pool.clone()));
+    state.campaign_repo   = Arc::new(PostgresCampaignRepository::new(pool.clone()));
+    state.commander_repo  = Arc::new(PostgresCommanderRepository::new(pool.clone()));
+    state.membership_repo = Arc::new(PostgresMembershipRepository::new(pool.clone()));
+    state.section_repo    = Arc::new(PostgresSectionRepository::new(pool.clone()));
     state.pool = Some(pool);
     let state = Arc::new(state);
 
