@@ -8,6 +8,9 @@ use crate::api_types::CombatResolveRequest;
 use crate::config::Config;
 use crate::repository::{
     AccountRepository, InMemoryAccountRepository,
+    CampaignRepository, InMemoryCampaignRepository,
+    CommanderRepository, InMemoryCommanderRepository,
+    SectionRepository, InMemorySectionRepository,
     SectorStateRepository, InMemorySectorStateRepository,
     TimerRepository, InMemoryTimerRepository,
 };
@@ -32,9 +35,12 @@ pub struct AppState {
     /// Pending TEEPIN challenges, keyed by wallet_address.
     /// One-time use — removed on verify.
     pub pending_challenges: DashMap<String, PendingChallenge>,
-    pub account_repo: Arc<dyn AccountRepository>,
-    pub sector_repo:  Arc<dyn SectorStateRepository>,
-    pub timer_repo:   Arc<dyn TimerRepository>,
+    pub account_repo:   Arc<dyn AccountRepository>,
+    pub campaign_repo:  Arc<dyn CampaignRepository>,
+    pub commander_repo: Arc<dyn CommanderRepository>,
+    pub section_repo:   Arc<dyn SectionRepository>,
+    pub sector_repo:    Arc<dyn SectorStateRepository>,
+    pub timer_repo:     Arc<dyn TimerRepository>,
     pub config: Arc<Config>,
     /// Postgres connection pool. None only in unit-test contexts that use in-memory repos.
     /// Production startup panics if DATABASE_URL is unset; pool is always Some in prod.
@@ -49,6 +55,9 @@ impl AppState {
             sessions:           DashMap::new(),
             pending_challenges: DashMap::new(),
             account_repo:       Arc::new(InMemoryAccountRepository::new()),
+            campaign_repo:      Arc::new(InMemoryCampaignRepository::new()),
+            commander_repo:     Arc::new(InMemoryCommanderRepository::new()),
+            section_repo:       Arc::new(InMemorySectionRepository::new()),
             sector_repo:        Arc::new(InMemorySectorStateRepository::new()),
             timer_repo:         Arc::new(InMemoryTimerRepository::new()),
             config,

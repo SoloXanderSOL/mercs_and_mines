@@ -3,7 +3,10 @@
 // This suppress is scoped to the repository module — remove once the types are fully wired up.
 #![allow(unused)]
 pub mod account;
+pub mod campaign;
+pub mod commander;
 pub mod postgres_account;
+pub mod section;
 pub mod sector;
 pub mod timer;
 
@@ -23,7 +26,20 @@ pub use account::{
     AccountRepository, GcnEventType, GcnLedgerEntry, InMemoryAccountRepository, PlayerAccount,
     PlayerProfile,
 };
+pub use campaign::{
+    CampaignInstance, CampaignLifecycle, CampaignRepository,
+    InMemoryCampaignRepository, NewCampaignInstance, PostgresCampaignRepository,
+    VictoryTickerType,
+};
+pub use commander::{
+    CommanderRecord, CommanderRepository,
+    InMemoryCommanderRepository, PostgresCommanderRepository,
+};
 pub use postgres_account::PostgresAccountRepository;
+pub use section::{
+    InMemorySectionRepository, PostgresSectionRepository,
+    SectionRecord, SectionRepository,
+};
 pub use sector::{
     InMemorySectorStateRepository, OccupationStatus, SectorId, SectorState, SectorStateRepository,
 };
