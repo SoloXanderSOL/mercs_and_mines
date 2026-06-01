@@ -14,7 +14,7 @@ pub mod timer;
 /// Phase-0 stand-in for `solana_sdk::pubkey::Pubkey`.
 /// Replace with the real type once the rustc-1.95 ICE (span-rendering bug triggered by
 /// Solana SDK macros) is resolved.  Swap uses here and the Cargo.toml dep to cut over.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct WalletAddress(pub [u8; 32]);
 
 impl WalletAddress {
@@ -42,7 +42,8 @@ pub use section::{
     SectionRecord, SectionRepository,
 };
 pub use sector::{
-    InMemorySectorStateRepository, OccupationStatus, SectorId, SectorState, SectorStateRepository,
+    InMemorySectorStateRepository, OccupationStatus, RedisSectorStateRepository,
+    SectorId, SectorState, SectorStateRepository,
 };
 pub use membership::{
     InMemoryMembershipRepository, MembershipRepository, PlayerCampaignMembership,

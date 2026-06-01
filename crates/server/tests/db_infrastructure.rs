@@ -13,6 +13,7 @@ use mercs_server::repository::{
     CommanderRecord, CommanderRepository, PostgresCommanderRepository,
     MembershipRepository, PostgresMembershipRepository,
     SectionRecord, SectionRepository, PostgresSectionRepository,
+    OccupationStatus, RedisSectorStateRepository, SectorState, SectorStateRepository,
 };
 
 async fn test_pool() -> Option<sqlx::PgPool> {
@@ -588,4 +589,67 @@ async fn redis_ping_succeeds() {
         .expect("PING command failed");
 
     assert_eq!(pong, "PONG");
+}
+
+#[tokio::test]
+async fn sector_state_repository_redis_is_correct() {
+    let url = match std::env::var("TEST_REDIS_URL").ok() {
+        Some(u) => u,
+        None => {
+            eprintln!("TEST_REDIS_URL not set — skipping Redis sector integration test");
+            return;
+        }
+    };
+
+    let client = redis::Client::open(url).expect("Invalid TEST_REDIS_URL");
+    let mgr = redis::aio::ConnectionManager::new(client)
+        .await
+        .expect("Failed to connect to Redis");
+    let repo = RedisSectorStateRepository::new(mgr.clone());
+
+    let sector_id  = uuid::Uuid::new_v4();
+    let campaign_id = uuid::Uuid::new_v4();
+
+    // 1. Upsert a sector; verify it appears in list_sectors (via sectors:all Set).
+    let state = SectorState {
+        sector_id,
+        campaign_id,
+        occupation_status: OccupationStatus::Neutral,
+        owner: None,
+        deployed_unit_count: 3,
+        active_timer_ids: vec![],
+    };
+    repo.upsert_sector(state.clone()).await.expect("upsert_sector failed");
+
+    let all = repo.list_sectors().await;
+    assert!(all.iter().any(|s| s.sector_id == sector_id), "upserted sector must appear in list_sectors");
+
+    // 2. Round-trip get_sector.
+    let fetched = repo.get_sector(sector_id).await.expect("get_sector returned None");
+    assert_eq!(fetched.sector_id, sector_id);
+    assert_eq!(fetched.campaign_id, campaign_id);
+    assert_eq!(fetched.deployed_unit_count, 3);
+
+    // 3. Player presence round-trip.
+    let wallet_a = WalletAddress([5u8; 32]);
+    let wallet_b = WalletAddress([6u8; 32]);
+    let players = vec![wallet_a, wallet_b];
+    repo.set_player_presence(sector_id, &players).await.expect("set_player_presence failed");
+    let presence = repo.get_player_presence(sector_id).await.expect("get_player_presence failed");
+    assert_eq!(presence.len(), 2);
+    assert!(presence.contains(&wallet_a));
+    assert!(presence.contains(&wallet_b));
+
+    // 4. Clean up test keys so the test is idempotent.
+    use redis::AsyncCommands;
+    let mut conn = mgr.clone();
+    conn.del::<_, ()>(vec![
+        format!("sector:{}:hex_state", sector_id),
+        format!("sector:{}:player_presence", sector_id),
+    ])
+    .await
+    .expect("DEL cleanup failed");
+    conn.srem::<_, _, ()>("sectors:all", sector_id.to_string())
+        .await
+        .expect("SREM cleanup failed");
 }
