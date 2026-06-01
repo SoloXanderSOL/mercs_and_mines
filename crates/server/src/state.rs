@@ -47,6 +47,9 @@ pub struct AppState {
     /// Postgres connection pool. None only in unit-test contexts that use in-memory repos.
     /// Production startup panics if DATABASE_URL is unset; pool is always Some in prod.
     pub pool: Option<sqlx::PgPool>,
+    /// Redis connection manager. None only in unit-test contexts that use in-memory repos.
+    /// Production startup panics if REDIS_URL is unset; always Some in prod.
+    pub redis: Option<redis::aio::ConnectionManager>,
 }
 
 impl AppState {
@@ -65,6 +68,7 @@ impl AppState {
             timer_repo:          Arc::new(InMemoryTimerRepository::new()),
             config,
             pool:               None,
+            redis:              None,
         }
     }
 }

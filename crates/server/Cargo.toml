@@ -40,3 +40,4 @@ reqwest        = { version = "0.12", default-features = false, features = ["rust
 bincode        = "1"
 base64         = "0.22"
 sqlx           = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "macros", "migrate", "chrono", "json", "uuid"] }
+redis          = { version = "0.27", features = ["tokio-comp", "connection-manager"] }

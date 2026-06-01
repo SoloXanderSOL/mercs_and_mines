@@ -566,3 +566,26 @@ async fn gcn_ledger_is_append_only_and_queryable() {
         .await
         .expect("post-test player_accounts cleanup failed");
 }
+
+#[tokio::test]
+async fn redis_ping_succeeds() {
+    let url = match std::env::var("TEST_REDIS_URL").ok() {
+        Some(u) => u,
+        None => {
+            eprintln!("TEST_REDIS_URL not set — skipping Redis integration test");
+            return;
+        }
+    };
+
+    let client = redis::Client::open(url).expect("Invalid TEST_REDIS_URL");
+    let mut mgr = redis::aio::ConnectionManager::new(client)
+        .await
+        .expect("Failed to connect to Redis");
+
+    let pong: String = redis::cmd("PING")
+        .query_async(&mut mgr)
+        .await
+        .expect("PING command failed");
+
+    assert_eq!(pong, "PONG");
+}
