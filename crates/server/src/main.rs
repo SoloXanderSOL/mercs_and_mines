@@ -4,7 +4,7 @@ use mercs_server::config::Config;
 use mercs_server::repository::{
     PostgresAccountRepository, PostgresCampaignRepository,
     PostgresCommanderRepository, PostgresMembershipRepository,
-    PostgresSectionRepository, RedisSectorStateRepository,
+    PostgresSectionRepository, RedisSectorStateRepository, RedisTimerRepository,
 };
 use mercs_server::state::AppState;
 use redis::Client as RedisClient;
@@ -53,6 +53,7 @@ async fn main() {
     state.membership_repo = Arc::new(PostgresMembershipRepository::new(pool.clone()));
     state.section_repo    = Arc::new(PostgresSectionRepository::new(pool.clone()));
     state.sector_repo     = Arc::new(RedisSectorStateRepository::new(redis_mgr.clone()));
+    state.timer_repo      = Arc::new(RedisTimerRepository::new(redis_mgr.clone()));
     state.pool  = Some(pool);
     state.redis = Some(redis_mgr);
     let state = Arc::new(state);

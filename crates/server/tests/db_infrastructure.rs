@@ -14,6 +14,7 @@ use mercs_server::repository::{
     MembershipRepository, PostgresMembershipRepository,
     SectionRecord, SectionRepository, PostgresSectionRepository,
     OccupationStatus, RedisSectorStateRepository, SectorState, SectorStateRepository,
+    DeploymentTimer, RedisTimerRepository, TimerRepository, TimerType,
 };
 
 async fn test_pool() -> Option<sqlx::PgPool> {
@@ -652,4 +653,79 @@ async fn sector_state_repository_redis_is_correct() {
     conn.srem::<_, _, ()>("sectors:all", sector_id.to_string())
         .await
         .expect("SREM cleanup failed");
+}
+
+#[tokio::test]
+async fn timer_repository_redis_is_correct() {
+    let url = match std::env::var("TEST_REDIS_URL").ok() {
+        Some(u) => u,
+        None => {
+            eprintln!("TEST_REDIS_URL not set — skipping Redis timer integration test");
+            return;
+        }
+    };
+
+    let client = redis::Client::open(url).expect("Invalid TEST_REDIS_URL");
+    let mgr = redis::aio::ConnectionManager::new(client)
+        .await
+        .expect("Failed to connect to Redis");
+    let repo = RedisTimerRepository::new(mgr.clone());
+
+    let sector_id  = uuid::Uuid::new_v4();
+    let timer_a_id = uuid::Uuid::new_v4();
+    let timer_b_id = uuid::Uuid::new_v4();
+    let wallet     = WalletAddress([9u8; 32]);
+
+    let now = chrono::Utc::now();
+
+    let timer_a = DeploymentTimer {
+        timer_id:     timer_a_id,
+        player_wallet: wallet,
+        sector_id,
+        timer_type:   TimerType::ConvoyArrival,
+        fires_at:     now - chrono::Duration::seconds(60),
+    };
+    let timer_b = DeploymentTimer {
+        timer_id:     timer_b_id,
+        player_wallet: wallet,
+        sector_id,
+        timer_type:   TimerType::DeploymentExpiry,
+        fires_at:     now + chrono::Duration::seconds(3600),
+    };
+
+    // 1. Schedule both timers.
+    repo.schedule_timer(timer_a.clone()).await.expect("schedule timer_a failed");
+    repo.schedule_timer(timer_b.clone()).await.expect("schedule timer_b failed");
+
+    // 2. get_due_timers(now) — only the past timer should be returned.
+    let due = repo.get_due_timers(now).await;
+    assert_eq!(due.len(), 1, "expected exactly one due timer");
+    assert_eq!(due[0].timer_id, timer_a_id, "due timer must be timer_a");
+
+    // 3. Verify payloads round-trip: get_due_timers returns the full struct.
+    assert_eq!(due[0].sector_id, sector_id);
+    assert!(matches!(due[0].timer_type, TimerType::ConvoyArrival));
+
+    // 4. Cancel the future timer.
+    repo.cancel_timer(timer_b_id).await.expect("cancel timer_b failed");
+
+    // 5. After cancel, scanning far-future window still returns only timer_a.
+    let far_future = now + chrono::Duration::seconds(7200);
+    let after_cancel = repo.get_due_timers(far_future).await;
+    assert_eq!(after_cancel.len(), 1, "only timer_a must remain after timer_b is cancelled");
+    assert_eq!(after_cancel[0].timer_id, timer_a_id);
+
+    // 6. Teardown — remove all test keys so the test is idempotent.
+    use redis::AsyncCommands;
+    let mut conn = mgr.clone();
+    conn.del::<_, ()>(vec![
+        format!("timer:{}", timer_a_id),
+        format!("timer:{}:sector_id", timer_a_id),
+        format!("sector:{}:timers", sector_id),
+    ])
+    .await
+    .expect("DEL cleanup (timer_a keys) failed");
+    conn.zrem::<_, _, ()>("timers:global", timer_a_id.to_string())
+        .await
+        .expect("ZREM timers:global cleanup failed");
 }

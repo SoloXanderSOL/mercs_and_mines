@@ -49,7 +49,7 @@ pub use membership::{
     InMemoryMembershipRepository, MembershipRepository, PlayerCampaignMembership,
     PostgresMembershipRepository,
 };
-pub use timer::{DeploymentTimer, InMemoryTimerRepository, TimerRepository, TimerType};
+pub use timer::{DeploymentTimer, InMemoryTimerRepository, RedisTimerRepository, TimerRepository, TimerType};
 
 #[derive(Debug, thiserror::Error)]
 pub enum RepositoryError {
