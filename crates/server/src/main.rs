@@ -3,7 +3,8 @@ use sqlx::postgres::PgPoolOptions;
 use mercs_server::config::Config;
 use mercs_server::repository::{
     PostgresAccountRepository, PostgresCampaignRepository,
-    PostgresCommanderRepository, PostgresMembershipRepository,
+    PostgresCommanderRepository, PostgresInputLogRepository,
+    PostgresMembershipRepository,
     PostgresSectionRepository, RedisSectorStateRepository, RedisSessionStateRepository,
     RedisTimerRepository,
 };
@@ -56,6 +57,7 @@ async fn main() {
     state.sector_repo     = Arc::new(RedisSectorStateRepository::new(redis_mgr.clone()));
     state.timer_repo      = Arc::new(RedisTimerRepository::new(redis_mgr.clone()));
     state.session_repo    = Arc::new(RedisSessionStateRepository::new(redis_mgr.clone()));
+    state.input_log_repo  = Arc::new(PostgresInputLogRepository::new(pool.clone()));
     state.pool  = Some(pool);
     state.redis = Some(redis_mgr);
     let state = Arc::new(state);

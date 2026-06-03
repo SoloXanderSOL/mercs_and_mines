@@ -5,6 +5,7 @@
 pub mod account;
 pub mod campaign;
 pub mod commander;
+pub mod input_log;
 pub mod membership;
 pub mod postgres_account;
 pub mod section;
@@ -49,6 +50,10 @@ pub use sector::{
 pub use membership::{
     InMemoryMembershipRepository, MembershipRepository, PlayerCampaignMembership,
     PostgresMembershipRepository,
+};
+pub use input_log::{
+    InMemoryInputLogRepository, InputLogRepository, InputLogRow,
+    PostgresInputLogRepository,
 };
 pub use timer::{DeploymentTimer, InMemoryTimerRepository, RedisTimerRepository, TimerRepository, TimerType};
 pub use session::{

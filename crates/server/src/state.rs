@@ -7,6 +7,7 @@ use crate::repository::{
     AccountRepository, InMemoryAccountRepository,
     CampaignRepository, InMemoryCampaignRepository,
     CommanderRepository, InMemoryCommanderRepository,
+    InputLogRepository, InMemoryInputLogRepository,
     MembershipRepository, InMemoryMembershipRepository,
     SectionRepository, InMemorySectionRepository,
     SectorStateRepository, InMemorySectorStateRepository,
@@ -24,7 +25,8 @@ pub struct PendingChallenge {
 }
 
 pub struct AppState {
-    pub session_repo:   Arc<dyn SessionStateRepository + Send + Sync>,
+    pub session_repo:    Arc<dyn SessionStateRepository + Send + Sync>,
+    pub input_log_repo:  Arc<dyn InputLogRepository + Send + Sync>,
     pub log_dir: PathBuf,
     /// Active 2-hour sessions, keyed by token_id.
     pub sessions: DashMap<String, shared::SessionToken>,
@@ -51,6 +53,7 @@ impl AppState {
     pub fn new(log_dir: PathBuf, config: Arc<Config>) -> Self {
         Self {
             session_repo:        Arc::new(InMemorySessionStateRepository::new()),
+            input_log_repo:      Arc::new(InMemoryInputLogRepository::new()),
             log_dir,
             sessions:           DashMap::new(),
             pending_challenges: DashMap::new(),

@@ -187,6 +187,9 @@ async fn post_mission_resolve(
         sector_tier: "Contested".into(),
         ruleset: "standard_v1".into(),
     };
+    if let Err(e) = state.input_log_repo.save_session_config(&config).await {
+        eprintln!("[routes] failed to persist session config: {e}");
+    }
     if let Ok(mut w) = crate::log_writer::SessionLogWriter::create(
         &state.log_dir, &session_id.to_string()
     ).await {
@@ -257,6 +260,9 @@ async fn post_combat_resolve(
         sector_tier: "Contested".into(),
         ruleset: "standard_v1".into(),
     };
+    if let Err(e) = state.input_log_repo.save_session_config(&config).await {
+        eprintln!("[routes] failed to persist session config: {e}");
+    }
     if let Ok(mut w) = crate::log_writer::SessionLogWriter::create(
         &state.log_dir, &session_id.to_string()
     ).await {
@@ -324,6 +330,9 @@ async fn post_pack_assault(
         sector_tier: "Contested".into(),
         ruleset: "standard_v1".into(),
     };
+    if let Err(e) = state.input_log_repo.save_session_config(&config).await {
+        eprintln!("[routes] failed to persist session config: {e}");
+    }
     if let Ok(mut w) = crate::log_writer::SessionLogWriter::create(
         &state.log_dir, &session_id.to_string()
     ).await {

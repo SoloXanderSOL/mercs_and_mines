@@ -24,6 +24,7 @@ use sim_engine::{
 
 use crate::{
     api_types::{convoy_vehicle_from_class, CombatResolveRequest},
+    repository::InputLogRepository,
     state::AppState,
 };
 
@@ -51,8 +52,9 @@ pub async fn ws_stream_handler(
     let log_dir = state.log_dir.clone();
     let sim_cfg = state.config.sim.clone();
     let default_max_ticks = state.config.server.default_max_ticks;
+    let input_log_repo = Arc::clone(&state.input_log_repo);
     ws.on_upgrade(move |socket| {
-        handle_ws(socket, session.params, session_id, log_dir, sim_cfg, default_max_ticks)
+        handle_ws(socket, session.params, session_id, log_dir, sim_cfg, default_max_ticks, input_log_repo)
     })
     .into_response()
 }
@@ -64,6 +66,7 @@ async fn handle_ws(
     log_dir: PathBuf,
     sim_cfg: SimConfig,
     default_max_ticks: usize,
+    input_log_repo: Arc<dyn InputLogRepository + Send + Sync>,
 ) {
     // Serialize before any field is consumed by unwrap_or.
     let params_payload = serde_json::to_value(&params).unwrap_or_default();
@@ -103,6 +106,9 @@ async fn handle_ws(
         ruleset: "standard_v1".into(),
     };
 
+    if let Err(e) = input_log_repo.save_session_config(&session_config).await {
+        eprintln!("[ws_combat] failed to persist session config: {e}");
+    }
     if let Some(w) = log.as_mut() {
         w.write_header(&session_config).await;
         w.append(&shared::InputLogEntry {

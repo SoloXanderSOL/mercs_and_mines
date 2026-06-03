@@ -11,6 +11,7 @@ use mercs_server::repository::{
     WalletAddress, CampaignLifecycle, CampaignRepository, NewCampaignInstance,
     PostgresCampaignRepository, VictoryTickerType,
     CommanderRecord, CommanderRepository, PostgresCommanderRepository,
+    InputLogRepository, PostgresInputLogRepository,
     MembershipRepository, PostgresMembershipRepository,
     SectionRecord, SectionRepository, PostgresSectionRepository,
     OccupationStatus, RedisSectorStateRepository, SectorState, SectorStateRepository,
@@ -817,4 +818,116 @@ async fn session_state_repository_redis_is_correct() {
     let double_consume = repo.consume_session(session_id).await
         .expect("second consume_session must not error");
     assert!(double_consume.is_none(), "second consume must return None");
+}
+
+#[tokio::test]
+async fn input_log_is_append_only_and_queryable() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => {
+            eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test");
+            return;
+        }
+    };
+
+    let repo = PostgresInputLogRepository::new(pool.clone());
+    let session_id = uuid::Uuid::new_v4();
+
+    // Pre-test cleanup in case a previous run left rows.
+    sqlx::query("ALTER TABLE input_logs DISABLE TRIGGER ALL")
+        .execute(&pool).await.expect("disable triggers for pre-test cleanup failed");
+    sqlx::query("DELETE FROM input_logs WHERE session_id = $1")
+        .bind(session_id).execute(&pool).await.expect("pre-test input_logs cleanup failed");
+    sqlx::query("ALTER TABLE input_logs ENABLE TRIGGER ALL")
+        .execute(&pool).await.expect("re-enable triggers after pre-test cleanup failed");
+    sqlx::query("DELETE FROM session_configs WHERE session_id = $1")
+        .bind(session_id).execute(&pool).await.expect("pre-test session_configs cleanup failed");
+
+    // Step 1: save a SessionConfig; assert Ok.
+    let config = shared::SessionConfig {
+        session_id:    session_id.to_string(),
+        build_version: "0.1.0".into(),
+        seed:          0xDEADBEEF_CAFEBABE_u64,
+        sector_id:     "test_sector".into(),
+        campaign_id:   "test_campaign".into(),
+        sector_tier:   "Contested".into(),
+        ruleset:       "standard_v1".into(),
+    };
+    repo.save_session_config(&config).await.expect("save_session_config failed");
+
+    // Step 2: get_session_config — round-trips correctly, seed survives u64 → i64 → u64.
+    let fetched_config = repo.get_session_config(&session_id).await
+        .expect("get_session_config error")
+        .expect("get_session_config returned None");
+    assert_eq!(fetched_config.session_id, config.session_id);
+    assert_eq!(fetched_config.seed, config.seed, "seed must round-trip u64→i64→u64 without loss");
+    assert_eq!(fetched_config.sector_id, "test_sector");
+
+    // Step 3: append three entries with distinct tick/seq.
+    let entries = vec![
+        shared::InputLogEntry {
+            tick: 0, seq: 0,
+            event_type: "session_start".into(),
+            player_id: None,
+            payload: serde_json::json!({"note": "entry A"}),
+            narrative_event: None,
+        },
+        shared::InputLogEntry {
+            tick: 1, seq: 0,
+            event_type: "player_action".into(),
+            player_id: Some("wallet_abc".into()),
+            payload: serde_json::json!({"action": "move"}),
+            narrative_event: Some("Unit moved north.".into()),
+        },
+        shared::InputLogEntry {
+            tick: 2, seq: 0,
+            event_type: "combat_end".into(),
+            player_id: None,
+            payload: serde_json::json!({"outcome": "victory"}),
+            narrative_event: None,
+        },
+    ];
+    for entry in &entries {
+        repo.append_entry(&session_id, entry).await.expect("append_entry failed");
+    }
+
+    // Step 4: get_entries_by_session — 3 entries, ordered (tick, seq) ASC.
+    let retrieved = repo.get_entries_by_session(&session_id).await
+        .expect("get_entries_by_session failed");
+    assert_eq!(retrieved.len(), 3, "expected exactly 3 entries");
+    assert_eq!(retrieved[0].tick, 0);
+    assert_eq!(retrieved[0].event_type, "session_start");
+    assert_eq!(retrieved[1].tick, 1);
+    assert_eq!(retrieved[1].player_id, Some("wallet_abc".into()));
+    assert_eq!(retrieved[1].narrative_event, Some("Unit moved north.".into()));
+    assert_eq!(retrieved[2].tick, 2);
+    assert_eq!(retrieved[2].event_type, "combat_end");
+
+    // Step 5: UPDATE must be blocked by the immutability trigger.
+    let tamper = sqlx::query(
+        "UPDATE input_logs SET event_type = 'TAMPERED' WHERE session_id = $1"
+    )
+    .bind(session_id)
+    .execute(&pool)
+    .await;
+    assert!(tamper.is_err(), "UPDATE must be blocked by the immutability trigger");
+
+    // Step 6: DELETE must be blocked by the immutability trigger.
+    let delete_attempt = sqlx::query(
+        "DELETE FROM input_logs WHERE session_id = $1"
+    )
+    .bind(session_id)
+    .execute(&pool)
+    .await;
+    assert!(delete_attempt.is_err(), "DELETE must be blocked by the immutability trigger");
+
+    // Post-test cleanup: disable triggers to allow deletion.
+    sqlx::query("ALTER TABLE input_logs DISABLE TRIGGER ALL")
+        .execute(&pool).await.expect("disable triggers for cleanup failed");
+    sqlx::query("DELETE FROM input_logs WHERE session_id = $1")
+        .bind(session_id).execute(&pool).await.expect("post-test input_logs cleanup failed");
+    sqlx::query("ALTER TABLE input_logs ENABLE TRIGGER ALL")
+        .execute(&pool).await.expect("re-enable triggers after cleanup failed");
+    sqlx::query("DELETE FROM session_configs WHERE session_id = $1")
+        .bind(session_id).execute(&pool).await.expect("post-test session_configs cleanup failed");
 }
