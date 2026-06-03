@@ -9,6 +9,7 @@ pub mod membership;
 pub mod postgres_account;
 pub mod section;
 pub mod sector;
+pub mod session;
 pub mod timer;
 
 /// Phase-0 stand-in for `solana_sdk::pubkey::Pubkey`.
@@ -50,6 +51,10 @@ pub use membership::{
     PostgresMembershipRepository,
 };
 pub use timer::{DeploymentTimer, InMemoryTimerRepository, RedisTimerRepository, TimerRepository, TimerType};
+pub use session::{
+    CombatSession, InMemorySessionStateRepository, RedisSessionStateRepository,
+    SessionStateRepository,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum RepositoryError {

@@ -7,7 +7,6 @@
 pub mod ws_combat;
 
 use std::sync::Arc;
-use std::time::Instant;
 
 use axum::{
     extract::{Path, State},
@@ -37,7 +36,8 @@ use crate::auth::AuthSession;
 use crate::api_types::{
     convoy_vehicle_from_class, CombatResolveRequest, MissionResolveRequest, PackAssaultRequest,
 };
-use crate::state::{AppState, CombatSession};
+use crate::state::AppState;
+use crate::repository::CombatSession;
 
 type AppError = (StatusCode, Json<Value>);
 
@@ -358,11 +358,15 @@ async fn post_combat_stream_start(
     Json(req): Json<CombatResolveRequest>,
 ) -> impl IntoResponse {
     let id = Uuid::new_v4();
-    state.combat_sessions.insert(id, CombatSession {
+    let session = CombatSession {
         params: req,
-        created_at: Instant::now(),
-    });
-    Json(json!({"session_id": id.to_string()}))
+        created_at: Utc::now(),
+    };
+    if let Err(e) = state.session_repo.save_session(id, session).await {
+        eprintln!("[session] failed to save combat session {id}: {e}");
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "failed to create session"}))).into_response();
+    }
+    Json(json!({"session_id": id.to_string()})).into_response()
 }
 
 // ── Session integrity anchor ───────────────────────────────────────────────

@@ -15,6 +15,7 @@ use mercs_server::repository::{
     SectionRecord, SectionRepository, PostgresSectionRepository,
     OccupationStatus, RedisSectorStateRepository, SectorState, SectorStateRepository,
     DeploymentTimer, RedisTimerRepository, TimerRepository, TimerType,
+    CombatSession, RedisSessionStateRepository, SessionStateRepository,
 };
 
 async fn test_pool() -> Option<sqlx::PgPool> {
@@ -728,4 +729,92 @@ async fn timer_repository_redis_is_correct() {
     conn.zrem::<_, _, ()>("timers:global", timer_a_id.to_string())
         .await
         .expect("ZREM timers:global cleanup failed");
+}
+
+#[tokio::test]
+async fn session_state_repository_redis_is_correct() {
+    let url = match std::env::var("TEST_REDIS_URL").ok() {
+        Some(u) => u,
+        None => {
+            eprintln!("TEST_REDIS_URL not set — skipping Redis session integration test");
+            return;
+        }
+    };
+
+    let client = redis::Client::open(url).expect("Invalid TEST_REDIS_URL");
+    let mgr = redis::aio::ConnectionManager::new(client)
+        .await
+        .expect("Failed to connect to Redis");
+    let repo = RedisSessionStateRepository::new(mgr.clone());
+
+    let session_id = uuid::Uuid::new_v4();
+
+    // 1. Build a CombatSession with a minimal CombatResolveRequest.
+    use sim_engine::types::{ArmorTag, CombatWeapon, Section, Vehicle, WeaponTag};
+    let section = Section {
+        id:               "test_section".into(),
+        name:             "Test Rifles".into(),
+        max_strength:     4,
+        current_strength: 4,
+        individual_hp:    10,
+        accuracy:         60,
+        evasion:          10,
+        weapon: CombatWeapon {
+            name:     "Rifle".into(),
+            ap:       2,
+            base_damage: 5,
+            tag:      WeaponTag::Slug,
+            accuracy: 0,
+        },
+        armor_at:  0,
+        armor_tag: ArmorTag::Unarmored,
+    };
+    let vehicle = Vehicle {
+        id:       "test_vehicle".into(),
+        name:     "Test Truck".into(),
+        hp:       50,
+        max_hp:   50,
+        at:       2,
+        armor_tag: ArmorTag::LightArmor,
+        evasion:  5,
+        weapons:  vec![],
+    };
+    let req = mercs_server::api_types::CombatResolveRequest {
+        section,
+        vehicle,
+        max_ticks:                  Some(10),
+        seed_override:              Some(42),
+        combat_initiation_type:     None,
+        defending_convoy_vehicles:  None,
+        commander:                  None,
+    };
+    let session = CombatSession {
+        params:     req,
+        created_at: chrono::Utc::now(),
+    };
+
+    // 2. save_session — assert Ok.
+    repo.save_session(session_id, session).await.expect("save_session failed");
+
+    // 3. get_session — assert Some; assert created_at is populated.
+    let fetched = repo.get_session(session_id).await
+        .expect("get_session error")
+        .expect("get_session returned None");
+    assert!(fetched.created_at.timestamp() > 0, "created_at must be a real timestamp");
+
+    // 4. consume_session — assert Some (session is returned and removed).
+    let consumed = repo.consume_session(session_id).await
+        .expect("consume_session error")
+        .expect("consume_session returned None");
+    assert_eq!(consumed.params.seed_override, Some(42));
+
+    // 5. get_session — assert None (gone after consume).
+    let after_consume = repo.get_session(session_id).await
+        .expect("get_session error after consume");
+    assert!(after_consume.is_none(), "session must be None after consume");
+
+    // 6. consume_session again — assert None (idempotent, not an error).
+    let double_consume = repo.consume_session(session_id).await
+        .expect("second consume_session must not error");
+    assert!(double_consume.is_none(), "second consume must return None");
 }

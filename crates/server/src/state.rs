@@ -1,10 +1,7 @@
 #![allow(unused)]
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
 use dashmap::DashMap;
-use uuid::Uuid;
-use crate::api_types::CombatResolveRequest;
 use crate::config::Config;
 use crate::repository::{
     AccountRepository, InMemoryAccountRepository,
@@ -13,13 +10,11 @@ use crate::repository::{
     MembershipRepository, InMemoryMembershipRepository,
     SectionRepository, InMemorySectionRepository,
     SectorStateRepository, InMemorySectorStateRepository,
+    SessionStateRepository, InMemorySessionStateRepository,
     TimerRepository, InMemoryTimerRepository,
 };
 
-pub struct CombatSession {
-    pub params: CombatResolveRequest,
-    pub created_at: Instant,
-}
+pub use crate::repository::CombatSession;
 
 pub struct PendingChallenge {
     /// The full challenge string the client must sign.
@@ -29,7 +24,7 @@ pub struct PendingChallenge {
 }
 
 pub struct AppState {
-    pub combat_sessions: DashMap<Uuid, CombatSession>,
+    pub session_repo:   Arc<dyn SessionStateRepository + Send + Sync>,
     pub log_dir: PathBuf,
     /// Active 2-hour sessions, keyed by token_id.
     pub sessions: DashMap<String, shared::SessionToken>,
@@ -55,7 +50,7 @@ pub struct AppState {
 impl AppState {
     pub fn new(log_dir: PathBuf, config: Arc<Config>) -> Self {
         Self {
-            combat_sessions:    DashMap::new(),
+            session_repo:        Arc::new(InMemorySessionStateRepository::new()),
             log_dir,
             sessions:           DashMap::new(),
             pending_challenges: DashMap::new(),

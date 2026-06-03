@@ -29,7 +29,7 @@ pub struct MissionResolveRequest {
     pub seed_override: Option<u32>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CombatResolveRequest {
     pub section: Section,
     pub vehicle: Vehicle,

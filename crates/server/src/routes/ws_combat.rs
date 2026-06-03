@@ -1,6 +1,5 @@
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use axum::{
     extract::{
@@ -33,13 +32,19 @@ pub async fn ws_stream_handler(
     Path(session_id): Path<Uuid>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let session = match state.combat_sessions.remove(&session_id) {
-        Some((_, s)) => s,
-        None => return StatusCode::NOT_FOUND.into_response(),
+    let session = match state.session_repo.consume_session(session_id).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            eprintln!("[session] consume_session error for {session_id}: {e}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
     };
 
     let stale_secs = state.config.server.combat_session_stale_secs;
-    if session.created_at.elapsed() > Duration::from_secs(stale_secs) {
+    if Utc::now().signed_duration_since(session.created_at)
+        > chrono::Duration::seconds(stale_secs as i64)
+    {
         return StatusCode::GONE.into_response();
     }
 
