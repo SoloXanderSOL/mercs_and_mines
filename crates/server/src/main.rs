@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use sqlx::postgres::PgPoolOptions;
 use mercs_server::config::Config;
+use mercs_server::lifecycle::run_sector_lifecycle_task;
 use mercs_server::repository::{
     PostgresAccountRepository, PostgresCampaignRepository,
     PostgresCommanderRepository, PostgresInputLogRepository,
@@ -61,6 +62,9 @@ async fn main() {
     state.pool  = Some(pool);
     state.redis = Some(redis_mgr);
     let state = Arc::new(state);
+
+    let lifecycle_repo = Arc::clone(&state.campaign_repo);
+    tokio::spawn(run_sector_lifecycle_task(lifecycle_repo));
 
     let app = mercs_server::routes::router(state);
     let listener = tokio::net::TcpListener::bind(&bind_addr)

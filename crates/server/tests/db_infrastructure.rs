@@ -934,6 +934,53 @@ async fn input_log_is_append_only_and_queryable() {
 }
 
 #[tokio::test]
+async fn sector_lifecycle_task_transitions_active_to_ending() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => {
+            eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test");
+            return;
+        }
+    };
+
+    let repo = PostgresCampaignRepository::new(pool.clone());
+
+    // Insert a campaign, set it Active, then backdate ends_at by 1 hour.
+    let params = NewCampaignInstance {
+        sector_id: uuid::Uuid::new_v4(),
+        map_seed:  0xDEAD_CAFE_i64,
+    };
+    let campaign = repo.create_campaign(&params).await.expect("create failed");
+    repo.update_sector_state(campaign.campaign_id, CampaignLifecycle::Active).await
+        .expect("transition to Active failed");
+    sqlx::query("UPDATE campaign_instances SET ends_at = $1 WHERE campaign_id = $2")
+        .bind(chrono::Utc::now() - chrono::Duration::hours(1))
+        .bind(campaign.campaign_id)
+        .execute(&pool)
+        .await
+        .expect("ends_at backdate failed");
+
+    // Run one poll cycle — should detect expired ends_at and transition to Ending.
+    mercs_server::lifecycle::poll_lifecycle_once(&repo).await;
+
+    let updated = repo.get_campaign(campaign.campaign_id).await
+        .expect("get failed")
+        .expect("not found");
+    assert_eq!(
+        updated.state,
+        CampaignLifecycle::Ending,
+        "Active campaign with expired ends_at must transition to Ending after poll"
+    );
+
+    // Post-test cleanup.
+    sqlx::query("DELETE FROM campaign_instances WHERE campaign_id = $1")
+        .bind(campaign.campaign_id)
+        .execute(&pool)
+        .await
+        .expect("post-test cleanup failed");
+}
+
+#[tokio::test]
 async fn sha256_integrity_matches_db_reconstruction() {
     let pool = match test_pool().await {
         Some(p) => p,

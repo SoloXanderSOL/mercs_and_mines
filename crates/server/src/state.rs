@@ -34,7 +34,7 @@ pub struct AppState {
     /// One-time use — removed on verify.
     pub pending_challenges: DashMap<String, PendingChallenge>,
     pub account_repo:    Arc<dyn AccountRepository>,
-    pub campaign_repo:   Arc<dyn CampaignRepository>,
+    pub campaign_repo:   Arc<dyn CampaignRepository + Send + Sync>,
     pub commander_repo:  Arc<dyn CommanderRepository>,
     pub membership_repo: Arc<dyn MembershipRepository>,
     pub section_repo:    Arc<dyn SectionRepository>,
