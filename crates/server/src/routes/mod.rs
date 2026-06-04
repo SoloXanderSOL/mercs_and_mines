@@ -384,12 +384,12 @@ async fn get_session_integrity(
     State(state): State<Arc<AppState>>,
     Path(raw_id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
-    uuid::Uuid::parse_str(&raw_id)
+    let session_id = uuid::Uuid::parse_str(&raw_id)
         .map_err(|_| bad_request("session_id must be a valid UUID"))?;
 
     let integrity = crate::integrity::compute_session_integrity(
-        &state.log_dir,
-        &raw_id,
+        state.input_log_repo.as_ref(),
+        session_id,
     )
     .await
     .map_err(|e| bad_request(format!("Could not compute integrity: {e}")))?;

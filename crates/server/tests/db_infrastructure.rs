@@ -5,6 +5,7 @@
 ///
 /// Skipped automatically when TEST_DATABASE_URL is absent so that plain
 /// `cargo test` continues to work without a database.
+use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPoolOptions;
 use mercs_server::repository::{
     AccountRepository, GcnLedgerEntry, PlayerAccount, PlayerProfile, PostgresAccountRepository,
@@ -922,6 +923,102 @@ async fn input_log_is_append_only_and_queryable() {
     assert!(delete_attempt.is_err(), "DELETE must be blocked by the immutability trigger");
 
     // Post-test cleanup: disable triggers to allow deletion.
+    sqlx::query("ALTER TABLE input_logs DISABLE TRIGGER ALL")
+        .execute(&pool).await.expect("disable triggers for cleanup failed");
+    sqlx::query("DELETE FROM input_logs WHERE session_id = $1")
+        .bind(session_id).execute(&pool).await.expect("post-test input_logs cleanup failed");
+    sqlx::query("ALTER TABLE input_logs ENABLE TRIGGER ALL")
+        .execute(&pool).await.expect("re-enable triggers after cleanup failed");
+    sqlx::query("DELETE FROM session_configs WHERE session_id = $1")
+        .bind(session_id).execute(&pool).await.expect("post-test session_configs cleanup failed");
+}
+
+#[tokio::test]
+async fn sha256_integrity_matches_db_reconstruction() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => {
+            eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test");
+            return;
+        }
+    };
+
+    let repo = PostgresInputLogRepository::new(pool.clone());
+    let session_id = uuid::Uuid::new_v4();
+
+    // Pre-test cleanup: session_configs has no immutability trigger.
+    // Fresh UUID means no prior input_logs rows — no trigger manipulation needed.
+    sqlx::query("DELETE FROM session_configs WHERE session_id = $1")
+        .bind(session_id).execute(&pool).await.expect("pre-test session_configs cleanup failed");
+
+    let config = shared::SessionConfig {
+        session_id:    session_id.to_string(),
+        build_version: "0.1.0".into(),
+        seed:          0xABCD_1234_5678_EF90_u64,
+        sector_id:     "integrity_sector".into(),
+        campaign_id:   "integrity_campaign".into(),
+        sector_tier:   "Hostile".into(),
+        ruleset:       "standard_v1".into(),
+    };
+    repo.save_session_config(&config).await.expect("save_session_config failed");
+
+    // Append entries in non-sequential order to exercise the ordering guarantee.
+    let entry_tick2 = shared::InputLogEntry {
+        tick: 2, seq: 0,
+        event_type: "combat_end".into(),
+        player_id: None,
+        payload: serde_json::json!({"outcome": "victory"}),
+        narrative_event: None,
+    };
+    let entry_tick1_seq0 = shared::InputLogEntry {
+        tick: 1, seq: 0,
+        event_type: "player_action".into(),
+        player_id: Some("wallet_integrity".into()),
+        payload: serde_json::json!({"action": "fire"}),
+        narrative_event: Some("Unit fired at target.".into()),
+    };
+    let entry_tick1_seq1 = shared::InputLogEntry {
+        tick: 1, seq: 1,
+        event_type: "server_decision".into(),
+        player_id: None,
+        payload: serde_json::json!({"roll": 42}),
+        narrative_event: None,
+    };
+
+    // Append in deliberately scrambled order.
+    repo.append_entry(&session_id, &entry_tick2).await.expect("append tick=2 failed");
+    repo.append_entry(&session_id, &entry_tick1_seq0).await.expect("append tick=1 seq=0 failed");
+    repo.append_entry(&session_id, &entry_tick1_seq1).await.expect("append tick=1 seq=1 failed");
+
+    // Compute expected hash locally: config header + entries sorted (tick ASC, seq ASC).
+    let ordered = [&entry_tick1_seq0, &entry_tick1_seq1, &entry_tick2];
+    let mut expected_buf = Vec::new();
+    let header_line = serde_json::to_string(&config).expect("serialize config failed");
+    expected_buf.extend_from_slice(header_line.as_bytes());
+    expected_buf.extend_from_slice(b"\n");
+    for entry in &ordered {
+        let line = serde_json::to_string(entry).expect("serialize entry failed");
+        expected_buf.extend_from_slice(line.as_bytes());
+        expected_buf.extend_from_slice(b"\n");
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(&expected_buf);
+    let expected_hash = hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect::<String>();
+
+    // Compute via DB reconstruction path.
+    let integrity = mercs_server::integrity::compute_session_integrity(&repo, session_id)
+        .await
+        .expect("compute_session_integrity failed");
+
+    assert_eq!(
+        integrity.log_hash, expected_hash,
+        "DB-reconstructed hash must match locally computed hash"
+    );
+    assert_eq!(integrity.session_id, config.session_id);
+    assert_eq!(integrity.seed, config.seed);
+    assert_eq!(integrity.build_version, config.build_version);
+
+    // Post-test cleanup.
     sqlx::query("ALTER TABLE input_logs DISABLE TRIGGER ALL")
         .execute(&pool).await.expect("disable triggers for cleanup failed");
     sqlx::query("DELETE FROM input_logs WHERE session_id = $1")

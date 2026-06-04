@@ -1,6 +1,7 @@
-use std::path::Path;
 use sha2::{Sha256, Digest};
-use tokio::io::AsyncReadExt;
+use uuid::Uuid;
+
+use crate::repository::{InputLogRepository, RepositoryError};
 
 pub struct SessionIntegrity {
     pub session_id:    String,
@@ -9,29 +10,30 @@ pub struct SessionIntegrity {
     pub log_hash:      String,
 }
 
-/// Reads the completed session log, parses the SessionConfig header for
-/// metadata, and computes a SHA-256 digest of the full file contents.
-/// The file is read once into memory — log files are bounded in size
-/// (one NDJSON line per tick; a 50-tick session is a few KB).
+/// Reconstructs the session byte sequence from the DB (config header + ordered entries),
+/// then computes a SHA-256 digest. Byte-identical to the .ndjson file format written by
+/// SessionLogWriter: serde_json::to_string(&record) + "\n" per line.
 pub async fn compute_session_integrity(
-    log_dir:    &Path,
-    session_id: &str,
-) -> std::io::Result<SessionIntegrity> {
-    let path = log_dir.join(format!("{}.ndjson", session_id));
-    let mut file = tokio::fs::File::open(&path).await?;
+    repo: &(dyn InputLogRepository + Send + Sync),
+    session_id: Uuid,
+) -> Result<SessionIntegrity, RepositoryError> {
+    let config = repo.get_session_config(&session_id).await?
+        .ok_or(RepositoryError::NotFound)?;
+
+    let entries = repo.get_entries_by_session(&session_id).await?;
 
     let mut buf = Vec::new();
-    file.read_to_end(&mut buf).await?;
+    let header = serde_json::to_string(&config)
+        .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+    buf.extend_from_slice(header.as_bytes());
+    buf.extend_from_slice(b"\n");
+    for entry in &entries {
+        let line = serde_json::to_string(entry)
+            .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        buf.extend_from_slice(line.as_bytes());
+        buf.extend_from_slice(b"\n");
+    }
 
-    // Parse SessionConfig from the first line — contains seed + build_version.
-    let first_line = buf
-        .split(|&b| b == b'\n')
-        .next()
-        .ok_or_else(|| io_err("log file is empty"))?;
-    let config: shared::SessionConfig = serde_json::from_slice(first_line)
-        .map_err(io_data_err)?;
-
-    // Hash the full file (header + all InputLogEntry lines).
     let mut hasher = Sha256::new();
     hasher.update(&buf);
     let log_hash = hasher
@@ -46,12 +48,4 @@ pub async fn compute_session_integrity(
         build_version: config.build_version,
         log_hash,
     })
-}
-
-fn io_err(msg: &str) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::InvalidData, msg)
-}
-
-fn io_data_err(e: impl std::error::Error + Send + Sync + 'static) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::InvalidData, e)
 }
