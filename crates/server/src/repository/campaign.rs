@@ -57,6 +57,22 @@ impl VictoryTickerType {
             Self::TrashKhansHorde      => "TRASH_KHANS_HORDE",
         }
     }
+
+    /// Returns all 10 variants in enum-declaration order.
+    pub fn variants() -> [Self; 10] {
+        [
+            Self::MilitaryDominance,
+            Self::OneWorldGunvernment,
+            Self::SqueakingProphets,
+            Self::VoidCallers,
+            Self::JumpLaneRestorers,
+            Self::SingularitySeekers,
+            Self::CapitalistDomination,
+            Self::GrandSyndicate,
+            Self::EmperorBobMovement,
+            Self::TrashKhansHorde,
+        ]
+    }
 }
 
 // ── Campaign instance record ─────────────────────────────────────────────────
@@ -364,5 +380,24 @@ impl CampaignRepository for InMemoryCampaignRepository {
         _victory_tickers: serde_json::Value,
     ) -> Result<(), sqlx::Error> {
         unimplemented!("InMemoryCampaignRepository is a unit-test stub only")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn victory_ticker_variants_covers_all_ten() {
+        let variants = VictoryTickerType::variants();
+        assert_eq!(variants.len(), 10);
+        for v in &variants {
+            assert!(!v.as_json_key().is_empty());
+        }
+        let keys: Vec<_> = variants.iter().map(|v| v.as_json_key()).collect();
+        let mut deduped = keys.clone();
+        deduped.sort_unstable();
+        deduped.dedup();
+        assert_eq!(keys.len(), deduped.len(), "duplicate keys found");
     }
 }
