@@ -1061,6 +1061,67 @@ async fn activate_campaign_is_idempotent() {
 }
 
 #[tokio::test]
+async fn campaign_scoped_log_entry_roundtrips() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => {
+            eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test");
+            return;
+        }
+    };
+
+    let repo = PostgresInputLogRepository::new(pool.clone());
+    let campaign_id = uuid::Uuid::new_v4();
+
+    // Step 1: append a campaign-scoped entry (no real campaign_instances row needed —
+    // input_logs.campaign_id has no FK constraint).
+    let entry = shared::InputLogEntry {
+        tick: 1,
+        seq: 0,
+        event_type: "campaign_started".into(),
+        player_id: None,
+        payload: serde_json::json!({}),
+        narrative_event: None,
+    };
+    repo.append_campaign_entry(&campaign_id, &entry)
+        .await
+        .expect("append_campaign_entry failed");
+
+    // Step 2: read back via direct query.
+    let row = sqlx::query!(
+        r#"SELECT session_id, campaign_id, event_type
+           FROM input_logs
+           WHERE campaign_id = $1"#,
+        campaign_id,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("fetch row failed");
+
+    // Step 3: assert fields.
+    assert!(row.session_id.is_none(), "session_id must be NULL for a campaign-scoped entry");
+    assert_eq!(row.campaign_id, Some(campaign_id), "campaign_id must match");
+    assert_eq!(row.event_type, "campaign_started");
+
+    // Step 4: immutability trigger must reject UPDATE.
+    let tamper = sqlx::query(
+        "UPDATE input_logs SET event_type = 'tampered' WHERE campaign_id = $1"
+    )
+    .bind(campaign_id)
+    .execute(&pool)
+    .await;
+    assert!(tamper.is_err(), "UPDATE must be blocked by the immutability trigger");
+
+    // Post-test cleanup: disable triggers to bypass immutability.
+    sqlx::query("ALTER TABLE input_logs DISABLE TRIGGER ALL")
+        .execute(&pool).await.expect("disable triggers for cleanup failed");
+    sqlx::query("DELETE FROM input_logs WHERE campaign_id = $1")
+        .bind(campaign_id).execute(&pool).await.expect("post-test input_logs cleanup failed");
+    sqlx::query("ALTER TABLE input_logs ENABLE TRIGGER ALL")
+        .execute(&pool).await.expect("re-enable triggers after cleanup failed");
+}
+
+#[tokio::test]
 async fn sha256_integrity_matches_db_reconstruction() {
     let pool = match test_pool().await {
         Some(p) => p,

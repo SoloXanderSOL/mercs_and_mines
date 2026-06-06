@@ -7,7 +7,7 @@ use super::RepositoryError;
 #[derive(Debug, sqlx::FromRow)]
 pub struct InputLogRow {
     pub log_id:          Uuid,
-    pub session_id:      Uuid,
+    pub session_id:      Option<Uuid>,
     pub tick:            i64,
     pub seq:             i64,
     pub event_type:      String,
@@ -52,6 +52,12 @@ pub trait InputLogRepository: Send + Sync {
         &self,
         session_id: &Uuid,
     ) -> Result<Option<shared::SessionConfig>, RepositoryError>;
+
+    async fn append_campaign_entry(
+        &self,
+        campaign_id: &Uuid,
+        entry: &shared::InputLogEntry,
+    ) -> Result<(), RepositoryError>;
 }
 
 // ── Postgres implementation ───────────────────────────────────────────────────
@@ -168,20 +174,46 @@ impl InputLogRepository for PostgresInputLogRepository {
             ruleset:       r.ruleset,
         }))
     }
+
+    async fn append_campaign_entry(
+        &self,
+        campaign_id: &Uuid,
+        entry: &shared::InputLogEntry,
+    ) -> Result<(), RepositoryError> {
+        sqlx::query!(
+            r#"
+            INSERT INTO input_logs (session_id, campaign_id, tick, seq, event_type, player_id, payload, narrative_event)
+            VALUES (NULL, $1, $2, $3, $4, $5, $6, $7)
+            "#,
+            campaign_id,
+            entry.tick as i64,
+            entry.seq as i64,
+            entry.event_type,
+            entry.player_id.as_deref(),
+            entry.payload.clone() as serde_json::Value,
+            entry.narrative_event.as_deref(),
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        Ok(())
+    }
 }
 
 // ── In-memory implementation ──────────────────────────────────────────────────
 
 pub struct InMemoryInputLogRepository {
-    entries: DashMap<Uuid, Vec<shared::InputLogEntry>>,
-    configs: DashMap<Uuid, shared::SessionConfig>,
+    entries:          DashMap<Uuid, Vec<shared::InputLogEntry>>,
+    configs:          DashMap<Uuid, shared::SessionConfig>,
+    campaign_entries: DashMap<Uuid, Vec<shared::InputLogEntry>>,
 }
 
 impl InMemoryInputLogRepository {
     pub fn new() -> Self {
         Self {
-            entries: DashMap::new(),
-            configs: DashMap::new(),
+            entries:          DashMap::new(),
+            configs:          DashMap::new(),
+            campaign_entries: DashMap::new(),
         }
     }
 }
@@ -219,5 +251,14 @@ impl InputLogRepository for InMemoryInputLogRepository {
         session_id: &Uuid,
     ) -> Result<Option<shared::SessionConfig>, RepositoryError> {
         Ok(self.configs.get(session_id).map(|v| v.clone()))
+    }
+
+    async fn append_campaign_entry(
+        &self,
+        campaign_id: &Uuid,
+        entry: &shared::InputLogEntry,
+    ) -> Result<(), RepositoryError> {
+        self.campaign_entries.entry(*campaign_id).or_default().push(entry.clone());
+        Ok(())
     }
 }
