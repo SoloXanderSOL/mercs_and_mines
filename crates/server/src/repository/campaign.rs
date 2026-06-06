@@ -119,6 +119,15 @@ pub trait CampaignRepository: Send + Sync {
         &self,
         state: CampaignLifecycle,
     ) -> Result<Vec<CampaignInstance>, sqlx::Error>;
+
+    /// Transition a Pending campaign to Active, setting ends_at and initializing victory_tickers.
+    /// Idempotent: if the campaign is already Active the UPDATE matches 0 rows and returns Ok(()).
+    async fn activate_campaign(
+        &self,
+        campaign_id: Uuid,
+        ends_at: DateTime<Utc>,
+        victory_tickers: serde_json::Value,
+    ) -> Result<(), sqlx::Error>;
 }
 
 // ── Postgres implementation ──────────────────────────────────────────────────
@@ -264,6 +273,32 @@ impl CampaignRepository for PostgresCampaignRepository {
         .fetch_all(&self.pool)
         .await
     }
+
+    async fn activate_campaign(
+        &self,
+        campaign_id: Uuid,
+        ends_at: DateTime<Utc>,
+        victory_tickers: serde_json::Value,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query!(
+            r#"UPDATE campaign_instances
+               SET state            = $1,
+                   ends_at          = $2,
+                   victory_tickers  = $3,
+                   started_at       = now(),
+                   updated_at       = now()
+               WHERE campaign_id = $4
+                 AND state       = $5"#,
+            CampaignLifecycle::Active  as CampaignLifecycle,
+            ends_at,
+            victory_tickers            as serde_json::Value,
+            campaign_id,
+            CampaignLifecycle::Pending as CampaignLifecycle,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 }
 
 // ── In-memory stub (unit-test contexts) ─────────────────────────────────────
@@ -319,6 +354,15 @@ impl CampaignRepository for InMemoryCampaignRepository {
         &self,
         _state: CampaignLifecycle,
     ) -> Result<Vec<CampaignInstance>, sqlx::Error> {
+        unimplemented!("InMemoryCampaignRepository is a unit-test stub only")
+    }
+
+    async fn activate_campaign(
+        &self,
+        _campaign_id: Uuid,
+        _ends_at: DateTime<Utc>,
+        _victory_tickers: serde_json::Value,
+    ) -> Result<(), sqlx::Error> {
         unimplemented!("InMemoryCampaignRepository is a unit-test stub only")
     }
 }

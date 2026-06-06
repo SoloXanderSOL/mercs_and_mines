@@ -981,6 +981,86 @@ async fn sector_lifecycle_task_transitions_active_to_ending() {
 }
 
 #[tokio::test]
+async fn activate_campaign_is_idempotent() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => {
+            eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test");
+            return;
+        }
+    };
+
+    let repo = PostgresCampaignRepository::new(pool.clone());
+
+    // 1. Create a Pending campaign.
+    let params = NewCampaignInstance {
+        sector_id: uuid::Uuid::new_v4(),
+        map_seed:  0xC0FFEE_i64,
+    };
+    let campaign = repo.create_campaign(&params).await.expect("create failed");
+    let campaign_id = campaign.campaign_id;
+
+    // 2. Build victory_tickers with all 10 variants at 0.0.
+    let mut ticker_map = serde_json::Map::new();
+    for variant in [
+        VictoryTickerType::MilitaryDominance,
+        VictoryTickerType::OneWorldGunvernment,
+        VictoryTickerType::SqueakingProphets,
+        VictoryTickerType::VoidCallers,
+        VictoryTickerType::JumpLaneRestorers,
+        VictoryTickerType::SingularitySeekers,
+        VictoryTickerType::CapitalistDomination,
+        VictoryTickerType::GrandSyndicate,
+        VictoryTickerType::EmperorBobMovement,
+        VictoryTickerType::TrashKhansHorde,
+    ] {
+        ticker_map.insert(variant.as_json_key().to_string(), serde_json::Value::from(0.0_f64));
+    }
+    let tickers = serde_json::Value::Object(ticker_map);
+
+    // 3. First call — happy path: Pending → Active.
+    let ends_at = chrono::Utc::now() + chrono::Duration::days(90);
+    repo.activate_campaign(campaign_id, ends_at, tickers.clone()).await
+        .expect("activate_campaign (first call) failed");
+
+    let after_first = repo.get_campaign(campaign_id).await
+        .expect("get_campaign error")
+        .expect("campaign not found after first activate");
+    assert_eq!(after_first.state, CampaignLifecycle::Active, "state must be Active after first call");
+    assert!(after_first.ends_at.is_some(), "ends_at must be set after first call");
+    let ticker_obj = after_first.victory_tickers.as_object().expect("victory_tickers must be an object");
+    assert_eq!(ticker_obj.len(), 10, "all 10 tickers must be present");
+    for val in ticker_obj.values() {
+        assert!(
+            (val.as_f64().expect("ticker value must be f64") - 0.0_f64).abs() < f64::EPSILON,
+            "all ticker values must be 0.0"
+        );
+    }
+
+    // 4. Second call — idempotency: Active campaign is not overwritten.
+    let different_ends_at = chrono::Utc::now() + chrono::Duration::days(1);
+    repo.activate_campaign(campaign_id, different_ends_at, tickers).await
+        .expect("activate_campaign (second call) must not error");
+
+    let after_second = repo.get_campaign(campaign_id).await
+        .expect("get_campaign error")
+        .expect("campaign not found after second activate");
+    assert_eq!(after_second.state, CampaignLifecycle::Active, "state must still be Active");
+    // ends_at must still reflect the ~90-day value, not the ~1-day value from the second call.
+    assert!(
+        after_second.ends_at.unwrap() > chrono::Utc::now() + chrono::Duration::days(80),
+        "ends_at must not be overwritten by the second activate call"
+    );
+
+    // 5. Post-test cleanup.
+    sqlx::query("DELETE FROM campaign_instances WHERE campaign_id = $1")
+        .bind(campaign_id)
+        .execute(&pool)
+        .await
+        .expect("post-test cleanup failed");
+}
+
+#[tokio::test]
 async fn sha256_integrity_matches_db_reconstruction() {
     let pool = match test_pool().await {
         Some(p) => p,
