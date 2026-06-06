@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::f64::consts::PI;
 use sim_engine::rng::Rng;
+use uuid::Uuid;
+use tracing;
 
 pub const MAP_RADIUS_HEXES: u32 = 35;
 pub const SAFE_ZONE_RADIUS: u32 = 5;
@@ -70,6 +72,161 @@ pub struct SectorMap {
     pub terrain: HashMap<String, HexTerrain>,
     pub magma_veins: Vec<MagmaVeinNode>,
     pub safe_zone: SafeZoneLayout,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SpawnType {
+    SoloQueue,
+    CorporateCharter { charter_id: Uuid },
+}
+
+#[derive(Debug, Clone)]
+pub struct PlayerSpawnRequest {
+    pub wallet_address: Vec<u8>,
+    pub spawn_type: SpawnType,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GatewayAssignment {
+    pub wallet_address: Vec<u8>,
+    pub q: i32,
+    pub r: i32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum Quadrant {
+    NE,
+    SE,
+    SW,
+    NW,
+}
+
+fn classify_quadrant(q: i32, r: i32) -> Quadrant {
+    if q > 0 && r <= 0 {
+        Quadrant::NE
+    } else if q >= 0 && r > 0 {
+        Quadrant::SE
+    } else if q < 0 && r >= 0 {
+        Quadrant::SW
+    } else {
+        Quadrant::NW
+    }
+}
+
+fn next_quadrant_clockwise(q: Quadrant) -> Quadrant {
+    match q {
+        Quadrant::NE => Quadrant::SE,
+        Quadrant::SE => Quadrant::SW,
+        Quadrant::SW => Quadrant::NW,
+        Quadrant::NW => Quadrant::NE,
+    }
+}
+
+/// Assigns a gateway rim hex to each player. Solo players get a uniform random draw.
+/// Charter groups are placed together in one quadrant with minimum 3-hex axial separation;
+/// overflow spills clockwise to the next quadrant.
+pub fn assign_gateway_hexes(
+    safe_zone: &SafeZoneLayout,
+    players: &[PlayerSpawnRequest],
+    rng: &mut Rng,
+) -> Vec<GatewayAssignment> {
+    // rim_hexes is non-empty for any valid SafeZoneLayout with SAFE_ZONE_RADIUS = 5
+    let rim = &safe_zone.rim_hexes;
+    let mut results: Vec<GatewayAssignment> = Vec::new();
+
+    let mut solo_players: Vec<&PlayerSpawnRequest> = Vec::new();
+    let mut charter_groups: HashMap<Uuid, Vec<&PlayerSpawnRequest>> = HashMap::new();
+
+    for player in players {
+        match &player.spawn_type {
+            SpawnType::SoloQueue => solo_players.push(player),
+            SpawnType::CorporateCharter { charter_id } => {
+                charter_groups.entry(*charter_id).or_default().push(player);
+            }
+        }
+    }
+
+    for player in &solo_players {
+        let idx = rng.roll_int(0, rim.len() as u32 - 1) as usize;
+        results.push(GatewayAssignment {
+            wallet_address: player.wallet_address.clone(),
+            q: rim[idx].0,
+            r: rim[idx].1,
+        });
+    }
+
+    for (charter_id, members) in &charter_groups {
+        let q_idx = rng.roll_int(0, 3);
+        let mut current_quadrant = match q_idx {
+            0 => Quadrant::NE,
+            1 => Quadrant::SE,
+            2 => Quadrant::SW,
+            _ => Quadrant::NW,
+        };
+        let mut quadrant_hexes: Vec<(i32, i32)> = rim
+            .iter()
+            .copied()
+            .filter(|&(q, r)| classify_quadrant(q, r) == current_quadrant)
+            .collect();
+        let mut assigned: Vec<(i32, i32)> = Vec::new();
+
+        for member in members {
+            let valid: Vec<(i32, i32)> = quadrant_hexes
+                .iter()
+                .copied()
+                .filter(|&(hq, hr)| {
+                    !assigned.contains(&(hq, hr))
+                        && assigned
+                            .iter()
+                            .all(|&(aq, ar)| hex_axial_distance(hq, hr, aq, ar) >= 3)
+                })
+                .collect();
+
+            let chosen = if !valid.is_empty() {
+                let idx = rng.roll_int(0, valid.len() as u32 - 1) as usize;
+                valid[idx]
+            } else {
+                current_quadrant = next_quadrant_clockwise(current_quadrant);
+                quadrant_hexes = rim
+                    .iter()
+                    .copied()
+                    .filter(|&(q, r)| classify_quadrant(q, r) == current_quadrant)
+                    .collect();
+                tracing::warn!(
+                    "Charter {:?} spilling to adjacent quadrant — insufficient valid \
+                     hexes with 3-hex separation in starting quadrant",
+                    charter_id
+                );
+                let valid2: Vec<(i32, i32)> = quadrant_hexes
+                    .iter()
+                    .copied()
+                    .filter(|&(hq, hr)| {
+                        !assigned.contains(&(hq, hr))
+                            && assigned
+                                .iter()
+                                .all(|&(aq, ar)| hex_axial_distance(hq, hr, aq, ar) >= 3)
+                    })
+                    .collect();
+                if !valid2.is_empty() {
+                    let idx = rng.roll_int(0, valid2.len() as u32 - 1) as usize;
+                    valid2[idx]
+                } else {
+                    *rim.iter()
+                        .find(|&&hex| !assigned.contains(&hex))
+                        .unwrap_or(&rim[0])
+                }
+            };
+
+            assigned.push(chosen);
+            results.push(GatewayAssignment {
+                wallet_address: member.wallet_address.clone(),
+                q: chosen.0,
+                r: chosen.1,
+            });
+        }
+    }
+
+    results
 }
 
 /// Axial distance between two hex coordinates using cube coordinate formula.
@@ -300,6 +457,11 @@ pub fn generate_sector_map(seed: u32, radius: u32) -> SectorMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uuid::Uuid;
+
+    fn test_safe_zone() -> SafeZoneLayout {
+        generate_sector_map(42, MAP_RADIUS_HEXES).safe_zone
+    }
 
     #[test]
     fn test_determinism() {
@@ -463,5 +625,113 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_solo_queue_lands_on_rim_hex() {
+        let safe_zone = test_safe_zone();
+        let players = vec![PlayerSpawnRequest {
+            wallet_address: vec![1, 2, 3],
+            spawn_type: SpawnType::SoloQueue,
+        }];
+        let mut rng = sim_engine::rng::Rng::new(42);
+        let assignments = assign_gateway_hexes(&safe_zone, &players, &mut rng);
+        assert_eq!(assignments.len(), 1);
+        let a = &assignments[0];
+        assert!(
+            safe_zone.rim_hexes.contains(&(a.q, a.r)),
+            "assignment ({},{}) not in rim_hexes",
+            a.q, a.r
+        );
+    }
+
+    #[test]
+    fn test_charter_members_in_same_quadrant() {
+        let safe_zone = test_safe_zone();
+        let charter_id = Uuid::nil();
+        let players = vec![
+            PlayerSpawnRequest { wallet_address: vec![1], spawn_type: SpawnType::CorporateCharter { charter_id } },
+            PlayerSpawnRequest { wallet_address: vec![2], spawn_type: SpawnType::CorporateCharter { charter_id } },
+            PlayerSpawnRequest { wallet_address: vec![3], spawn_type: SpawnType::CorporateCharter { charter_id } },
+        ];
+        let mut rng = sim_engine::rng::Rng::new(42);
+        let assignments = assign_gateway_hexes(&safe_zone, &players, &mut rng);
+        assert_eq!(assignments.len(), 3);
+        let first_quadrant = super::classify_quadrant(assignments[0].q, assignments[0].r);
+        for a in &assignments {
+            assert_eq!(
+                super::classify_quadrant(a.q, a.r),
+                first_quadrant,
+                "assignment ({},{}) is in a different quadrant",
+                a.q, a.r
+            );
+        }
+    }
+
+    #[test]
+    fn test_charter_pairs_have_min_3_hex_separation() {
+        let safe_zone = test_safe_zone();
+        let charter_id = Uuid::nil();
+        let players = vec![
+            PlayerSpawnRequest { wallet_address: vec![1], spawn_type: SpawnType::CorporateCharter { charter_id } },
+            PlayerSpawnRequest { wallet_address: vec![2], spawn_type: SpawnType::CorporateCharter { charter_id } },
+            PlayerSpawnRequest { wallet_address: vec![3], spawn_type: SpawnType::CorporateCharter { charter_id } },
+            PlayerSpawnRequest { wallet_address: vec![4], spawn_type: SpawnType::CorporateCharter { charter_id } },
+        ];
+        let mut rng = sim_engine::rng::Rng::new(42);
+        let assignments = assign_gateway_hexes(&safe_zone, &players, &mut rng);
+        assert_eq!(assignments.len(), 4);
+        for i in 0..assignments.len() {
+            for j in (i + 1)..assignments.len() {
+                let a = &assignments[i];
+                let b = &assignments[j];
+                let dist = hex_axial_distance(a.q, a.r, b.q, b.r);
+                assert!(
+                    dist >= 3,
+                    "pair ({},{}) and ({},{}) have separation {} < 3",
+                    a.q, a.r, b.q, b.r, dist
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_five_member_charter_fully_placed() {
+        let safe_zone = test_safe_zone();
+        let charter_id = Uuid::nil();
+        let players: Vec<PlayerSpawnRequest> = (1u8..=5)
+            .map(|i| PlayerSpawnRequest {
+                wallet_address: vec![i],
+                spawn_type: SpawnType::CorporateCharter { charter_id },
+            })
+            .collect();
+        let mut rng = sim_engine::rng::Rng::new(42);
+        let assignments = assign_gateway_hexes(&safe_zone, &players, &mut rng);
+        assert_eq!(assignments.len(), 5, "expected 5 assignments");
+        for a in &assignments {
+            assert!(
+                safe_zone.rim_hexes.contains(&(a.q, a.r)),
+                "assignment ({},{}) not in rim_hexes",
+                a.q, a.r
+            );
+        }
+    }
+
+    #[test]
+    fn test_assign_gateway_hexes_is_deterministic() {
+        let safe_zone = test_safe_zone();
+        let charter_id = Uuid::nil();
+        let players = vec![
+            PlayerSpawnRequest { wallet_address: vec![1], spawn_type: SpawnType::SoloQueue },
+            PlayerSpawnRequest { wallet_address: vec![2], spawn_type: SpawnType::SoloQueue },
+            PlayerSpawnRequest { wallet_address: vec![3], spawn_type: SpawnType::CorporateCharter { charter_id } },
+            PlayerSpawnRequest { wallet_address: vec![4], spawn_type: SpawnType::CorporateCharter { charter_id } },
+            PlayerSpawnRequest { wallet_address: vec![5], spawn_type: SpawnType::CorporateCharter { charter_id } },
+        ];
+        let mut rng1 = sim_engine::rng::Rng::new(42);
+        let result1 = assign_gateway_hexes(&safe_zone, &players, &mut rng1);
+        let mut rng2 = sim_engine::rng::Rng::new(42);
+        let result2 = assign_gateway_hexes(&safe_zone, &players, &mut rng2);
+        assert_eq!(result1, result2);
     }
 }
