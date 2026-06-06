@@ -4,6 +4,7 @@ pub mod api_types;
 pub mod auth;
 pub mod integrity;
 pub mod lifecycle;
+pub mod map_gen;
 pub mod log_reader;
 pub mod log_writer;
 pub mod repository;
