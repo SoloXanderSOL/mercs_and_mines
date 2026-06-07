@@ -852,8 +852,8 @@ async fn input_log_is_append_only_and_queryable() {
         session_id:    session_id.to_string(),
         build_version: "0.1.0".into(),
         seed:          0xDEADBEEF_CAFEBABE_u64,
-        sector_id:     "test_sector".into(),
-        campaign_id:   "test_campaign".into(),
+        sector_id:     uuid::Uuid::new_v4(),
+        campaign_id:   uuid::Uuid::new_v4(),
         sector_tier:   "Contested".into(),
         ruleset:       "standard_v1".into(),
     };
@@ -865,7 +865,7 @@ async fn input_log_is_append_only_and_queryable() {
         .expect("get_session_config returned None");
     assert_eq!(fetched_config.session_id, config.session_id);
     assert_eq!(fetched_config.seed, config.seed, "seed must round-trip u64→i64→u64 without loss");
-    assert_eq!(fetched_config.sector_id, "test_sector");
+    assert_eq!(fetched_config.sector_id, config.sector_id);
 
     // Step 3: append three entries with distinct tick/seq.
     let entries = vec![
@@ -1150,8 +1150,8 @@ async fn sha256_integrity_matches_db_reconstruction() {
         session_id:    session_id.to_string(),
         build_version: "0.1.0".into(),
         seed:          0xABCD_1234_5678_EF90_u64,
-        sector_id:     "integrity_sector".into(),
-        campaign_id:   "integrity_campaign".into(),
+        sector_id:     uuid::Uuid::new_v4(),
+        campaign_id:   uuid::Uuid::new_v4(),
         sector_tier:   "Hostile".into(),
         ruleset:       "standard_v1".into(),
     };
@@ -1383,8 +1383,8 @@ async fn session_config_is_immutable() {
     .bind(session_id)
     .bind(0xDEADBEEF_i64)
     .bind("0.1.0")
-    .bind("test_sector")
-    .bind("test_campaign")
+    .bind(uuid::Uuid::nil())
+    .bind(uuid::Uuid::nil())
     .bind("Contested")
     .bind("standard_v1")
     .execute(&pool)

@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 pub mod hex;
 pub mod ws_events;
@@ -26,8 +27,8 @@ pub struct SessionConfig {
     pub build_version: String,
     /// Seed that initializes the session GameRng. Must be stored and replayed exactly.
     pub seed: u64,
-    pub sector_id: String,
-    pub campaign_id: String,
+    pub sector_id: Uuid,
+    pub campaign_id: Uuid,
     pub sector_tier: String,
     pub ruleset: String,
 }

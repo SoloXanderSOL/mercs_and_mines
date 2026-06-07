@@ -168,8 +168,8 @@ impl InputLogRepository for PostgresInputLogRepository {
             session_id:    r.session_id.to_string(),
             seed:          r.seed as u64,
             build_version: r.build_version,
-            sector_id:     r.sector_id,
-            campaign_id:   r.campaign_id,
+            sector_id:     r.sector_id,   // UUID column → Uuid field
+            campaign_id:   r.campaign_id, // UUID column → Uuid field
             sector_tier:   r.sector_tier,
             ruleset:       r.ruleset,
         }))

@@ -100,8 +100,8 @@ async fn handle_ws(
         session_id: session_id.to_string(),
         build_version: env!("CARGO_PKG_VERSION").to_string(),
         seed: seed as u64,
-        sector_id: "combat_session".into(),
-        campaign_id: "phase0".into(),
+        sector_id: Uuid::nil(),
+        campaign_id: Uuid::nil(),
         sector_tier: "Contested".into(),
         ruleset: "standard_v1".into(),
     };
