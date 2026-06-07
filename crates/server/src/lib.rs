@@ -1,3 +1,4 @@
+pub mod campaign_init;
 pub mod config;
 pub mod solana;
 pub mod api_types;

@@ -5,6 +5,7 @@
 ///
 /// Skipped automatically when TEST_DATABASE_URL is absent so that plain
 /// `cargo test` continues to work without a database.
+use mercs_server::campaign_init::initialize_campaign;
 use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPoolOptions;
 use mercs_server::repository::{
@@ -374,8 +375,8 @@ async fn player_campaign_membership_is_correct() {
         .expect("add_member failed");
     assert!(!membership.membership_id.is_nil(), "membership_id must not be nil");
     assert!(membership.is_active, "is_active must be true on creation");
-    assert!(membership.spawn_hex_q.is_none(), "spawn_hex_q must be None before assignment");
-    assert!(membership.spawn_hex_r.is_none(), "spawn_hex_r must be None before assignment");
+    assert!(membership.gateway_hex_q.is_none(), "gateway_hex_q must be None before assignment");
+    assert!(membership.gateway_hex_r.is_none(), "gateway_hex_r must be None before assignment");
 
     // Step 3 — get_membership: fetch by (wallet, campaign_id).
     let fetched = membership_repo
@@ -388,18 +389,18 @@ async fn player_campaign_membership_is_correct() {
     assert_eq!(fetched.wallet_address, wallet_bytes);
     assert!(fetched.is_active);
 
-    // Step 4 — assign_spawn_hex.
+    // Step 4 — assign_gateway_hex.
     membership_repo
-        .assign_spawn_hex(&wallet_bytes, campaign_id, 3, -2)
+        .assign_gateway_hex(&wallet_bytes, campaign_id, 3, -2)
         .await
-        .expect("assign_spawn_hex failed");
+        .expect("assign_gateway_hex failed");
     let after_hex = membership_repo
         .get_membership(&wallet_bytes, campaign_id)
         .await
         .expect("get_membership error")
         .expect("membership not found after hex assignment");
-    assert_eq!(after_hex.spawn_hex_q, Some(3), "spawn_hex_q must be 3");
-    assert_eq!(after_hex.spawn_hex_r, Some(-2), "spawn_hex_r must be -2");
+    assert_eq!(after_hex.gateway_hex_q, Some(3), "gateway_hex_q must be 3");
+    assert_eq!(after_hex.gateway_hex_r, Some(-2), "gateway_hex_r must be -2");
 
     // Step 5 — duplicate insert must be rejected by uq_player_campaign.
     let dup = membership_repo
@@ -622,6 +623,8 @@ async fn sector_state_repository_redis_is_correct() {
         owner: None,
         deployed_unit_count: 3,
         active_timer_ids: vec![],
+        terrain: std::collections::HashMap::new(),
+        magma_veins: vec![],
     };
     repo.upsert_sector(state.clone()).await.expect("upsert_sector failed");
 
@@ -1215,4 +1218,139 @@ async fn sha256_integrity_matches_db_reconstruction() {
         .execute(&pool).await.expect("re-enable triggers after cleanup failed");
     sqlx::query("DELETE FROM session_configs WHERE session_id = $1")
         .bind(session_id).execute(&pool).await.expect("post-test session_configs cleanup failed");
+}
+
+#[tokio::test]
+async fn initialize_campaign_orchestrates_correctly() {
+    let db_url = match std::env::var("TEST_DATABASE_URL").ok() {
+        Some(u) => u,
+        None => {
+            eprintln!("TEST_DATABASE_URL not set — skipping initialize_campaign integration test");
+            return;
+        }
+    };
+    let redis_url = match std::env::var("TEST_REDIS_URL").ok() {
+        Some(u) => u,
+        None => {
+            eprintln!("TEST_REDIS_URL not set — skipping initialize_campaign integration test");
+            return;
+        }
+    };
+
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&db_url)
+        .await
+        .expect("Failed to connect to test Postgres");
+    sqlx::migrate!("../../migrations")
+        .run(&pool)
+        .await
+        .expect("Migrations failed");
+
+    let client = redis::Client::open(redis_url).expect("Invalid TEST_REDIS_URL");
+    let redis_mgr = redis::aio::ConnectionManager::new(client)
+        .await
+        .expect("Failed to connect to Redis");
+
+    let campaign_repo   = PostgresCampaignRepository::new(pool.clone());
+    let membership_repo = PostgresMembershipRepository::new(pool.clone());
+    let sector_repo     = RedisSectorStateRepository::new(redis_mgr.clone());
+    let input_log_repo  = PostgresInputLogRepository::new(pool.clone());
+
+    let sector_id = uuid::Uuid::new_v4();
+    let campaign = campaign_repo.create_campaign(&NewCampaignInstance {
+        sector_id,
+        map_seed: 12345_i64,
+    }).await.expect("create_campaign failed");
+    let campaign_id = campaign.campaign_id;
+
+    let wallets: Vec<Vec<u8>> = (1u8..=3).map(|i| vec![i; 32]).collect();
+    for w in &wallets {
+        sqlx::query(
+            "INSERT INTO player_accounts (wallet_address, trust_standing, gcn_balance)
+             VALUES ($1, 0, 0)
+             ON CONFLICT (wallet_address) DO NOTHING"
+        )
+        .bind(w)
+        .execute(&pool)
+        .await
+        .expect("player_accounts FK seed failed");
+    }
+    for w in &wallets {
+        membership_repo.add_member(w, campaign_id, None, None)
+            .await
+            .expect("add_member failed");
+    }
+
+    initialize_campaign(
+        campaign_id,
+        &campaign_repo,
+        &membership_repo,
+        &sector_repo,
+        &input_log_repo,
+    ).await.expect("initialize_campaign returned Err");
+
+    let updated = campaign_repo.get_campaign(campaign_id).await
+        .expect("get_campaign error")
+        .expect("campaign not found after initialize");
+    assert_eq!(updated.state, CampaignLifecycle::Active, "state must be Active after initialize");
+    let ends_at = updated.ends_at.expect("ends_at must be Some after initialize");
+    assert!(
+        ends_at > chrono::Utc::now() + chrono::Duration::days(80),
+        "ends_at must be at least 80 days in the future"
+    );
+
+    let sector_state = sector_repo.get_sector(sector_id).await
+        .expect("get_sector returned None — upsert_sector must have written to Redis");
+    assert!(
+        !sector_state.terrain.is_empty(),
+        "terrain must be populated in Redis after initialize"
+    );
+
+    let members = membership_repo.list_members_by_campaign(campaign_id).await
+        .expect("list_members_by_campaign failed");
+    assert_eq!(members.len(), 3, "expected 3 members");
+    for m in &members {
+        assert!(m.gateway_hex_q.is_some(), "gateway_hex_q must be Some after initialize");
+        assert!(m.gateway_hex_r.is_some(), "gateway_hex_r must be Some after initialize");
+    }
+
+    let log_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM input_logs WHERE campaign_id = $1 AND event_type = 'campaign_started'"
+    )
+    .bind(campaign_id)
+    .fetch_one(&pool)
+    .await
+    .expect("log count query failed");
+    assert!(log_count >= 1, "input_logs must have at least one campaign_started entry");
+
+    sqlx::query("ALTER TABLE input_logs DISABLE TRIGGER ALL")
+        .execute(&pool).await.expect("disable triggers for cleanup failed");
+    sqlx::query("DELETE FROM input_logs WHERE campaign_id = $1")
+        .bind(campaign_id).execute(&pool).await.expect("post-test input_logs cleanup failed");
+    sqlx::query("ALTER TABLE input_logs ENABLE TRIGGER ALL")
+        .execute(&pool).await.expect("re-enable triggers after cleanup failed");
+
+    sqlx::query("DELETE FROM campaign_instances WHERE campaign_id = $1")
+        .bind(campaign_id)
+        .execute(&pool)
+        .await
+        .expect("post-test campaign cleanup failed");
+
+    for w in &wallets {
+        sqlx::query("DELETE FROM player_accounts WHERE wallet_address = $1")
+            .bind(w)
+            .execute(&pool)
+            .await
+            .expect("post-test player_accounts cleanup failed");
+    }
+
+    use redis::AsyncCommands;
+    let mut conn = redis_mgr.clone();
+    conn.del::<_, ()>(format!("sector:{}:hex_state", sector_id))
+        .await
+        .expect("DEL sector hex_state cleanup failed");
+    conn.srem::<_, _, ()>("sectors:all", sector_id.to_string())
+        .await
+        .expect("SREM sectors:all cleanup failed");
 }

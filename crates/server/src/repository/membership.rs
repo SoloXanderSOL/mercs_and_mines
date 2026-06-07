@@ -12,8 +12,8 @@ pub struct PlayerCampaignMembership {
     pub membership_id: Uuid,
     pub wallet_address: Vec<u8>,
     pub campaign_id: Uuid,
-    pub spawn_hex_q: Option<i32>,
-    pub spawn_hex_r: Option<i32>,
+    pub gateway_hex_q: Option<i32>,
+    pub gateway_hex_r: Option<i32>,
     pub joined_at: DateTime<Utc>,
     pub is_active: bool,
 }
@@ -26,8 +26,8 @@ pub trait MembershipRepository: Send + Sync {
         &self,
         wallet_address: &[u8],
         campaign_id: Uuid,
-        spawn_hex_q: Option<i32>,
-        spawn_hex_r: Option<i32>,
+        gateway_hex_q: Option<i32>,
+        gateway_hex_r: Option<i32>,
     ) -> Result<PlayerCampaignMembership, sqlx::Error>;
 
     async fn get_membership(
@@ -36,7 +36,7 @@ pub trait MembershipRepository: Send + Sync {
         campaign_id: Uuid,
     ) -> Result<Option<PlayerCampaignMembership>, sqlx::Error>;
 
-    async fn assign_spawn_hex(
+    async fn assign_gateway_hex(
         &self,
         wallet_address: &[u8],
         campaign_id: Uuid,
@@ -84,21 +84,21 @@ impl MembershipRepository for PostgresMembershipRepository {
         &self,
         wallet_address: &[u8],
         campaign_id: Uuid,
-        spawn_hex_q: Option<i32>,
-        spawn_hex_r: Option<i32>,
+        gateway_hex_q: Option<i32>,
+        gateway_hex_r: Option<i32>,
     ) -> Result<PlayerCampaignMembership, sqlx::Error> {
         let row = sqlx::query_as!(
             PlayerCampaignMembership,
             r#"INSERT INTO player_campaign_membership
-                (wallet_address, campaign_id, spawn_hex_q, spawn_hex_r)
+                (wallet_address, campaign_id, gateway_hex_q, gateway_hex_r)
                VALUES ($1, $2, $3, $4)
                RETURNING
                 membership_id, wallet_address, campaign_id,
-                spawn_hex_q, spawn_hex_r, joined_at, is_active"#,
+                gateway_hex_q, gateway_hex_r, joined_at, is_active"#,
             wallet_address,
             campaign_id,
-            spawn_hex_q,
-            spawn_hex_r,
+            gateway_hex_q,
+            gateway_hex_r,
         )
         .fetch_one(&self.pool)
         .await?;
@@ -114,7 +114,7 @@ impl MembershipRepository for PostgresMembershipRepository {
             PlayerCampaignMembership,
             r#"SELECT
                 membership_id, wallet_address, campaign_id,
-                spawn_hex_q, spawn_hex_r, joined_at, is_active
+                gateway_hex_q, gateway_hex_r, joined_at, is_active
                FROM player_campaign_membership
                WHERE wallet_address = $1 AND campaign_id = $2"#,
             wallet_address,
@@ -125,7 +125,7 @@ impl MembershipRepository for PostgresMembershipRepository {
         Ok(row)
     }
 
-    async fn assign_spawn_hex(
+    async fn assign_gateway_hex(
         &self,
         wallet_address: &[u8],
         campaign_id: Uuid,
@@ -134,7 +134,7 @@ impl MembershipRepository for PostgresMembershipRepository {
     ) -> Result<(), sqlx::Error> {
         sqlx::query!(
             r#"UPDATE player_campaign_membership
-               SET spawn_hex_q = $3, spawn_hex_r = $4
+               SET gateway_hex_q = $3, gateway_hex_r = $4
                WHERE wallet_address = $1 AND campaign_id = $2"#,
             wallet_address,
             campaign_id,
@@ -171,7 +171,7 @@ impl MembershipRepository for PostgresMembershipRepository {
             PlayerCampaignMembership,
             r#"SELECT
                 membership_id, wallet_address, campaign_id,
-                spawn_hex_q, spawn_hex_r, joined_at, is_active
+                gateway_hex_q, gateway_hex_r, joined_at, is_active
                FROM player_campaign_membership
                WHERE campaign_id = $1
                ORDER BY joined_at ASC"#,
@@ -190,7 +190,7 @@ impl MembershipRepository for PostgresMembershipRepository {
             PlayerCampaignMembership,
             r#"SELECT
                 membership_id, wallet_address, campaign_id,
-                spawn_hex_q, spawn_hex_r, joined_at, is_active
+                gateway_hex_q, gateway_hex_r, joined_at, is_active
                FROM player_campaign_membership
                WHERE wallet_address = $1
                ORDER BY joined_at ASC"#,
@@ -240,8 +240,8 @@ impl MembershipRepository for InMemoryMembershipRepository {
         &self,
         wallet_address: &[u8],
         campaign_id: Uuid,
-        spawn_hex_q: Option<i32>,
-        spawn_hex_r: Option<i32>,
+        gateway_hex_q: Option<i32>,
+        gateway_hex_r: Option<i32>,
     ) -> Result<PlayerCampaignMembership, sqlx::Error> {
         let key = (wallet_address.to_vec(), campaign_id);
         if self.store.contains_key(&key) {
@@ -253,8 +253,8 @@ impl MembershipRepository for InMemoryMembershipRepository {
             membership_id:  Uuid::new_v4(),
             wallet_address: wallet_address.to_vec(),
             campaign_id,
-            spawn_hex_q,
-            spawn_hex_r,
+            gateway_hex_q,
+            gateway_hex_r,
             joined_at:      Utc::now(),
             is_active:      true,
         };
@@ -271,7 +271,7 @@ impl MembershipRepository for InMemoryMembershipRepository {
         Ok(self.store.get(&key).map(|r| r.clone()))
     }
 
-    async fn assign_spawn_hex(
+    async fn assign_gateway_hex(
         &self,
         wallet_address: &[u8],
         campaign_id: Uuid,
@@ -280,8 +280,8 @@ impl MembershipRepository for InMemoryMembershipRepository {
     ) -> Result<(), sqlx::Error> {
         let key = (wallet_address.to_vec(), campaign_id);
         if let Some(mut m) = self.store.get_mut(&key) {
-            m.spawn_hex_q = Some(q);
-            m.spawn_hex_r = Some(r);
+            m.gateway_hex_q = Some(q);
+            m.gateway_hex_r = Some(r);
         }
         Ok(())
     }

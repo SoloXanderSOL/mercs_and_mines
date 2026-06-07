@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::f64::consts::PI;
+use serde::{Deserialize, Serialize};
 use sim_engine::rng::Rng;
 use uuid::Uuid;
 use tracing;
@@ -24,7 +25,7 @@ const TERRAIN_CUM_VOLCANIC_CALDERA: f64 = 0.93;
 const TERRAIN_CUM_MOUNTAIN: f64         = 0.95;
 const TERRAIN_CUM_RAVINE: f64           = 0.97;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum HexTerrain {
     AshenPlains,
     ScorchedDesert,
@@ -51,7 +52,7 @@ impl HexTerrain {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MagmaVeinNode {
     pub q: i32,
     pub r: i32,

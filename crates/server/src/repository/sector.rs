@@ -1,4 +1,5 @@
 #![allow(unused)]
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -6,6 +7,7 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::map_gen::{HexTerrain, MagmaVeinNode};
 use crate::repository::WalletAddress;
 use super::RepositoryError;
 
@@ -19,6 +21,10 @@ pub struct SectorState {
     pub owner: Option<WalletAddress>,
     pub deployed_unit_count: u32,
     pub active_timer_ids: Vec<Uuid>,
+    #[serde(default)]
+    pub terrain: HashMap<String, HexTerrain>,
+    #[serde(default)]
+    pub magma_veins: Vec<MagmaVeinNode>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
