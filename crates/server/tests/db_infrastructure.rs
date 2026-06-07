@@ -932,8 +932,12 @@ async fn input_log_is_append_only_and_queryable() {
         .bind(session_id).execute(&pool).await.expect("post-test input_logs cleanup failed");
     sqlx::query("ALTER TABLE input_logs ENABLE TRIGGER ALL")
         .execute(&pool).await.expect("re-enable triggers after cleanup failed");
+    sqlx::query("ALTER TABLE session_configs DISABLE TRIGGER ALL")
+        .execute(&pool).await.expect("disable session_configs triggers for cleanup failed");
     sqlx::query("DELETE FROM session_configs WHERE session_id = $1")
         .bind(session_id).execute(&pool).await.expect("post-test session_configs cleanup failed");
+    sqlx::query("ALTER TABLE session_configs ENABLE TRIGGER ALL")
+        .execute(&pool).await.expect("re-enable session_configs triggers after cleanup failed");
 }
 
 #[tokio::test]
@@ -1216,8 +1220,12 @@ async fn sha256_integrity_matches_db_reconstruction() {
         .bind(session_id).execute(&pool).await.expect("post-test input_logs cleanup failed");
     sqlx::query("ALTER TABLE input_logs ENABLE TRIGGER ALL")
         .execute(&pool).await.expect("re-enable triggers after cleanup failed");
+    sqlx::query("ALTER TABLE session_configs DISABLE TRIGGER ALL")
+        .execute(&pool).await.expect("disable session_configs triggers for cleanup failed");
     sqlx::query("DELETE FROM session_configs WHERE session_id = $1")
         .bind(session_id).execute(&pool).await.expect("post-test session_configs cleanup failed");
+    sqlx::query("ALTER TABLE session_configs ENABLE TRIGGER ALL")
+        .execute(&pool).await.expect("re-enable session_configs triggers after cleanup failed");
 }
 
 #[tokio::test]
@@ -1353,4 +1361,59 @@ async fn initialize_campaign_orchestrates_correctly() {
     conn.srem::<_, _, ()>("sectors:all", sector_id.to_string())
         .await
         .expect("SREM sectors:all cleanup failed");
+}
+
+#[tokio::test]
+async fn session_config_is_immutable() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => {
+            eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test");
+            return;
+        }
+    };
+
+    let session_id = uuid::Uuid::new_v4();
+
+    // Step 1: INSERT a session_configs row.
+    sqlx::query(
+        "INSERT INTO session_configs (session_id, seed, build_version, sector_id, campaign_id, sector_tier, ruleset)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)"
+    )
+    .bind(session_id)
+    .bind(0xDEADBEEF_i64)
+    .bind("0.1.0")
+    .bind("test_sector")
+    .bind("test_campaign")
+    .bind("Contested")
+    .bind("standard_v1")
+    .execute(&pool)
+    .await
+    .expect("session_configs INSERT failed");
+
+    // Step 2: UPDATE must be blocked by the immutability trigger.
+    let tamper = sqlx::query(
+        "UPDATE session_configs SET seed = 999 WHERE session_id = $1"
+    )
+    .bind(session_id)
+    .execute(&pool)
+    .await;
+    assert!(tamper.is_err(), "UPDATE must be blocked by the immutability trigger");
+
+    // Step 3: DELETE must be blocked by the immutability trigger.
+    let delete_attempt = sqlx::query(
+        "DELETE FROM session_configs WHERE session_id = $1"
+    )
+    .bind(session_id)
+    .execute(&pool)
+    .await;
+    assert!(delete_attempt.is_err(), "DELETE must be blocked by the immutability trigger");
+
+    // Post-test cleanup: disable triggers to allow deletion.
+    sqlx::query("ALTER TABLE session_configs DISABLE TRIGGER ALL")
+        .execute(&pool).await.expect("disable triggers for cleanup failed");
+    sqlx::query("DELETE FROM session_configs WHERE session_id = $1")
+        .bind(session_id).execute(&pool).await.expect("post-test session_configs cleanup failed");
+    sqlx::query("ALTER TABLE session_configs ENABLE TRIGGER ALL")
+        .execute(&pool).await.expect("re-enable triggers after cleanup failed");
 }
