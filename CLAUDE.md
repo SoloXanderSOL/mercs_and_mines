@@ -29,14 +29,15 @@ is the ground truth.
 As of 2026-06-07:
 
 - **Section 1 (Database Layer):** 1a (Postgres), 1b (Redis), 1c (Input Log) — complete.
-  42 tests green. The three in-memory stubs are replaced with real backends.
+  43 tests green. The three in-memory stubs are replaced with real backends.
 - **Section 2a (Sector Lifecycle):** Complete. `check_campaign_transition` pure Rust
   logic + background Tokio task wired to DB.
-- **Section 2b bricks 2b-1 through 2b-3.5:** Complete. `generate_sector_map`,
-  `assign_gateway_hexes`, `activate_campaign`, and `append_campaign_entry` all done.
+- **Section 2b bricks 2b-1 through 2b-4:** Complete. `generate_sector_map`,
+  `assign_gateway_hexes`, `activate_campaign`, `append_campaign_entry`, and
+  `initialize_campaign` orchestration all done.
 
-**Currently next: brick 2b-4 (`initialize_campaign` orchestration).** Read the full
-2b-4 scope in the Phase 1 document before writing a line.
+**Currently next: brick 2b-5 (`POST /api/admin/campaign/:id/launch`).** Read the full
+2b-5 scope in the Phase 1 document before writing a line.
 
 ---
 
@@ -98,6 +99,13 @@ existing code architecture:
 Structural correctness takes priority over speed. If an instruction requires a hack,
 surface the root design problem instead of implementing the hack.
 
+**Audit mode:** When the Director asks you to audit existing code rather than build, the
+same protocol applies — but you write zero code. Read the specified files, identify any
+hacks, workarounds, schema violations, or structural mismatches, and report findings
+using the `### ARCHITECTURAL ALARM` header for each one. Do not attempt to fix anything.
+List findings only. The Director will rule on each one before any remediation work
+begins.
+
 ---
 
 ## 4. NETWORKING AND DATA DEFAULTS
@@ -123,27 +131,42 @@ surface the root design problem instead of implementing the hack.
 ## 5. WSL EXECUTION ENVIRONMENT
 
 The Bash tool dispatches to Windows (Git Bash / MSYS2), not WSL. Cargo on Windows fails
-on `openssl-sys`. Do not attempt `wsl -e bash -c "..."` with shell special characters —
-PowerShell intercepts pipes before they reach WSL.
+on `openssl-sys`.
 
-**Canonical pattern for all cargo/sqlx commands:**
+**PRIMARY pattern — inline -c (use this first):**
+
+    wsl bash -c "source /home/ajone/.cargo/env && cd /home/ajone/PROJECTS/mercs_and_mines && set -a && source .env && set +a && cargo build 2>&1 | tail -30 && cargo test 2>&1"
+
+Use the explicit path `/home/ajone/.cargo/env`, NOT `$HOME/.cargo/env` — PowerShell
+expands `$HOME` before WSL sees it, resolving to a Windows path that bash cannot source.
+
+Use `set -a; source .env; set +a` so child processes (including `cargo test`) inherit
+`TEST_DATABASE_URL` and `TEST_REDIS_URL`. Plain `source .env` sets shell-local variables
+only — tests will silently skip instead of running.
+
+**FALLBACK pattern — script file (if inline -c fails):**
 
 1. Use the Write tool to create a temporary `.sh` script at a Windows-accessible path:
    `C:\Users\ajone\PROJECTS\Mercs_and_Mines\run_brick.sh`
 2. Invoke via Bash tool: `wsl -e bash /mnt/c/Users/ajone/PROJECTS/Mercs_and_Mines/run_brick.sh`
 3. Delete the script after.
 
-**Script template:**
+Script contents:
 ```bash
 #!/bin/bash
-source $HOME/.cargo/env
+source /home/ajone/.cargo/env
 cd /home/ajone/PROJECTS/mercs_and_mines
 set -a; source .env; set +a
 cargo build 2>&1 | tail -30
-cargo test -- --test-output immediate 2>&1
+cargo test 2>&1
 ```
 
-The script must source `$HOME/.cargo/env` or `cargo` will not be on PATH inside WSL.
+Note: Git Bash may intercept `/mnt/c/` paths when the script-file pattern is used —
+if so, fall back to the inline form above.
+
+For final definition-of-done integration test runs, add `-- --test-threads=1` to the
+cargo test invocation to eliminate the known flaky parallel trigger race on
+`input_log_is_append_only_and_queryable`.
 
 If a system package is missing (redis-server, libssl-dev, etc.), do not attempt
 `apt install`. Surface it to the Director with a single copy-pasteable sudo command.
