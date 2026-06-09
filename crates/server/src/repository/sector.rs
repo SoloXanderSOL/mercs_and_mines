@@ -36,9 +36,9 @@ pub enum OccupationStatus {
 
 #[async_trait]
 pub trait SectorStateRepository: Send + Sync {
-    async fn get_sector(&self, sector_id: SectorId) -> Option<SectorState>;
+    async fn get_sector(&self, sector_id: SectorId) -> Result<Option<SectorState>, RepositoryError>;
     async fn upsert_sector(&self, state: SectorState) -> Result<(), RepositoryError>;
-    async fn list_sectors(&self) -> Vec<SectorState>;
+    async fn list_sectors(&self) -> Result<Vec<SectorState>, RepositoryError>;
     async fn get_player_presence(&self, sector_id: SectorId) -> Result<Vec<WalletAddress>, RepositoryError>;
     async fn set_player_presence(&self, sector_id: SectorId, players: &[WalletAddress]) -> Result<(), RepositoryError>;
 }
@@ -69,8 +69,8 @@ impl Default for InMemorySectorStateRepository {
 
 #[async_trait]
 impl SectorStateRepository for InMemorySectorStateRepository {
-    async fn get_sector(&self, sector_id: SectorId) -> Option<SectorState> {
-        self.sectors.get(&sector_id).map(|e| e.value().clone())
+    async fn get_sector(&self, sector_id: SectorId) -> Result<Option<SectorState>, RepositoryError> {
+        Ok(self.sectors.get(&sector_id).map(|e| e.value().clone()))
     }
 
     async fn upsert_sector(&self, state: SectorState) -> Result<(), RepositoryError> {
@@ -78,8 +78,8 @@ impl SectorStateRepository for InMemorySectorStateRepository {
         Ok(())
     }
 
-    async fn list_sectors(&self) -> Vec<SectorState> {
-        self.sectors.iter().map(|e| e.value().clone()).collect()
+    async fn list_sectors(&self) -> Result<Vec<SectorState>, RepositoryError> {
+        Ok(self.sectors.iter().map(|e| e.value().clone()).collect())
     }
 
     async fn get_player_presence(&self, sector_id: SectorId) -> Result<Vec<WalletAddress>, RepositoryError> {
@@ -119,12 +119,16 @@ impl RedisSectorStateRepository {
 
 #[async_trait]
 impl SectorStateRepository for RedisSectorStateRepository {
-    async fn get_sector(&self, sector_id: SectorId) -> Option<SectorState> {
+    async fn get_sector(&self, sector_id: SectorId) -> Result<Option<SectorState>, RepositoryError> {
         use redis::AsyncCommands;
         let mut conn = self.conn.clone();
-        let raw: Option<String> = conn.get(Self::hex_state_key(sector_id)).await.ok()?;
-        let json = raw?;
-        serde_json::from_str(&json).ok()
+        let raw: Option<String> = conn.get(Self::hex_state_key(sector_id))
+            .await
+            .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        let Some(json) = raw else { return Ok(None) };
+        serde_json::from_str(&json)
+            .map(Some)
+            .map_err(|e| RepositoryError::Internal(e.to_string()))
     }
 
     async fn upsert_sector(&self, state: SectorState) -> Result<(), RepositoryError> {
@@ -142,21 +146,21 @@ impl SectorStateRepository for RedisSectorStateRepository {
         Ok(())
     }
 
-    async fn list_sectors(&self) -> Vec<SectorState> {
+    async fn list_sectors(&self) -> Result<Vec<SectorState>, RepositoryError> {
         use redis::AsyncCommands;
         let mut conn = self.conn.clone();
-        let ids: Vec<String> = match conn.smembers("sectors:all").await {
-            Ok(v) => v,
-            Err(_) => return vec![],
-        };
+        let ids: Vec<String> = conn.smembers("sectors:all")
+            .await
+            .map_err(|e| RepositoryError::Internal(e.to_string()))?;
         let mut out = Vec::with_capacity(ids.len());
         for id_str in ids {
-            let Ok(sector_id) = id_str.parse::<Uuid>() else { continue };
-            if let Some(s) = self.get_sector(sector_id).await {
+            let sector_id = id_str.parse::<Uuid>()
+                .map_err(|e| RepositoryError::Internal(format!("invalid sector id {id_str}: {e}")))?;
+            if let Some(s) = self.get_sector(sector_id).await? {
                 out.push(s);
             }
         }
-        out
+        Ok(out)
     }
 
     async fn get_player_presence(&self, sector_id: SectorId) -> Result<Vec<WalletAddress>, RepositoryError> {

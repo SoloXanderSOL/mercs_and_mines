@@ -33,11 +33,11 @@ pub struct AppState {
     /// Pending TEEPIN challenges, keyed by wallet_address.
     /// One-time use — removed on verify.
     pub pending_challenges: DashMap<String, PendingChallenge>,
-    pub account_repo:    Arc<dyn AccountRepository>,
-    pub campaign_repo:   Arc<dyn CampaignRepository + Send + Sync>,
-    pub commander_repo:  Arc<dyn CommanderRepository>,
-    pub membership_repo: Arc<dyn MembershipRepository>,
-    pub section_repo:    Arc<dyn SectionRepository>,
+    pub account_repo:    Arc<dyn AccountRepository    + Send + Sync>,
+    pub campaign_repo:   Arc<dyn CampaignRepository  + Send + Sync>,
+    pub commander_repo:  Arc<dyn CommanderRepository  + Send + Sync>,
+    pub membership_repo: Arc<dyn MembershipRepository + Send + Sync>,
+    pub section_repo:    Arc<dyn SectionRepository    + Send + Sync>,
     pub sector_repo:     Arc<dyn SectorStateRepository>,
     pub timer_repo:      Arc<dyn TimerRepository>,
     pub config: Arc<Config>,

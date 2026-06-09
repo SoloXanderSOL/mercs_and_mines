@@ -34,7 +34,7 @@ pub enum TimerType {
 pub trait TimerRepository: Send + Sync {
     async fn schedule_timer(&self, timer: DeploymentTimer) -> Result<(), RepositoryError>;
     async fn cancel_timer(&self, timer_id: Uuid) -> Result<(), RepositoryError>;
-    async fn get_due_timers(&self, now: DateTime<Utc>) -> Vec<DeploymentTimer>;
+    async fn get_due_timers(&self, now: DateTime<Utc>) -> Result<Vec<DeploymentTimer>, RepositoryError>;
 }
 
 pub struct InMemoryTimerRepository(pub Arc<DashMap<Uuid, DeploymentTimer>>);
@@ -65,12 +65,12 @@ impl TimerRepository for InMemoryTimerRepository {
             .ok_or(RepositoryError::NotFound)
     }
 
-    async fn get_due_timers(&self, now: DateTime<Utc>) -> Vec<DeploymentTimer> {
-        self.0
+    async fn get_due_timers(&self, now: DateTime<Utc>) -> Result<Vec<DeploymentTimer>, RepositoryError> {
+        Ok(self.0
             .iter()
             .filter(|entry| entry.fires_at <= now)
             .map(|entry| entry.value().clone())
-            .collect()
+            .collect())
     }
 }
 
@@ -151,30 +151,28 @@ impl TimerRepository for RedisTimerRepository {
             .map_err(|e| RepositoryError::Internal(e.to_string()))
     }
 
-    async fn get_due_timers(&self, now: DateTime<Utc>) -> Vec<DeploymentTimer> {
+    async fn get_due_timers(&self, now: DateTime<Utc>) -> Result<Vec<DeploymentTimer>, RepositoryError> {
         use redis::AsyncCommands;
         let mut conn  = self.conn.clone();
         let now_score = now.timestamp() as f64;
 
-        let ids: Vec<String> = match conn
+        let ids: Vec<String> = conn
             .zrangebyscore("timers:global", "-inf", now_score)
             .await
-        {
-            Ok(v)  => v,
-            Err(_) => return vec![],
-        };
+            .map_err(|e| RepositoryError::Internal(e.to_string()))?;
 
         let mut out = Vec::with_capacity(ids.len());
         for id_str in ids {
-            let Ok(tid) = id_str.parse::<Uuid>() else { continue };
-            let raw: Option<String> = match conn.get(Self::timer_key(tid)).await {
-                Ok(v)  => v,
-                Err(_) => continue,
-            };
+            let tid = id_str.parse::<Uuid>()
+                .map_err(|e| RepositoryError::Internal(format!("invalid timer id {id_str}: {e}")))?;
+            let raw: Option<String> = conn.get(Self::timer_key(tid))
+                .await
+                .map_err(|e| RepositoryError::Internal(e.to_string()))?;
             let Some(json) = raw else { continue };
-            let Ok(timer)  = serde_json::from_str::<DeploymentTimer>(&json) else { continue };
+            let timer = serde_json::from_str::<DeploymentTimer>(&json)
+                .map_err(|e| RepositoryError::Internal(format!("deser timer {tid}: {e}")))?;
             out.push(timer);
         }
-        out
+        Ok(out)
     }
 }

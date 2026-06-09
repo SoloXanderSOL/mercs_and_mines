@@ -516,7 +516,7 @@ async fn gcn_ledger_is_append_only_and_queryable() {
     assert_eq!(balance, 450, "gcn_balance must be 450 after +500 and -50");
 
     // Step 4: get_gcn_ledger — two entries, correct deltas, correct balance_after, A before B.
-    let ledger = repo.get_gcn_ledger(&wallet).await;
+    let ledger = repo.get_gcn_ledger(&wallet).await.expect("get_gcn_ledger failed");
     assert_eq!(ledger.len(), 2, "expected exactly two ledger entries");
     let entry_a = &ledger[0];
     let entry_b = &ledger[1];
@@ -628,11 +628,11 @@ async fn sector_state_repository_redis_is_correct() {
     };
     repo.upsert_sector(state.clone()).await.expect("upsert_sector failed");
 
-    let all = repo.list_sectors().await;
+    let all = repo.list_sectors().await.expect("list_sectors failed");
     assert!(all.iter().any(|s| s.sector_id == sector_id), "upserted sector must appear in list_sectors");
 
     // 2. Round-trip get_sector.
-    let fetched = repo.get_sector(sector_id).await.expect("get_sector returned None");
+    let fetched = repo.get_sector(sector_id).await.expect("get_sector failed").expect("get_sector returned None");
     assert_eq!(fetched.sector_id, sector_id);
     assert_eq!(fetched.campaign_id, campaign_id);
     assert_eq!(fetched.deployed_unit_count, 3);
@@ -704,7 +704,7 @@ async fn timer_repository_redis_is_correct() {
     repo.schedule_timer(timer_b.clone()).await.expect("schedule timer_b failed");
 
     // 2. get_due_timers(now) — only the past timer should be returned.
-    let due = repo.get_due_timers(now).await;
+    let due = repo.get_due_timers(now).await.expect("get_due_timers failed");
     assert_eq!(due.len(), 1, "expected exactly one due timer");
     assert_eq!(due[0].timer_id, timer_a_id, "due timer must be timer_a");
 
@@ -717,7 +717,7 @@ async fn timer_repository_redis_is_correct() {
 
     // 5. After cancel, scanning far-future window still returns only timer_a.
     let far_future = now + chrono::Duration::seconds(7200);
-    let after_cancel = repo.get_due_timers(far_future).await;
+    let after_cancel = repo.get_due_timers(far_future).await.expect("get_due_timers (far_future) failed");
     assert_eq!(after_cancel.len(), 1, "only timer_a must remain after timer_b is cancelled");
     assert_eq!(after_cancel[0].timer_id, timer_a_id);
 
@@ -1309,6 +1309,7 @@ async fn initialize_campaign_orchestrates_correctly() {
     );
 
     let sector_state = sector_repo.get_sector(sector_id).await
+        .expect("get_sector failed")
         .expect("get_sector returned None — upsert_sector must have written to Redis");
     assert!(
         !sector_state.terrain.is_empty(),

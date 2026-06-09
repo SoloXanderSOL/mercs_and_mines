@@ -40,14 +40,14 @@ pub struct GcnLedgerEntry {
 
 #[async_trait]
 pub trait AccountRepository: Send + Sync {
-    async fn get_account(&self, wallet: &Pubkey) -> Option<PlayerAccount>;
+    async fn get_account(&self, wallet: &Pubkey) -> Result<Option<PlayerAccount>, RepositoryError>;
     async fn upsert_account(&self, account: PlayerAccount) -> Result<(), RepositoryError>;
     async fn append_gcn_entry(
         &self,
         wallet: &Pubkey,
         entry: GcnLedgerEntry,
     ) -> Result<(), RepositoryError>;
-    async fn get_gcn_ledger(&self, wallet: &Pubkey) -> Vec<GcnLedgerEntry>;
+    async fn get_gcn_ledger(&self, wallet: &Pubkey) -> Result<Vec<GcnLedgerEntry>, RepositoryError>;
 }
 
 pub struct InMemoryAccountRepository(pub Arc<DashMap<Pubkey, PlayerAccount>>);
@@ -66,8 +66,8 @@ impl Default for InMemoryAccountRepository {
 
 #[async_trait]
 impl AccountRepository for InMemoryAccountRepository {
-    async fn get_account(&self, wallet: &Pubkey) -> Option<PlayerAccount> {
-        self.0.get(wallet).map(|entry| entry.value().clone())
+    async fn get_account(&self, wallet: &Pubkey) -> Result<Option<PlayerAccount>, RepositoryError> {
+        Ok(self.0.get(wallet).map(|entry| entry.value().clone()))
     }
 
     async fn upsert_account(&self, account: PlayerAccount) -> Result<(), RepositoryError> {
@@ -99,10 +99,10 @@ impl AccountRepository for InMemoryAccountRepository {
         Ok(())
     }
 
-    async fn get_gcn_ledger(&self, wallet: &Pubkey) -> Vec<GcnLedgerEntry> {
-        self.0
+    async fn get_gcn_ledger(&self, wallet: &Pubkey) -> Result<Vec<GcnLedgerEntry>, RepositoryError> {
+        Ok(self.0
             .get(wallet)
             .map(|entry| entry.gcn_ledger.clone())
-            .unwrap_or_default()
+            .unwrap_or_default())
     }
 }

@@ -18,7 +18,7 @@ impl PostgresAccountRepository {
 
 #[async_trait]
 impl AccountRepository for PostgresAccountRepository {
-    async fn get_account(&self, wallet: &WalletAddress) -> Option<PlayerAccount> {
+    async fn get_account(&self, wallet: &WalletAddress) -> Result<Option<PlayerAccount>, RepositoryError> {
         let wallet_bytes = wallet.0.to_vec();
         let row = sqlx::query!(
             "SELECT wallet_address, trust_standing, gcn_balance \
@@ -28,17 +28,18 @@ impl AccountRepository for PostgresAccountRepository {
         )
         .fetch_optional(&self.pool)
         .await
-        .ok()
-        .flatten()?;
+        .map_err(|e| RepositoryError::Internal(e.to_string()))?;
 
-        let addr: [u8; 32] = row.wallet_address.try_into().ok()?;
-        Some(PlayerAccount {
+        let Some(row) = row else { return Ok(None) };
+        let addr: [u8; 32] = row.wallet_address.try_into()
+            .map_err(|_| RepositoryError::Internal("wallet_address is not 32 bytes".into()))?;
+        Ok(Some(PlayerAccount {
             wallet: WalletAddress(addr),
             trust_standing: row.trust_standing as i32,
             gcn_balance: row.gcn_balance,
             profile: PlayerProfile { display_name: None, sector_id: None },
             gcn_ledger: vec![],
-        })
+        }))
     }
 
     async fn upsert_account(&self, account: PlayerAccount) -> Result<(), RepositoryError> {
@@ -98,7 +99,7 @@ impl AccountRepository for PostgresAccountRepository {
         Ok(())
     }
 
-    async fn get_gcn_ledger(&self, wallet: &WalletAddress) -> Vec<GcnLedgerEntry> {
+    async fn get_gcn_ledger(&self, wallet: &WalletAddress) -> Result<Vec<GcnLedgerEntry>, RepositoryError> {
         let wallet_bytes = wallet.0.to_vec();
         let rows = sqlx::query!(
             "SELECT entry_id, wallet_address, delta, balance_after, entry_type, session_id, memo, recorded_at \
@@ -109,22 +110,23 @@ impl AccountRepository for PostgresAccountRepository {
         )
         .fetch_all(&self.pool)
         .await
-        .unwrap_or_default();
+        .map_err(|e| RepositoryError::Internal(e.to_string()))?;
 
-        rows.into_iter()
-            .filter_map(|row| {
-                let addr: [u8; 32] = row.wallet_address.try_into().ok()?;
-                Some(GcnLedgerEntry {
-                    entry_id: row.entry_id,
-                    wallet: WalletAddress(addr),
-                    delta: row.delta,
-                    balance_after: row.balance_after,
-                    entry_type: row.entry_type,
-                    session_id: row.session_id,
-                    memo: row.memo,
-                    recorded_at: row.recorded_at,
-                })
-            })
-            .collect()
+        let mut entries = Vec::with_capacity(rows.len());
+        for row in rows {
+            let addr: [u8; 32] = row.wallet_address.try_into()
+                .map_err(|_| RepositoryError::Internal("wallet_address is not 32 bytes".into()))?;
+            entries.push(GcnLedgerEntry {
+                entry_id: row.entry_id,
+                wallet: WalletAddress(addr),
+                delta: row.delta,
+                balance_after: row.balance_after,
+                entry_type: row.entry_type,
+                session_id: row.session_id,
+                memo: row.memo,
+                recorded_at: row.recorded_at,
+            });
+        }
+        Ok(entries)
     }
 }

@@ -6,6 +6,8 @@ use serde_json::Value as JsonValue;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use super::RepositoryError;
+
 // ── SectionRecord ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -25,14 +27,14 @@ pub struct SectionRecord {
 
 #[async_trait]
 pub trait SectionRepository: Send + Sync {
-    async fn create_section(&self, record: SectionRecord) -> anyhow::Result<()>;
-    async fn get_section(&self, section_id: Uuid) -> anyhow::Result<Option<SectionRecord>>;
-    async fn update_headcount(&self, section_id: Uuid, headcount: i16) -> anyhow::Result<()>;
-    async fn assign_commander(&self, section_id: Uuid, commander_id: Option<Uuid>) -> anyhow::Result<()>;
-    async fn update_xp(&self, section_id: Uuid, xp: i32) -> anyhow::Result<()>;
-    async fn list_sections_by_commander(&self, commander_id: Uuid) -> anyhow::Result<Vec<SectionRecord>>;
-    async fn list_sections_by_campaign(&self, campaign_id: Uuid) -> anyhow::Result<Vec<SectionRecord>>;
-    async fn delete_sections_by_campaign(&self, campaign_id: Uuid) -> anyhow::Result<u64>;
+    async fn create_section(&self, record: SectionRecord) -> Result<(), RepositoryError>;
+    async fn get_section(&self, section_id: Uuid) -> Result<Option<SectionRecord>, RepositoryError>;
+    async fn update_headcount(&self, section_id: Uuid, headcount: i16) -> Result<(), RepositoryError>;
+    async fn assign_commander(&self, section_id: Uuid, commander_id: Option<Uuid>) -> Result<(), RepositoryError>;
+    async fn update_xp(&self, section_id: Uuid, xp: i32) -> Result<(), RepositoryError>;
+    async fn list_sections_by_commander(&self, commander_id: Uuid) -> Result<Vec<SectionRecord>, RepositoryError>;
+    async fn list_sections_by_campaign(&self, campaign_id: Uuid) -> Result<Vec<SectionRecord>, RepositoryError>;
+    async fn delete_sections_by_campaign(&self, campaign_id: Uuid) -> Result<u64, RepositoryError>;
 }
 
 // ── PostgresSectionRepository ────────────────────────────────────────────────
@@ -49,7 +51,7 @@ impl PostgresSectionRepository {
 
 #[async_trait]
 impl SectionRepository for PostgresSectionRepository {
-    async fn create_section(&self, r: SectionRecord) -> anyhow::Result<()> {
+    async fn create_section(&self, r: SectionRecord) -> Result<(), RepositoryError> {
         sqlx::query!(
             r#"INSERT INTO section_records (
                 section_id, campaign_id, commander_id, name, headcount, loadout, xp
@@ -63,11 +65,12 @@ impl SectionRepository for PostgresSectionRepository {
             r.xp,
         )
         .execute(&self.pool)
-        .await?;
+        .await
+        .map_err(|e| RepositoryError::Internal(e.to_string()))?;
         Ok(())
     }
 
-    async fn get_section(&self, section_id: Uuid) -> anyhow::Result<Option<SectionRecord>> {
+    async fn get_section(&self, section_id: Uuid) -> Result<Option<SectionRecord>, RepositoryError> {
         let row = sqlx::query!(
             r#"SELECT
                 section_id, campaign_id, commander_id, name, headcount,
@@ -76,7 +79,8 @@ impl SectionRepository for PostgresSectionRepository {
             section_id
         )
         .fetch_optional(&self.pool)
-        .await?;
+        .await
+        .map_err(|e| RepositoryError::Internal(e.to_string()))?;
 
         Ok(row.map(|r| SectionRecord {
             section_id:   r.section_id,
@@ -91,7 +95,7 @@ impl SectionRepository for PostgresSectionRepository {
         }))
     }
 
-    async fn update_headcount(&self, section_id: Uuid, headcount: i16) -> anyhow::Result<()> {
+    async fn update_headcount(&self, section_id: Uuid, headcount: i16) -> Result<(), RepositoryError> {
         let clamped = i16::max(0, headcount);
         sqlx::query!(
             "UPDATE section_records SET headcount = $1, updated_at = now() WHERE section_id = $2",
@@ -99,33 +103,36 @@ impl SectionRepository for PostgresSectionRepository {
             section_id,
         )
         .execute(&self.pool)
-        .await?;
+        .await
+        .map_err(|e| RepositoryError::Internal(e.to_string()))?;
         Ok(())
     }
 
-    async fn assign_commander(&self, section_id: Uuid, commander_id: Option<Uuid>) -> anyhow::Result<()> {
+    async fn assign_commander(&self, section_id: Uuid, commander_id: Option<Uuid>) -> Result<(), RepositoryError> {
         sqlx::query!(
             "UPDATE section_records SET commander_id = $1, updated_at = now() WHERE section_id = $2",
             commander_id,
             section_id,
         )
         .execute(&self.pool)
-        .await?;
+        .await
+        .map_err(|e| RepositoryError::Internal(e.to_string()))?;
         Ok(())
     }
 
-    async fn update_xp(&self, section_id: Uuid, xp: i32) -> anyhow::Result<()> {
+    async fn update_xp(&self, section_id: Uuid, xp: i32) -> Result<(), RepositoryError> {
         sqlx::query!(
             "UPDATE section_records SET xp = $1, updated_at = now() WHERE section_id = $2",
             xp,
             section_id,
         )
         .execute(&self.pool)
-        .await?;
+        .await
+        .map_err(|e| RepositoryError::Internal(e.to_string()))?;
         Ok(())
     }
 
-    async fn list_sections_by_commander(&self, commander_id: Uuid) -> anyhow::Result<Vec<SectionRecord>> {
+    async fn list_sections_by_commander(&self, commander_id: Uuid) -> Result<Vec<SectionRecord>, RepositoryError> {
         let rows = sqlx::query!(
             r#"SELECT
                 section_id, campaign_id, commander_id, name, headcount,
@@ -134,7 +141,8 @@ impl SectionRepository for PostgresSectionRepository {
             commander_id
         )
         .fetch_all(&self.pool)
-        .await?;
+        .await
+        .map_err(|e| RepositoryError::Internal(e.to_string()))?;
 
         Ok(rows.into_iter().map(|r| SectionRecord {
             section_id:   r.section_id,
@@ -149,7 +157,7 @@ impl SectionRepository for PostgresSectionRepository {
         }).collect())
     }
 
-    async fn list_sections_by_campaign(&self, campaign_id: Uuid) -> anyhow::Result<Vec<SectionRecord>> {
+    async fn list_sections_by_campaign(&self, campaign_id: Uuid) -> Result<Vec<SectionRecord>, RepositoryError> {
         let rows = sqlx::query!(
             r#"SELECT
                 section_id, campaign_id, commander_id, name, headcount,
@@ -158,7 +166,8 @@ impl SectionRepository for PostgresSectionRepository {
             campaign_id
         )
         .fetch_all(&self.pool)
-        .await?;
+        .await
+        .map_err(|e| RepositoryError::Internal(e.to_string()))?;
 
         Ok(rows.into_iter().map(|r| SectionRecord {
             section_id:   r.section_id,
@@ -173,13 +182,14 @@ impl SectionRepository for PostgresSectionRepository {
         }).collect())
     }
 
-    async fn delete_sections_by_campaign(&self, campaign_id: Uuid) -> anyhow::Result<u64> {
+    async fn delete_sections_by_campaign(&self, campaign_id: Uuid) -> Result<u64, RepositoryError> {
         let result = sqlx::query!(
             "DELETE FROM section_records WHERE campaign_id = $1",
             campaign_id,
         )
         .execute(&self.pool)
-        .await?;
+        .await
+        .map_err(|e| RepositoryError::Internal(e.to_string()))?;
         Ok(result.rows_affected())
     }
 }
@@ -204,51 +214,51 @@ impl Default for InMemorySectionRepository {
 
 #[async_trait]
 impl SectionRepository for InMemorySectionRepository {
-    async fn create_section(&self, record: SectionRecord) -> anyhow::Result<()> {
+    async fn create_section(&self, record: SectionRecord) -> Result<(), RepositoryError> {
         self.store.insert(record.section_id, record);
         Ok(())
     }
 
-    async fn get_section(&self, section_id: Uuid) -> anyhow::Result<Option<SectionRecord>> {
+    async fn get_section(&self, section_id: Uuid) -> Result<Option<SectionRecord>, RepositoryError> {
         Ok(self.store.get(&section_id).map(|r| r.clone()))
     }
 
-    async fn update_headcount(&self, section_id: Uuid, headcount: i16) -> anyhow::Result<()> {
+    async fn update_headcount(&self, section_id: Uuid, headcount: i16) -> Result<(), RepositoryError> {
         if let Some(mut r) = self.store.get_mut(&section_id) {
             r.headcount = i16::max(0, headcount);
         }
         Ok(())
     }
 
-    async fn assign_commander(&self, section_id: Uuid, commander_id: Option<Uuid>) -> anyhow::Result<()> {
+    async fn assign_commander(&self, section_id: Uuid, commander_id: Option<Uuid>) -> Result<(), RepositoryError> {
         if let Some(mut r) = self.store.get_mut(&section_id) {
             r.commander_id = commander_id;
         }
         Ok(())
     }
 
-    async fn update_xp(&self, section_id: Uuid, xp: i32) -> anyhow::Result<()> {
+    async fn update_xp(&self, section_id: Uuid, xp: i32) -> Result<(), RepositoryError> {
         if let Some(mut r) = self.store.get_mut(&section_id) {
             r.xp = xp;
         }
         Ok(())
     }
 
-    async fn list_sections_by_commander(&self, commander_id: Uuid) -> anyhow::Result<Vec<SectionRecord>> {
+    async fn list_sections_by_commander(&self, commander_id: Uuid) -> Result<Vec<SectionRecord>, RepositoryError> {
         Ok(self.store.iter()
             .filter(|r| r.commander_id == Some(commander_id))
             .map(|r| r.clone())
             .collect())
     }
 
-    async fn list_sections_by_campaign(&self, campaign_id: Uuid) -> anyhow::Result<Vec<SectionRecord>> {
+    async fn list_sections_by_campaign(&self, campaign_id: Uuid) -> Result<Vec<SectionRecord>, RepositoryError> {
         Ok(self.store.iter()
             .filter(|r| r.campaign_id == campaign_id)
             .map(|r| r.clone())
             .collect())
     }
 
-    async fn delete_sections_by_campaign(&self, campaign_id: Uuid) -> anyhow::Result<u64> {
+    async fn delete_sections_by_campaign(&self, campaign_id: Uuid) -> Result<u64, RepositoryError> {
         let keys: Vec<Uuid> = self.store.iter()
             .filter(|r| r.campaign_id == campaign_id)
             .map(|r| r.section_id)
