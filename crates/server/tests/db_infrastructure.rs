@@ -1095,8 +1095,9 @@ async fn activate_campaign_is_idempotent() {
 
     // 3. First call — happy path: Pending → Active.
     let ends_at = chrono::Utc::now() + chrono::Duration::days(90);
-    repo.activate_campaign(campaign_id, ends_at, tickers.clone()).await
+    let activated = repo.activate_campaign(campaign_id, ends_at, tickers.clone()).await
         .expect("activate_campaign (first call) failed");
+    assert!(activated, "first activate_campaign call must return true (1 row updated)");
 
     let after_first = repo.get_campaign(campaign_id).await
         .expect("get_campaign error")
@@ -1114,8 +1115,9 @@ async fn activate_campaign_is_idempotent() {
 
     // 4. Second call — idempotency: Active campaign is not overwritten.
     let different_ends_at = chrono::Utc::now() + chrono::Duration::days(1);
-    repo.activate_campaign(campaign_id, different_ends_at, tickers).await
+    let activated_again = repo.activate_campaign(campaign_id, different_ends_at, tickers).await
         .expect("activate_campaign (second call) must not error");
+    assert!(!activated_again, "second activate_campaign call must return false (0 rows updated — already Active)");
 
     let after_second = repo.get_campaign(campaign_id).await
         .expect("get_campaign error")
@@ -1399,7 +1401,7 @@ async fn initialize_campaign_orchestrates_correctly() {
     .fetch_one(&pool)
     .await
     .expect("log count query failed");
-    assert!(log_count >= 1, "input_logs must have at least one campaign_started entry");
+    assert_eq!(log_count, 1, "input_logs must have exactly one campaign_started entry — retry must not produce duplicates");
 
     sqlx::query("ALTER TABLE input_logs DISABLE TRIGGER ALL")
         .execute(&pool).await.expect("disable triggers for cleanup failed");

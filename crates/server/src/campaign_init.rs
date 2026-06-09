@@ -22,6 +22,8 @@ pub enum InitError {
     NotPending,
     CampaignNotFound,
     NoMembersFound,
+    WasAlreadyActive,
+    GatewayAssignmentFailed,
     RepositoryError(RepositoryError),
     SqlxError(sqlx::Error),
 }
@@ -82,8 +84,12 @@ pub async fn initialize_campaign(
 
     let ends_at = Utc::now() + Duration::days(90);
 
-    campaign_repo.activate_campaign(campaign_id, ends_at, initial_tickers).await
+    let activated = campaign_repo.activate_campaign(campaign_id, ends_at, initial_tickers).await
         .map_err(InitError::SqlxError)?;
+
+    if !activated {
+        return Err(InitError::WasAlreadyActive);
+    }
 
     // 3.8 — write sector state to Redis
     sector_repo.upsert_sector(SectorState {
@@ -98,6 +104,9 @@ pub async fn initialize_campaign(
     }).await.map_err(InitError::RepositoryError)?;
 
     // 3.9 — assign gateway hexes in DB
+    if assignments.len() != members.len() {
+        return Err(InitError::GatewayAssignmentFailed);
+    }
     for assignment in &assignments {
         membership_repo.assign_gateway_hex(
             &assignment.wallet_address,

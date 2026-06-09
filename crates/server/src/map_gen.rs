@@ -147,8 +147,21 @@ pub fn assign_gateway_hexes(
         }
     }
 
-    for player in &solo_players {
-        let idx = rng.roll_int(0, rim.len() as u32 - 1) as usize;
+    let mut rim_indices: Vec<usize> = (0..rim.len()).collect();
+    for i in (1..rim.len()).rev() {
+        let j = rng.roll_int(0, i as u32) as usize;
+        rim_indices.swap(i, j);
+    }
+    for (slot, player) in solo_players.iter().enumerate() {
+        let idx = if slot < rim_indices.len() {
+            rim_indices[slot]
+        } else {
+            tracing::warn!(
+                "solo player count ({}) exceeds rim hex count ({}) — reusing slot 0",
+                solo_players.len(), rim.len()
+            );
+            rim_indices[0]
+        };
         results.push(GatewayAssignment {
             wallet_address: player.wallet_address.clone(),
             q: rim[idx].0,

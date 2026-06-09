@@ -137,13 +137,14 @@ pub trait CampaignRepository: Send + Sync {
     ) -> Result<Vec<CampaignInstance>, sqlx::Error>;
 
     /// Transition a Pending campaign to Active, setting ends_at and initializing victory_tickers.
-    /// Idempotent: if the campaign is already Active the UPDATE matches 0 rows and returns Ok(()).
+    /// Returns true if the campaign was just activated (1 row updated), false if it was already
+    /// Active (0 rows updated — idempotent no-op). Never errors on a 0-row update.
     async fn activate_campaign(
         &self,
         campaign_id: Uuid,
         ends_at: DateTime<Utc>,
         victory_tickers: serde_json::Value,
-    ) -> Result<(), sqlx::Error>;
+    ) -> Result<bool, sqlx::Error>;
 }
 
 // ── Postgres implementation ──────────────────────────────────────────────────
@@ -295,8 +296,8 @@ impl CampaignRepository for PostgresCampaignRepository {
         campaign_id: Uuid,
         ends_at: DateTime<Utc>,
         victory_tickers: serde_json::Value,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query!(
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query!(
             r#"UPDATE campaign_instances
                SET state            = $1,
                    ends_at          = $2,
@@ -313,7 +314,7 @@ impl CampaignRepository for PostgresCampaignRepository {
         )
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(result.rows_affected() == 1)
     }
 }
 
@@ -378,7 +379,7 @@ impl CampaignRepository for InMemoryCampaignRepository {
         _campaign_id: Uuid,
         _ends_at: DateTime<Utc>,
         _victory_tickers: serde_json::Value,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<bool, sqlx::Error> {
         unimplemented!("InMemoryCampaignRepository is a unit-test stub only")
     }
 }
