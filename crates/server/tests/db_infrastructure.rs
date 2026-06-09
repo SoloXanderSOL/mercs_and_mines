@@ -192,6 +192,10 @@ async fn commander_section_crud_is_correct() {
         .execute(&pool)
         .await
         .expect("pre-test commander cleanup failed");
+    // Wallet [2u8;32] is shared with initialize_campaign_orchestrates_correctly.
+    // Clear any orphaned membership rows so the post-test player_accounts delete succeeds.
+    sqlx::query("DELETE FROM player_campaign_membership WHERE wallet_address = $1")
+        .bind(&[2u8; 32].to_vec()).execute(&pool).await.ok();
 
     let commander_id = uuid::Uuid::new_v4();
     let wallet_bytes = [2u8; 32].to_vec();
@@ -1334,6 +1338,20 @@ async fn initialize_campaign_orchestrates_correctly() {
     let membership_repo = PostgresMembershipRepository::new(pool.clone());
     let sector_repo     = RedisSectorStateRepository::new(redis_mgr.clone());
     let input_log_repo  = PostgresInputLogRepository::new(pool.clone());
+
+    // Pre-test: clear membership rows left by any prior panicked run.
+    // wallet_address has ON DELETE RESTRICT, so memberships must be removed before
+    // player_accounts can be deleted. The cascade on campaign_id only covers the
+    // campaign created in THIS run — orphaned rows from prior crashes must be wiped by wallet.
+    let test_wallets: Vec<Vec<u8>> = (1u8..=3).map(|i| vec![i; 32]).collect();
+    for w in &test_wallets {
+        sqlx::query("DELETE FROM player_campaign_membership WHERE wallet_address = $1")
+            .bind(w).execute(&pool).await.expect("pre-test membership cleanup");
+    }
+    for w in &test_wallets {
+        sqlx::query("DELETE FROM player_accounts WHERE wallet_address = $1")
+            .bind(w).execute(&pool).await.ok();
+    }
 
     let sector_id = uuid::Uuid::new_v4();
     let campaign = campaign_repo.create_campaign(&NewCampaignInstance {

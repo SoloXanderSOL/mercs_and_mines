@@ -58,6 +58,11 @@ pub trait InputLogRepository: Send + Sync {
         campaign_id: &Uuid,
         entry: &shared::InputLogEntry,
     ) -> Result<(), RepositoryError>;
+    // Phase 2: add get_entries_by_campaign(&self, campaign_id: &Uuid)
+    //   -> Result<Vec<InputLogEntry>, RepositoryError>
+    // for replay and integrity audit of campaign-scoped log entries
+    // (victory_ticker_delta, campaign_started, etc.).
+    // These rows are write-only until that method exists.
 }
 
 // ── Postgres implementation ───────────────────────────────────────────────────

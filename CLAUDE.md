@@ -26,18 +26,19 @@ Before writing any code, read the Phase 1 Alpha Foundation document to understan
 is already built. Do not guess — read it. The status block at the top of that document
 is the ground truth.
 
-As of 2026-06-07:
+As of 2026-06-09:
 
 - **Section 1 (Database Layer):** 1a (Postgres), 1b (Redis), 1c (Input Log) — complete.
-  43 tests green. The three in-memory stubs are replaced with real backends.
+  Arch Audits 4 and 6 complete.
 - **Section 2a (Sector Lifecycle):** Complete. `check_campaign_transition` pure Rust
-  logic + background Tokio task wired to DB.
+  logic + background Tokio task wired to DB. Arch Audit 3 complete.
 - **Section 2b bricks 2b-1 through 2b-4:** Complete. `generate_sector_map`,
   `assign_gateway_hexes`, `activate_campaign`, `append_campaign_entry`, and
-  `initialize_campaign` orchestration all done.
+  `initialize_campaign` orchestration all done. Arch Audit 5 complete.
 
-**Currently next: brick 2b-5 (`POST /api/admin/campaign/:id/launch`).** Read the full
-2b-5 scope in the Phase 1 document before writing a line.
+**47/47 tests green (single-threaded). Currently next: brick 2b-5
+(`POST /api/admin/campaign/:id/launch`).** Read the full 2b-5 scope in the Phase 1
+document before writing a line.
 
 ---
 
@@ -135,7 +136,7 @@ on `openssl-sys`.
 
 **PRIMARY pattern — inline -c (use this first):**
 
-    wsl bash -c "source /home/ajone/.cargo/env && cd /home/ajone/PROJECTS/mercs_and_mines && set -a && source .env && set +a && cargo build 2>&1 | tail -30 && cargo test 2>&1"
+    wsl bash -c "source /home/ajone/.cargo/env && cd /home/ajone/PROJECTS/mercs_and_mines && set -a && source .env && set +a && cargo build 2>&1 | tail -30 && cargo test --workspace -- --test-threads=1 2>&1"
 
 Use the explicit path `/home/ajone/.cargo/env`, NOT `$HOME/.cargo/env` — PowerShell
 expands `$HOME` before WSL sees it, resolving to a Windows path that bash cannot source.
@@ -158,15 +159,18 @@ source /home/ajone/.cargo/env
 cd /home/ajone/PROJECTS/mercs_and_mines
 set -a; source .env; set +a
 cargo build 2>&1 | tail -30
-cargo test 2>&1
+cargo test --workspace -- --test-threads=1 2>&1
 ```
 
 Note: Git Bash may intercept `/mnt/c/` paths when the script-file pattern is used —
 if so, fall back to the inline form above.
 
-For final definition-of-done integration test runs, add `-- --test-threads=1` to the
-cargo test invocation to eliminate the known flaky parallel trigger race on
-`input_log_is_append_only_and_queryable`.
+**Canonical test command:** Always use `cargo test --workspace -- --test-threads=1`.
+Never use bare `cargo test` or `cargo test --workspace` without the thread constraint.
+Several integration tests share wallet addresses and have `ON DELETE RESTRICT` FK
+constraints — parallel execution causes FK-23503 failures that are not caused by the
+code under test. Any test report produced without `--test-threads=1` is unreliable and
+must be re-run before reporting results to the Director.
 
 If a system package is missing (redis-server, libssl-dev, etc.), do not attempt
 `apt install`. Surface it to the Director with a single copy-pasteable sudo command.

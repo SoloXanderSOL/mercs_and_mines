@@ -466,6 +466,10 @@ async fn post_ore_run_start(
     State(_state): State<Arc<AppState>>,
     Json(req): Json<OreRunRequest>,
 ) -> impl IntoResponse {
+    // TODO Phase 1: assign session_id and persist session config via save_session_config
+    // before ore-run outcomes are attached to campaign resource events. The seed is
+    // currently returned to the client but not anchored server-side — any run wired
+    // into campaign state without this fix will be un-auditable.
     let seed = req.seed_override.unwrap_or_else(generate_seed);
     let timestamp = Utc::now().to_rfc3339();
     let (result, ticks) = run_ore_run(req.approach, seed, &timestamp);
