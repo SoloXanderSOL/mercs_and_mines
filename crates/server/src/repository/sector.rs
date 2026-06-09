@@ -18,8 +18,10 @@ pub struct SectorState {
     pub sector_id: SectorId,
     pub campaign_id: Uuid,
     pub occupation_status: OccupationStatus,
+    #[serde(default)]
     pub owner: Option<WalletAddress>,
     pub deployed_unit_count: u32,
+    #[serde(default)]
     pub active_timer_ids: Vec<Uuid>,
     #[serde(default)]
     pub terrain: HashMap<String, HexTerrain>,
@@ -132,18 +134,18 @@ impl SectorStateRepository for RedisSectorStateRepository {
     }
 
     async fn upsert_sector(&self, state: SectorState) -> Result<(), RepositoryError> {
-        use redis::AsyncCommands;
         let mut conn = self.conn.clone();
         let json = serde_json::to_string(&state)
             .map_err(|e| RepositoryError::Internal(e.to_string()))?;
         let sector_id = state.sector_id;
-        conn.set::<_, _, ()>(Self::hex_state_key(sector_id), json)
+        let hex_key = Self::hex_state_key(sector_id);
+        let sector_id_str = sector_id.to_string();
+        redis::pipe()
+            .set(&hex_key, &json)
+            .sadd("sectors:all", &sector_id_str)
+            .query_async::<()>(&mut conn)
             .await
-            .map_err(|e| RepositoryError::Internal(e.to_string()))?;
-        conn.sadd::<_, _, ()>("sectors:all", sector_id.to_string())
-            .await
-            .map_err(|e| RepositoryError::Internal(e.to_string()))?;
-        Ok(())
+            .map_err(|e| RepositoryError::Internal(e.to_string()))
     }
 
     async fn list_sectors(&self) -> Result<Vec<SectorState>, RepositoryError> {
@@ -156,8 +158,12 @@ impl SectorStateRepository for RedisSectorStateRepository {
         for id_str in ids {
             let sector_id = id_str.parse::<Uuid>()
                 .map_err(|e| RepositoryError::Internal(format!("invalid sector id {id_str}: {e}")))?;
-            if let Some(s) = self.get_sector(sector_id).await? {
-                out.push(s);
+            match self.get_sector(sector_id).await? {
+                Some(s) => out.push(s),
+                None => tracing::warn!(
+                    sector_id = %sector_id,
+                    "sectors:all entry has no hex_state key — orphaned entry"
+                ),
             }
         }
         Ok(out)

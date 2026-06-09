@@ -133,20 +133,23 @@ impl TimerRepository for RedisTimerRepository {
         let mut conn = self.conn.clone();
         let timer_id_str = timer_id.to_string();
 
-        let sector_str: Option<String> = conn
-            .get(Self::timer_sector_key(timer_id))
+        // Read the full payload to get sector_id — avoids a separate reverse-lookup GET,
+        // so if this succeeds and the pipeline fails, no sorted-set entries are left orphaned.
+        let json: Option<String> = conn
+            .get(Self::timer_key(timer_id))
             .await
             .map_err(|e| RepositoryError::Internal(e.to_string()))?;
-        let sector_str = sector_str.ok_or(RepositoryError::NotFound)?;
-        let sector_id  = sector_str.parse::<Uuid>()
+        let json = json.ok_or(RepositoryError::NotFound)?;
+        let timer: DeploymentTimer = serde_json::from_str(&json)
             .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        let sector_id = timer.sector_id;
 
-        let mut pipe = redis::pipe();
-        pipe.zrem(Self::sector_timers_key(sector_id), &timer_id_str).ignore()
-            .zrem("timers:global", &timer_id_str).ignore()
-            .del(Self::timer_key(timer_id)).ignore()
-            .del(Self::timer_sector_key(timer_id)).ignore();
-        pipe.query_async::<()>(&mut conn)
+        redis::pipe()
+            .zrem(Self::sector_timers_key(sector_id), &timer_id_str)
+            .zrem("timers:global", &timer_id_str)
+            .del(Self::timer_key(timer_id))
+            .del(Self::timer_sector_key(timer_id))
+            .query_async::<()>(&mut conn)
             .await
             .map_err(|e| RepositoryError::Internal(e.to_string()))
     }

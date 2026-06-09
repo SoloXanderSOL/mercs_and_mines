@@ -737,6 +737,74 @@ async fn timer_repository_redis_is_correct() {
 }
 
 #[tokio::test]
+async fn cancel_timer_removes_from_both_sorted_sets() {
+    let url = match std::env::var("TEST_REDIS_URL").ok() {
+        Some(u) => u,
+        None => {
+            eprintln!("TEST_REDIS_URL not set — skipping cancel_timer sorted-set test");
+            return;
+        }
+    };
+
+    let client = redis::Client::open(url).expect("Invalid TEST_REDIS_URL");
+    let mgr = redis::aio::ConnectionManager::new(client)
+        .await
+        .expect("Failed to connect to Redis");
+    let repo = RedisTimerRepository::new(mgr.clone());
+
+    let sector_id = uuid::Uuid::new_v4();
+    let timer_id  = uuid::Uuid::new_v4();
+    let wallet    = WalletAddress([7u8; 32]);
+
+    let timer = DeploymentTimer {
+        timer_id,
+        player_wallet: wallet,
+        sector_id,
+        timer_type: TimerType::DeploymentExpiry,
+        fires_at: chrono::Utc::now() - chrono::Duration::seconds(1),
+    };
+
+    repo.schedule_timer(timer).await.expect("schedule_timer failed");
+
+    // Verify it appears before cancel.
+    let before = repo.get_due_timers(chrono::Utc::now() + chrono::Duration::seconds(60))
+        .await
+        .expect("get_due_timers before cancel failed");
+    assert!(before.iter().any(|t| t.timer_id == timer_id), "timer must appear before cancel");
+
+    repo.cancel_timer(timer_id).await.expect("cancel_timer failed");
+
+    // After cancel, a far-future scan must not return the cancelled timer.
+    let after = repo.get_due_timers(chrono::Utc::now() + chrono::Duration::seconds(7200))
+        .await
+        .expect("get_due_timers after cancel failed");
+    assert!(
+        !after.iter().any(|t| t.timer_id == timer_id),
+        "cancelled timer must not appear in get_due_timers"
+    );
+
+    // Verify both sorted sets no longer contain the timer_id.
+    use redis::AsyncCommands;
+    let mut conn = mgr.clone();
+    let global_score: Option<f64> = conn
+        .zscore("timers:global", timer_id.to_string())
+        .await
+        .expect("ZSCORE timers:global failed");
+    assert!(global_score.is_none(), "timer must be removed from timers:global");
+
+    let sector_score: Option<f64> = conn
+        .zscore(format!("sector:{}:timers", sector_id), timer_id.to_string())
+        .await
+        .expect("ZSCORE sector timers failed");
+    assert!(sector_score.is_none(), "timer must be removed from sector:{{id}}:timers");
+
+    // Teardown — keys should already be deleted by cancel_timer, but clean up the sector key.
+    conn.del::<_, ()>(format!("sector:{}:timers", sector_id))
+        .await
+        .expect("DEL sector timers cleanup failed");
+}
+
+#[tokio::test]
 async fn session_state_repository_redis_is_correct() {
     let url = match std::env::var("TEST_REDIS_URL").ok() {
         Some(u) => u,
