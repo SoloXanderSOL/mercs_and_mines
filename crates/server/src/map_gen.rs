@@ -60,7 +60,7 @@ pub struct MagmaVeinNode {
     pub is_tectonic_anchor: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SafeZoneLayout {
     pub centre: (i32, i32),
     pub hexes: Vec<(i32, i32)>,
@@ -169,6 +169,11 @@ pub fn assign_gateway_hexes(
         });
     }
 
+    // TODO(phase-2): HashMap iteration order is deterministic within one process run
+    // but varies across restarts. When Phase 2 runs multiple game servers, charter
+    // members will receive different gateway hexes after a restart. Fix: replace this
+    // HashMap with a BTreeMap keyed by charter_id, or collect and sort entries by
+    // charter_id before iterating.
     for (charter_id, members) in &charter_groups {
         let q_idx = rng.roll_int(0, 3);
         let mut current_quadrant = match q_idx {
@@ -431,7 +436,11 @@ pub fn generate_sector_map(seed: u32, radius: u32) -> SectorMap {
 
         terrain.insert(format!("{},{}", oq, or_), HexTerrain::GunOutpost);
 
-        // Place tectonic anchor on a valid neighbour — immediate ring first
+        // Place tectonic anchor on a valid ring-1 neighbour.
+        // Placement tolerance is ±2 from the rolled radius, not ±1.
+        // polar_to_axial cube-rounding can snap the outpost position ±1 beyond the
+        // rolled FORWARD_OUTPOST_MIN/MAX_RADIUS band; the GunOutpost→anchor neighbour
+        // step adds another ±1. Both drift sources must be accounted for here.
         let mut anchor_placed = false;
         for &(dq, dr) in &NEIGHBOURS {
             let nq = oq + dq;
@@ -446,22 +455,13 @@ pub fn generate_sector_map(seed: u32, radius: u32) -> SectorMap {
             break;
         }
 
-        // Fall back to distance-2 ring if no immediate neighbour was valid
         if !anchor_placed {
-            'outer: for dq in -2i32..=2 {
-                for dr in -2i32..=2 {
-                    let nq = oq + dq;
-                    let nr = or_ + dr;
-                    if hex_axial_distance(oq, or_, nq, nr) != 2 { continue; }
-                    let ndist = hex_axial_distance(nq, nr, 0, 0);
-                    if ndist > radius - 1 { continue; }
-                    if !terrain_passable_for_vein(nq, nr, &terrain) { continue; }
-                    if ndist <= SAFE_ZONE_RADIUS { continue; }
-                    if vein_exists_at(&magma_veins, nq, nr) { continue; }
-                    magma_veins.push(MagmaVeinNode { q: nq, r: nr, tier: 3, is_tectonic_anchor: true });
-                    break 'outer;
-                }
-            }
+            tracing::warn!(
+                outpost_q = oq,
+                outpost_r = or_,
+                "Forward Outpost placed with no valid ring-1 Tectonic Anchor slot; \
+                 outpost has no adjacent anchor vein"
+            );
         }
     }
 
@@ -494,6 +494,9 @@ mod tests {
         for (i, (v1, v2)) in map1.magma_veins.iter().zip(map2.magma_veins.iter()).enumerate() {
             assert_eq!(v1, v2, "vein {} differs", i);
         }
+        assert_eq!(map1.safe_zone.centre,    map2.safe_zone.centre);
+        assert_eq!(map1.safe_zone.hexes,     map2.safe_zone.hexes);
+        assert_eq!(map1.safe_zone.rim_hexes, map2.safe_zone.rim_hexes);
     }
 
     #[test]

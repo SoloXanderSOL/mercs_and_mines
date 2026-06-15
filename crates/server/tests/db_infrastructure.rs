@@ -822,7 +822,7 @@ async fn session_state_repository_redis_is_correct() {
     let mgr = redis::aio::ConnectionManager::new(client)
         .await
         .expect("Failed to connect to Redis");
-    let repo = RedisSessionStateRepository::new(mgr.clone());
+    let repo = RedisSessionStateRepository::new(mgr.clone(), 300);
 
     let session_id = uuid::Uuid::new_v4();
 

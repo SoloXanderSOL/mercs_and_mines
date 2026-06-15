@@ -49,7 +49,7 @@ async fn main() {
     let config = Arc::new(Config::from_env());
     let bind_addr = config.server.bind_addr.clone();
     let log_dir = std::env::var("LOG_DIR").unwrap_or_else(|_| "./logs".into());
-    let mut state = AppState::new(std::path::PathBuf::from(log_dir), config);
+    let mut state = AppState::new(std::path::PathBuf::from(log_dir), config.clone());
     state.account_repo    = Arc::new(PostgresAccountRepository::new(pool.clone()));
     state.campaign_repo   = Arc::new(PostgresCampaignRepository::new(pool.clone()));
     state.commander_repo  = Arc::new(PostgresCommanderRepository::new(pool.clone()));
@@ -57,14 +57,20 @@ async fn main() {
     state.section_repo    = Arc::new(PostgresSectionRepository::new(pool.clone()));
     state.sector_repo     = Arc::new(RedisSectorStateRepository::new(redis_mgr.clone()));
     state.timer_repo      = Arc::new(RedisTimerRepository::new(redis_mgr.clone()));
-    state.session_repo    = Arc::new(RedisSessionStateRepository::new(redis_mgr.clone()));
+    state.session_repo    = Arc::new(RedisSessionStateRepository::new(redis_mgr.clone(), config.server.combat_session_stale_secs));
     state.input_log_repo  = Arc::new(PostgresInputLogRepository::new(pool.clone()));
     state.pool  = Some(pool);
     state.redis = Some(redis_mgr);
     let state = Arc::new(state);
 
     let lifecycle_repo = Arc::clone(&state.campaign_repo);
-    tokio::spawn(run_sector_lifecycle_task(lifecycle_repo));
+    tokio::spawn(async move {
+        loop {
+            run_sector_lifecycle_task(Arc::clone(&lifecycle_repo)).await;
+            tracing::error!("lifecycle task exited unexpectedly — restarting in 5s");
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+    });
 
     let app = mercs_server::routes::router(state);
     let listener = tokio::net::TcpListener::bind(&bind_addr)

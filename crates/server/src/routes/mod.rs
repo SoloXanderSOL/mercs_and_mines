@@ -204,13 +204,18 @@ async fn post_mission_resolve(
             }),
             narrative_event: None,
         }).await;
-        w.append(&shared::InputLogEntry {
-            tick: 1, seq: 0,
-            event_type: "combat_end".into(),
-            player_id: None,
-            payload: serde_json::to_value(&report).unwrap_or_default(),
-            narrative_event: None,
-        }).await;
+        match serde_json::to_value(&report) {
+            Ok(payload) => {
+                w.append(&shared::InputLogEntry {
+                    tick: 1, seq: 0,
+                    event_type: "combat_end".into(),
+                    player_id: None,
+                    payload,
+                    narrative_event: None,
+                }).await;
+            }
+            Err(e) => eprintln!("[routes] to_value failed for combat_end log entry: {e}"),
+        }
     }
 
     Ok(Json(report))
@@ -277,13 +282,18 @@ async fn post_combat_resolve(
             }),
             narrative_event: None,
         }).await;
-        w.append(&shared::InputLogEntry {
-            tick: 1, seq: 0,
-            event_type: "combat_end".into(),
-            player_id: None,
-            payload: serde_json::to_value(&report).unwrap_or_default(),
-            narrative_event: None,
-        }).await;
+        match serde_json::to_value(&report) {
+            Ok(payload) => {
+                w.append(&shared::InputLogEntry {
+                    tick: 1, seq: 0,
+                    event_type: "combat_end".into(),
+                    player_id: None,
+                    payload,
+                    narrative_event: None,
+                }).await;
+            }
+            Err(e) => eprintln!("[routes] to_value failed for combat_end log entry: {e}"),
+        }
     }
 
     Json(serde_json::json!({
@@ -347,13 +357,18 @@ async fn post_pack_assault(
             }),
             narrative_event: None,
         }).await;
-        w.append(&shared::InputLogEntry {
-            tick: 1, seq: 0,
-            event_type: "combat_end".into(),
-            player_id: None,
-            payload: serde_json::to_value(&report).unwrap_or_default(),
-            narrative_event: None,
-        }).await;
+        match serde_json::to_value(&report) {
+            Ok(payload) => {
+                w.append(&shared::InputLogEntry {
+                    tick: 1, seq: 0,
+                    event_type: "combat_end".into(),
+                    player_id: None,
+                    payload,
+                    narrative_event: None,
+                }).await;
+            }
+            Err(e) => eprintln!("[routes] to_value failed for combat_end log entry: {e}"),
+        }
     }
 
     Json(report)

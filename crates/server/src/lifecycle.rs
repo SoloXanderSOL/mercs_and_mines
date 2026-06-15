@@ -33,6 +33,11 @@ pub fn check_campaign_transition(
                 return Some(CampaignLifecycle::Ending);
             }
         }
+    } else {
+        tracing::warn!(
+            campaign_id = %campaign.campaign_id,
+            "victory_tickers is not a JSON object — ticker check skipped"
+        );
     }
 
     None
@@ -119,7 +124,7 @@ mod tests {
         let campaign = make_campaign(
             CampaignLifecycle::Active,
             Some(now + Duration::seconds(3600)),
-            json!({ "MilitaryDominance": 50.0 }),
+            json!({ "MILITARY_DOMINANCE": 50.0 }),
         );
         assert_eq!(check_campaign_transition(&campaign, now), None);
     }
@@ -130,7 +135,7 @@ mod tests {
         let campaign = make_campaign(
             CampaignLifecycle::Active,
             None,
-            json!({ "CapitalistDomination": 100.0 }),
+            json!({ "CAPITALIST_DOMINATION": 100.0 }),
         );
         assert_eq!(check_campaign_transition(&campaign, now), Some(CampaignLifecycle::Ending));
     }
@@ -141,7 +146,7 @@ mod tests {
         let campaign = make_campaign(
             CampaignLifecycle::Active,
             None,
-            json!({ "MilitaryDominance": 150.0 }),
+            json!({ "MILITARY_DOMINANCE": 150.0 }),
         );
         assert_eq!(check_campaign_transition(&campaign, now), Some(CampaignLifecycle::Ending));
     }
@@ -152,7 +157,7 @@ mod tests {
         let campaign = make_campaign(
             CampaignLifecycle::Active,
             None,
-            json!({ "MilitaryDominance": 99.9 }),
+            json!({ "MILITARY_DOMINANCE": 99.9 }),
         );
         assert_eq!(check_campaign_transition(&campaign, now), None);
     }
@@ -170,7 +175,7 @@ mod tests {
         let campaign = make_campaign(
             CampaignLifecycle::Ending,
             Some(now - Duration::seconds(1)),
-            json!({ "MilitaryDominance": 100.0 }),
+            json!({ "MILITARY_DOMINANCE": 100.0 }),
         );
         assert_eq!(check_campaign_transition(&campaign, now), None);
     }
@@ -181,12 +186,12 @@ mod tests {
         let ended = make_campaign(
             CampaignLifecycle::Ended,
             Some(now - Duration::seconds(1)),
-            json!({ "MilitaryDominance": 100.0 }),
+            json!({ "MILITARY_DOMINANCE": 100.0 }),
         );
         let archived = make_campaign(
             CampaignLifecycle::Archived,
             Some(now - Duration::seconds(1)),
-            json!({ "MilitaryDominance": 100.0 }),
+            json!({ "MILITARY_DOMINANCE": 100.0 }),
         );
         assert_eq!(check_campaign_transition(&ended, now), None);
         assert_eq!(check_campaign_transition(&archived, now), None);

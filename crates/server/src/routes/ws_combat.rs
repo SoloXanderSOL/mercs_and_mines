@@ -188,19 +188,23 @@ async fn handle_ws(
                         let ended = event.combat_ended;
 
                         if let Some(w) = log.as_mut() {
-                            let entry = shared::InputLogEntry {
-                                tick: event.tick_index as u64,
-                                seq: 0,
-                                event_type: if event.combat_ended {
-                                    "combat_end".into()
-                                } else {
-                                    "combat_tick".into()
-                                },
-                                player_id: None,
-                                payload: serde_json::to_value(&event).unwrap_or_default(),
-                                narrative_event: event.narrative.clone(),
-                            };
-                            w.append(&entry).await;
+                            match serde_json::to_value(&event) {
+                                Ok(payload) => {
+                                    w.append(&shared::InputLogEntry {
+                                        tick: event.tick_index as u64,
+                                        seq: 0,
+                                        event_type: if event.combat_ended {
+                                            "combat_end".into()
+                                        } else {
+                                            "combat_tick".into()
+                                        },
+                                        player_id: None,
+                                        payload,
+                                        narrative_event: event.narrative.clone(),
+                                    }).await;
+                                }
+                                Err(e) => eprintln!("[ws_combat] to_value failed for tick log entry: {e}"),
+                            }
                             last_tick = event.tick_index as u64;
                         }
 

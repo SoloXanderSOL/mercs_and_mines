@@ -88,11 +88,14 @@ impl SessionStateRepository for InMemorySessionStateRepository {
 
 pub struct RedisSessionStateRepository {
     conn: redis::aio::ConnectionManager,
+    /// Redis TTL = stale_secs * 2: app gate is the authoritative expiry;
+    /// Redis keeps the key for a reconnect window beyond it before eviction.
+    redis_ttl_secs: u64,
 }
 
 impl RedisSessionStateRepository {
-    pub fn new(conn: redis::aio::ConnectionManager) -> Self {
-        Self { conn }
+    pub fn new(conn: redis::aio::ConnectionManager, stale_secs: u64) -> Self {
+        Self { conn, redis_ttl_secs: stale_secs * 2 }
     }
 
     fn state_key(session_id: Uuid) -> String {
@@ -111,7 +114,7 @@ impl SessionStateRepository for RedisSessionStateRepository {
         let mut conn = self.conn.clone();
         let json = serde_json::to_string(&session)
             .map_err(|e| RepositoryError::Internal(e.to_string()))?;
-        conn.set_ex::<_, _, ()>(Self::state_key(session_id), json, 1800)
+        conn.set_ex::<_, _, ()>(Self::state_key(session_id), json, self.redis_ttl_secs)
             .await
             .map_err(|e| RepositoryError::Internal(e.to_string()))
     }
