@@ -4,6 +4,7 @@
 //   seed_override None    → generated from OS entropy via rng::generate_seed().
 // Timestamp is always generated server-side via chrono::Utc::now(); never accepted from client.
 
+pub mod admin;
 pub mod ws_combat;
 
 use std::sync::Arc;
@@ -513,6 +514,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/combat/aar/:session_id",    get(get_combat_aar))
         .route("/api/ore-run/start",             post(post_ore_run_start))
         .route("/api/session/:id/integrity",     get(get_session_integrity))
+        .merge(admin::router())
         .with_state(state)
         .fallback_service(ServeDir::new("app").append_index_html_on_directories(true))
 }

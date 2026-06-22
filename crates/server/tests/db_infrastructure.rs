@@ -1506,3 +1506,137 @@ async fn session_config_is_immutable() {
     sqlx::query("ALTER TABLE session_configs ENABLE TRIGGER ALL")
         .execute(&pool).await.expect("re-enable triggers after cleanup failed");
 }
+
+#[tokio::test]
+async fn admin_launch_campaign_returns_200_then_409() {
+    use std::sync::Arc;
+    use axum::{body::Body, http::{Request, StatusCode}};
+    use tower::ServiceExt;
+
+    let db_url = match std::env::var("TEST_DATABASE_URL").ok() {
+        Some(u) => u,
+        None => {
+            eprintln!("TEST_DATABASE_URL not set — skipping admin launch integration test");
+            return;
+        }
+    };
+    let redis_url = match std::env::var("TEST_REDIS_URL").ok() {
+        Some(u) => u,
+        None => {
+            eprintln!("TEST_REDIS_URL not set — skipping admin launch integration test");
+            return;
+        }
+    };
+
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&db_url)
+        .await
+        .expect("Failed to connect to test Postgres");
+    sqlx::migrate!("../../migrations").run(&pool).await.expect("Migrations failed");
+
+    let client = redis::Client::open(redis_url).expect("Invalid TEST_REDIS_URL");
+    let redis_mgr = redis::aio::ConnectionManager::new(client)
+        .await
+        .expect("Failed to connect to Redis");
+
+    // Build an AppState backed by real repos for the router
+    let config = Arc::new(mercs_server::config::Config::default());
+    let mut state = mercs_server::state::AppState::new(
+        std::path::PathBuf::from("/tmp"),
+        config,
+    );
+    state.campaign_repo   = Arc::new(PostgresCampaignRepository::new(pool.clone()));
+    state.membership_repo = Arc::new(PostgresMembershipRepository::new(pool.clone()));
+    state.sector_repo     = Arc::new(RedisSectorStateRepository::new(redis_mgr.clone()));
+    state.input_log_repo  = Arc::new(PostgresInputLogRepository::new(pool.clone()));
+    let state = Arc::new(state);
+
+    // Wallets 10–12 (unique to this test — no conflict with other integration tests)
+    let wallets: Vec<Vec<u8>> = (10u8..=12).map(|i| vec![i; 32]).collect();
+
+    // Pre-test cleanup in case a prior panicked run left rows
+    for w in &wallets {
+        sqlx::query("DELETE FROM player_campaign_membership WHERE wallet_address = $1")
+            .bind(w).execute(&pool).await.ok();
+    }
+    for w in &wallets {
+        sqlx::query("DELETE FROM player_accounts WHERE wallet_address = $1")
+            .bind(w).execute(&pool).await.ok();
+    }
+
+    // Setup: Pending campaign + 3 members (mirrors initialize_campaign_orchestrates_correctly)
+    let sector_id = uuid::Uuid::new_v4();
+    let campaign_repo   = PostgresCampaignRepository::new(pool.clone());
+    let membership_repo = PostgresMembershipRepository::new(pool.clone());
+
+    let campaign = campaign_repo.create_campaign(&NewCampaignInstance {
+        sector_id,
+        map_seed: 55555_i64,
+    }).await.expect("create_campaign failed");
+    let campaign_id = campaign.campaign_id;
+
+    for w in &wallets {
+        sqlx::query(
+            "INSERT INTO player_accounts (wallet_address, trust_standing, gcn_balance)
+             VALUES ($1, 0, 0)
+             ON CONFLICT (wallet_address) DO NOTHING"
+        )
+        .bind(w).execute(&pool).await.expect("player_accounts seed failed");
+    }
+    for w in &wallets {
+        membership_repo.add_member(w, campaign_id, None, None)
+            .await.expect("add_member failed");
+    }
+
+    // First POST — expect 200
+    let app = mercs_server::routes::router(Arc::clone(&state));
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/admin/campaign/{}/launch", campaign_id))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "first launch must return 200");
+
+    // Verify DB: campaign must now be Active with ends_at set
+    let updated = campaign_repo.get_campaign(campaign_id).await
+        .expect("get_campaign error")
+        .expect("campaign not found after launch");
+    assert_eq!(updated.state, CampaignLifecycle::Active, "state must be Active after launch");
+    assert!(updated.ends_at.is_some(), "ends_at must be Some after launch");
+
+    // Second POST — expect 409 (oneshot consumed app above; build a new one)
+    let app2 = mercs_server::routes::router(Arc::clone(&state));
+    let req2 = Request::builder()
+        .method("POST")
+        .uri(format!("/api/admin/campaign/{}/launch", campaign_id))
+        .body(Body::empty())
+        .unwrap();
+    let resp2 = app2.oneshot(req2).await.unwrap();
+    assert_eq!(resp2.status(), StatusCode::CONFLICT, "second launch must return 409");
+
+    // Cleanup
+    sqlx::query("ALTER TABLE input_logs DISABLE TRIGGER ALL")
+        .execute(&pool).await.expect("disable triggers for cleanup");
+    sqlx::query("DELETE FROM input_logs WHERE campaign_id = $1")
+        .bind(campaign_id).execute(&pool).await.expect("cleanup input_logs");
+    sqlx::query("ALTER TABLE input_logs ENABLE TRIGGER ALL")
+        .execute(&pool).await.expect("re-enable triggers after cleanup");
+
+    // CASCADE on campaign_id removes player_campaign_membership rows
+    sqlx::query("DELETE FROM campaign_instances WHERE campaign_id = $1")
+        .bind(campaign_id).execute(&pool).await.expect("cleanup campaign_instances");
+
+    for w in &wallets {
+        sqlx::query("DELETE FROM player_accounts WHERE wallet_address = $1")
+            .bind(w).execute(&pool).await.expect("cleanup player_accounts");
+    }
+
+    use redis::AsyncCommands;
+    let mut conn = redis_mgr.clone();
+    conn.del::<_, ()>(format!("sector:{}:hex_state", sector_id))
+        .await.expect("DEL sector hex_state cleanup");
+    conn.srem::<_, _, ()>("sectors:all", sector_id.to_string())
+        .await.expect("SREM sectors:all cleanup");
+}
