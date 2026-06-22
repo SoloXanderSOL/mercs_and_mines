@@ -13,6 +13,13 @@ use super::RepositoryError;
 
 pub type SectorId = Uuid;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HexOccupant {
+    pub id: Uuid,
+    pub owner_wallet: Vec<u8>,
+    pub unit_type: String,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct SectorState {
     pub sector_id: SectorId,
@@ -27,6 +34,8 @@ pub struct SectorState {
     pub terrain: HashMap<String, HexTerrain>,
     #[serde(default)]
     pub magma_veins: Vec<MagmaVeinNode>,
+    #[serde(default)]
+    pub hex_occupancy: HashMap<String, Vec<HexOccupant>>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -43,6 +52,8 @@ pub trait SectorStateRepository: Send + Sync {
     async fn list_sectors(&self) -> Result<Vec<SectorState>, RepositoryError>;
     async fn get_player_presence(&self, sector_id: SectorId) -> Result<Vec<WalletAddress>, RepositoryError>;
     async fn set_player_presence(&self, sector_id: SectorId, players: &[WalletAddress]) -> Result<(), RepositoryError>;
+    async fn add_hex_occupant(&self, sector_id: SectorId, q: i32, r: i32, entry: HexOccupant) -> Result<(), RepositoryError>;
+    async fn remove_hex_occupant(&self, sector_id: SectorId, q: i32, r: i32, unit_id: Uuid) -> Result<(), RepositoryError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -94,6 +105,24 @@ impl SectorStateRepository for InMemorySectorStateRepository {
     async fn set_player_presence(&self, sector_id: SectorId, players: &[WalletAddress]) -> Result<(), RepositoryError> {
         self.presence.insert(sector_id, players.to_vec());
         Ok(())
+    }
+
+    async fn add_hex_occupant(&self, sector_id: SectorId, q: i32, r: i32, entry: HexOccupant) -> Result<(), RepositoryError> {
+        let mut state = self.get_sector(sector_id).await?
+            .ok_or(RepositoryError::NotFound)?;
+        let key = format!("{},{}", q, r);
+        state.hex_occupancy.entry(key).or_default().push(entry);
+        self.upsert_sector(state).await
+    }
+
+    async fn remove_hex_occupant(&self, sector_id: SectorId, q: i32, r: i32, unit_id: Uuid) -> Result<(), RepositoryError> {
+        let mut state = self.get_sector(sector_id).await?
+            .ok_or(RepositoryError::NotFound)?;
+        let key = format!("{},{}", q, r);
+        if let Some(vec) = state.hex_occupancy.get_mut(&key) {
+            vec.retain(|e| e.id != unit_id);
+        }
+        self.upsert_sector(state).await
     }
 }
 
@@ -190,5 +219,23 @@ impl SectorStateRepository for RedisSectorStateRepository {
         conn.set::<_, _, ()>(Self::presence_key(sector_id), json)
             .await
             .map_err(|e| RepositoryError::Internal(e.to_string()))
+    }
+
+    async fn add_hex_occupant(&self, sector_id: SectorId, q: i32, r: i32, entry: HexOccupant) -> Result<(), RepositoryError> {
+        let mut state = self.get_sector(sector_id).await?
+            .ok_or(RepositoryError::NotFound)?;
+        let key = format!("{},{}", q, r);
+        state.hex_occupancy.entry(key).or_default().push(entry);
+        self.upsert_sector(state).await
+    }
+
+    async fn remove_hex_occupant(&self, sector_id: SectorId, q: i32, r: i32, unit_id: Uuid) -> Result<(), RepositoryError> {
+        let mut state = self.get_sector(sector_id).await?
+            .ok_or(RepositoryError::NotFound)?;
+        let key = format!("{},{}", q, r);
+        if let Some(vec) = state.hex_occupancy.get_mut(&key) {
+            vec.retain(|e| e.id != unit_id);
+        }
+        self.upsert_sector(state).await
     }
 }

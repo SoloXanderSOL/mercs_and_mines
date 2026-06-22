@@ -44,7 +44,7 @@ pub use section::{
     SectionRecord, SectionRepository,
 };
 pub use sector::{
-    InMemorySectorStateRepository, OccupationStatus, RedisSectorStateRepository,
+    HexOccupant, InMemorySectorStateRepository, OccupationStatus, RedisSectorStateRepository,
     SectorId, SectorState, SectorStateRepository,
 };
 pub use membership::{

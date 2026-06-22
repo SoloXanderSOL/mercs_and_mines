@@ -16,7 +16,7 @@ use mercs_server::repository::{
     InputLogRepository, PostgresInputLogRepository,
     MembershipRepository, PostgresMembershipRepository,
     SectionRecord, SectionRepository, PostgresSectionRepository,
-    OccupationStatus, RedisSectorStateRepository, SectorState, SectorStateRepository,
+    HexOccupant, OccupationStatus, RedisSectorStateRepository, SectorState, SectorStateRepository,
     DeploymentTimer, RedisTimerRepository, TimerRepository, TimerType,
     CombatSession, RedisSessionStateRepository, SessionStateRepository,
 };
@@ -629,6 +629,7 @@ async fn sector_state_repository_redis_is_correct() {
         active_timer_ids: vec![],
         terrain: std::collections::HashMap::new(),
         magma_veins: vec![],
+        hex_occupancy: std::collections::HashMap::new(),
     };
     repo.upsert_sector(state.clone()).await.expect("upsert_sector failed");
 
@@ -1639,4 +1640,82 @@ async fn admin_launch_campaign_returns_200_then_409() {
         .await.expect("DEL sector hex_state cleanup");
     conn.srem::<_, _, ()>("sectors:all", sector_id.to_string())
         .await.expect("SREM sectors:all cleanup");
+}
+
+#[tokio::test]
+async fn hex_occupancy_add_remove_roundtrips() {
+    let url = match std::env::var("TEST_REDIS_URL").ok() {
+        Some(u) => u,
+        None => {
+            eprintln!("TEST_REDIS_URL not set — skipping hex occupancy integration test");
+            return;
+        }
+    };
+
+    let client = redis::Client::open(url).expect("Invalid TEST_REDIS_URL");
+    let mgr = redis::aio::ConnectionManager::new(client)
+        .await
+        .expect("Failed to connect to Redis");
+    let repo = RedisSectorStateRepository::new(mgr.clone());
+
+    let sector_id  = uuid::Uuid::new_v4();
+    let campaign_id = uuid::Uuid::new_v4();
+
+    // Seed the sector with no occupants.
+    let base_state = SectorState {
+        sector_id,
+        campaign_id,
+        occupation_status: OccupationStatus::Neutral,
+        owner: None,
+        deployed_unit_count: 0,
+        active_timer_ids: vec![],
+        terrain: std::collections::HashMap::new(),
+        magma_veins: vec![],
+        hex_occupancy: std::collections::HashMap::new(),
+    };
+    repo.upsert_sector(base_state).await.expect("upsert_sector failed");
+
+    let occ_a = HexOccupant { id: uuid::Uuid::new_v4(), owner_wallet: vec![1u8; 32], unit_type: "Tank".to_string() };
+    let occ_b = HexOccupant { id: uuid::Uuid::new_v4(), owner_wallet: vec![2u8; 32], unit_type: "Scout".to_string() };
+    let id_a = occ_a.id;
+    let id_b = occ_b.id;
+
+    // Add both occupants to hex (2, 3).
+    repo.add_hex_occupant(sector_id, 2, 3, occ_a).await.expect("add occ_a at (2,3) failed");
+    repo.add_hex_occupant(sector_id, 2, 3, occ_b).await.expect("add occ_b at (2,3) failed");
+
+    // Add occ_a (by id_a clone) to a different hex (5, -1).
+    let occ_a2 = HexOccupant { id: id_a, owner_wallet: vec![1u8; 32], unit_type: "Tank".to_string() };
+    repo.add_hex_occupant(sector_id, 5, -1, occ_a2).await.expect("add occ_a at (5,-1) failed");
+
+    // Assert: "2,3" has 2 entries, "5,-1" has 1 entry.
+    let fetched = repo.get_sector(sector_id).await.expect("get_sector failed").expect("sector not found");
+    let at_2_3 = fetched.hex_occupancy.get("2,3").expect("key '2,3' missing");
+    assert_eq!(at_2_3.len(), 2, "expected 2 occupants at (2,3)");
+    let at_5_n1 = fetched.hex_occupancy.get("5,-1").expect("key '5,-1' missing");
+    assert_eq!(at_5_n1.len(), 1, "expected 1 occupant at (5,-1)");
+
+    // Remove occ_a from hex (2, 3).
+    repo.remove_hex_occupant(sector_id, 2, 3, id_a).await.expect("remove_hex_occupant failed");
+
+    // Assert: "2,3" now has 1 entry (occ_b only), "5,-1" unchanged.
+    let fetched2 = repo.get_sector(sector_id).await.expect("get_sector failed").expect("sector not found");
+    let at_2_3_after = fetched2.hex_occupancy.get("2,3").expect("key '2,3' missing after remove");
+    assert_eq!(at_2_3_after.len(), 1, "expected 1 occupant at (2,3) after remove");
+    assert_eq!(at_2_3_after[0].id, id_b, "remaining occupant at (2,3) must be occ_b");
+    let at_5_n1_after = fetched2.hex_occupancy.get("5,-1").expect("key '5,-1' missing after remove");
+    assert_eq!(at_5_n1_after.len(), 1, "expected 1 occupant at (5,-1) — unaffected by remove");
+
+    // Cleanup.
+    use redis::AsyncCommands;
+    let mut conn = mgr.clone();
+    conn.del::<_, ()>(vec![
+        format!("sector:{}:hex_state", sector_id),
+        format!("sector:{}:player_presence", sector_id),
+    ])
+    .await
+    .expect("DEL cleanup failed");
+    conn.srem::<_, _, ()>("sectors:all", sector_id.to_string())
+        .await
+        .expect("SREM cleanup failed");
 }
