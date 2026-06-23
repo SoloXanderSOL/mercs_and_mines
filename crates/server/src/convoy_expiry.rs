@@ -157,6 +157,7 @@ pub async fn poll_expiry_once(state: &AppState) {
                             "hex_r": convoy.destination_r,
                             "unit_a": pair.a.id,
                             "unit_b": pair.b.id,
+                            "owner_b": bs58::encode(&pair.b.owner_wallet).into_string(),
                         }),
                         narrative_event: None,
                     };

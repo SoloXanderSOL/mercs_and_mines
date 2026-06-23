@@ -949,6 +949,92 @@ async fn session_state_repository_redis_is_correct() {
 }
 
 #[tokio::test]
+async fn commander_generate_and_persist() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => {
+            eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test");
+            return;
+        }
+    };
+
+    let commander_repo = PostgresCommanderRepository::new(pool.clone());
+    let campaign_repo  = PostgresCampaignRepository::new(pool.clone());
+
+    // 1. Seed campaign (FK prerequisite).
+    let campaign = campaign_repo.create_campaign(&NewCampaignInstance {
+        sector_id: uuid::Uuid::new_v4(),
+        map_seed:  0xABCD1234_i64,
+    }).await.expect("create campaign failed");
+    let campaign_id = campaign.campaign_id;
+
+    // Wallet [8u8;32] — unique to this test to avoid FK conflicts with parallel test setup.
+    let wallet_bytes = [8u8; 32].to_vec();
+
+    // Pre-test cleanup.
+    sqlx::query("DELETE FROM commander_records WHERE campaign_id = $1")
+        .bind(campaign_id).execute(&pool).await.ok();
+    sqlx::query("DELETE FROM player_campaign_membership WHERE wallet_address = $1")
+        .bind(&wallet_bytes).execute(&pool).await.ok();
+
+    // Seed player_accounts FK.
+    sqlx::query(
+        "INSERT INTO player_accounts (wallet_address, trust_standing, gcn_balance)
+         VALUES ($1, 0, 0) ON CONFLICT (wallet_address) DO NOTHING"
+    )
+    .bind(&wallet_bytes)
+    .execute(&pool)
+    .await
+    .expect("player_accounts FK seed failed");
+
+    // 2. Generate a commander deterministically.
+    let record = mercs_server::commander_gen::generate_commander(
+        wallet_bytes.clone(),
+        campaign_id,
+        42u32,
+    );
+
+    // 3. Assert generated fields before persisting.
+    assert!(!record.name.is_empty(), "name must be non-empty");
+    assert_eq!(record.rank, 1);
+    assert_eq!(record.xp, 0);
+    assert_eq!(record.stress, 0);
+    assert!(!record.is_shattered);
+    assert!(!record.is_kia);
+    assert!(!record.is_nft);
+    assert!(record.veteran_trait.is_none());
+    assert_eq!(record.prng_seed_state, 42i64);
+    assert_eq!(record.campaign_id, campaign_id);
+
+    let canonical_origins = [
+        "Human (Corporate)", "Human (Underhive)",
+        "Raccoon (Mod-Moped)", "Raccoon (Rocker-Chopper)", "Hamster Attachment",
+    ];
+    assert!(
+        canonical_origins.contains(&record.origin.as_str()),
+        "origin '{}' not canonical", record.origin
+    );
+
+    // 4. Persist.
+    let commander_id = record.commander_id;
+    let expected_name = record.name.clone();
+    commander_repo.create_commander(record).await.expect("create_commander failed");
+
+    // 5. Round-trip: get back and assert fidelity.
+    let fetched = commander_repo.get_commander(commander_id).await
+        .expect("get_commander error")
+        .expect("commander not found after create");
+    assert_eq!(fetched.name, expected_name);
+    assert_eq!(fetched.prng_seed_state, 42i64);
+    assert_eq!(fetched.rank, 1);
+    assert_eq!(fetched.campaign_id, campaign_id);
+
+    // Cleanup.
+    sqlx::query!("DELETE FROM commander_records WHERE commander_id = $1", commander_id)
+        .execute(&pool).await.ok();
+}
+
+#[tokio::test]
 async fn input_log_is_append_only_and_queryable() {
     let pool = match test_pool().await {
         Some(p) => p,
