@@ -50,6 +50,20 @@ impl HexTerrain {
                 | HexTerrain::Ravine
         )
     }
+
+    pub fn travel_time_modifier(&self) -> f64 {
+        match self {
+            HexTerrain::AshenPlains | HexTerrain::ScorchedDesert | HexTerrain::ToxicZone => 1.0,
+            HexTerrain::RuinedCity => 1.5,
+            HexTerrain::CityState | HexTerrain::GunOutpost => 0.5,
+            HexTerrain::CooledMagma => 2.0,
+            // impassable — route validation must reject these before arrival time is computed
+            HexTerrain::MagmaFlow
+                | HexTerrain::VolcanicCaldera
+                | HexTerrain::Mountain
+                | HexTerrain::Ravine => f64::INFINITY,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -19,6 +19,7 @@ use mercs_server::repository::{
     HexOccupant, OccupationStatus, RedisSectorStateRepository, SectorState, SectorStateRepository,
     DeploymentTimer, RedisTimerRepository, TimerRepository, TimerType,
     CombatSession, RedisSessionStateRepository, SessionStateRepository,
+    ConvoyDbRecord, ConvoyRepository, PostgresConvoyRepository,
 };
 
 async fn test_pool() -> Option<sqlx::PgPool> {
@@ -664,6 +665,56 @@ async fn sector_state_repository_redis_is_correct() {
     conn.srem::<_, _, ()>("sectors:all", sector_id.to_string())
         .await
         .expect("SREM cleanup failed");
+}
+
+#[tokio::test]
+async fn convoy_record_crud() {
+    let Some(pool) = test_pool().await else {
+        eprintln!("TEST_DATABASE_URL not set — skipping convoy_record_crud");
+        return;
+    };
+
+    let repo = PostgresConvoyRepository::new(pool.clone());
+    let convoy_id = uuid::Uuid::new_v4();
+
+    let record = ConvoyDbRecord {
+        convoy_id,
+        sector_id:     uuid::Uuid::new_v4(),
+        owner_wallet:  vec![7u8; 32],
+        origin_q:      3,
+        origin_r:      -2,
+        destination_q: 7,
+        destination_r: 1,
+        route:         serde_json::json!([{"q": 3, "r": -2}, {"q": 7, "r": 1}]),
+        arrival_time:  chrono::Utc::now() + chrono::Duration::minutes(40),
+        vehicle_class: "BehemothMegaTruck".to_string(),
+        cargo:         serde_json::json!({"magma_ore": 100}),
+        in_transit:    true,
+        created_at:    chrono::Utc::now(),
+    };
+
+    // create
+    let returned_id = repo.create_convoy(record.clone()).await.expect("create_convoy failed");
+    assert_eq!(returned_id, convoy_id);
+
+    // get — verify initial state
+    let fetched = repo.get_convoy(convoy_id).await.expect("get_convoy failed").expect("convoy not found");
+    assert!(fetched.in_transit);
+    assert_eq!(fetched.vehicle_class, "BehemothMegaTruck");
+    assert_eq!(fetched.owner_wallet, vec![7u8; 32]);
+
+    // mark_arrived
+    repo.mark_arrived(convoy_id).await.expect("mark_arrived failed");
+
+    // get — verify in_transit flipped
+    let fetched2 = repo.get_convoy(convoy_id).await.expect("get_convoy failed").expect("convoy not found after mark_arrived");
+    assert!(!fetched2.in_transit, "in_transit must be false after mark_arrived");
+
+    // cleanup
+    sqlx::query!("DELETE FROM convoy_records WHERE convoy_id = $1", convoy_id)
+        .execute(&pool)
+        .await
+        .expect("cleanup DELETE failed");
 }
 
 #[tokio::test]
@@ -1718,4 +1769,161 @@ async fn hex_occupancy_add_remove_roundtrips() {
     conn.srem::<_, _, ()>("sectors:all", sector_id.to_string())
         .await
         .expect("SREM cleanup failed");
+}
+
+#[tokio::test]
+async fn convoy_dispatch_creates_db_record_and_timer() {
+    use std::sync::Arc;
+    use axum::{body::Body, http::{Request, StatusCode}};
+    use tower::ServiceExt;
+    use redis::AsyncCommands;
+    use shared::SessionToken;
+    use chrono::Utc;
+
+    let db_url = match std::env::var("TEST_DATABASE_URL").ok() {
+        Some(u) => u,
+        None => {
+            eprintln!("TEST_DATABASE_URL not set — skipping convoy dispatch integration test");
+            return;
+        }
+    };
+    let redis_url = match std::env::var("TEST_REDIS_URL").ok() {
+        Some(u) => u,
+        None => {
+            eprintln!("TEST_REDIS_URL not set — skipping convoy dispatch integration test");
+            return;
+        }
+    };
+
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&db_url)
+        .await
+        .expect("Failed to connect to test Postgres");
+    sqlx::migrate!("../../migrations").run(&pool).await.expect("Migrations failed");
+
+    let client = redis::Client::open(redis_url).expect("Invalid TEST_REDIS_URL");
+    let redis_mgr = redis::aio::ConnectionManager::new(client)
+        .await
+        .expect("Failed to connect to Redis");
+
+    // Build AppState with real repos
+    let config = Arc::new(mercs_server::config::Config::default());
+    let mut state = mercs_server::state::AppState::new(
+        std::path::PathBuf::from("/tmp"),
+        config,
+    );
+    state.campaign_repo  = Arc::new(PostgresCampaignRepository::new(pool.clone()));
+    state.convoy_repo    = Arc::new(PostgresConvoyRepository::new(pool.clone()));
+    state.sector_repo    = Arc::new(RedisSectorStateRepository::new(redis_mgr.clone()));
+    state.timer_repo     = Arc::new(RedisTimerRepository::new(redis_mgr.clone()));
+    state.input_log_repo = Arc::new(PostgresInputLogRepository::new(pool.clone()));
+    let state = Arc::new(state);
+
+    // Wallet [88u8; 32] — distinct from all other test wallets
+    let wallet_bytes = [88u8; 32];
+    let wallet_b58 = bs58::encode(wallet_bytes).into_string();
+    let token_id = "convoy-dispatch-test-token".to_string();
+    let now = Utc::now().timestamp();
+    let session_token = SessionToken {
+        token_id:       token_id.clone(),
+        account_id:     wallet_b58.clone(),
+        wallet_address: wallet_b58.clone(),
+        issued_at:      now,
+        expires_at:     now + 7200,
+    };
+    state.sessions.insert(token_id.clone(), session_token);
+
+    // Create a campaign in Postgres (sector_id is just a UUID — no Postgres FK)
+    let campaign_repo = PostgresCampaignRepository::new(pool.clone());
+    let campaign = campaign_repo.create_campaign(&NewCampaignInstance {
+        sector_id: uuid::Uuid::new_v4(),
+        map_seed:  77777_i64,
+    }).await.expect("create_campaign failed");
+    let campaign_id = campaign.campaign_id;
+    let sector_id   = campaign.sector_id;
+
+    // Seed SectorState in Redis with terrain at destination hex (5, 3)
+    let mut terrain = std::collections::HashMap::new();
+    terrain.insert("5,3".to_string(), mercs_server::map_gen::HexTerrain::AshenPlains);
+    let sector_state = SectorState {
+        sector_id,
+        campaign_id,
+        occupation_status:   OccupationStatus::Neutral,
+        owner:               None,
+        deployed_unit_count: 0,
+        active_timer_ids:    vec![],
+        terrain,
+        magma_veins:         vec![],
+        hex_occupancy:       std::collections::HashMap::new(),
+    };
+    state.sector_repo.upsert_sector(sector_state).await.expect("upsert_sector failed");
+
+    // Fire POST /api/campaign/:id/convoy/dispatch
+    let app = mercs_server::routes::router(Arc::clone(&state));
+    let body = serde_json::json!({
+        "origin_q": 3, "origin_r": -2,
+        "destination_q": 5, "destination_r": 3,
+        "vehicle_class": "BehemothMegaTruck",
+        "cargo": {}
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/campaign/{}/convoy/dispatch", campaign_id))
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {}", token_id))
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED, "dispatch must return 201");
+
+    // Parse convoy_id from response body
+    let resp_bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+    let resp_json: serde_json::Value = serde_json::from_slice(&resp_bytes).unwrap();
+    let convoy_id: uuid::Uuid = resp_json["convoy_id"].as_str().unwrap().parse().unwrap();
+
+    // Assert: convoy in DB with in_transit = true
+    let conv_repo = PostgresConvoyRepository::new(pool.clone());
+    let fetched = conv_repo.get_convoy(convoy_id).await
+        .expect("get_convoy error")
+        .expect("convoy not found in DB after dispatch");
+    assert!(fetched.in_transit, "convoy must be in_transit after dispatch");
+    assert_eq!(fetched.vehicle_class, "BehemothMegaTruck");
+
+    // Assert: timer key exists in Redis
+    let mut conn = redis_mgr.clone();
+    let timer_json: Option<String> = conn
+        .get(format!("timer:{}", convoy_id))
+        .await
+        .expect("Redis GET timer key failed");
+    assert!(timer_json.is_some(), "timer key timer:{convoy_id} must exist in Redis after dispatch");
+
+    // ── Cleanup ───────────────────────────────────────────────────────────────
+    sqlx::query!("DELETE FROM convoy_records WHERE convoy_id = $1", convoy_id)
+        .execute(&pool).await.expect("cleanup convoy_records");
+
+    sqlx::query("ALTER TABLE input_logs DISABLE TRIGGER ALL")
+        .execute(&pool).await.expect("disable triggers for cleanup");
+    sqlx::query!("DELETE FROM input_logs WHERE campaign_id = $1", campaign_id)
+        .execute(&pool).await.expect("cleanup input_logs");
+    sqlx::query("ALTER TABLE input_logs ENABLE TRIGGER ALL")
+        .execute(&pool).await.expect("re-enable triggers after cleanup");
+
+    sqlx::query!("DELETE FROM campaign_instances WHERE campaign_id = $1", campaign_id)
+        .execute(&pool).await.expect("cleanup campaign_instances");
+
+    let timer_id_str  = convoy_id.to_string();
+    let sector_id_str = sector_id.to_string();
+    conn.del::<_, ()>(vec![
+        format!("timer:{}", convoy_id),
+        format!("timer:{}:sector_id", convoy_id),
+    ]).await.expect("DEL timer keys cleanup");
+    conn.zrem::<_, _, ()>("timers:global", &timer_id_str).await.expect("ZREM timers:global");
+    conn.zrem::<_, _, ()>(format!("sector:{}:timers", sector_id), &timer_id_str).await.expect("ZREM sector timers");
+    conn.del::<_, ()>(vec![
+        format!("sector:{}:hex_state", sector_id),
+        format!("sector:{}:player_presence", sector_id),
+    ]).await.expect("DEL sector keys cleanup");
+    conn.srem::<_, _, ()>("sectors:all", &sector_id_str).await.expect("SREM sectors:all");
+    let _ = sector_id_str; // silence unused warning
 }

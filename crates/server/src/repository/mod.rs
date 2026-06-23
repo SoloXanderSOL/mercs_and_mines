@@ -4,6 +4,7 @@
 #![allow(unused)]
 pub mod account;
 pub mod campaign;
+pub mod convoy;
 pub mod commander;
 pub mod input_log;
 pub mod membership;
@@ -34,6 +35,7 @@ pub use campaign::{
     InMemoryCampaignRepository, NewCampaignInstance, PostgresCampaignRepository,
     VictoryTickerType,
 };
+pub use convoy::{ConvoyDbRecord, ConvoyRepository, InMemoryConvoyRepository, PostgresConvoyRepository};
 pub use commander::{
     CommanderRecord, CommanderRepository,
     InMemoryCommanderRepository, PostgresCommanderRepository,

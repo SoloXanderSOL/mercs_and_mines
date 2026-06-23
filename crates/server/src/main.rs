@@ -4,6 +4,7 @@ use mercs_server::config::Config;
 use mercs_server::lifecycle::run_sector_lifecycle_task;
 use mercs_server::repository::{
     PostgresAccountRepository, PostgresCampaignRepository,
+    PostgresConvoyRepository,
     PostgresCommanderRepository, PostgresInputLogRepository,
     PostgresMembershipRepository,
     PostgresSectionRepository, RedisSectorStateRepository, RedisSessionStateRepository,
@@ -57,6 +58,7 @@ async fn main() {
     state.section_repo    = Arc::new(PostgresSectionRepository::new(pool.clone()));
     state.sector_repo     = Arc::new(RedisSectorStateRepository::new(redis_mgr.clone()));
     state.timer_repo      = Arc::new(RedisTimerRepository::new(redis_mgr.clone()));
+    state.convoy_repo     = Arc::new(PostgresConvoyRepository::new(pool.clone()));
     state.session_repo    = Arc::new(RedisSessionStateRepository::new(redis_mgr.clone(), config.server.combat_session_stale_secs));
     state.input_log_repo  = Arc::new(PostgresInputLogRepository::new(pool.clone()));
     state.pool  = Some(pool);

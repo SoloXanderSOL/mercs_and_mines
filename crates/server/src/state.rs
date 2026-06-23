@@ -6,6 +6,7 @@ use crate::config::Config;
 use crate::repository::{
     AccountRepository, InMemoryAccountRepository,
     CampaignRepository, InMemoryCampaignRepository,
+    ConvoyRepository, InMemoryConvoyRepository,
     CommanderRepository, InMemoryCommanderRepository,
     InputLogRepository, InMemoryInputLogRepository,
     MembershipRepository, InMemoryMembershipRepository,
@@ -40,6 +41,7 @@ pub struct AppState {
     pub section_repo:    Arc<dyn SectionRepository    + Send + Sync>,
     pub sector_repo:     Arc<dyn SectorStateRepository>,
     pub timer_repo:      Arc<dyn TimerRepository>,
+    pub convoy_repo:     Arc<dyn ConvoyRepository>,
     pub config: Arc<Config>,
     /// Postgres connection pool. None only in unit-test contexts that use in-memory repos.
     /// Production startup panics if DATABASE_URL is unset; pool is always Some in prod.
@@ -64,6 +66,7 @@ impl AppState {
             section_repo:        Arc::new(InMemorySectionRepository::new()),
             sector_repo:         Arc::new(InMemorySectorStateRepository::new()),
             timer_repo:          Arc::new(InMemoryTimerRepository::new()),
+            convoy_repo:         Arc::new(InMemoryConvoyRepository),
             config,
             pool:               None,
             redis:              None,

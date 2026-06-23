@@ -5,6 +5,7 @@
 // Timestamp is always generated server-side via chrono::Utc::now(); never accepted from client.
 
 pub mod admin;
+pub mod convoys;
 pub mod ws_combat;
 
 use std::sync::Arc;
@@ -515,6 +516,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/ore-run/start",             post(post_ore_run_start))
         .route("/api/session/:id/integrity",     get(get_session_integrity))
         .merge(admin::router())
+        .merge(convoys::router())
         .with_state(state)
         .fallback_service(ServeDir::new("app").append_index_html_on_directories(true))
 }
