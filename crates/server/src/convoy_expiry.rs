@@ -6,6 +6,7 @@ use dashmap::DashMap;
 use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
 
+use crate::convoy_collision::check_same_hex_collision;
 use crate::repository::{HexOccupant, TimerType};
 use crate::state::AppState;
 
@@ -122,6 +123,52 @@ pub async fn poll_expiry_once(state: &AppState) {
             tracing::warn!("add_hex_occupant failed for convoy {}: {:?}", convoy.convoy_id, e);
         }
         // TODO: active_timer_ids on SectorState is not updated by schedule_timer or cancel_timer — pre-existing debt
+
+        // Same-hex collision check: build post-update occupants in memory from pre-update sector state
+        // (sector_opt is pre-update — sector was read before remove/add_hex_occupant)
+        if let Some(ref sector) = sector_opt {
+            let dest_key = format!("{},{}", convoy.destination_q, convoy.destination_r);
+            let mut occupants: Vec<HexOccupant> = sector
+                .hex_occupancy
+                .get(&dest_key)
+                .cloned()
+                .unwrap_or_default();
+            let arriving_occupant = HexOccupant {
+                id:           convoy.convoy_id,
+                owner_wallet: convoy.owner_wallet.clone(),
+                unit_type:    convoy.vehicle_class.clone(),
+            };
+            occupants.push(arriving_occupant);
+
+            if let Some(pair) = check_same_hex_collision(&occupants) {
+                tracing::warn!(
+                    "collision detected at ({},{}): {:?}",
+                    convoy.destination_q, convoy.destination_r, pair
+                );
+                // Phase 2: call resolveCombat here
+                if let Some(cid) = campaign_id {
+                    let collision_entry = shared::InputLogEntry {
+                        tick: 0,
+                        seq: 0,
+                        event_type: "collision_detected".to_string(),
+                        player_id: Some(bs58::encode(&pair.a.owner_wallet).into_string()),
+                        payload: serde_json::json!({
+                            "hex_q": convoy.destination_q,
+                            "hex_r": convoy.destination_r,
+                            "unit_a": pair.a.id,
+                            "unit_b": pair.b.id,
+                        }),
+                        narrative_event: None,
+                    };
+                    if let Err(e) = state.input_log_repo.append_campaign_entry(&cid, &collision_entry).await {
+                        tracing::warn!(
+                            "failed to log collision_detected for campaign {}: {:?}", cid, e
+                        );
+                    }
+                }
+            }
+        }
+        // TODO(phase-2): check_crossing_collision requires ConvoyRepository::list_in_transit — deferred
 
         if let Some(cid) = campaign_id {
             let player_id = bs58::encode(&convoy.owner_wallet).into_string();
