@@ -74,6 +74,15 @@ async fn main() {
         }
     });
 
+    let expiry_state = Arc::clone(&state);
+    tokio::spawn(async move {
+        loop {
+            mercs_server::convoy_expiry::run_convoy_expiry_task(Arc::clone(&expiry_state)).await;
+            tracing::error!("convoy expiry task exited unexpectedly — restarting in 5s");
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+    });
+
     let app = mercs_server::routes::router(state);
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await

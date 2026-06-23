@@ -2,7 +2,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use dashmap::DashMap;
+use tokio::sync::mpsc::UnboundedSender;
+use uuid::Uuid;
 use crate::config::Config;
+use crate::convoy_expiry::ConvoyEvent;
 use crate::repository::{
     AccountRepository, InMemoryAccountRepository,
     CampaignRepository, InMemoryCampaignRepository,
@@ -42,6 +45,8 @@ pub struct AppState {
     pub sector_repo:     Arc<dyn SectorStateRepository>,
     pub timer_repo:      Arc<dyn TimerRepository>,
     pub convoy_repo:     Arc<dyn ConvoyRepository>,
+    /// Sender map for convoy event WebSocket notifications, keyed by campaign_id.
+    pub convoy_event_senders: DashMap<Uuid, UnboundedSender<ConvoyEvent>>,
     pub config: Arc<Config>,
     /// Postgres connection pool. None only in unit-test contexts that use in-memory repos.
     /// Production startup panics if DATABASE_URL is unset; pool is always Some in prod.
@@ -67,6 +72,7 @@ impl AppState {
             sector_repo:         Arc::new(InMemorySectorStateRepository::new()),
             timer_repo:          Arc::new(InMemoryTimerRepository::new()),
             convoy_repo:         Arc::new(InMemoryConvoyRepository),
+            convoy_event_senders: DashMap::new(),
             config,
             pool:               None,
             redis:              None,
