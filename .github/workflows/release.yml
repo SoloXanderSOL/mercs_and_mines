@@ -32,7 +32,10 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-
 
       - name: Run tests
-        run: cargo test --locked
+        # --workspace covers every crate; --test-threads=1 is mandatory because the
+        # shared-database integration tests reuse wallet addresses behind
+        # ON DELETE RESTRICT constraints and collide with FK-23503 in parallel.
+        run: cargo test --workspace --locked -- --test-threads=1
 
       - name: Build release binary
         # --locked enforces Cargo.lock exactly — required for build determinism.
