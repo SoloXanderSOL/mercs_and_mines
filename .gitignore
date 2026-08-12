@@ -7,3 +7,7 @@ test-ledger
 .yarn
 .env
 smoke_test.mjs
+
+# NTFS alternate-data-stream metadata, created when assets are copied in from
+# Windows. Never content — always a stub recording the file's download origin.
+*:Zone.Identifier
