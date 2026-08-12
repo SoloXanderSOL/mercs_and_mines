@@ -10,4 +10,6 @@ smoke_test.mjs
 
 # NTFS alternate-data-stream metadata, created when assets are copied in from
 # Windows. Never content — always a stub recording the file's download origin.
-*:Zone.Identifier
+# No colon in the pattern: WSL stores the ':' as U+F03A because ':' is illegal
+# in Windows filenames, so a literal ':' here matches neither variant.
+*Zone.Identifier
