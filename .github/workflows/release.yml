@@ -14,14 +14,46 @@ env:
   # intact, it just reads the schema from an artifact rather than a connection.
   # sqlx 0.8 auto-detects the cache when DATABASE_URL is absent; being explicit means
   # CI can never silently attempt a connection and fail obscurely.
-  # Regenerate with `cargo sqlx prepare --workspace` whenever a query or migration
-  # changes, or the build fails here rather than at runtime.
+  # Regenerate with `cargo sqlx prepare --workspace -- --all-targets` whenever a query
+  # or migration changes, or the build fails here rather than at runtime.
+  # The `-- --all-targets` is load-bearing: without it the command still exits 0 but
+  # writes a 44-file cache that omits every macro used from a test target, and the
+  # build then fails in CI (red run #58). The correct command produces 49 files.
   SQLX_OFFLINE: true
 
 jobs:
   build:
     name: Build
     runs-on: ubuntu-latest
+    # Versions deliberately match production (Postgres 16, Redis 7): a CI database on a
+    # different major version tests the wrong thing. No migration step is needed — the
+    # harness runs sqlx::migrate!("../../migrations") against the pool itself.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: mercs
+          POSTGRES_PASSWORD: mercs
+          POSTGRES_DB: mercs_test
+        ports:
+          - 5432:5432
+        # The health checks are not optional. Without them the test step can start
+        # before Postgres accepts connections, producing an intermittent failure that
+        # looks exactly like a code bug.
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -44,7 +76,31 @@ jobs:
         # --workspace covers every crate; --test-threads=1 is mandatory because the
         # shared-database integration tests reuse wallet addresses behind
         # ON DELETE RESTRICT constraints and collide with FK-23503 in parallel.
-        run: cargo test --workspace --locked -- --test-threads=1
+        #
+        # --nocapture is load-bearing for the GAP-26 guard below. libtest captures the
+        # stdout/stderr of PASSING tests and discards it, so the "TEST_..._URL not set"
+        # messages a self-skipping test prints never reach the log without it. Verified:
+        # with a database absent and no --nocapture, `grep -c 'not set'` returns 0 even
+        # though all 26 database tests skipped themselves. Do not remove this flag
+        # without also removing the guard step, or the guard silently passes forever.
+        env:
+          TEST_DATABASE_URL: postgres://mercs:mercs@localhost:5432/mercs_test
+          TEST_REDIS_URL: redis://localhost:6379
+        run: |
+          set -o pipefail
+          cargo test --workspace --locked -- --test-threads=1 --nocapture 2>&1 | tee test-output.txt
+
+      - name: Fail if any integration test skipped itself
+        # GAP-26: these tests return early when their env var is absent, which cargo
+        # reports as a pass. A green run is therefore not evidence they executed.
+        # This step is the evidence. Do not delete it.
+        run: |
+          if grep -qE 'TEST_(DATABASE|REDIS)_URL not set' test-output.txt; then
+            echo "::error::Integration tests skipped themselves — Postgres or Redis is not reaching the test process."
+            grep -E 'TEST_(DATABASE|REDIS)_URL not set' test-output.txt
+            exit 1
+          fi
+          echo "No self-skips: the database and Redis suites executed."
 
       - name: Build release binary
         # --locked enforces Cargo.lock exactly — required for build determinism.
@@ -68,6 +124,10 @@ jobs:
   deploy:
     name: Deploy to DigitalOcean
     needs: build
+    # This workflow also accepts workflow_dispatch. Without this condition, manually
+    # dispatching it from ANY branch builds that branch and ships it to the production
+    # droplet. Deploy is main-only, full stop.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - name: Download server binary
