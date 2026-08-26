@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO gcn_transaction_ledger (wallet_address, delta, balance_after, entry_type, session_id, memo) VALUES ($1, $2, $3, $4, $5, $6)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Bytea",
+        "Int8",
+        "Int8",
+        "Text",
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "9ac3f8ec2384e63e7b1f905ea52c63e6165dd15769d3590a7f5960798442d2c2"
+}

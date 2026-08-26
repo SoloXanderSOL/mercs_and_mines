@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM commander_records WHERE commander_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "eba9d2e550d59057a15c5e0b6d6377d8f6957c43c6eeefcc3aeb74ef11acf3f0"
+}

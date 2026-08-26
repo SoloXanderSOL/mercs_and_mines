@@ -1,0 +1,58 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT session_id, seed, build_version, sector_id, campaign_id, sector_tier, ruleset\n            FROM session_configs\n            WHERE session_id = $1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "session_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "seed",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "build_version",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "sector_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 4,
+        "name": "campaign_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 5,
+        "name": "sector_tier",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "ruleset",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "731d7ee26d03aae306f49bc4e29efd2a5efd0e9b886a1c0afa2770a53d199e72"
+}

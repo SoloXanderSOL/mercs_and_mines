@@ -1,0 +1,94 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT convoy_id, sector_id, owner_wallet,\n                      origin_q, origin_r, destination_q, destination_r,\n                      route, arrival_time, vehicle_class, cargo, in_transit, created_at\n               FROM convoy_records WHERE convoy_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "convoy_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "sector_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "owner_wallet",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 3,
+        "name": "origin_q",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 4,
+        "name": "origin_r",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 5,
+        "name": "destination_q",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 6,
+        "name": "destination_r",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 7,
+        "name": "route",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 8,
+        "name": "arrival_time",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 9,
+        "name": "vehicle_class",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "cargo",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 11,
+        "name": "in_transit",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 12,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "287ab191d501306b7d57a911bb78511f9f6865541cdbb93f803b35fdcf7b4d65"
+}

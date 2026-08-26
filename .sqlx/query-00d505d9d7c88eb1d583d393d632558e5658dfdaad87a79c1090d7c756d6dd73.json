@@ -1,0 +1,70 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT log_id, session_id, tick, seq, event_type, player_id,\n                   payload as \"payload: serde_json::Value\",\n                   narrative_event, recorded_at\n            FROM input_logs\n            WHERE session_id = $1\n            ORDER BY tick ASC, seq ASC\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "log_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "session_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "tick",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "seq",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "event_type",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "player_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "payload: serde_json::Value",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 7,
+        "name": "narrative_event",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "recorded_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "00d505d9d7c88eb1d583d393d632558e5658dfdaad87a79c1090d7c756d6dd73"
+}

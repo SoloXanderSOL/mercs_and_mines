@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE convoy_records SET in_transit = false WHERE convoy_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "2a0c164f36498d190a8b56b0bb4ed8effbb8c917c9aa811da21ba246b0b5185c"
+}

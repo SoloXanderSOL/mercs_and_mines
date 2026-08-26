@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO commander_records (\n                commander_id, campaign_id, player_wallet, name, rank, xp, stress,\n                origin, faction_bias, specialization, fatal_flaw, veteran_trait,\n                is_shattered, is_kia, is_nft, prng_seed_state\n            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Bytea",
+        "Text",
+        "Int2",
+        "Int4",
+        "Int2",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Bool",
+        "Bool",
+        "Bool",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "af1a5e87483379cb90a3290fcce38ba0dbde6fe1cc86f5d2c5e9dd221891ee0b"
+}

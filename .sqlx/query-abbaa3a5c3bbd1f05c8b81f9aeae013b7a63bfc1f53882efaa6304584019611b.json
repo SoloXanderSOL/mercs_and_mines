@@ -1,0 +1,64 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT entry_id, wallet_address, delta, balance_after, entry_type, session_id, memo, recorded_at FROM gcn_transaction_ledger WHERE wallet_address = $1 ORDER BY recorded_at ASC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "entry_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "wallet_address",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 2,
+        "name": "delta",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "balance_after",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "entry_type",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "session_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 6,
+        "name": "memo",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "recorded_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bytea"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "abbaa3a5c3bbd1f05c8b81f9aeae013b7a63bfc1f53882efaa6304584019611b"
+}

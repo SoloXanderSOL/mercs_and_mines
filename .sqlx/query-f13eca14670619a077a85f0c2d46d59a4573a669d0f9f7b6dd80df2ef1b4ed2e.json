@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM input_logs WHERE campaign_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f13eca14670619a077a85f0c2d46d59a4573a669d0f9f7b6dd80df2ef1b4ed2e"
+}

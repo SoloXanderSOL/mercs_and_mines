@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE commander_records SET stress = $1, updated_at = now() WHERE commander_id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int2",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "37f8cce71dc348845906155730c20af62697a13c249b9c9d24161463c90feca0"
+}

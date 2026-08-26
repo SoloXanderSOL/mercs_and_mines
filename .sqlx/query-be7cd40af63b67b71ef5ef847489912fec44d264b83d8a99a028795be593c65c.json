@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT wallet_address, trust_standing, gcn_balance FROM player_accounts WHERE wallet_address = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "wallet_address",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 1,
+        "name": "trust_standing",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "gcn_balance",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bytea"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "be7cd40af63b67b71ef5ef847489912fec44d264b83d8a99a028795be593c65c"
+}

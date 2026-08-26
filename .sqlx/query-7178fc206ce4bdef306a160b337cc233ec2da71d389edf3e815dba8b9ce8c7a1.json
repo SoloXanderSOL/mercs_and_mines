@@ -1,0 +1,124 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n                commander_id, campaign_id, player_wallet, name, rank, xp, stress,\n                origin, faction_bias, specialization, fatal_flaw, veteran_trait,\n                is_shattered, is_kia, is_nft, prng_seed_state, created_at, updated_at\n               FROM commander_records WHERE campaign_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "commander_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "campaign_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "player_wallet",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 3,
+        "name": "name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "rank",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 5,
+        "name": "xp",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 6,
+        "name": "stress",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 7,
+        "name": "origin",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "faction_bias",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "specialization",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "fatal_flaw",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "veteran_trait",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 12,
+        "name": "is_shattered",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 13,
+        "name": "is_kia",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 14,
+        "name": "is_nft",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 15,
+        "name": "prng_seed_state",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 16,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 17,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "7178fc206ce4bdef306a160b337cc233ec2da71d389edf3e815dba8b9ce8c7a1"
+}

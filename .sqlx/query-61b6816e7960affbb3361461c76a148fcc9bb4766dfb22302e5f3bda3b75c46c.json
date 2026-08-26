@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM campaign_instances WHERE campaign_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "61b6816e7960affbb3361461c76a148fcc9bb4766dfb22302e5f3bda3b75c46c"
+}

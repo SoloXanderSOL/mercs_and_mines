@@ -1,0 +1,61 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO player_campaign_membership\n                (wallet_address, campaign_id, gateway_hex_q, gateway_hex_r)\n               VALUES ($1, $2, $3, $4)\n               RETURNING\n                membership_id, wallet_address, campaign_id,\n                gateway_hex_q, gateway_hex_r, joined_at, is_active",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "membership_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "wallet_address",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 2,
+        "name": "campaign_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "gateway_hex_q",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 4,
+        "name": "gateway_hex_r",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 5,
+        "name": "joined_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 6,
+        "name": "is_active",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bytea",
+        "Uuid",
+        "Int4",
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "9a68425962c3bed9e0c723685b5aba02fc499c618e3a80045f83015a02216f1b"
+}

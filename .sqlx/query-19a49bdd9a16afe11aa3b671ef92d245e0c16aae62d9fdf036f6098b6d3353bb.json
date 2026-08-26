@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE player_campaign_membership\n               SET gateway_hex_q = $3, gateway_hex_r = $4\n               WHERE wallet_address = $1 AND campaign_id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Bytea",
+        "Uuid",
+        "Int4",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "19a49bdd9a16afe11aa3b671ef92d245e0c16aae62d9fdf036f6098b6d3353bb"
+}

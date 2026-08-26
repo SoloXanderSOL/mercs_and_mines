@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE player_accounts SET gcn_balance = gcn_balance + $1, updated_at = now() WHERE wallet_address = $2 RETURNING gcn_balance",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "gcn_balance",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Bytea"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "83e2d9faaddbc448e7207e4f16fed7f8213dbc83fc65a6013eea42faab60b027"
+}

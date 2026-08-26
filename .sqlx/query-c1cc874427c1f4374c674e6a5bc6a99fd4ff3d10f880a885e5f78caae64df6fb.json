@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE campaign_instances\n               SET victory_tickers = jsonb_set(victory_tickers, ARRAY[$1::text], to_jsonb($2::float8), true),\n                   updated_at = now()\n               WHERE campaign_id = $3",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Float8",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c1cc874427c1f4374c674e6a5bc6a99fd4ff3d10f880a885e5f78caae64df6fb"
+}

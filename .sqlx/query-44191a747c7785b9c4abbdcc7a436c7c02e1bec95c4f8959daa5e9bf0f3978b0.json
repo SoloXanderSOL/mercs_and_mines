@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO convoy_records (\n                convoy_id, sector_id, owner_wallet,\n                origin_q, origin_r, destination_q, destination_r,\n                route, arrival_time, vehicle_class, cargo, in_transit\n            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Bytea",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Jsonb",
+        "Timestamptz",
+        "Text",
+        "Jsonb",
+        "Bool"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "44191a747c7785b9c4abbdcc7a436c7c02e1bec95c4f8959daa5e9bf0f3978b0"
+}

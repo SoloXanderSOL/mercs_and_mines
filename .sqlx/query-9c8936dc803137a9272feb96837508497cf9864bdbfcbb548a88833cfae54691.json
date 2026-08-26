@@ -1,0 +1,44 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE campaign_instances\n               SET state            = $1,\n                   ends_at          = $2,\n                   victory_tickers  = $3,\n                   started_at       = now(),\n                   updated_at       = now()\n               WHERE campaign_id = $4\n                 AND state       = $5",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        {
+          "Custom": {
+            "name": "sector_state",
+            "kind": {
+              "Enum": [
+                "Pending",
+                "Active",
+                "Ending",
+                "Ended",
+                "Archived"
+              ]
+            }
+          }
+        },
+        "Timestamptz",
+        "Jsonb",
+        "Uuid",
+        {
+          "Custom": {
+            "name": "sector_state",
+            "kind": {
+              "Enum": [
+                "Pending",
+                "Active",
+                "Ending",
+                "Ended",
+                "Archived"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "9c8936dc803137a9272feb96837508497cf9864bdbfcbb548a88833cfae54691"
+}

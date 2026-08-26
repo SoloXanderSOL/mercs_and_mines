@@ -8,6 +8,15 @@ on:
 env:
   RUST_BACKTRACE: 1
   CARGO_TERM_COLOR: always
+  # sqlx::query! is a COMPILE-TIME macro: it normally connects to a live database to
+  # validate SQL against the real schema. Runners have no database, so verification
+  # comes from the committed .sqlx/ cache instead — compile-time checking stays fully
+  # intact, it just reads the schema from an artifact rather than a connection.
+  # sqlx 0.8 auto-detects the cache when DATABASE_URL is absent; being explicit means
+  # CI can never silently attempt a connection and fail obscurely.
+  # Regenerate with `cargo sqlx prepare --workspace` whenever a query or migration
+  # changes, or the build fails here rather than at runtime.
+  SQLX_OFFLINE: true
 
 jobs:
   build:

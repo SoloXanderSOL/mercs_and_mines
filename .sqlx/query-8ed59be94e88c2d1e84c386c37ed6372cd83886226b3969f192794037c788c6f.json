@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE section_records SET headcount = $1, updated_at = now() WHERE section_id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int2",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8ed59be94e88c2d1e84c386c37ed6372cd83886226b3969f192794037c788c6f"
+}

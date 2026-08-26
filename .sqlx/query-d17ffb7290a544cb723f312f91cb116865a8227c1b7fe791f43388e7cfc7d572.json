@@ -1,0 +1,83 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n                   campaign_id,\n                   sector_id,\n                   map_seed,\n                   state AS \"state: CampaignLifecycle\",\n                   victory_tickers AS \"victory_tickers: JsonValue\",\n                   started_at,\n                   ends_at,\n                   created_at,\n                   updated_at\n               FROM campaign_instances\n               WHERE campaign_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "campaign_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "sector_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "map_seed",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "state: CampaignLifecycle",
+        "type_info": {
+          "Custom": {
+            "name": "sector_state",
+            "kind": {
+              "Enum": [
+                "Pending",
+                "Active",
+                "Ending",
+                "Ended",
+                "Archived"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "victory_tickers: JsonValue",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 5,
+        "name": "started_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 6,
+        "name": "ends_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 7,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 8,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "d17ffb7290a544cb723f312f91cb116865a8227c1b7fe791f43388e7cfc7d572"
+}

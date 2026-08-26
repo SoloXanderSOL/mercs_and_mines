@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE player_campaign_membership\n               SET is_active = FALSE\n               WHERE wallet_address = $1 AND campaign_id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Bytea",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e21b9192f51289aaf207d58e44c1031a17e1b605751cd96e03d034beb9151c2e"
+}

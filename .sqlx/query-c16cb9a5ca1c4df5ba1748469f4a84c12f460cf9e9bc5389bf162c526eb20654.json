@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE commander_records SET veteran_trait = $1, updated_at = now() WHERE commander_id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c16cb9a5ca1c4df5ba1748469f4a84c12f460cf9e9bc5389bf162c526eb20654"
+}

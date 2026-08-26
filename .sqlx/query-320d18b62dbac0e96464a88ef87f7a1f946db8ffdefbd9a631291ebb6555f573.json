@@ -1,0 +1,58 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n                membership_id, wallet_address, campaign_id,\n                gateway_hex_q, gateway_hex_r, joined_at, is_active\n               FROM player_campaign_membership\n               WHERE campaign_id = $1\n               ORDER BY joined_at ASC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "membership_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "wallet_address",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 2,
+        "name": "campaign_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "gateway_hex_q",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 4,
+        "name": "gateway_hex_r",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 5,
+        "name": "joined_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 6,
+        "name": "is_active",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "320d18b62dbac0e96464a88ef87f7a1f946db8ffdefbd9a631291ebb6555f573"
+}
