@@ -87,6 +87,24 @@ jobs:
             mercs-server \
             "${{ secrets.DEV_SERVER_USER }}@${{ secrets.DEV_SERVER_HOST }}:${{ secrets.DEV_SERVER_APP_PATH }}/mercs-server.new"
 
+      # Preserve the last-known-good binary BEFORE the swap destroys it. Without this
+      # there is nothing to roll back to when the health check below fails.
+      - name: Back up current binary
+        env:
+          APP_PATH: ${{ secrets.DEV_SERVER_APP_PATH }}
+        run: |
+          ssh "${{ secrets.DEV_SERVER_USER }}@${{ secrets.DEV_SERVER_HOST }}" \
+            "APP_PATH='$APP_PATH' bash -s" <<'REMOTE'
+          set -euo pipefail
+          rm -f "$APP_PATH/mercs-server.prev"
+          if [ -f "$APP_PATH/mercs-server" ]; then
+            cp -a "$APP_PATH/mercs-server" "$APP_PATH/mercs-server.prev"
+            echo "Backed up current binary -> mercs-server.prev"
+          else
+            echo "No existing binary (first deploy) — nothing to back up."
+          fi
+          REMOTE
+
       - name: Atomic swap and set permissions
         run: |
           ssh "${{ secrets.DEV_SERVER_USER }}@${{ secrets.DEV_SERVER_HOST }}" \
@@ -94,14 +112,64 @@ jobs:
                 ${{ secrets.DEV_SERVER_APP_PATH }}/mercs-server \
              && chmod +x ${{ secrets.DEV_SERVER_APP_PATH }}/mercs-server"
 
+      # --exclude='_dev/' keeps app/_dev/ (base_demo.html and any future scratch pages)
+      # off the public host. nginx also denies /_dev/ — belt and braces, both are canon.
       - name: Upload app directory to server
         run: |
-          rsync -a --delete \
+          rsync -a --delete --exclude='_dev/' \
             app/ \
             "${{ secrets.DEV_SERVER_USER }}@${{ secrets.DEV_SERVER_HOST }}:${{ secrets.DEV_SERVER_APP_PATH }}/app/"
 
-      - name: Restart service
+      # Restart, then prove the new binary actually serves before declaring victory.
+      # `systemctl restart` returns success the moment the process forks, so it is not
+      # evidence of anything on its own. Restart and health check are one remote script
+      # so that a restart failure funnels into the same rollback path.
+      #
+      # Probe is loopback: the binary binds 127.0.0.1:3000 and is not publicly
+      # reachable (Security_Mandate.md 2i). /api/units is unauthenticated and stateless,
+      # but main.rs connects Postgres and Redis and runs migrations BEFORE binding —
+      # so any 200 proves the whole startup path, not just that a process exists.
+      # 60s budget: a first boot against a fresh database also runs 15 migrations.
+      - name: Restart, health check, and roll back on failure
+        env:
+          APP_PATH: ${{ secrets.DEV_SERVER_APP_PATH }}
         run: |
           ssh "${{ secrets.DEV_SERVER_USER }}@${{ secrets.DEV_SERVER_HOST }}" \
-            "sudo systemctl reset-failed mercs-and-mines \
-             && sudo systemctl restart mercs-and-mines"
+            "APP_PATH='$APP_PATH' bash -s" <<'REMOTE'
+          set -uo pipefail
+
+          HEALTH_URL='http://127.0.0.1:3000/api/units'
+          TIMEOUT_SECS=60
+
+          sudo systemctl reset-failed mercs-and-mines || true
+          if ! sudo systemctl restart mercs-and-mines; then
+            echo "systemctl restart returned non-zero — falling through to the health check."
+          fi
+
+          echo "Polling $HEALTH_URL for up to ${TIMEOUT_SECS}s..."
+          deadline=$(( SECONDS + TIMEOUT_SECS ))
+          while ! curl -sf --max-time 5 "$HEALTH_URL" >/dev/null 2>&1; do
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::DEPLOY FAILED — $HEALTH_URL did not respond within ${TIMEOUT_SECS}s."
+              echo "----- last 50 journal lines -----"
+              sudo journalctl -u mercs-and-mines -n 50 --no-pager || true
+              echo "---------------------------------"
+
+              if [ -f "$APP_PATH/mercs-server.prev" ]; then
+                echo "Restoring mercs-server.prev..."
+                mv "$APP_PATH/mercs-server.prev" "$APP_PATH/mercs-server"
+                chmod +x "$APP_PATH/mercs-server"
+                sudo systemctl reset-failed mercs-and-mines || true
+                sudo systemctl restart mercs-and-mines || true
+                echo "::error::ROLLED BACK to the previous binary. Verify the service by hand before deploying again."
+              else
+                echo "::error::No mercs-server.prev exists (first deploy) — NO ROLLBACK POSSIBLE. The service is down."
+              fi
+              exit 1
+            fi
+            sleep 2
+          done
+
+          echo "Health check passed — new binary is serving."
+          rm -f "$APP_PATH/mercs-server.prev"
+          REMOTE

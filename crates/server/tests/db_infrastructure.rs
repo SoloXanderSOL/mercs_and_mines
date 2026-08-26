@@ -1645,6 +1645,75 @@ async fn session_config_is_immutable() {
         .execute(&pool).await.expect("re-enable triggers after cleanup failed");
 }
 
+/// Fail-closed admin auth: the launch endpoint must answer 401 whenever ADMIN_API_KEY
+/// is absent or empty, no matter what the client sends. The old code skipped the check
+/// entirely when the variable was unset, which made this an unauthenticated write
+/// endpoint on a public host.
+///
+/// Canon: Phase_1_Section_2_Campaign_State_Machine.md, brick 2b-5 —
+/// "401 if wrong; 401 if the var is unset — the check never skips."
+///
+/// All the unauthorized cases live in ONE test deliberately: they mutate the
+/// process-global ADMIN_API_KEY, and separate `#[test]` fns would race under a parallel
+/// runner. Needs neither Postgres nor Redis — the check returns before any repository
+/// is touched, so the default in-memory AppState is enough.
+#[tokio::test]
+async fn admin_launch_endpoint_fails_closed() {
+    use std::sync::Arc;
+    use axum::{body::Body, http::{Request, StatusCode}};
+    use tower::ServiceExt;
+
+    let config = Arc::new(mercs_server::config::Config::default());
+    let state = Arc::new(mercs_server::state::AppState::new(
+        std::path::PathBuf::from("/tmp"),
+        config,
+    ));
+    let uri = format!("/api/admin/campaign/{}/launch", uuid::Uuid::new_v4());
+
+    // Case 1: ADMIN_API_KEY unset, no header at all.
+    std::env::remove_var("ADMIN_API_KEY");
+    let req = Request::builder()
+        .method("POST")
+        .uri(&uri)
+        .body(Body::empty())
+        .unwrap();
+    let resp = mercs_server::routes::router(Arc::clone(&state)).oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(), StatusCode::UNAUTHORIZED,
+        "unset ADMIN_API_KEY + no header must return 401"
+    );
+
+    // Case 2: ADMIN_API_KEY unset, client supplies a header anyway. This is the
+    // regression guard — the old code let this straight through.
+    let req = Request::builder()
+        .method("POST")
+        .uri(&uri)
+        .header("x-admin-key", "anything-at-all")
+        .body(Body::empty())
+        .unwrap();
+    let resp = mercs_server::routes::router(Arc::clone(&state)).oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(), StatusCode::UNAUTHORIZED,
+        "unset ADMIN_API_KEY must never skip the check"
+    );
+
+    // Case 3: ADMIN_API_KEY set, wrong header.
+    std::env::set_var("ADMIN_API_KEY", "test-only-not-a-real-admin-key");
+    let req = Request::builder()
+        .method("POST")
+        .uri(&uri)
+        .header("x-admin-key", "wrong-key")
+        .body(Body::empty())
+        .unwrap();
+    let resp = mercs_server::routes::router(Arc::clone(&state)).oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(), StatusCode::UNAUTHORIZED,
+        "wrong X-Admin-Key must return 401"
+    );
+
+    std::env::remove_var("ADMIN_API_KEY");
+}
+
 #[tokio::test]
 async fn admin_launch_campaign_returns_200_then_409() {
     use std::sync::Arc;
@@ -1727,11 +1796,18 @@ async fn admin_launch_campaign_returns_200_then_409() {
             .await.expect("add_member failed");
     }
 
+    // Admin auth fails closed, so every request below must carry the key.
+    // Obviously-fake test value — the real key lives only on the box. See guard rail 3
+    // of LINUX_HANDOFF_MERGE_PREP_2026-08-26 and .env.example.
+    const TEST_ADMIN_KEY: &str = "test-only-not-a-real-admin-key";
+    std::env::set_var("ADMIN_API_KEY", TEST_ADMIN_KEY);
+
     // First POST — expect 200
     let app = mercs_server::routes::router(Arc::clone(&state));
     let req = Request::builder()
         .method("POST")
         .uri(format!("/api/admin/campaign/{}/launch", campaign_id))
+        .header("x-admin-key", TEST_ADMIN_KEY)
         .body(Body::empty())
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
@@ -1749,10 +1825,13 @@ async fn admin_launch_campaign_returns_200_then_409() {
     let req2 = Request::builder()
         .method("POST")
         .uri(format!("/api/admin/campaign/{}/launch", campaign_id))
+        .header("x-admin-key", TEST_ADMIN_KEY)
         .body(Body::empty())
         .unwrap();
     let resp2 = app2.oneshot(req2).await.unwrap();
     assert_eq!(resp2.status(), StatusCode::CONFLICT, "second launch must return 409");
+
+    std::env::remove_var("ADMIN_API_KEY");
 
     // Cleanup
     sqlx::query("ALTER TABLE input_logs DISABLE TRIGGER ALL")
