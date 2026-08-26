@@ -3,7 +3,19 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>Mercs &amp; Mines — Demo</title>
+  <title>Mercs &amp; Mines — Playable Demo</title>
+  <meta name="description" content="Four raccoon biker packs, one ore convoy, and a decision to make. Play the combat demo.">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Mercs &amp; Mines">
+  <meta property="og:title" content="Mercs &amp; Mines — Playable Demo">
+  <meta property="og:description" content="Four raccoon biker packs, one ore convoy, and a decision to make. Play the combat demo.">
+  <meta property="og:url" content="https://mercsandmines.com/game.html">
+  <meta property="og:image" content="https://mercsandmines.com/assets/og-card.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:site" content="@SoloXanderSOL">
+  <link rel="icon" type="image/png" href="/assets/favicon-512.png">
   <link rel="stylesheet" href="style.css">
   <script src="https://unpkg.com/@solana/web3.js@1.98.0/lib/index.iife.min.js"></script>
   <style>
@@ -333,7 +345,7 @@
   <!-- ══ Screen: Login ══════════════════════════════════════════════════════ -->
   <div id="screen-login" class="screen">
     <h1>Mercs &amp; Mines</h1>
-    <p class="subtitle">Phase 0 — Hackathon Demo</p>
+    <p class="subtitle">Phase 0 — Playable Demo</p>
     <p id="login-status">Connect your Phantom wallet to continue.</p>
     <button id="btn-connect">Connect Phantom</button>
     <button id="btn-sign" disabled>Sign &amp; Enter</button>
@@ -343,18 +355,16 @@
     </button>
     <br>
     <button class="btn-home" onclick="window.location.href='index.html'">&#8592; Landing Page</button>
-    <button class="btn-home" onclick="window.location.href='pitch.html'">Read the Full Pitch</button>
   </div>
 
   <!-- ══ Screen: Command Hub (post-login) ══════════════════════════════════ -->
   <div id="screen-hub" class="screen hidden">
     <h2>Command Terminal</h2>
-    <p class="subtitle">Phase 0 — Hackathon Demo</p>
+    <p class="subtitle">Phase 0 — Playable Demo</p>
     <button id="btn-ore-run">&#9654;&nbsp; Run: The Ore Run [DEMO]</button>
     <br>
     <button class="btn-home" onclick="window.location.href='lore.html'">Learn More About Planet Gunmetal</button>
     <button class="btn-home" onclick="window.location.href='index.html'">&#8592; Landing Page</button>
-    <button class="btn-home" onclick="window.location.href='pitch.html'">Read the Full Pitch</button>
   </div>
 
   <!-- ══ Screen 1: Pre-Battle ═══════════════════════════════════════════════ -->

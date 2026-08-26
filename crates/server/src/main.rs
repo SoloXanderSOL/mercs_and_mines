@@ -87,6 +87,6 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
         .unwrap_or_else(|_| panic!("Failed to bind {}", bind_addr));
-    println!("Mercs and Mines server listening on {}", bind_addr);
+    println!("Mercs & Mines server listening on {}", bind_addr);
     axum::serve(listener, app).await.expect("Server error");
 }
