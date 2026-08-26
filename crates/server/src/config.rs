@@ -1,5 +1,7 @@
 // Server + simulation config — loaded once at startup via dotenvy.
-// All fields have fallback defaults so the server runs without a .env file.
+// Every field in THIS struct has a fallback default. That is not the same as the
+// server running without a .env file: DATABASE_URL and REDIS_URL are read directly
+// in main.rs, have no defaults, and panic when absent.
 // See .env.example for the full variable list and commentary.
 
 use sim_engine::config::SimConfig;
@@ -54,9 +56,23 @@ fn env_i32(key: &str, default: i32) -> i32 {
 
 // ── Server config ─────────────────────────────────────────────────────────────
 
+/// Fallback bind address when SERVER_BIND_ADDR is unset. LOOPBACK ON PURPOSE.
+///
+/// The safe state must be the default. nginx terminates TLS and proxies only `/api/`
+/// to this binary; a public bind puts the game API on the internet *and* serves `app/`
+/// straight out of the ServeDir fallback in `routes/mod.rs`, which bypasses nginx
+/// entirely — including the `/_dev/` deny rule. There is no firewall rule behind this.
+///
+/// Binding `0.0.0.0` is a deliberate local-dev opt-in (testing from a phone on the LAN,
+/// for instance) set via SERVER_BIND_ADDR. It must never be the production value.
+/// See Security_Mandate.md section 2i.
+///
+/// One constant, used by both `Default` and `from_env`, so the two cannot drift apart.
+pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:3000";
+
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
-    /// TCP bind address for the Axum HTTP server.
+    /// TCP bind address for the Axum HTTP server. See [`DEFAULT_BIND_ADDR`].
     pub bind_addr: String,
     /// TEEPIN session duration in seconds (2 hours = 7200).
     pub session_duration_secs: i64,
@@ -75,7 +91,7 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            bind_addr:                  "0.0.0.0:3000".to_string(),
+            bind_addr:                  DEFAULT_BIND_ADDR.to_string(),
             session_duration_secs:      7200,
             challenge_expiry_secs:      60,
             combat_session_stale_secs:  300,
@@ -89,7 +105,7 @@ impl Default for ServerConfig {
 impl ServerConfig {
     fn from_env() -> Self {
         Self {
-            bind_addr:                  env_str  ("SERVER_BIND_ADDR",            "0.0.0.0:3000"),
+            bind_addr:                  env_str  ("SERVER_BIND_ADDR",            DEFAULT_BIND_ADDR),
             session_duration_secs:      env_i64  ("SESSION_DURATION_SECS",       7200),
             challenge_expiry_secs:      env_i64  ("CHALLENGE_EXPIRY_SECS",       60),
             combat_session_stale_secs:  env_u64  ("COMBAT_SESSION_STALE_SECS",   300),
@@ -158,6 +174,51 @@ impl Config {
                 unit_default_hp:              env_i32  ("UNIT_DEFAULT_HP",              d.unit_default_hp),
                 tick_stream_delay_ms:         env_u64  ("TICK_STREAM_DELAY_MS",         d.tick_stream_delay_ms),
             },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ServerConfig, DEFAULT_BIND_ADDR};
+
+    /// The bind address must be loopback unless someone deliberately overrides it.
+    /// Safety is the default state, not a systemd drop-in bolted on afterwards —
+    /// that drop-in is defence in depth, not the guarantee. See Security_Mandate.md 2i.
+    ///
+    /// Both cases live in one test on purpose: they mutate the process-global
+    /// SERVER_BIND_ADDR, and separate `#[test]` fns would race under a parallel runner.
+    /// Note the repo's own `.env` sets SERVER_BIND_ADDR=0.0.0.0:3000 and the canonical
+    /// test command sources it, so the unset case MUST clear the variable explicitly.
+    #[test]
+    fn bind_addr_defaults_to_loopback_and_honours_override() {
+        let restore = std::env::var("SERVER_BIND_ADDR").ok();
+
+        // No SERVER_BIND_ADDR anywhere → loopback.
+        std::env::remove_var("SERVER_BIND_ADDR");
+        assert_eq!(DEFAULT_BIND_ADDR, "127.0.0.1:3000");
+        assert_eq!(
+            ServerConfig::from_env().bind_addr,
+            "127.0.0.1:3000",
+            "with SERVER_BIND_ADDR unset the server must bind loopback, not 0.0.0.0"
+        );
+        assert_eq!(
+            ServerConfig::default().bind_addr,
+            "127.0.0.1:3000",
+            "Default and from_env must not drift apart"
+        );
+
+        // Explicit override still works — local dev must be able to bind the LAN.
+        std::env::set_var("SERVER_BIND_ADDR", "0.0.0.0:3000");
+        assert_eq!(
+            ServerConfig::from_env().bind_addr,
+            "0.0.0.0:3000",
+            "an explicit SERVER_BIND_ADDR must still be honoured"
+        );
+
+        match restore {
+            Some(v) => std::env::set_var("SERVER_BIND_ADDR", v),
+            None => std::env::remove_var("SERVER_BIND_ADDR"),
         }
     }
 }
