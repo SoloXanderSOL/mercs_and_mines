@@ -13,3 +13,8 @@ smoke_test.mjs
 # No colon in the pattern: WSL stores the ':' as U+F03A because ':' is illegal
 # in Windows filenames, so a literal ':' here matches neither variant.
 *Zone.Identifier
+
+# Written by the CI 'Run tests' step, which tees cargo test output to a file so the
+# GAP-26 self-skip guard can grep it. Disposable on the runner, but reproducing that
+# command locally drops it in the repo root where 'git add -A' would sweep it up.
+test-output.txt
