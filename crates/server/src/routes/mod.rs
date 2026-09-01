@@ -146,15 +146,6 @@ async fn post_auth_verify(
         .await
         .map_err(|e| bad_request(format!("account upsert: {e}")))?;
 
-    // Fire-and-forget: auth returns immediately; Solana confirmation runs in background.
-    let wallet_pk = solana_sdk::pubkey::Pubkey::from(pubkey_bytes);
-    let cfg = Arc::clone(&state.config);
-    tokio::spawn(async move {
-        if let Err(e) = crate::solana::dispatch_founding_courtesy(wallet_pk, &cfg).await {
-            eprintln!("[solana] founding_courtesy dispatch error for {wallet_pk}: {e}");
-        }
-    });
-
     Ok(Json(serde_json::to_value(&token).unwrap()))
 }
 

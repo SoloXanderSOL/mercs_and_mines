@@ -2,9 +2,6 @@
 members = [
     "crates/*",
 ]
-exclude = [
-    "programs/*",
-]
 resolver = "2"
 
 [workspace.package]
