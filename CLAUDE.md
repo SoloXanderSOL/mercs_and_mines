@@ -38,19 +38,37 @@ As of 2026-09-02:
 - **Section 2 (Campaign State Machine):** 2a and 2b complete. 2c and 2d deferred until
   after Sections 3–5. Arch Audits 3 and 5 complete.
 - **Section 3 (Hex Map and Timers):** Complete — 3a-1, 3b-1, 3b-2, 3c-1, 3d-1, 3e-1.
-- **Section 4 (Commander Records):** In progress. 4a-1 complete; 4a-2 unblocked.
+- **Section 4 (Commander Records):** In progress. 4a-1 and 4b-0 complete; 4a-2 unblocked.
 - **Sections 5 and 6:** Not started.
 
-**71/71 tests green (single-threaded, verified at `7b59a9e`). Currently next: brick 4b-1
-— XP Tracking and Rank Progression**, respecced 2026-09-02: reuse `sim-engine`'s
-`OutcomeType` rather than defining a new enum, and **no input-log write** — the rank-up
-entry was removed from scope. Read the full 4b-1 scope in the Phase 1 document before
-writing a line.
+**73/73 tests green (single-threaded, verified at `9591331`). Next brick: 4b-1 — XP
+Tracking and Rank Progression.** It reuses `sim-engine`'s `OutcomeType` rather than
+defining a new enum, and writes **no input-log entry** — the rank-up entry was removed
+from scope. **Do not start it without checking whether ODQ-22 and ODQ-23 have been
+ruled**; both landed on 4b-1 and both were unruled as of 2026-09-02. Read the full 4b-1
+scope and its carried constraints in the Phase 1 document before writing a line.
 
 **Mission outcome taxonomy (canon 2026-09-02):** `Success / Defeat / TacticalRetreat /
-Wipeout`. `TacticalRetreat` is **reserved and unreachable** until a player retreat input
-exists; `PartialSuccess` is retired. The resolver has not been migrated to this yet —
-that is GAP-35, and it is not part of 4b-1.
+Wipeout`. `PartialSuccess` is retired; `FullSuccess` is now `Success`.
+
+**GAP-35 part 1 landed in `9591331`.** `calc_rewards` no longer matches on the enum — it
+keys on `is_success` and `margin` — and the resolver assigns the canon names. Reward
+scaling is decoupled from the taxonomy by ruling: do not reintroduce a match on
+`OutcomeType` in `calc_rewards`, or retiring a variant silently becomes a balance change.
+
+**GAP-35 part 2 is still open, and it is the sharp one.** `Wipeout` is assigned from a
+roll margin, not from the Section reaching 0 strength — and §4e hangs permadeath on
+`Wipeout`. On a 50%-success fixture that is **~52% of all losses**, rising to ~66% at 30%
+success. Do not build anything that treats `Wipeout` as meaning "the Section was
+destroyed" until part 2 lands.
+
+**`TacticalRetreat` is reserved and must never be assigned on the mission path.** Note
+the qualifier: a player retreat input *does* exist on the streaming WS combat pipe
+(`ClientCommand::Retreat` in `routes/ws_combat.rs`), and it emits
+`shared::ws_events::CombatOutcome::Retreated` — a **different enum**, which also now
+shares the bare variant name `Defeat` with `OutcomeType`. Always write
+`OutcomeType::Defeat` fully qualified; never `use` the bare variant. These two points are
+ODQ-23 and ODQ-22 respectively, both unruled.
 
 ---
 
@@ -74,8 +92,13 @@ without exception:
   count. Wall-clock time drives *when events are injected* (the timer service); `Step()`
   itself must remain a pure function.
 
-* **Append-Only Input Logs:** Log player inputs, timer expiries, and server decisions.
-  Do NOT log full game states. The log must be immutable and strictly ordered. Each
+* **Append-Only Input Logs — the test is RECOMPUTABILITY.** Log what a replay cannot
+  reconstruct; log nothing it can. Player inputs and timer expiries are logged.
+  **Derived server decisions are not** — a `BattleReport`, a rank-up or an XP award is
+  recomputable from the seed plus the logged inputs, and logging it creates a second
+  source of truth. *(Canon 2026-09-02; supersedes the former "and server decisions"
+  wording, which licensed exactly what this forbids.)* Do NOT log full game states.
+  The log must be immutable and strictly ordered. Each
   entry includes tick index, sequence number, and build version. The `input_logs` table
   has DB-level triggers rejecting UPDATE and DELETE — this is load-bearing, not a
   convention.
@@ -207,6 +230,8 @@ Always use absolute paths when referencing these documents in handoff prompts.
 
 | Topic                                                   | Document                                                                                                                   |
 | ------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| **Open gaps, tracked defects, and their owning bricks** | `C:\Users\ajone\PROJECTS\Mercs_and_Mines\Mercs_and_Mines_WIKI\Wiki\GDD\Design_Implementation_Gap_Tracker.md` |
+| **Unruled design questions - check before building**    | `C:\Users\ajone\PROJECTS\Mercs_and_Mines\Mercs_and_Mines_WIKI\Wiki\GDD\Open_Design_Questions.md` |
 | **Phase 1 build plan, current status, all brick specs** | `C:\Users\ajone\PROJECTS\Mercs_and_Mines\Mercs_and_Mines_WIKI\Wiki\GDD\Phase_1_Alpha_Foundation_Breakdown.md`              |
 | Implementation language, approved libraries             | `C:\Users\ajone\PROJECTS\Mercs_and_Mines\Mercs_and_Mines_WIKI\Wiki\GDD\Tech_Stack_and_Language_Mandate.md`                 |
 | Determinism, tick loop, input log schema                | `C:\Users\ajone\PROJECTS\Mercs_and_Mines\Mercs_and_Mines_WIKI\Wiki\GDD\Technical_Architecture_Deterministic_Simulation.md` |
