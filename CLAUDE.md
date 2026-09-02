@@ -27,19 +27,30 @@ Before writing any code, read the Phase 1 Alpha Foundation document to understan
 is already built. Do not guess — read it. The status block at the top of that document
 is the ground truth.
 
-As of 2026-06-09:
+As of 2026-09-02:
 
-- **Section 1 (Database Layer):** 1a (Postgres), 1b (Redis), 1c (Input Log) — complete.
-  Arch Audits 4 and 6 complete.
-- **Section 2a (Sector Lifecycle):** Complete. `check_campaign_transition` pure Rust
-  logic + background Tokio task wired to DB. Arch Audit 3 complete.
-- **Section 2b bricks 2b-1 through 2b-4:** Complete. `generate_sector_map`,
-  `assign_gateway_hexes`, `activate_campaign`, `append_campaign_entry`, and
-  `initialize_campaign` orchestration all done. Arch Audit 5 complete.
+- **Section 1 (Database Layer):** 1a (Postgres) and 1b (Redis) complete. **1c is NOT
+  complete — brick 1c-2 is reopened (GAP-34).** The session integrity endpoint hashes a
+  table nothing writes to: `append_entry` has zero production call sites while the read
+  path was repointed at Postgres. Arch Audit 4 complete. **Arch Audit 6 ran and its
+  conclusion is superseded** — not incomplete, and not clear either; the defect it
+  missed is its own subject.
+- **Section 2 (Campaign State Machine):** 2a and 2b complete. 2c and 2d deferred until
+  after Sections 3–5. Arch Audits 3 and 5 complete.
+- **Section 3 (Hex Map and Timers):** Complete — 3a-1, 3b-1, 3b-2, 3c-1, 3d-1, 3e-1.
+- **Section 4 (Commander Records):** In progress. 4a-1 complete; 4a-2 unblocked.
+- **Sections 5 and 6:** Not started.
 
-**47/47 tests green (single-threaded). Currently next: brick 2b-5
-(`POST /api/admin/campaign/:id/launch`).** Read the full 2b-5 scope in the Phase 1
-document before writing a line.
+**71/71 tests green (single-threaded, verified at `7b59a9e`). Currently next: brick 4b-1
+— XP Tracking and Rank Progression**, respecced 2026-09-02: reuse `sim-engine`'s
+`OutcomeType` rather than defining a new enum, and **no input-log write** — the rank-up
+entry was removed from scope. Read the full 4b-1 scope in the Phase 1 document before
+writing a line.
+
+**Mission outcome taxonomy (canon 2026-09-02):** `Success / Defeat / TacticalRetreat /
+Wipeout`. `TacticalRetreat` is **reserved and unreachable** until a player retreat input
+exists; `PartialSuccess` is retired. The resolver has not been migrated to this yet —
+that is GAP-35, and it is not part of 4b-1.
 
 ---
 
