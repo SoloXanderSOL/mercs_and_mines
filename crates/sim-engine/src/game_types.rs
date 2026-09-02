@@ -349,11 +349,14 @@ pub struct ScoreBreakdown {
     pub margin: i32,
 }
 
-/// Director ruling 2026-04-21: Critical Success / Critical Failure are legacy values. Removed.
+/// Taxonomy is agency and survival, not roll margin. Canon_Type_Reference.md §9.
+/// `TacticalRetreat` is reserved and unreachable: no player retreat input exists,
+/// and nothing may assign it from a roll. GAP-35 part 2 still owes state-based
+/// `Wipeout` assignment — it currently fires on a wide-margin loss, not a body count.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum OutcomeType {
-    FullSuccess,
-    PartialSuccess,
+    Success,
+    Defeat,
     TacticalRetreat,
     Wipeout,
 }

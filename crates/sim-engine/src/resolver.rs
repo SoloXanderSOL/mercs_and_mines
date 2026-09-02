@@ -1,11 +1,16 @@
 // AP/AT combat, mission, pack assault, commander stress, and travel/logistics resolvers.
 // Source: src/engine/resolver.ts — all formulas preserved for input-log replay parity.
 //
-// Outcome mapping (Director ruling 2026-04-21 removed Critical variants from OutcomeType):
-//   TS "Critical Success" (margin ≥ 25) → FullSuccess
-//   TS "Success"          (margin < 25) → PartialSuccess
-//   TS "Failure"          (|margin| < 25) → TacticalRetreat
-//   TS "Critical Failure" (|margin| ≥ 25) → Wipeout
+// Outcome mapping (GAP-35 part 1, 2026-09-02 — the TS margin tiers no longer survive;
+// the taxonomy is agency and survival, so a win is a win at any margin):
+//   success                        → Success
+//   failure, |margin| ≥ threshold  → Wipeout
+//   failure, |margin| < threshold  → Defeat
+//   TacticalRetreat                → reserved, never assigned; no retreat input exists
+//
+// Rewards no longer read this enum at all — calc_rewards keys on is_success + margin.
+// GAP-35 part 2 still owes state-based Wipeout: it fires on a wide-margin loss rather
+// than on the Section actually reaching 0 strength, so permadeath is still roll-driven.
 //
 // Type gaps vs. the TS source:
 //   UnitDefinition has no `species` field — Hamster/Duck/Boar branches are unreachable.
@@ -46,7 +51,7 @@ use crate::types::{
 //        if damage           — roll_d100() [hp amount]
 //        if damage           — chance() [KIA check]
 //        if KIA + Sawbones   — chance() [Trauma Protocol]
-//   3. loot (FullSuccess / PartialSuccess only):
+//   3. loot (successful missions only — calc_rewards returns early on failure):
 //        always              — chance() [drop check]
 //        if drop             — next_f64() [grade], next_f64() [item name]
 //   4. report ID            — next_u32() × 2
@@ -283,17 +288,25 @@ fn resolve_unit_damage(
 
 // ── Reward calculation ─────────────────────────────────────────────────────
 
+/// Rewards key on the two values that actually decide them — whether the mission
+/// succeeded and by what margin — never on `OutcomeType`. Matching on the enum is
+/// what turned retiring a variant into a silent balance change (GAP-35): once the
+/// narrow-win variant was gone, a variant match would have handed every win the
+/// 1.5× multiplier, and the failure arm would have stopped covering every loss.
 fn calc_rewards(
     mission: &MissionDefinition,
-    outcome: &OutcomeType,
+    is_success: bool,
+    margin: f64,
     squad: &Squad,
     rng: &mut Rng,
     cfg: &SimConfig,
 ) -> Rewards {
-    if matches!(outcome, OutcomeType::TacticalRetreat | OutcomeType::Wipeout) {
+    if !is_success {
         return Rewards { credits: 0, ore: 0, loot_drop: None };
     }
-    let multiplier: f64 = if matches!(outcome, OutcomeType::FullSuccess) {
+    // No `.abs()`: the early return above means the mission succeeded, and `margin`
+    // is non-negative whenever it did.
+    let multiplier: f64 = if margin >= cfg.outcome_margin_threshold {
         cfg.full_success_reward_mult
     } else {
         1.0
@@ -346,9 +359,11 @@ pub fn resolve_mission(
     let margin              = success_probability - raw_roll as f64;
 
     let outcome = if is_success {
-        if margin >= cfg.outcome_margin_threshold { OutcomeType::FullSuccess } else { OutcomeType::PartialSuccess }
+        OutcomeType::Success
+    } else if margin.abs() >= cfg.outcome_margin_threshold {
+        OutcomeType::Wipeout
     } else {
-        if margin.abs() >= cfg.outcome_margin_threshold { OutcomeType::Wipeout } else { OutcomeType::TacticalRetreat }
+        OutcomeType::Defeat
     };
 
     let avg_damage_shield = calc_total_damage_shield(squad);
@@ -365,7 +380,7 @@ pub fn resolve_mission(
         })
         .collect();
 
-    let rewards = calc_rewards(mission, &outcome, squad, &mut rng, cfg);
+    let rewards = calc_rewards(mission, is_success, margin, squad, &mut rng, cfg);
 
     let narrative_tag = format!("{:?}_{:?}_{:?}", outcome, mission.category, mission.environment);
 
@@ -1207,6 +1222,134 @@ pub async fn resolve_combat_streaming(
 
         if combat_ended {
             return;
+        }
+    }
+}
+
+// ── Tests ──────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::game_types::UnitDefinition;
+
+    /// Fixed fixture, tuned so `success_probability` lands exactly on 50.0:
+    ///   base_skill_score  (8/10 × 50) =  40.0
+    ///   ability_bonus     (success_mod) = 30
+    ///   difficulty_penalty (4 × 5)      = −20
+    /// Nothing else contributes — one unit (no squad-size bonus), no equipment
+    /// (no gear bonus), no commander, and Vanguard/Assault/Wasteland triggers no
+    /// mission-type modifier. A 50.0 threshold against `roll_d100()`'s [1,100]
+    /// splits the 1000-seed sweep across all four outcome bands at roughly 25%
+    /// each, so the reward totals below actually exercise every branch of
+    /// `calc_rewards`.
+    fn fixture() -> (Squad, MissionDefinition, SimConfig) {
+        let definition = UnitDefinition {
+            archetype:         UnitArchetype::Vanguard,
+            emoji:             "V".to_string(),
+            hiring_cost:       0,
+            base_skill:        5,
+            monthly_upkeep:    0,
+            upkeep_extras:     String::new(),
+            hardpoints:        vec![],
+            success_mod:       30,
+            damage_shield_mod: 0,
+            loot_bonus:        0,
+            async_ability:     String::new(),
+            passive_trait:     String::new(),
+            flavor_text:       String::new(),
+        };
+
+        let squad = Squad {
+            units: vec![Unit {
+                id:         "fixture-unit".to_string(),
+                name:       "Fixture".to_string(),
+                definition,
+                skill:      8,
+                xp:         0,
+                current_hp: 10,
+                max_hp:     10,
+                status:     UnitStatus::Ready,
+                equipment:  vec![],
+            }],
+            commander: None,
+        };
+
+        let mission = MissionDefinition {
+            id:                  "fixture-mission".to_string(),
+            name:                "Fixture Mission".to_string(),
+            category:            MissionCategory::Assault,
+            difficulty:          4,
+            duration_minutes:    60,
+            environment:         MissionEnvironment::Wasteland,
+            credit_reward:       1000,
+            ore_reward:          500,
+            base_hp_loss_chance: 50,
+            base_kia_multiplier: 1.0,
+            flavor_text:         String::new(),
+        };
+
+        (squad, mission, SimConfig::default())
+    }
+
+    /// Equivalence gate for GAP-35 part 1 (brick 4b-0).
+    ///
+    /// `calc_rewards` was refactored from matching on `OutcomeType` variants to
+    /// keying on `is_success` + `margin`. The refactor is meant to be exactly
+    /// behaviour-preserving, so the payout of a fixed 1000-seed sweep must not
+    /// move by a single credit. These totals were recorded BEFORE the refactor.
+    ///
+    /// The per-band counts are asserted alongside the totals deliberately: totals
+    /// alone could hide two offsetting errors (one band gaining what another
+    /// loses), and the bands are what the two rewritten arms actually decide.
+    #[test]
+    fn reward_totals_are_unchanged_across_a_fixed_seed_sweep() {
+        let (squad, mission, cfg) = fixture();
+
+        let mut credits: u64 = 0;
+        let mut ore: u64 = 0;
+        let mut full_band = 0u32; // 1.5× multiplier
+        let mut flat_band = 0u32; // 1.0× multiplier
+        let mut zero_band = 0u32; // no payout
+
+        for seed in 0..1000u32 {
+            let report = resolve_mission(&squad, &mission, "2026-09-02T00:00:00Z", Some(seed), &cfg);
+            credits += report.rewards.credits as u64;
+            ore     += report.rewards.ore     as u64;
+            match report.rewards.credits {
+                1500 => full_band += 1,
+                1000 => flat_band += 1,
+                0    => zero_band += 1,
+                other => panic!("unexpected credit payout {} at seed {}", other, seed),
+            }
+        }
+
+        println!("REWARD SWEEP credits={} ore={}", credits, ore);
+        println!("BANDS full={} flat={} zero={}", full_band, flat_band, zero_band);
+
+        // Recorded 2026-09-02 against the pre-refactor enum-matching `calc_rewards`.
+        assert_eq!((credits, ore), (632_000, 316_000));
+        assert_eq!((full_band, flat_band, zero_band), (254, 251, 495));
+    }
+
+    /// `TacticalRetreat` is a player-agency outcome: it may only be assigned when a
+    /// player chooses to withdraw, and no retreat input exists yet. Nothing may hand
+    /// it out from a roll. Canon_Type_Reference.md §9, GAP-35.
+    ///
+    /// `OutcomeType` has no `PartialEq`, so this matches rather than compares — and
+    /// the derive is deliberately not added, because nothing needs it.
+    #[test]
+    fn no_mission_outcome_is_ever_tactical_retreat() {
+        let (squad, mission, cfg) = fixture();
+
+        for seed in 0..1000u32 {
+            let report = resolve_mission(&squad, &mission, "2026-09-02T00:00:00Z", Some(seed), &cfg);
+            assert!(
+                !matches!(report.outcome, OutcomeType::TacticalRetreat),
+                "seed {} produced a TacticalRetreat from a roll; it is reserved until a \
+                 player retreat input exists",
+                seed,
+            );
         }
     }
 }
