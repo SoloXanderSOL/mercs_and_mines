@@ -10,13 +10,14 @@ the reference document below.
 
 ## THE IMPLEMENTATION LANGUAGE IS RUST
 
-The entire stack — game server, simulation engine, and all Solana on-chain programs — is
-written in Rust. No TypeScript server, no Node.js, no second language in the hot path.
-On-chain programs use the Anchor framework.
+The entire stack — game server and simulation engine — is written in Rust. No TypeScript
+server, no Node.js, no second language in the hot path. There are no on-chain programs;
+Trust deliveries are resolved server-side.
 
-The approved library choices (Tokio, Axum, serde, tokio-tungstenite, Anchor, solana-sdk,
+The approved library choices (Tokio, Axum, serde, tokio-tungstenite, ed25519-dalek,
 sqlx, redis) are listed in the Tech Stack reference document below. Deviations require
-Director approval.
+Director approval. Wallet signatures are verified with ed25519-dalek, not the Solana
+SDK; the browser client loads @solana/web3.js for Phantom wallet connect only.
 
 ---
 
