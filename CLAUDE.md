@@ -27,7 +27,7 @@ Before writing any code, read the Phase 1 Alpha Foundation document to understan
 is already built. Do not guess — read it. The status block at the top of that document
 is the ground truth.
 
-As of 2026-09-02:
+As of 2026-09-08:
 
 - **Section 1 (Database Layer):** 1a (Postgres) and 1b (Redis) complete. **1c is NOT
   complete — brick 1c-2 is reopened (GAP-34).** The session integrity endpoint hashes a
@@ -38,15 +38,16 @@ As of 2026-09-02:
 - **Section 2 (Campaign State Machine):** 2a and 2b complete. 2c and 2d deferred until
   after Sections 3–5. Arch Audits 3 and 5 complete.
 - **Section 3 (Hex Map and Timers):** Complete — 3a-1, 3b-1, 3b-2, 3c-1, 3d-1, 3e-1.
-- **Section 4 (Commander Records):** In progress. 4a-1 and 4b-0 complete; 4a-2 unblocked.
+- **Section 4 (Commander Records):** In progress. 4a-1, 4b-0 and 4b-1 complete; 4a-2 unblocked; 4e-0 (state-based Wipeout, GAP-35 part 2) inserted ahead of 4e-1.
 - **Sections 5 and 6:** Not started.
 
-**73/73 tests green (single-threaded, verified at `9591331`). Next brick: 4b-1 — XP
-Tracking and Rank Progression.** It reuses `sim-engine`'s `OutcomeType` rather than
+**88/88 tests green (single-threaded, verified at `2c3e9ba`). Next brick: 4c-1 — Stress;
+4e-0 can run alongside it.** 4b-1 reused `sim-engine`'s `OutcomeType` rather than
 defining a new enum, and writes **no input-log entry** — the rank-up entry was removed
-from scope. **Do not start it without checking whether ODQ-22 and ODQ-23 have been
-ruled**; both landed on 4b-1 and both were unruled as of 2026-09-02. Read the full 4b-1
-scope and its carried constraints in the Phase 1 document before writing a line.
+from scope. **ODQ-22 and ODQ-23 were ruled 2026-09-03 — engagement and mission outcomes
+are separate levels, and the mission and streaming pipes are separate ledgers; see
+`Wiki/GDD/Canon_Type_Reference.md` §9.** Read the full scope of the next brick and its
+carried constraints in the Phase 1 document before writing a line.
 
 **Mission outcome taxonomy (canon 2026-09-02):** `Success / Defeat / TacticalRetreat /
 Wipeout`. `PartialSuccess` is retired; `FullSuccess` is now `Success`.
@@ -60,7 +61,8 @@ scaling is decoupled from the taxonomy by ruling: do not reintroduce a match on
 roll margin, not from the Section reaching 0 strength — and §4e hangs permadeath on
 `Wipeout`. On a 50%-success fixture that is **~52% of all losses**, rising to ~66% at 30%
 success. Do not build anything that treats `Wipeout` as meaning "the Section was
-destroyed" until part 2 lands.
+destroyed" until part 2 lands. Owned by brick 4e-0 (ruled 2026-09-03), a hard
+prerequisite of 4e-1.
 
 **`TacticalRetreat` is reserved and must never be assigned on the mission path.** Note
 the qualifier: a player retreat input *does* exist on the streaming WS combat pipe
@@ -68,7 +70,7 @@ the qualifier: a player retreat input *does* exist on the streaming WS combat pi
 `shared::ws_events::CombatOutcome::Retreated` — a **different enum**, which also now
 shares the bare variant name `Defeat` with `OutcomeType`. Always write
 `OutcomeType::Defeat` fully qualified; never `use` the bare variant. These two points are
-ODQ-23 and ODQ-22 respectively, both unruled.
+ODQ-23 and ODQ-22 respectively, both ruled 2026-09-03.
 
 ---
 
