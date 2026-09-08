@@ -6,7 +6,7 @@
 //   success                        → Success
 //   failure, |margin| ≥ threshold  → Wipeout
 //   failure, |margin| < threshold  → Defeat
-//   TacticalRetreat                → reserved, never assigned; no retreat input exists
+//   TacticalRetreat                → reserved, never assigned on the mission path; the WS retreat is a separate ledger (ODQ-23)
 //
 // Rewards no longer read this enum at all — calc_rewards keys on is_success + margin.
 // GAP-35 part 2 still owes state-based Wipeout: it fires on a wide-margin loss rather
@@ -1333,7 +1333,7 @@ mod tests {
     }
 
     /// `TacticalRetreat` is a player-agency outcome: it may only be assigned when a
-    /// player chooses to withdraw, and no retreat input exists yet. Nothing may hand
+    /// player chooses to withdraw, and the mission path has no retreat input yet. Nothing may hand
     /// it out from a roll. Canon_Type_Reference.md §9, GAP-35.
     ///
     /// `OutcomeType` has no `PartialEq`, so this matches rather than compares — and
@@ -1347,7 +1347,7 @@ mod tests {
             assert!(
                 !matches!(report.outcome, OutcomeType::TacticalRetreat),
                 "seed {} produced a TacticalRetreat from a roll; it is reserved until a \
-                 player retreat input exists",
+                 mission-path retreat input exists",
                 seed,
             );
         }

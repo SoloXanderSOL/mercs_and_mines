@@ -13,7 +13,7 @@ use mercs_server::repository::{
     WalletAddress, CampaignLifecycle, CampaignRepository, NewCampaignInstance,
     PostgresCampaignRepository, VictoryTickerType,
     CommanderRecord, CommanderRepository, PostgresCommanderRepository,
-    InMemoryInputLogRepository, InputLogRepository, PostgresInputLogRepository,
+    InputLogRepository, PostgresInputLogRepository,
     MembershipRepository, PostgresMembershipRepository,
     SectionRecord, SectionRepository, PostgresSectionRepository,
     HexOccupant, OccupationStatus, RedisSectorStateRepository, SectorState, SectorStateRepository,
@@ -1029,9 +1029,87 @@ async fn commander_generate_and_persist() {
     assert_eq!(fetched.rank, 1);
     assert_eq!(fetched.campaign_id, campaign_id);
 
-    // Cleanup.
+    // Cleanup — all three rows this test seeded (Reviewer 4a-1 finding 1).
     sqlx::query!("DELETE FROM commander_records WHERE commander_id = $1", commander_id)
         .execute(&pool).await.ok();
+    sqlx::query("DELETE FROM campaign_instances WHERE campaign_id = $1")
+        .bind(campaign_id).execute(&pool).await.ok();
+    sqlx::query("DELETE FROM player_accounts WHERE wallet_address = $1")
+        .bind(&wallet_bytes).execute(&pool).await.ok();
+}
+
+/// Brick 4b-1 — `apply_mission_xp` through the Postgres backend. The default
+/// trait method sequences `get_commander` + `update_rank_and_xp`; this proves the
+/// derived rank and cumulative XP land in the row.
+#[tokio::test]
+async fn apply_mission_xp_persists_rank_and_xp() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => {
+            eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test");
+            return;
+        }
+    };
+
+    let commander_repo = PostgresCommanderRepository::new(pool.clone());
+    let campaign_repo  = PostgresCampaignRepository::new(pool.clone());
+
+    // 1. Seed campaign (FK prerequisite).
+    let campaign = campaign_repo.create_campaign(&NewCampaignInstance {
+        sector_id: uuid::Uuid::new_v4(),
+        map_seed:  0x4B01_i64,
+    }).await.expect("create campaign failed");
+    let campaign_id = campaign.campaign_id;
+
+    // Wallet [9u8;32] — unique to this test.
+    let wallet_bytes = [9u8; 32].to_vec();
+
+    // Pre-test cleanup.
+    sqlx::query("DELETE FROM commander_records WHERE campaign_id = $1")
+        .bind(campaign_id).execute(&pool).await.ok();
+    sqlx::query("DELETE FROM player_campaign_membership WHERE wallet_address = $1")
+        .bind(&wallet_bytes).execute(&pool).await.ok();
+
+    // Seed player_accounts FK.
+    sqlx::query(
+        "INSERT INTO player_accounts (wallet_address, trust_standing, gcn_balance)
+         VALUES ($1, 0, 0) ON CONFLICT (wallet_address) DO NOTHING"
+    )
+    .bind(&wallet_bytes)
+    .execute(&pool)
+    .await
+    .expect("player_accounts FK seed failed");
+
+    // 2. Generate a commander sitting just below the rank-2 threshold.
+    let mut record = mercs_server::commander_gen::generate_commander(
+        wallet_bytes.clone(),
+        campaign_id,
+        42u32,
+    );
+    record.xp = 88;
+    let commander_id = record.commander_id;
+    commander_repo.create_commander(record).await.expect("create_commander failed");
+
+    // 3. T1 Success: +12 XP → 100 → rank 2.
+    commander_repo
+        .apply_mission_xp(commander_id, 1, sim_engine::game_types::OutcomeType::Success)
+        .await
+        .expect("apply_mission_xp failed");
+
+    // 4. Round-trip.
+    let fetched = commander_repo.get_commander(commander_id).await
+        .expect("get_commander error")
+        .expect("commander not found after apply_mission_xp");
+    assert_eq!(fetched.xp, 100, "xp must be 88 + 12");
+    assert_eq!(fetched.rank, 2, "rank must be derived from cumulative xp");
+
+    // Cleanup — all three tables.
+    sqlx::query!("DELETE FROM commander_records WHERE commander_id = $1", commander_id)
+        .execute(&pool).await.ok();
+    sqlx::query("DELETE FROM campaign_instances WHERE campaign_id = $1")
+        .bind(campaign_id).execute(&pool).await.ok();
+    sqlx::query("DELETE FROM player_accounts WHERE wallet_address = $1")
+        .bind(&wallet_bytes).execute(&pool).await.ok();
 }
 
 #[tokio::test]

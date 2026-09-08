@@ -2,6 +2,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
+use sim_engine::game_types::OutcomeType;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -44,6 +45,39 @@ pub trait CommanderRepository: Send + Sync {
     async fn set_kia(&self, commander_id: Uuid) -> Result<(), RepositoryError>;
     async fn list_commanders_by_campaign(&self, campaign_id: Uuid) -> Result<Vec<CommanderRecord>, RepositoryError>;
     async fn delete_commanders_by_campaign(&self, campaign_id: Uuid) -> Result<u64, RepositoryError>;
+
+    /// Orchestration wrapper — Phase_1_Section_4 §4b. The arithmetic lives in
+    /// commander_gen; this method only sequences one read and one existing write.
+    async fn apply_mission_xp(
+        &self,
+        commander_id: Uuid,
+        tier: u8,
+        outcome: OutcomeType,
+    ) -> Result<(), RepositoryError> {
+        let rec = self
+            .get_commander(commander_id)
+            .await?
+            .ok_or(RepositoryError::NotFound)?;
+        if rec.is_kia {
+            return Ok(()); // "the XP record dies with them" — no write
+        }
+        if matches!(outcome, OutcomeType::Wipeout) {
+            return Ok(()); // 0 XP, no write
+        }
+        // Shattered still earns: the mission that broke them still happened.
+        let new_xp = rec.xp + crate::commander_gen::xp_award(tier, &outcome);
+        let new_rank = crate::commander_gen::rank_for_xp(new_xp);
+        if new_rank > rec.rank {
+            tracing::info!(commander_id = %commander_id, from = rec.rank, to = new_rank, "commander rank-up");
+            // TODO(phase-2): ranks 2-4 — implement Field Citations shortlist generation and
+            // citation_gate_pending resolution — see Commander_Field_Citations.md and Phase 2 §10.
+            if new_rank == 5 {
+                // TODO(phase-2): offer Retirement Option — Commander_Field_Citations.md §4.
+                tracing::info!(commander_id = %commander_id, "rank 5 reached");
+            }
+        }
+        self.update_rank_and_xp(commander_id, new_rank, new_xp).await
+    }
 }
 
 // ── PostgresCommanderRepository ──────────────────────────────────────────────
@@ -365,5 +399,88 @@ mod tests {
         repo.update_stress(id, 73).await.unwrap();
         let r = repo.get_commander(id).await.unwrap().unwrap();
         assert_eq!(r.stress, 73, "stress 73 must be stored unchanged");
+    }
+
+    // ── apply_mission_xp (brick 4b-1) ────────────────────────────────────────
+
+    /// Build a generated commander with the given xp/rank, persist it in an
+    /// in-memory repo, and return (repo, id). Flags are applied by the caller
+    /// through the closure before insertion.
+    async fn seeded_repo(
+        xp: i32,
+        rank: i16,
+        mutate: impl FnOnce(&mut CommanderRecord),
+    ) -> (InMemoryCommanderRepository, Uuid) {
+        let mut rec = crate::commander_gen::generate_commander(vec![7u8; 32], Uuid::nil(), 42);
+        rec.xp = xp;
+        rec.rank = rank;
+        mutate(&mut rec);
+        let id = rec.commander_id;
+        let repo = InMemoryCommanderRepository::new();
+        repo.create_commander(rec).await.unwrap();
+        (repo, id)
+    }
+
+    #[tokio::test]
+    async fn apply_mission_xp_adds_xp_below_threshold() {
+        let (repo, id) = seeded_repo(0, 1, |_| {}).await;
+        repo.apply_mission_xp(id, 1, OutcomeType::Success).await.unwrap();
+        let r = repo.get_commander(id).await.unwrap().unwrap();
+        assert_eq!(r.xp, 12);
+        assert_eq!(r.rank, 1);
+    }
+
+    #[tokio::test]
+    async fn apply_mission_xp_levels_up_at_threshold() {
+        let (repo, id) = seeded_repo(88, 1, |_| {}).await;
+        repo.apply_mission_xp(id, 1, OutcomeType::Success).await.unwrap();
+        let r = repo.get_commander(id).await.unwrap().unwrap();
+        assert_eq!(r.xp, 100);
+        assert_eq!(r.rank, 2);
+    }
+
+    #[tokio::test]
+    async fn apply_mission_xp_rank_caps_at_5() {
+        let (repo, id) = seeded_repo(2600, 5, |_| {}).await;
+        repo.apply_mission_xp(id, 5, OutcomeType::Success).await.unwrap();
+        let r = repo.get_commander(id).await.unwrap().unwrap();
+        assert_eq!(r.xp, 2750);
+        assert_eq!(r.rank, 5);
+    }
+
+    #[tokio::test]
+    async fn apply_mission_xp_wipeout_writes_nothing() {
+        let (repo, id) = seeded_repo(88, 1, |_| {}).await;
+        repo.apply_mission_xp(id, 5, OutcomeType::Wipeout).await.unwrap();
+        let r = repo.get_commander(id).await.unwrap().unwrap();
+        assert_eq!(r.xp, 88);
+        assert_eq!(r.rank, 1);
+    }
+
+    #[tokio::test]
+    async fn apply_mission_xp_kia_writes_nothing() {
+        let (repo, id) = seeded_repo(88, 1, |r| r.is_kia = true).await;
+        repo.apply_mission_xp(id, 1, OutcomeType::Success).await.unwrap();
+        let r = repo.get_commander(id).await.unwrap().unwrap();
+        assert_eq!(r.xp, 88);
+        assert_eq!(r.rank, 1);
+    }
+
+    #[tokio::test]
+    async fn apply_mission_xp_shattered_still_earns() {
+        let (repo, id) = seeded_repo(88, 1, |r| r.is_shattered = true).await;
+        repo.apply_mission_xp(id, 1, OutcomeType::Success).await.unwrap();
+        let r = repo.get_commander(id).await.unwrap().unwrap();
+        assert_eq!(r.xp, 100);
+        assert_eq!(r.rank, 2);
+    }
+
+    /// Fetch happens before the Wipeout short-circuit: an unknown commander is
+    /// NotFound even when the outcome would otherwise write nothing.
+    #[tokio::test]
+    async fn apply_mission_xp_unknown_commander_is_not_found() {
+        let repo = InMemoryCommanderRepository::new();
+        let r = repo.apply_mission_xp(Uuid::new_v4(), 1, OutcomeType::Wipeout).await;
+        assert!(matches!(r, Err(RepositoryError::NotFound)), "got {:?}", r);
     }
 }
