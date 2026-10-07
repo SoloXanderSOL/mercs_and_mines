@@ -31,12 +31,14 @@ pub struct SimConfig {
 
     // ── Mission resolver: outcome thresholds ─────────────────────────────────
 
-    /// Margin (success_probability − raw_roll) that separates Full Success from
-    /// Partial Success, and Wipeout from Tactical Retreat.
+    /// Win margin (success_probability − raw_roll) at or above which
+    /// `decisive_success_reward_mult` applies. Sets the reward multiplier and
+    /// nothing else — it never decides the mission outcome.
     pub outcome_margin_threshold: f64,
 
-    /// Reward multiplier applied to credits and ore on a Full Success outcome.
-    pub full_success_reward_mult: f64,
+    /// Reward multiplier applied to credits and ore on a decisive success: a win
+    /// with a survivor and a margin at or above `outcome_margin_threshold`.
+    pub decisive_success_reward_mult: f64,
 
     // ── Mission score calculation ─────────────────────────────────────────────
 
@@ -114,7 +116,7 @@ impl Default for SimConfig {
             kia_base_chance_failure:      35.0,
             sawbones_trauma_chance:       0.30,
             outcome_margin_threshold:     25.0,
-            full_success_reward_mult:     1.5,
+            decisive_success_reward_mult: 1.5,
             squad_size_bonus_per_unit:    3,
             base_skill_score_weight:      50.0,
             ghost_wire_mission_bonus:     7,

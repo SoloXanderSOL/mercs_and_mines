@@ -1,16 +1,16 @@
 // AP/AT combat, mission, pack assault, commander stress, and travel/logistics resolvers.
 // Source: src/engine/resolver.ts — all formulas preserved for input-log replay parity.
 //
-// Outcome mapping (GAP-35 part 1, 2026-09-02 — the TS margin tiers no longer survive;
-// the taxonomy is agency and survival, so a win is a win at any margin):
-//   success                        → Success
-//   failure, |margin| ≥ threshold  → Wipeout
-//   failure, |margin| < threshold  → Defeat
+// Outcome mapping (GAP-35, closed by brick 4e-0 — survival-based, Canon_Type_Reference §9).
+// classify_outcome applies these in order, after unit damage is resolved:
+//   1. zero units                  → Defeat (the route rejects this first; defence in depth)
+//   2. every unit KIA, win or lose → Wipeout
+//   3. objective completed         → Success (a survivor is guaranteed by step 2)
+//   4. otherwise                   → Defeat
 //   TacticalRetreat                → reserved, never assigned on the mission path; the WS retreat is a separate ledger (ODQ-23)
 //
-// Rewards no longer read this enum at all — calc_rewards keys on is_success + margin.
-// GAP-35 part 2 still owes state-based Wipeout: it fires on a wide-margin loss rather
-// than on the Section actually reaching 0 strength, so permadeath is still roll-driven.
+// Rewards never read this enum — calc_rewards keys on is_success, any_survivor and margin.
+// The roll margin only decides the reward multiplier; it never decides the outcome.
 //
 // Type gaps vs. the TS source:
 //   UnitDefinition has no `species` field — Hamster/Duck/Boar branches are unreachable.
@@ -288,14 +288,16 @@ fn resolve_unit_damage(
 
 // ── Reward calculation ─────────────────────────────────────────────────────
 
-/// Rewards key on the two values that actually decide them — whether the mission
-/// succeeded and by what margin — never on `OutcomeType`. Matching on the enum is
-/// what turned retiring a variant into a silent balance change (GAP-35): once the
-/// narrow-win variant was gone, a variant match would have handed every win the
-/// 1.5× multiplier, and the failure arm would have stopped covering every loss.
+/// Rewards key on the values that actually decide them — whether the mission
+/// succeeded, whether anyone survived to bring the haul home, and by what margin —
+/// never on `OutcomeType`. Matching on the enum is what turned retiring a variant
+/// into a silent balance change (GAP-35): once the narrow-win variant was gone, a
+/// variant match would have handed every win the 1.5× multiplier, and the failure
+/// arm would have stopped covering every loss.
 fn calc_rewards(
     mission: &MissionDefinition,
     is_success: bool,
+    any_survivor: bool,
     margin: f64,
     squad: &Squad,
     rng: &mut Rng,
@@ -304,21 +306,44 @@ fn calc_rewards(
     if !is_success {
         return Rewards { credits: 0, ore: 0, loot_drop: None };
     }
-    // No `.abs()`: the early return above means the mission succeeded, and `margin`
-    // is non-negative whenever it did.
-    let multiplier: f64 = if margin >= cfg.outcome_margin_threshold {
-        cfg.full_success_reward_mult
-    } else {
-        1.0
-    };
-    let credits = (mission.credit_reward as f64 * multiplier).round() as u32;
-    let ore     = (mission.ore_reward     as f64 * multiplier).round() as u32;
     let total_loot_bonus: u32 = squad
         .units
         .iter()
         .map(|u| u.definition.loot_bonus.max(0) as u32)
         .sum();
-    Rewards { credits, ore, loot_drop: roll_loot(rng, total_loot_bonus, mission.difficulty, cfg) }
+    // The loot roll runs on every win, survivors or not: skipping it on a pyrrhic
+    // win would shift generate_report_id's draws and break replay parity.
+    let loot_drop = roll_loot(rng, total_loot_bonus, mission.difficulty, cfg);
+    if !any_survivor {
+        // Pyrrhic win: nobody is left to carry the haul home — it stays with the corpses.
+        return Rewards { credits: 0, ore: 0, loot_drop: None };
+    }
+    // No `.abs()`: the early return above means the mission succeeded, and `margin`
+    // is non-negative whenever it did.
+    let multiplier: f64 = if margin >= cfg.outcome_margin_threshold {
+        cfg.decisive_success_reward_mult
+    } else {
+        1.0
+    };
+    let credits = (mission.credit_reward as f64 * multiplier).round() as u32;
+    let ore     = (mission.ore_reward     as f64 * multiplier).round() as u32;
+    Rewards { credits, ore, loot_drop }
+}
+
+/// Survival-based outcome — the rule order is load-bearing (header, Canon_Type_Reference §9).
+/// Pure: draws nothing, so where it is called cannot move an RNG draw.
+pub(crate) fn classify_outcome(is_success: bool, unit_results: &[UnitBattleResult]) -> OutcomeType {
+    if unit_results.is_empty() {
+        return OutcomeType::Defeat;
+    }
+    if unit_results.iter().all(|u| matches!(u.final_status, UnitStatus::Kia)) {
+        return OutcomeType::Wipeout;
+    }
+    if is_success {
+        OutcomeType::Success
+    } else {
+        OutcomeType::Defeat
+    }
 }
 
 // ── Mission resolver ───────────────────────────────────────────────────────
@@ -358,14 +383,6 @@ pub fn resolve_mission(
     let is_success          = (raw_roll as f64) <= success_probability;
     let margin              = success_probability - raw_roll as f64;
 
-    let outcome = if is_success {
-        OutcomeType::Success
-    } else if margin.abs() >= cfg.outcome_margin_threshold {
-        OutcomeType::Wipeout
-    } else {
-        OutcomeType::Defeat
-    };
-
     let avg_damage_shield = calc_total_damage_shield(squad);
     let has_sawbones = squad
         .units
@@ -380,7 +397,10 @@ pub fn resolve_mission(
         })
         .collect();
 
-    let rewards = calc_rewards(mission, is_success, margin, squad, &mut rng, cfg);
+    let any_survivor = unit_results.iter().any(|u| !matches!(u.final_status, UnitStatus::Kia));
+    let outcome = classify_outcome(is_success, &unit_results);
+
+    let rewards = calc_rewards(mission, is_success, any_survivor, margin, squad, &mut rng, cfg);
 
     let narrative_tag = format!("{:?}_{:?}_{:?}", outcome, mission.category, mission.environment);
 
@@ -1292,18 +1312,21 @@ mod tests {
         (squad, mission, SimConfig::default())
     }
 
-    /// Equivalence gate for GAP-35 part 1 (brick 4b-0).
+    /// Recorded-sweep gate, first set by brick 4b-0 and amended by brick 4e-0.
     ///
-    /// `calc_rewards` was refactored from matching on `OutcomeType` variants to
-    /// keying on `is_success` + `margin`. The refactor is meant to be exactly
-    /// behaviour-preserving, so the payout of a fixed 1000-seed sweep must not
-    /// move by a single credit. These totals were recorded BEFORE the refactor.
+    /// 4b-0 refactored `calc_rewards` from matching on `OutcomeType` to keying on
+    /// `is_success` + `margin`, and recorded this sweep's payout before the refactor
+    /// (632,000 credits / 316,000 ore, bands 254 / 251 / 495) to prove equivalence.
+    /// 4e-0 then stopped paying pyrrhic wins — wins where the lone fixture unit is
+    /// KIA. Its before-reading found 9 such seeds (6 in the 1.5× band, 3 in the 1.0×
+    /// band; 12,000 credits, 6,000 ore). The numbers below are 4b-0's equivalence
+    /// minus exactly those seeds, derived by arithmetic, not re-recorded.
     ///
     /// The per-band counts are asserted alongside the totals deliberately: totals
     /// alone could hide two offsetting errors (one band gaining what another
-    /// loses), and the bands are what the two rewritten arms actually decide.
+    /// loses), and the bands are what the reward arms actually decide.
     #[test]
-    fn reward_totals_are_unchanged_across_a_fixed_seed_sweep() {
+    fn reward_totals_match_the_recorded_sweep() {
         let (squad, mission, cfg) = fixture();
 
         let mut credits: u64 = 0;
@@ -1327,9 +1350,77 @@ mod tests {
         println!("REWARD SWEEP credits={} ore={}", credits, ore);
         println!("BANDS full={} flat={} zero={}", full_band, flat_band, zero_band);
 
-        // Recorded 2026-09-02 against the pre-refactor enum-matching `calc_rewards`.
-        assert_eq!((credits, ore), (632_000, 316_000));
-        assert_eq!((full_band, flat_band, zero_band), (254, 251, 495));
+        // 4b-0's 2026-09-02 recording minus the 9 pyrrhic seeds of 4e-0's step 0.
+        assert_eq!((credits, ore), (632_000 - 12_000, 316_000 - 6_000));
+        assert_eq!((full_band, flat_band, zero_band), (254 - 6, 251 - 3, 495 + 9));
+    }
+
+    fn unit_result(final_status: UnitStatus) -> UnitBattleResult {
+        UnitBattleResult {
+            unit_id:      "u".to_string(),
+            unit_name:    "U".to_string(),
+            unit_type:    "Vanguard".to_string(),
+            emoji:        "V".to_string(),
+            hp_lost:      0,
+            hp_remaining: 0,
+            final_status,
+            status_note:  String::new(),
+        }
+    }
+
+    #[test]
+    fn classify_outcome_all_kia_is_wipeout_win_or_lose() {
+        let all_kia = vec![unit_result(UnitStatus::Kia), unit_result(UnitStatus::Kia)];
+        assert!(matches!(classify_outcome(true, &all_kia), OutcomeType::Wipeout));
+        assert!(matches!(classify_outcome(false, &all_kia), OutcomeType::Wipeout));
+    }
+
+    #[test]
+    fn classify_outcome_one_survivor_is_success_or_defeat() {
+        let one_survivor = vec![
+            unit_result(UnitStatus::Kia),
+            unit_result(UnitStatus::Wounded),
+            unit_result(UnitStatus::Kia),
+        ];
+        assert!(matches!(classify_outcome(true, &one_survivor), OutcomeType::Success));
+        assert!(matches!(classify_outcome(false, &one_survivor), OutcomeType::Defeat));
+    }
+
+    /// `.all()` over an empty slice is vacuously true; rule 1 must catch zero units
+    /// before rule 2 can call them a Wipeout.
+    #[test]
+    fn classify_outcome_zero_units_is_defeat_win_or_lose() {
+        assert!(matches!(classify_outcome(true, &[]), OutcomeType::Defeat));
+        assert!(matches!(classify_outcome(false, &[]), OutcomeType::Defeat));
+    }
+
+    /// The 9 pyrrhic seeds from 4e-0's step-0 before-reading, with the report IDs
+    /// they produced BEFORE the brick. Each is now a Wipeout that pays nothing, and
+    /// an unchanged report_id proves the loot roll still ran — skipping it would
+    /// shift generate_report_id's draws.
+    #[test]
+    fn pyrrhic_wins_pay_nothing_and_move_no_draw() {
+        const PYRRHIC: [(u32, &str); 9] = [
+            (51,  "5173c938eb65cd69"),
+            (63,  "a97d6481a9972eb2"),
+            (75,  "eeaf03950e21b906"),
+            (555, "b8a692aba49abb70"),
+            (585, "9c5f71ae9b03ffa8"),
+            (667, "9f8e8f3815401c57"),
+            (816, "a173acd62043e792"),
+            (939, "5315134887fa5e16"),
+            (968, "32ea85f55dd6e75b"),
+        ];
+        assert!(!PYRRHIC.is_empty());
+        let (squad, mission, cfg) = fixture();
+        for (seed, report_id) in PYRRHIC {
+            let report = resolve_mission(&squad, &mission, "2026-09-02T00:00:00Z", Some(seed), &cfg);
+            assert!(matches!(report.outcome, OutcomeType::Wipeout), "seed {}", seed);
+            assert_eq!(report.rewards.credits, 0, "seed {}", seed);
+            assert_eq!(report.rewards.ore, 0, "seed {}", seed);
+            assert!(report.rewards.loot_drop.is_none(), "seed {}", seed);
+            assert_eq!(report.report_id, report_id, "seed {}: a draw moved", seed);
+        }
     }
 
     /// `TacticalRetreat` is a player-agency outcome: it may only be assigned when a

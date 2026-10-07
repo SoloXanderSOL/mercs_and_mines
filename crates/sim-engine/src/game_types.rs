@@ -350,9 +350,11 @@ pub struct ScoreBreakdown {
 }
 
 /// Taxonomy is agency and survival, not roll margin. Canon_Type_Reference.md §9.
+/// `Success` needs the objective completed AND at least one unit alive. `Wipeout` is
+/// every unit KIA, win or lose, and pays nothing. A failure with survivors is `Defeat`.
+/// Assigned by `resolver::classify_outcome` from the post-damage unit results.
 /// `TacticalRetreat` is reserved and unreachable: the mission path has no retreat input (the streaming pipe's ClientCommand::Retreat is a separate ledger — ODQ-23),
-/// and nothing may assign it from a roll. GAP-35 part 2 still owes state-based
-/// `Wipeout` assignment — it currently fires on a wide-margin loss, not a body count.
+/// and nothing may assign it from a roll.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum OutcomeType {
     Success,

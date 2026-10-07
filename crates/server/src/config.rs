@@ -54,6 +54,31 @@ fn env_i32(key: &str, default: i32) -> i32 {
         .unwrap_or(default)
 }
 
+pub(crate) const DECISIVE_SUCCESS_REWARD_MULT_KEY: &str = "DECISIVE_SUCCESS_REWARD_MULT";
+pub(crate) const LEGACY_FULL_SUCCESS_REWARD_MULT_KEY: &str = "FULL_SUCCESS_REWARD_MULT"; // TODO(phase-1-close): remove after one release
+
+/// Reads `key`, then `legacy_key`, then falls back to `default`. A value that will
+/// not parse counts as absent. Takes a lookup closure so tests never touch the
+/// process environment; `from_env` passes `|k| std::env::var(k).ok()`.
+fn f64_with_fallback(
+    get: impl Fn(&str) -> Option<String>,
+    key: &str,
+    legacy_key: &str,
+    default: f64,
+) -> f64 {
+    if let Some(v) = get(key).and_then(|v| v.parse().ok()) {
+        return v;
+    }
+    if let Some(v) = get(legacy_key).and_then(|v| v.parse().ok()) {
+        tracing::warn!(
+            "{} is deprecated; read as a fallback because {} is unset or unparseable — rename it",
+            legacy_key, key
+        );
+        return v;
+    }
+    default
+}
+
 // ── Server config ─────────────────────────────────────────────────────────────
 
 /// Fallback bind address when SERVER_BIND_ADDR is unset. LOOPBACK ON PURPOSE.
@@ -143,7 +168,12 @@ impl Config {
                 kia_base_chance_failure:      env_f64  ("KIA_BASE_CHANCE_FAILURE",      d.kia_base_chance_failure),
                 sawbones_trauma_chance:       env_f64  ("SAWBONES_TRAUMA_CHANCE",       d.sawbones_trauma_chance),
                 outcome_margin_threshold:     env_f64  ("OUTCOME_MARGIN_THRESHOLD",     d.outcome_margin_threshold),
-                full_success_reward_mult:     env_f64  ("FULL_SUCCESS_REWARD_MULT",     d.full_success_reward_mult),
+                decisive_success_reward_mult: f64_with_fallback(
+                    |k| std::env::var(k).ok(),
+                    DECISIVE_SUCCESS_REWARD_MULT_KEY,
+                    LEGACY_FULL_SUCCESS_REWARD_MULT_KEY,
+                    d.decisive_success_reward_mult,
+                ),
                 squad_size_bonus_per_unit:    env_i32  ("SQUAD_SIZE_BONUS_PER_UNIT",    d.squad_size_bonus_per_unit),
                 base_skill_score_weight:      env_f64  ("BASE_SKILL_SCORE_WEIGHT",      d.base_skill_score_weight),
                 ghost_wire_mission_bonus:     env_i32  ("GHOST_WIRE_MISSION_BONUS",     d.ghost_wire_mission_bonus),
@@ -172,7 +202,55 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::{ServerConfig, DEFAULT_BIND_ADDR};
+    use super::{
+        f64_with_fallback, ServerConfig, DECISIVE_SUCCESS_REWARD_MULT_KEY, DEFAULT_BIND_ADDR,
+        LEGACY_FULL_SUCCESS_REWARD_MULT_KEY,
+    };
+    use std::collections::HashMap;
+
+    /// Fixed-map lookup — the reward-mult tests never mutate the process environment.
+    fn lookup(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: HashMap<String, String> =
+            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        move |k| map.get(k).cloned()
+    }
+
+    fn reward_mult(pairs: &[(&str, &str)]) -> f64 {
+        f64_with_fallback(
+            lookup(pairs),
+            DECISIVE_SUCCESS_REWARD_MULT_KEY,
+            LEGACY_FULL_SUCCESS_REWARD_MULT_KEY,
+            1.5,
+        )
+    }
+
+    #[test]
+    fn reward_mult_prefers_new_key() {
+        let v = reward_mult(&[
+            (DECISIVE_SUCCESS_REWARD_MULT_KEY, "2.0"),
+            (LEGACY_FULL_SUCCESS_REWARD_MULT_KEY, "3.0"),
+        ]);
+        assert_eq!(v, 2.0);
+    }
+
+    #[test]
+    fn reward_mult_falls_back_to_legacy_key() {
+        assert_eq!(reward_mult(&[(LEGACY_FULL_SUCCESS_REWARD_MULT_KEY, "3.0")]), 3.0);
+    }
+
+    #[test]
+    fn reward_mult_unparseable_new_key_counts_as_absent() {
+        let v = reward_mult(&[
+            (DECISIVE_SUCCESS_REWARD_MULT_KEY, "not-a-number"),
+            (LEGACY_FULL_SUCCESS_REWARD_MULT_KEY, "3.0"),
+        ]);
+        assert_eq!(v, 3.0);
+    }
+
+    #[test]
+    fn reward_mult_defaults_when_neither_key_set() {
+        assert_eq!(reward_mult(&[]), 1.5);
+    }
 
     /// The bind address must be loopback unless someone deliberately overrides it.
     /// Safety is the default state, not a systemd drop-in bolted on afterwards —

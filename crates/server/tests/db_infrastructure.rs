@@ -1792,6 +1792,38 @@ async fn admin_launch_endpoint_fails_closed() {
     std::env::remove_var("ADMIN_API_KEY");
 }
 
+/// A mission needs at least one unit (brick 4e-0, GAP-36 empty-squad half). The
+/// route refuses before the mission lookup, so nothing rolls and nothing is logged.
+/// Needs neither Postgres nor Redis — the default in-memory AppState is enough.
+#[tokio::test]
+async fn mission_resolve_rejects_empty_squad() {
+    use std::sync::Arc;
+    use axum::{body::Body, http::{Request, StatusCode}};
+    use tower::ServiceExt;
+
+    let config = Arc::new(mercs_server::config::Config::default());
+    let state = Arc::new(mercs_server::state::AppState::new(
+        std::path::PathBuf::from("/tmp"),
+        config,
+    ));
+    let body = serde_json::json!({
+        "squad": { "units": [], "commander": null },
+        "mission_id": "GUARD_DUTY",
+        "seed_override": 1,
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/mission/resolve")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = mercs_server::routes::router(Arc::clone(&state)).oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(), StatusCode::BAD_REQUEST,
+        "a zero-unit deployment must be refused before it rolls"
+    );
+}
+
 #[tokio::test]
 async fn admin_launch_campaign_returns_200_then_409() {
     use std::sync::Arc;

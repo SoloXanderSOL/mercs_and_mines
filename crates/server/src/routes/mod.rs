@@ -161,6 +161,9 @@ async fn post_mission_resolve(
     State(state): State<Arc<AppState>>,
     Json(req): Json<MissionResolveRequest>,
 ) -> Result<impl IntoResponse, AppError> {
+    if req.squad.units.is_empty() {
+        return Err(bad_request("A mission needs at least one unit"));
+    }
     let req_payload = serde_json::to_value(&req).unwrap_or_default();
 
     let mission = missions()
