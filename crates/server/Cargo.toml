@@ -38,3 +38,4 @@ dotenvy        = "0.15"
 sqlx           = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "macros", "migrate", "chrono", "json", "uuid"] }
 redis          = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 tracing        = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

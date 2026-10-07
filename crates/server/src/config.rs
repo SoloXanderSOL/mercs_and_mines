@@ -57,19 +57,31 @@ fn env_i32(key: &str, default: i32) -> i32 {
 pub(crate) const DECISIVE_SUCCESS_REWARD_MULT_KEY: &str = "DECISIVE_SUCCESS_REWARD_MULT";
 pub(crate) const LEGACY_FULL_SUCCESS_REWARD_MULT_KEY: &str = "FULL_SUCCESS_REWARD_MULT"; // TODO(phase-1-close): remove after one release
 
-/// Reads `key`, then `legacy_key`, then falls back to `default`. A value that will
-/// not parse counts as absent. Takes a lookup closure so tests never touch the
-/// process environment; `from_env` passes `|k| std::env::var(k).ok()`.
+/// Reads `key`, then `legacy_key`, then falls back to `default`. A value is usable
+/// only if it parses as `f64` AND is finite — `NaN`, `inf` and unparseable text all
+/// count as absent, with a warning, because a NaN multiplier silently pays 0.
+/// Takes a lookup closure so tests never touch the process environment;
+/// `from_env` passes `|k| std::env::var(k).ok()`.
 fn f64_with_fallback(
     get: impl Fn(&str) -> Option<String>,
     key: &str,
     legacy_key: &str,
     default: f64,
 ) -> f64 {
-    if let Some(v) = get(key).and_then(|v| v.parse().ok()) {
+    let usable = |k: &str| -> Option<f64> {
+        let raw = get(k)?;
+        match raw.parse::<f64>() {
+            Ok(v) if v.is_finite() => Some(v),
+            _ => {
+                tracing::warn!("{} is set to {:?}, which is not a finite number; ignoring it", k, raw);
+                None
+            }
+        }
+    };
+    if let Some(v) = usable(key) {
         return v;
     }
-    if let Some(v) = get(legacy_key).and_then(|v| v.parse().ok()) {
+    if let Some(v) = usable(legacy_key) {
         tracing::warn!(
             "{} is deprecated; read as a fallback because {} is unset or unparseable — rename it",
             legacy_key, key
@@ -250,6 +262,22 @@ mod tests {
     #[test]
     fn reward_mult_defaults_when_neither_key_set() {
         assert_eq!(reward_mult(&[]), 1.5);
+    }
+
+    /// `"NaN"` and `"inf"` parse as f64 — they must still count as absent.
+    #[test]
+    fn reward_mult_non_finite_counts_as_absent() {
+        let v = reward_mult(&[
+            (DECISIVE_SUCCESS_REWARD_MULT_KEY, "NaN"),
+            (LEGACY_FULL_SUCCESS_REWARD_MULT_KEY, "1.25"),
+        ]);
+        assert_eq!(v, 1.25);
+        assert_eq!(reward_mult(&[(DECISIVE_SUCCESS_REWARD_MULT_KEY, "inf")]), 1.5);
+    }
+
+    #[test]
+    fn reward_mult_unparseable_legacy_key_falls_to_default() {
+        assert_eq!(reward_mult(&[(LEGACY_FULL_SUCCESS_REWARD_MULT_KEY, "1,5")]), 1.5);
     }
 
     /// The bind address must be loopback unless someone deliberately overrides it.
