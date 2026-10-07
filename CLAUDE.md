@@ -15,7 +15,7 @@ server, no Node.js, no second language in the hot path. There are no on-chain pr
 Trust deliveries are resolved server-side.
 
 The approved library choices (Tokio, Axum, serde, tokio-tungstenite, ed25519-dalek,
-sqlx, redis) are listed in the Tech Stack reference document below. Deviations require
+sqlx, redis, tracing, tracing-subscriber) are listed in the Tech Stack reference document below. Deviations require
 Director approval. Wallet signatures are verified with ed25519-dalek, not the Solana
 SDK; the browser client loads @solana/web3.js for Phantom wallet connect only.
 
@@ -40,8 +40,12 @@ As of 2026-10-07:
 - **Section 3 (Hex Map and Timers):** Complete — 3a-1, 3b-1, 3b-2, 3c-1, 3d-1, 3e-1.
 - **Section 4 (Commander Records):** In progress. 4a-1, 4b-0, 4b-1 and 4e-0 (state-based Wipeout, GAP-35 part 2) complete; 4a-2 unblocked.
 - **Sections 5 and 6:** Not started.
+- **INF-1 (infrastructure, GAP-37):** Complete — `tracing` subscriber installed, reward-mult
+  config hardened, workspace version `0.2.0`.
 
-**97/97 tests green (single-threaded, verified at `5bacbb7`). Next brick: 4c-1 — Stress.** 4b-1 reused `sim-engine`'s `OutcomeType` rather than
+**99/99 tests green (single-threaded, verified at `ddb4ff3`). Workspace version `0.2.0`.
+Next brick: 4c-1 — Stress.** Any brick that changes what `resolve_mission` produces for
+a given seed bumps the workspace version in the same brick. 4b-1 reused `sim-engine`'s `OutcomeType` rather than
 defining a new enum, and writes **no input-log entry** — the rank-up entry was removed
 from scope. **ODQ-22 and ODQ-23 were ruled 2026-09-03 — engagement and mission outcomes
 are separate levels, and the mission and streaming pipes are separate ledgers; see
