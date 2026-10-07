@@ -27,7 +27,7 @@ Before writing any code, read the Phase 1 Alpha Foundation document to understan
 is already built. Do not guess — read it. The status block at the top of that document
 is the ground truth.
 
-As of 2026-09-08:
+As of 2026-10-07:
 
 - **Section 1 (Database Layer):** 1a (Postgres) and 1b (Redis) complete. **1c is NOT
   complete — brick 1c-2 is reopened (GAP-34).** The session integrity endpoint hashes a
@@ -38,11 +38,10 @@ As of 2026-09-08:
 - **Section 2 (Campaign State Machine):** 2a and 2b complete. 2c and 2d deferred until
   after Sections 3–5. Arch Audits 3 and 5 complete.
 - **Section 3 (Hex Map and Timers):** Complete — 3a-1, 3b-1, 3b-2, 3c-1, 3d-1, 3e-1.
-- **Section 4 (Commander Records):** In progress. 4a-1, 4b-0 and 4b-1 complete; 4a-2 unblocked; 4e-0 (state-based Wipeout, GAP-35 part 2) inserted ahead of 4e-1.
+- **Section 4 (Commander Records):** In progress. 4a-1, 4b-0, 4b-1 and 4e-0 (state-based Wipeout, GAP-35 part 2) complete; 4a-2 unblocked.
 - **Sections 5 and 6:** Not started.
 
-**88/88 tests green (single-threaded, verified at `2c3e9ba`). Next brick: 4c-1 — Stress;
-4e-0 can run alongside it.** 4b-1 reused `sim-engine`'s `OutcomeType` rather than
+**97/97 tests green (single-threaded, verified at `5bacbb7`). Next brick: 4c-1 — Stress.** 4b-1 reused `sim-engine`'s `OutcomeType` rather than
 defining a new enum, and writes **no input-log entry** — the rank-up entry was removed
 from scope. **ODQ-22 and ODQ-23 were ruled 2026-09-03 — engagement and mission outcomes
 are separate levels, and the mission and streaming pipes are separate ledgers; see
@@ -57,12 +56,13 @@ keys on `is_success` and `margin` — and the resolver assigns the canon names. 
 scaling is decoupled from the taxonomy by ruling: do not reintroduce a match on
 `OutcomeType` in `calc_rewards`, or retiring a variant silently becomes a balance change.
 
-**GAP-35 part 2 is still open, and it is the sharp one.** `Wipeout` is assigned from a
-roll margin, not from the Section reaching 0 strength — and §4e hangs permadeath on
-`Wipeout`. On a 50%-success fixture that is **~52% of all losses**, rising to ~66% at 30%
-success. Do not build anything that treats `Wipeout` as meaning "the Section was
-destroyed" until part 2 lands. Owned by brick 4e-0 (ruled 2026-09-03), a hard
-prerequisite of 4e-1.
+**GAP-35 part 2 landed in `5bacbb7` (brick 4e-0) — outcomes are survival-based.**
+`classify_outcome` runs after unit damage: **Success = objective completed AND at least
+one unit alive.** Every unit KIA is `Wipeout`, **win or lose**, and pays nothing — no
+credits, no ore, no loot (the loot roll still runs, so no draw moves). A failure with
+survivors is `Defeat`. A zero-unit mission is rejected at the route (`400`). The roll
+margin now sets only the reward multiplier (`DECISIVE_SUCCESS_REWARD_MULT`). Permadeath
+reads `Wipeout`.
 
 **`TacticalRetreat` is reserved and must never be assigned on the mission path.** Note
 the qualifier: a player retreat input *does* exist on the streaming WS combat pipe
