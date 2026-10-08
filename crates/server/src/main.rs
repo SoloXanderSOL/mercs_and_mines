@@ -16,13 +16,7 @@ use redis::Client as RedisClient;
 #[tokio::main]
 async fn main() {
     dotenvy::dotenv().ok();
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+    mercs_server::init_tracing();
 
     let database_url = std::env::var("DATABASE_URL")
         .expect("DATABASE_URL must be set (add it to .env or the environment)");

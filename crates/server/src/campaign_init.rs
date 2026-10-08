@@ -65,7 +65,7 @@ pub async fn initialize_campaign(
             spawn_type: SpawnType::SoloQueue,
         })
         .collect();
-    // Phase 2: wire CorporateCharter once charter_id is added to
+    // TODO(phase-2): wire CorporateCharter once charter_id is added to
     // player_campaign_membership
 
     // 3.6 — assign gateway hexes (independent PRNG stream)

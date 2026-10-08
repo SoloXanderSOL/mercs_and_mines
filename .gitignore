@@ -17,3 +17,6 @@ smoke_test.mjs
 # GAP-26 self-skip guard can grep it. Disposable on the runner, but reproducing that
 # command locally drops it in the repo root where 'git add -A' would sweep it up.
 test-output.txt
+
+# Combat session logs, written at runtime by log_writer (LOG_DIR, default ./logs).
+logs/

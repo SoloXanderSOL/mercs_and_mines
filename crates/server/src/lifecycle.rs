@@ -4,6 +4,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
+use crate::repeat_warn::RepeatWarn;
 use crate::repository::campaign::{CampaignInstance, CampaignLifecycle, CampaignRepository};
 
 /// Returns the lifecycle state the campaign should transition to, or `None` if no
@@ -45,13 +46,29 @@ pub fn check_campaign_transition(
 
 pub const LIFECYCLE_POLL_INTERVAL_SECS: u64 = 60;
 
+/// Repeat a persistent `list_campaigns_by_state` failure about once an hour (GAP-38).
+pub const LIFECYCLE_WARN_EVERY_TICKS: u32 = (3600 / LIFECYCLE_POLL_INTERVAL_SECS) as u32;
+
 /// Runs one scan of all Active campaigns and applies any warranted lifecycle transitions.
-/// DB errors are logged at WARN and skipped — a transient failure must not abort the loop.
-pub async fn poll_lifecycle_once(repo: &(dyn CampaignRepository + Send + Sync)) {
+/// A failed campaign scan is suppressed by `list_warn` after its first line (GAP-38);
+/// per-campaign failures still log every tick (GAP-39). Neither aborts the loop.
+pub async fn poll_lifecycle_once(
+    repo: &(dyn CampaignRepository + Send + Sync),
+    list_warn: &mut RepeatWarn,
+) {
     let campaigns = match repo.list_campaigns_by_state(CampaignLifecycle::Active).await {
-        Ok(v) => v,
+        Ok(v) => {
+            if let Some(n) = list_warn.ok() {
+                tracing::info!("lifecycle poll: list_campaigns_by_state recovered after {n} failed polls");
+            }
+            v
+        }
         Err(e) => {
-            tracing::warn!("lifecycle poll: list_campaigns_by_state failed: {e}");
+            match list_warn.fail() {
+                Some(1) => tracing::warn!("lifecycle poll: list_campaigns_by_state failed: {e}"),
+                Some(n) => tracing::warn!("lifecycle poll: list_campaigns_by_state still failing ({n} consecutive polls): {e}"),
+                None => {}
+            }
             return;
         }
     };
@@ -75,9 +92,10 @@ pub async fn poll_lifecycle_once(repo: &(dyn CampaignRepository + Send + Sync)) 
 
 pub async fn run_sector_lifecycle_task(repo: Arc<dyn CampaignRepository + Send + Sync>) {
     let mut interval = tokio::time::interval(Duration::from_secs(LIFECYCLE_POLL_INTERVAL_SECS));
+    let mut list_warn = RepeatWarn::new(LIFECYCLE_WARN_EVERY_TICKS);
     loop {
         interval.tick().await;
-        poll_lifecycle_once(repo.as_ref()).await;
+        poll_lifecycle_once(repo.as_ref(), &mut list_warn).await;
     }
 }
 

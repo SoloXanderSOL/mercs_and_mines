@@ -91,6 +91,27 @@ fn f64_with_fallback(
     default
 }
 
+/// Reads a `u32` stress penalty. Unset → `default`, silently. Set but not a `u32`
+/// (`""`, `"-5"`, `"10.0"`, `" 7"`; `str::parse` does not trim) → `default`, with a warning.
+/// Above `warn_above` → the value as given, with a warning and **no clamp**: a penalty that
+/// size shatters a Commander in one application, which is legal, merely suspicious.
+/// Takes a lookup closure so tests never touch the process environment.
+fn u32_with_warn(get: impl Fn(&str) -> Option<String>, key: &str, default: u32, warn_above: u32) -> u32 {
+    let Some(raw) = get(key) else { return default };
+    match raw.parse::<u32>() {
+        Ok(v) => {
+            if v > warn_above {
+                tracing::warn!("{} is {}, above MAX_STRESS ({}): one application shatters any Commander; using it as given", key, v, warn_above);
+            }
+            v
+        }
+        Err(_) => {
+            tracing::warn!("{} is set to {:?}, which is not a whole number; ignoring it", key, raw);
+            default
+        }
+    }
+}
+
 // ── Server config ─────────────────────────────────────────────────────────────
 
 /// Fallback bind address when SERVER_BIND_ADDR is unset. LOOPBACK ON PURPOSE.
@@ -194,8 +215,8 @@ impl Config {
                 pyroclast_industrial_bonus:   env_i32  ("PYROCLAST_INDUSTRIAL_BONUS",   d.pyroclast_industrial_bonus),
                 vanguard_stack_bonus_per_unit: env_i32 ("VANGUARD_STACK_BONUS_PER_UNIT",d.vanguard_stack_bonus_per_unit),
                 max_vanguard_stack_bonus:     env_i32  ("MAX_VANGUARD_STACK_BONUS",     d.max_vanguard_stack_bonus),
-                deployment_stress_penalty:    env_u32  ("DEPLOYMENT_STRESS_PENALTY",    d.deployment_stress_penalty),
-                casualty_stress_penalty:      env_u32  ("CASUALTY_STRESS_PENALTY",      d.casualty_stress_penalty),
+                deployment_stress_penalty:    u32_with_warn(|k| std::env::var(k).ok(), "DEPLOYMENT_STRESS_PENALTY", d.deployment_stress_penalty, u32::from(sim_engine::constants::MAX_STRESS)),
+                casualty_stress_penalty:      u32_with_warn(|k| std::env::var(k).ok(), "CASUALTY_STRESS_PENALTY",   d.casualty_stress_penalty,   u32::from(sim_engine::constants::MAX_STRESS)),
                 max_loot_bonus_cap:           env_u32  ("MAX_LOOT_BONUS_CAP",           d.max_loot_bonus_cap),
                 loot_drain_multiplier:        env_f64  ("LOOT_DRAIN_MULTIPLIER",        d.loot_drain_multiplier),
                 loot_basic_weight_min:        env_f64  ("LOOT_BASIC_WEIGHT_MIN",        d.loot_basic_weight_min),
@@ -215,8 +236,8 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::{
-        f64_with_fallback, ServerConfig, DECISIVE_SUCCESS_REWARD_MULT_KEY, DEFAULT_BIND_ADDR,
-        LEGACY_FULL_SUCCESS_REWARD_MULT_KEY,
+        f64_with_fallback, u32_with_warn, ServerConfig, DECISIVE_SUCCESS_REWARD_MULT_KEY,
+        DEFAULT_BIND_ADDR, LEGACY_FULL_SUCCESS_REWARD_MULT_KEY,
     };
     use std::collections::HashMap;
 
@@ -278,6 +299,20 @@ mod tests {
     #[test]
     fn reward_mult_unparseable_legacy_key_falls_to_default() {
         assert_eq!(reward_mult(&[(LEGACY_FULL_SUCCESS_REWARD_MULT_KEY, "1,5")]), 1.5);
+    }
+
+    /// INF-2 — a stress penalty that is set but unusable warns and falls back; one above
+    /// MAX_STRESS warns and is kept as given (no clamp).
+    #[test]
+    fn stress_penalty_warns_and_falls_back_without_clamping() {
+        let pen = |pairs: &[(&str, &str)]| u32_with_warn(lookup(pairs), "K", 10, 100);
+        assert_eq!(pen(&[]), 10, "unset → default");
+        assert_eq!(pen(&[("K", "7")]), 7);
+        assert_eq!(pen(&[("K", "100")]), 100, "MAX_STRESS itself is not suspicious");
+        assert_eq!(pen(&[("K", "150")]), 150, "above MAX_STRESS: warn, never clamp");
+        for bad in ["", "abc", "-5", "10.0", " 7"] {
+            assert_eq!(pen(&[("K", bad)]), 10, "{bad:?} must fall back to the default");
+        }
     }
 
     /// The bind address must be loopback unless someone deliberately overrides it.

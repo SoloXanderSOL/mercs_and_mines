@@ -210,9 +210,10 @@ impl CommanderRepository for PostgresCommanderRepository {
 
     async fn update_stress(&self, commander_id: Uuid, stress: i16) -> Result<(), RepositoryError> {
         let clamped = i16::max(0, i16::min(100, stress));
-        // One statement: no path can leave stress at 100 without Shattered. The formula
+        // One statement: no update_stress call can leave stress at 100 without Shattered. The formula
         // stays in Rust; SQL only compares the already-clamped value. The literal is typed
         // SMALLINT so Postgres deduces one type for $1 (an int4 literal makes it ambiguous).
+        // (create_commander inserts its record verbatim and bypasses this).
         let result = sqlx::query!(
             "UPDATE commander_records SET stress = $1, is_shattered = is_shattered OR $1 >= 100::SMALLINT, updated_at = now() WHERE commander_id = $2",
             clamped,

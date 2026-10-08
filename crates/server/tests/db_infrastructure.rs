@@ -182,15 +182,16 @@ async fn commander_section_crud_is_correct() {
     }).await.expect("create campaign failed");
     let campaign_id = campaign.campaign_id;
 
-    // Pre-test cleanup in case a previous run left rows.
-    sqlx::query("DELETE FROM section_records WHERE campaign_id = $1")
-        .bind(campaign_id)
-        .execute(&pool)
-        .await
-        .expect("pre-test section cleanup failed");
     // Wallet [2u8;32] is shared with initialize_campaign_orchestrates_correctly.
     // Pre-clean by wallet in FK order (F5): a campaign_id pre-clean is a no-op, since
     // the campaign above is brand new.
+    // Sections left by a panicked run, reached through wallet [2u8;32]'s stale commanders.
+    // Must run before the commander delete: section_records.commander_id is ON DELETE
+    // SET NULL, so afterwards the join matches nothing. Sections whose commander was
+    // already deleted by an earlier run have commander_id NULL and are unreachable here;
+    // they are clutter, not a collision, because this test reads only sections it creates.
+    sqlx::query("DELETE FROM section_records WHERE commander_id IN (SELECT commander_id FROM commander_records WHERE player_wallet = $1)")
+        .bind(&[2u8; 32].to_vec()).execute(&pool).await.ok();
     sqlx::query("DELETE FROM commander_records WHERE player_wallet = $1")
         .bind(&[2u8; 32].to_vec()).execute(&pool).await.ok();
     sqlx::query("DELETE FROM player_campaign_membership WHERE wallet_address = $1")
@@ -1063,7 +1064,7 @@ async fn apply_mission_xp_persists_rank_and_xp() {
     }).await.expect("create campaign failed");
     let campaign_id = campaign.campaign_id;
 
-    // Wallet [9u8;32] — unique to this test.
+    // Wallet [9u8;32]: the only Postgres account/commander use. It also appears as a non-FK owner in timer_repository_redis_is_correct and convoy_ws_receives_arrived_event.
     let wallet_bytes = [9u8; 32].to_vec();
 
     // Pre-test cleanup by wallet, in FK order (F5).
@@ -1179,6 +1180,11 @@ async fn commander_stress_wrapper_shatters_in_one_write() {
     assert_eq!(after.stress, 100, "95 + default deployment penalty 10 caps at 100");
     assert!(after.is_shattered, "update_stress must set is_shattered in the same write");
     assert!(!after.is_kia, "Shattered is not Permadeath");
+
+    // Stickiness on Postgres (Reviewer 4c-1 F2): a lower write keeps the flag.
+    commander_repo.update_stress(commander_id, 40).await.expect("update_stress failed");
+    let lower = commander_repo.get_commander(commander_id).await.unwrap().unwrap();
+    assert!(lower.stress == 40 && lower.is_shattered, "a lower stress write must not clear Shattered");
 
     sqlx::query!("DELETE FROM commander_records WHERE commander_id = $1", commander_id)
         .execute(&pool).await.ok();
@@ -1359,7 +1365,7 @@ async fn sector_lifecycle_task_transitions_active_to_ending() {
         .expect("ends_at backdate failed");
 
     // Run one poll cycle — should detect expired ends_at and transition to Ending.
-    mercs_server::lifecycle::poll_lifecycle_once(&repo).await;
+    mercs_server::lifecycle::poll_lifecycle_once(&repo, &mut mercs_server::repeat_warn::RepeatWarn::new(1)).await;
 
     let updated = repo.get_campaign(campaign.campaign_id).await
         .expect("get failed")
@@ -2412,7 +2418,7 @@ async fn convoy_timer_fires_and_marks_arrived() {
     state.sector_repo    = sector_repo.clone();
     state.timer_repo     = timer_repo.clone();
     state.input_log_repo = log_repo.clone();
-    poll_expiry_once(&state).await;
+    poll_expiry_once(&state, &mut mercs_server::repeat_warn::RepeatWarn::new(1)).await;
 
     // Assert: convoy is no longer in_transit
     let fetched = convoy_repo.get_convoy(convoy_id).await
@@ -2550,7 +2556,7 @@ async fn convoy_ws_receives_arrived_event() {
     }).await.expect("add_hex_occupant failed");
 
     // Run expiry — should fire ConvoyArrived into the injected sender
-    poll_expiry_once(&state).await;
+    poll_expiry_once(&state, &mut mercs_server::repeat_warn::RepeatWarn::new(1)).await;
 
     // Assert: WS message received within 2 seconds
     let msg = tokio::time::timeout(

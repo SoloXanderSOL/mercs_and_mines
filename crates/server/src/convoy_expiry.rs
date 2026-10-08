@@ -7,6 +7,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
 
 use crate::convoy_collision::check_same_hex_collision;
+use crate::repeat_warn::RepeatWarn;
 use crate::repository::{HexOccupant, TimerType};
 use crate::state::AppState;
 
@@ -22,6 +23,9 @@ pub enum ConvoyEvent {
 
 pub const EXPIRY_POLL_INTERVAL_SECS: u64 = 10;
 
+/// Repeat a persistent `get_due_timers` failure about once an hour (GAP-38).
+pub const EXPIRY_WARN_EVERY_TICKS: u32 = (3600 / EXPIRY_POLL_INTERVAL_SECS) as u32;
+
 fn notify_player_convoy_arrived(
     senders:     &DashMap<Uuid, UnboundedSender<ConvoyEvent>>,
     campaign_id: Uuid,
@@ -34,11 +38,20 @@ fn notify_player_convoy_arrived(
     }
 }
 
-pub async fn poll_expiry_once(state: &AppState) {
+pub async fn poll_expiry_once(state: &AppState, due_timers_warn: &mut RepeatWarn) {
     let timers = match state.timer_repo.get_due_timers(Utc::now()).await {
-        Ok(v) => v,
+        Ok(v) => {
+            if let Some(n) = due_timers_warn.ok() {
+                tracing::info!("poll_expiry_once: get_due_timers recovered after {n} failed polls");
+            }
+            v
+        }
         Err(e) => {
-            tracing::warn!("poll_expiry_once: get_due_timers failed: {e}");
+            match due_timers_warn.fail() {
+                Some(1) => tracing::warn!("poll_expiry_once: get_due_timers failed: {e}"),
+                Some(n) => tracing::warn!("poll_expiry_once: get_due_timers still failing ({n} consecutive polls): {e}"),
+                None => {}
+            }
             return;
         }
     };
@@ -109,8 +122,8 @@ pub async fn poll_expiry_once(state: &AppState) {
             owner_wallet: convoy.owner_wallet.clone(),
             unit_type: convoy.vehicle_class.clone(),
         };
-        // NOTE: arrival at impassable terrain is possible if sector was cold at dispatch time;
-        // Phase 2 must validate route fully before dispatch
+        // NOTE: arrival at impassable terrain is possible if sector was cold at dispatch time.
+        // TODO(phase-2): validate the route fully before dispatch.
         if let Err(e) = state.sector_repo
             .add_hex_occupant(
                 timer.sector_id,
@@ -145,7 +158,7 @@ pub async fn poll_expiry_once(state: &AppState) {
                     "collision detected at ({},{}): {:?}",
                     convoy.destination_q, convoy.destination_r, pair
                 );
-                // Phase 2: call resolveCombat here
+                // TODO(phase-2): call resolveCombat here
                 if let Some(cid) = campaign_id {
                     let collision_entry = shared::InputLogEntry {
                         tick: 0,
@@ -203,8 +216,9 @@ pub async fn run_convoy_expiry_task(state: Arc<AppState>) {
     // TODO(phase-2): no saga/compensation for partial convoy dispatch failure —
     // orphaned in_transit=true records need a reconciliation sweep
     let mut interval = tokio::time::interval(Duration::from_secs(EXPIRY_POLL_INTERVAL_SECS));
+    let mut due_timers_warn = RepeatWarn::new(EXPIRY_WARN_EVERY_TICKS);
     loop {
         interval.tick().await;
-        poll_expiry_once(state.as_ref()).await;
+        poll_expiry_once(state.as_ref(), &mut due_timers_warn).await;
     }
 }
