@@ -270,9 +270,14 @@ mod tests {
     #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "outside 1..=5")]
-    fn xp_award_out_of_range_tier_panics_in_debug() {
-        // Either call panics; the first one fires, which is what should_panic needs.
+    fn xp_award_tier_zero_panics_in_debug() {
         let _ = xp_award(0, &OutcomeType::Success);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "outside 1..=5")]
+    fn xp_award_tier_six_panics_in_debug() {
         let _ = xp_award(6, &OutcomeType::Success);
     }
 

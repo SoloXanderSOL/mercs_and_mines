@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE commander_records SET stress = $1, is_shattered = is_shattered OR $1 >= 100::SMALLINT, updated_at = now() WHERE commander_id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int2",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b50e35bc32739e85b473941f275ed0daf7fe6c29ad5e285f72cb11b2244089ef"
+}

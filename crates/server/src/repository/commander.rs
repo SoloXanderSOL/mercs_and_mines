@@ -1,12 +1,20 @@
-#![allow(unused)]
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
+use sim_engine::config::SimConfig;
 use sim_engine::game_types::OutcomeType;
+use sim_engine::resolver::{stress_after_casualties, stress_after_deployment};
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::RepositoryError;
+
+/// The `stress` column is SMALLINT with no CHECK constraint, so a stored value may sit
+/// outside 0..=100 (`create_commander` inserts unclamped). Clamp before handing it to
+/// the sim's u8 stress functions. The way back is a plain `i16::from(level)`.
+fn stress_to_level(stress: i16) -> u8 {
+    stress.clamp(0, 100) as u8
+}
 
 // ── CommanderRecord ──────────────────────────────────────────────────────────
 
@@ -38,9 +46,13 @@ pub struct CommanderRecord {
 pub trait CommanderRepository: Send + Sync {
     async fn create_commander(&self, record: CommanderRecord) -> Result<(), RepositoryError>;
     async fn get_commander(&self, commander_id: Uuid) -> Result<Option<CommanderRecord>, RepositoryError>;
+    /// Clamps to 0..=100 and sets `is_shattered` in the same write when the clamped
+    /// value reaches 100. The flag is sticky: a lower value never clears it.
     async fn update_stress(&self, commander_id: Uuid, stress: i16) -> Result<(), RepositoryError>;
     async fn update_rank_and_xp(&self, commander_id: Uuid, rank: i16, xp: i32) -> Result<(), RepositoryError>;
     async fn set_veteran_trait(&self, commander_id: Uuid, veteran_trait: String) -> Result<(), RepositoryError>;
+    /// `update_stress` is authoritative on the stress path: it sets Shattered itself when
+    /// stress reaches 100. This mutator remains for non-stress causes.
     async fn set_shattered(&self, commander_id: Uuid) -> Result<(), RepositoryError>;
     async fn set_kia(&self, commander_id: Uuid) -> Result<(), RepositoryError>;
     async fn list_commanders_by_campaign(&self, campaign_id: Uuid) -> Result<Vec<CommanderRecord>, RepositoryError>;
@@ -77,6 +89,43 @@ pub trait CommanderRepository: Send + Sync {
             }
         }
         self.update_rank_and_xp(commander_id, new_rank, new_xp).await
+    }
+
+    /// Orchestration wrapper — Phase_1_Section_4 §4c. The formula lives in
+    /// sim_engine::resolver; this method only sequences one read and one write.
+    /// Applies regardless of mission outcome.
+    async fn apply_deployment_stress(
+        &self,
+        commander_id: Uuid,
+        cfg: &SimConfig,
+    ) -> Result<(), RepositoryError> {
+        let rec = self
+            .get_commander(commander_id)
+            .await?
+            .ok_or(RepositoryError::NotFound)?;
+        if rec.is_kia {
+            return Ok(());
+        }
+        let next = stress_after_deployment(stress_to_level(rec.stress), cfg);
+        self.update_stress(commander_id, i16::from(next)).await
+    }
+
+    /// Orchestration wrapper — Phase_1_Section_4 §4c. Applies regardless of mission outcome.
+    async fn apply_casualty_stress(
+        &self,
+        commander_id: Uuid,
+        casualties: u32,
+        cfg: &SimConfig,
+    ) -> Result<(), RepositoryError> {
+        let rec = self
+            .get_commander(commander_id)
+            .await?
+            .ok_or(RepositoryError::NotFound)?;
+        if rec.is_kia {
+            return Ok(());
+        }
+        let next = stress_after_casualties(stress_to_level(rec.stress), casualties, cfg);
+        self.update_stress(commander_id, i16::from(next)).await
     }
 }
 
@@ -161,19 +210,25 @@ impl CommanderRepository for PostgresCommanderRepository {
 
     async fn update_stress(&self, commander_id: Uuid, stress: i16) -> Result<(), RepositoryError> {
         let clamped = i16::max(0, i16::min(100, stress));
-        sqlx::query!(
-            "UPDATE commander_records SET stress = $1, updated_at = now() WHERE commander_id = $2",
+        // One statement: no path can leave stress at 100 without Shattered. The formula
+        // stays in Rust; SQL only compares the already-clamped value. The literal is typed
+        // SMALLINT so Postgres deduces one type for $1 (an int4 literal makes it ambiguous).
+        let result = sqlx::query!(
+            "UPDATE commander_records SET stress = $1, is_shattered = is_shattered OR $1 >= 100::SMALLINT, updated_at = now() WHERE commander_id = $2",
             clamped,
             commander_id,
         )
         .execute(&self.pool)
         .await
         .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        if result.rows_affected() == 0 {
+            return Err(RepositoryError::NotFound);
+        }
         Ok(())
     }
 
     async fn update_rank_and_xp(&self, commander_id: Uuid, rank: i16, xp: i32) -> Result<(), RepositoryError> {
-        sqlx::query!(
+        let result = sqlx::query!(
             "UPDATE commander_records SET rank = $1, xp = $2, updated_at = now() WHERE commander_id = $3",
             rank,
             xp,
@@ -182,11 +237,14 @@ impl CommanderRepository for PostgresCommanderRepository {
         .execute(&self.pool)
         .await
         .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        if result.rows_affected() == 0 {
+            return Err(RepositoryError::NotFound);
+        }
         Ok(())
     }
 
     async fn set_veteran_trait(&self, commander_id: Uuid, veteran_trait: String) -> Result<(), RepositoryError> {
-        sqlx::query!(
+        let result = sqlx::query!(
             "UPDATE commander_records SET veteran_trait = $1, updated_at = now() WHERE commander_id = $2",
             veteran_trait,
             commander_id,
@@ -194,28 +252,37 @@ impl CommanderRepository for PostgresCommanderRepository {
         .execute(&self.pool)
         .await
         .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        if result.rows_affected() == 0 {
+            return Err(RepositoryError::NotFound);
+        }
         Ok(())
     }
 
     async fn set_shattered(&self, commander_id: Uuid) -> Result<(), RepositoryError> {
-        sqlx::query!(
+        let result = sqlx::query!(
             "UPDATE commander_records SET is_shattered = TRUE, updated_at = now() WHERE commander_id = $1",
             commander_id,
         )
         .execute(&self.pool)
         .await
         .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        if result.rows_affected() == 0 {
+            return Err(RepositoryError::NotFound);
+        }
         Ok(())
     }
 
     async fn set_kia(&self, commander_id: Uuid) -> Result<(), RepositoryError> {
-        sqlx::query!(
+        let result = sqlx::query!(
             "UPDATE commander_records SET is_kia = TRUE, updated_at = now() WHERE commander_id = $1",
             commander_id,
         )
         .execute(&self.pool)
         .await
         .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        if result.rows_affected() == 0 {
+            return Err(RepositoryError::NotFound);
+        }
         Ok(())
     }
 
@@ -296,39 +363,35 @@ impl CommanderRepository for InMemoryCommanderRepository {
     }
 
     async fn update_stress(&self, commander_id: Uuid, stress: i16) -> Result<(), RepositoryError> {
-        if let Some(mut r) = self.store.get_mut(&commander_id) {
-            let clamped = i16::max(0, i16::min(100, stress));
-            r.stress = clamped;
-        }
+        let mut r = self.store.get_mut(&commander_id).ok_or(RepositoryError::NotFound)?;
+        let clamped = i16::max(0, i16::min(100, stress));
+        r.stress = clamped;
+        r.is_shattered = r.is_shattered || clamped >= 100;
         Ok(())
     }
 
     async fn update_rank_and_xp(&self, commander_id: Uuid, rank: i16, xp: i32) -> Result<(), RepositoryError> {
-        if let Some(mut r) = self.store.get_mut(&commander_id) {
-            r.rank = rank;
-            r.xp = xp;
-        }
+        let mut r = self.store.get_mut(&commander_id).ok_or(RepositoryError::NotFound)?;
+        r.rank = rank;
+        r.xp = xp;
         Ok(())
     }
 
     async fn set_veteran_trait(&self, commander_id: Uuid, veteran_trait: String) -> Result<(), RepositoryError> {
-        if let Some(mut r) = self.store.get_mut(&commander_id) {
-            r.veteran_trait = Some(veteran_trait);
-        }
+        let mut r = self.store.get_mut(&commander_id).ok_or(RepositoryError::NotFound)?;
+        r.veteran_trait = Some(veteran_trait);
         Ok(())
     }
 
     async fn set_shattered(&self, commander_id: Uuid) -> Result<(), RepositoryError> {
-        if let Some(mut r) = self.store.get_mut(&commander_id) {
-            r.is_shattered = true;
-        }
+        let mut r = self.store.get_mut(&commander_id).ok_or(RepositoryError::NotFound)?;
+        r.is_shattered = true;
         Ok(())
     }
 
     async fn set_kia(&self, commander_id: Uuid) -> Result<(), RepositoryError> {
-        if let Some(mut r) = self.store.get_mut(&commander_id) {
-            r.is_kia = true;
-        }
+        let mut r = self.store.get_mut(&commander_id).ok_or(RepositoryError::NotFound)?;
+        r.is_kia = true;
         Ok(())
     }
 
@@ -482,5 +545,85 @@ mod tests {
         let repo = InMemoryCommanderRepository::new();
         let r = repo.apply_mission_xp(Uuid::new_v4(), 1, OutcomeType::Wipeout).await;
         assert!(matches!(r, Err(RepositoryError::NotFound)), "got {:?}", r);
+    }
+
+    // ── stress wrappers + F3 (brick 4c-1) ────────────────────────────────────
+
+    #[test]
+    fn stress_to_level_clamps() {
+        assert_eq!(stress_to_level(-5), 0);
+        assert_eq!(stress_to_level(0), 0);
+        assert_eq!(stress_to_level(55), 55);
+        assert_eq!(stress_to_level(100), 100);
+        assert_eq!(stress_to_level(150), 100);
+        assert_eq!(stress_to_level(i16::MIN), 0);
+        assert_eq!(stress_to_level(i16::MAX), 100);
+    }
+
+    #[tokio::test]
+    async fn apply_deployment_stress_adds_penalty() {
+        let (repo, id) = seeded_repo(0, 1, |r| r.stress = 30).await;
+        repo.apply_deployment_stress(id, &SimConfig::default()).await.unwrap();
+        let r = repo.get_commander(id).await.unwrap().unwrap();
+        assert_eq!(r.stress, 40);
+        assert!(!r.is_shattered);
+    }
+
+    /// G3 (in-memory): the single update_stress write sets Shattered; no set_shattered call.
+    #[tokio::test]
+    async fn apply_casualty_stress_to_100_shatters() {
+        let (repo, id) = seeded_repo(0, 1, |r| r.stress = 90).await;
+        repo.apply_casualty_stress(id, 4, &SimConfig::default()).await.unwrap();
+        let r = repo.get_commander(id).await.unwrap().unwrap();
+        assert_eq!(r.stress, 100);
+        assert!(r.is_shattered);
+    }
+
+    #[tokio::test]
+    async fn update_stress_never_clears_shattered() {
+        let (repo, id) = seeded_repo(0, 1, |_| {}).await;
+        repo.update_stress(id, 100).await.unwrap();
+        assert!(repo.get_commander(id).await.unwrap().unwrap().is_shattered);
+        repo.update_stress(id, 40).await.unwrap();
+        let r = repo.get_commander(id).await.unwrap().unwrap();
+        assert_eq!(r.stress, 40);
+        assert!(r.is_shattered, "Shattered is sticky");
+    }
+
+    #[tokio::test]
+    async fn stress_wrappers_skip_kia() {
+        let (repo, id) = seeded_repo(0, 1, |r| { r.is_kia = true; r.stress = 30; }).await;
+        let cfg = SimConfig::default();
+        repo.apply_deployment_stress(id, &cfg).await.unwrap();
+        repo.apply_casualty_stress(id, 4, &cfg).await.unwrap();
+        let r = repo.get_commander(id).await.unwrap().unwrap();
+        assert_eq!(r.stress, 30);
+    }
+
+    #[tokio::test]
+    async fn stress_wrappers_unknown_id_return_not_found() {
+        let repo = InMemoryCommanderRepository::new();
+        let cfg = SimConfig::default();
+        let r = repo.apply_deployment_stress(Uuid::new_v4(), &cfg).await;
+        assert!(matches!(r, Err(RepositoryError::NotFound)), "got {:?}", r);
+        let r = repo.apply_casualty_stress(Uuid::new_v4(), 1, &cfg).await;
+        assert!(matches!(r, Err(RepositoryError::NotFound)), "got {:?}", r);
+    }
+
+    /// G4 (in-memory): F3 across all five single-row mutators.
+    #[tokio::test]
+    async fn mutators_unknown_id_return_not_found() {
+        let repo = InMemoryCommanderRepository::new();
+        let id = Uuid::new_v4();
+        let r = repo.update_stress(id, 10).await;
+        assert!(matches!(r, Err(RepositoryError::NotFound)), "update_stress: {:?}", r);
+        let r = repo.update_rank_and_xp(id, 2, 100).await;
+        assert!(matches!(r, Err(RepositoryError::NotFound)), "update_rank_and_xp: {:?}", r);
+        let r = repo.set_veteran_trait(id, "Grizzled".into()).await;
+        assert!(matches!(r, Err(RepositoryError::NotFound)), "set_veteran_trait: {:?}", r);
+        let r = repo.set_shattered(id).await;
+        assert!(matches!(r, Err(RepositoryError::NotFound)), "set_shattered: {:?}", r);
+        let r = repo.set_kia(id).await;
+        assert!(matches!(r, Err(RepositoryError::NotFound)), "set_kia: {:?}", r);
     }
 }

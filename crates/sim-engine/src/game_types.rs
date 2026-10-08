@@ -251,7 +251,7 @@ pub struct Unit {
 // ----------------------------------------------------------------
 
 /// Thresholds: 0–30 RESTED | 31–70 STRAINED | 71–99 BREAKING_POINT | 100 SHATTERED
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum StressTier {
     Rested,

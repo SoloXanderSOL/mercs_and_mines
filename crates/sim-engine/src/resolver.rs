@@ -818,15 +818,35 @@ pub fn resolve_pack_assault(
 
 // ── Commander stress system ────────────────────────────────────────────────
 
-/// Returns the StressTier for a Commander based on their current stress_level.
+/// Returns the StressTier for a stress level.
 /// Thresholds: 0–30 RESTED | 31–70 STRAINED | 71–99 BREAKING_POINT | 100 SHATTERED
-pub fn get_stress_tier(commander: &Commander) -> StressTier {
-    match commander.stress_level {
+/// Levels 101..=255 fall through to RESTED. That is preserved behaviour, not canon:
+/// the fix is to stop accepting client-sent Commanders (GAP-36).
+pub fn stress_tier_for(level: u8) -> StressTier {
+    match level {
         MAX_STRESS                                              => StressTier::Shattered,
         STRESS_BREAKING_POINT_MIN..=STRESS_BREAKING_POINT_MAX  => StressTier::BreakingPoint,
         STRESS_STRAINED_MIN..=STRESS_STRAINED_MAX               => StressTier::Strained,
         _                                                       => StressTier::Rested,
     }
+}
+
+/// Stress level after the one-time deployment penalty, capped at MAX_STRESS.
+/// Saturating arithmetic: an absurd penalty clamps to 100 instead of wrapping.
+pub fn stress_after_deployment(level: u8, cfg: &SimConfig) -> u8 {
+    (level as u32).saturating_add(cfg.deployment_stress_penalty).min(MAX_STRESS as u32) as u8
+}
+
+/// Stress level after `casualties` × casualty penalty, capped at MAX_STRESS.
+pub fn stress_after_casualties(level: u8, casualties: u32, cfg: &SimConfig) -> u8 {
+    (level as u32)
+        .saturating_add(casualties.saturating_mul(cfg.casualty_stress_penalty))
+        .min(MAX_STRESS as u32) as u8
+}
+
+/// Returns the StressTier for a Commander based on their current stress_level.
+pub fn get_stress_tier(commander: &Commander) -> StressTier {
+    stress_tier_for(commander.stress_level)
 }
 
 fn clamp_and_check_shattered(commander: &mut Commander) {
@@ -873,8 +893,7 @@ pub fn apply_commander_buffs_to_vehicle(commander: &mut Commander, vehicle: &mut
 /// Call exactly once per deployment before combat begins.
 /// NOTE: is_kia is never touched here.
 pub fn apply_deployment_penalty(commander: &mut Commander, cfg: &SimConfig) {
-    commander.stress_level =
-        (commander.stress_level as u32 + cfg.deployment_stress_penalty).min(MAX_STRESS as u32) as u8;
+    commander.stress_level = stress_after_deployment(commander.stress_level, cfg);
     clamp_and_check_shattered(commander);
 }
 
@@ -882,8 +901,7 @@ pub fn apply_deployment_penalty(commander: &mut Commander, cfg: &SimConfig) {
 /// Call once per casualty event. Removing from the active roster is the caller's responsibility.
 /// NOTE: is_kia is never touched here.
 pub fn resolve_commander_stress(commander: &mut Commander, casualties: u32, cfg: &SimConfig) {
-    commander.stress_level =
-        (commander.stress_level as u32 + casualties * cfg.casualty_stress_penalty).min(MAX_STRESS as u32) as u8;
+    commander.stress_level = stress_after_casualties(commander.stress_level, casualties, cfg);
     clamp_and_check_shattered(commander);
 }
 
@@ -1251,7 +1269,7 @@ pub async fn resolve_combat_streaming(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::game_types::UnitDefinition;
+    use crate::game_types::{CommanderPassiveBuffs, QualityGrade, Species, UnitDefinition};
 
     /// Fixed fixture, tuned so `success_probability` lands exactly on 50.0:
     ///   base_skill_score  (8/10 × 50) =  40.0
@@ -1442,5 +1460,116 @@ mod tests {
                 seed,
             );
         }
+    }
+
+    // ── Commander stress (brick 4c-1) ────────────────────────────────────────
+
+    /// Independent oracle: today's `get_stress_tier` match, copied verbatim and
+    /// reading a parameter instead of a field. It must never call the code it pins.
+    fn reference_tier(l: u8) -> StressTier {
+        match l {
+            MAX_STRESS                                             => StressTier::Shattered,
+            STRESS_BREAKING_POINT_MIN..=STRESS_BREAKING_POINT_MAX => StressTier::BreakingPoint,
+            STRESS_STRAINED_MIN..=STRESS_STRAINED_MAX              => StressTier::Strained,
+            _                                                      => StressTier::Rested,
+        }
+    }
+
+    fn commander_at(stress_level: u8) -> Commander {
+        Commander {
+            id:               "c".to_string(),
+            name:             "C".to_string(),
+            species:          Species::HumanCorporate,
+            rank:             1,
+            skill:            5,
+            success_aura:     0,
+            quality_grade:    QualityGrade::Basic,
+            ability:          String::new(),
+            flavor_text:      String::new(),
+            stress_level,
+            is_kia:           false,
+            is_shattered:     false,
+            can_retreat:      true,
+            passive_buffs:    CommanderPassiveBuffs { accuracy: 0, evasion: 0, damage_reduction: 0 },
+            attached_unit_id: None,
+        }
+    }
+
+    /// G1: the whole u8 domain, because the boundaries are where an off-by-one hides.
+    #[test]
+    fn stress_tier_matches_reference_over_full_u8_domain() {
+        for l in 0..=u8::MAX {
+            assert_eq!(get_stress_tier(&commander_at(l)), reference_tier(l), "get_stress_tier at level {}", l);
+            assert_eq!(stress_tier_for(l), reference_tier(l), "stress_tier_for at level {}", l);
+        }
+    }
+
+    /// G2: every band edge, plus the preserved out-of-band behaviour.
+    #[test]
+    fn stress_tier_boundaries() {
+        assert_eq!(stress_tier_for(0),   StressTier::Rested);
+        assert_eq!(stress_tier_for(30),  StressTier::Rested);
+        assert_eq!(stress_tier_for(31),  StressTier::Strained);
+        assert_eq!(stress_tier_for(70),  StressTier::Strained);
+        assert_eq!(stress_tier_for(71),  StressTier::BreakingPoint);
+        assert_eq!(stress_tier_for(99),  StressTier::BreakingPoint);
+        assert_eq!(stress_tier_for(100), StressTier::Shattered);
+        // 101..=255 → Rested is preserved, not canon. Only a client-sent Commander can
+        // carry such a level; GAP-36 closes that by reading commander_records instead.
+        assert_eq!(stress_tier_for(101), StressTier::Rested);
+        assert_eq!(stress_tier_for(255), StressTier::Rested);
+    }
+
+    #[test]
+    fn stress_after_deployment_matches_reference_formula() {
+        for p in [0u32, 10, 100] {
+            let cfg = SimConfig { deployment_stress_penalty: p, ..SimConfig::default() };
+            for l in 0..=u8::MAX {
+                // Verbatim pre-extraction expression (plain +, deliberately).
+                let reference = (l as u32 + p).min(MAX_STRESS as u32) as u8;
+                assert_eq!(stress_after_deployment(l, &cfg), reference, "level {} penalty {}", l, p);
+            }
+        }
+        assert_eq!(stress_after_deployment(95, &SimConfig::default()), 100);
+    }
+
+    #[test]
+    fn stress_after_casualties_matches_reference_formula() {
+        let cfg = SimConfig::default();
+        let p = cfg.casualty_stress_penalty;
+        for l in 0..=u8::MAX {
+            for c in 0..=50u32 {
+                // Verbatim pre-extraction expression (plain + and *, deliberately).
+                let reference = (l as u32 + c * p).min(MAX_STRESS as u32) as u8;
+                assert_eq!(stress_after_casualties(l, c, &cfg), reference, "level {} casualties {}", l, c);
+            }
+        }
+    }
+
+    /// R-2: inputs that used to panic (debug) or wrap (release) now clamp to 100.
+    #[test]
+    fn stress_penalties_saturate_instead_of_wrapping() {
+        let huge_deploy = SimConfig { deployment_stress_penalty: u32::MAX, ..SimConfig::default() };
+        assert_eq!(stress_after_deployment(50, &huge_deploy), 100);
+
+        assert_eq!(stress_after_casualties(50, u32::MAX, &SimConfig::default()), 100);
+
+        let huge_casualty = SimConfig { casualty_stress_penalty: u32::MAX, ..SimConfig::default() };
+        assert_eq!(stress_after_casualties(50, 2, &huge_casualty), 100);
+    }
+
+    #[test]
+    fn sim_stress_callers_set_shattered_at_100() {
+        let cfg = SimConfig::default();
+
+        let mut c = commander_at(95);
+        apply_deployment_penalty(&mut c, &cfg);
+        assert_eq!(c.stress_level, 100);
+        assert!(c.is_shattered);
+
+        let mut c = commander_at(50);
+        apply_deployment_penalty(&mut c, &cfg);
+        assert_eq!(c.stress_level, 60);
+        assert!(!c.is_shattered);
     }
 }

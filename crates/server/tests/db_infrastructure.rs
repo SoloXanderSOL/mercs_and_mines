@@ -188,14 +188,14 @@ async fn commander_section_crud_is_correct() {
         .execute(&pool)
         .await
         .expect("pre-test section cleanup failed");
-    sqlx::query("DELETE FROM commander_records WHERE campaign_id = $1")
-        .bind(campaign_id)
-        .execute(&pool)
-        .await
-        .expect("pre-test commander cleanup failed");
     // Wallet [2u8;32] is shared with initialize_campaign_orchestrates_correctly.
-    // Clear any orphaned membership rows so the post-test player_accounts delete succeeds.
+    // Pre-clean by wallet in FK order (F5): a campaign_id pre-clean is a no-op, since
+    // the campaign above is brand new.
+    sqlx::query("DELETE FROM commander_records WHERE player_wallet = $1")
+        .bind(&[2u8; 32].to_vec()).execute(&pool).await.ok();
     sqlx::query("DELETE FROM player_campaign_membership WHERE wallet_address = $1")
+        .bind(&[2u8; 32].to_vec()).execute(&pool).await.ok();
+    sqlx::query("DELETE FROM player_accounts WHERE wallet_address = $1")
         .bind(&[2u8; 32].to_vec()).execute(&pool).await.ok();
 
     let commander_id = uuid::Uuid::new_v4();
@@ -971,10 +971,12 @@ async fn commander_generate_and_persist() {
     // Wallet [8u8;32] — unique to this test to avoid FK conflicts with parallel test setup.
     let wallet_bytes = [8u8; 32].to_vec();
 
-    // Pre-test cleanup.
-    sqlx::query("DELETE FROM commander_records WHERE campaign_id = $1")
-        .bind(campaign_id).execute(&pool).await.ok();
+    // Pre-test cleanup by wallet, in FK order (F5).
+    sqlx::query("DELETE FROM commander_records WHERE player_wallet = $1")
+        .bind(&wallet_bytes).execute(&pool).await.ok();
     sqlx::query("DELETE FROM player_campaign_membership WHERE wallet_address = $1")
+        .bind(&wallet_bytes).execute(&pool).await.ok();
+    sqlx::query("DELETE FROM player_accounts WHERE wallet_address = $1")
         .bind(&wallet_bytes).execute(&pool).await.ok();
 
     // Seed player_accounts FK.
@@ -1064,10 +1066,12 @@ async fn apply_mission_xp_persists_rank_and_xp() {
     // Wallet [9u8;32] — unique to this test.
     let wallet_bytes = [9u8; 32].to_vec();
 
-    // Pre-test cleanup.
-    sqlx::query("DELETE FROM commander_records WHERE campaign_id = $1")
-        .bind(campaign_id).execute(&pool).await.ok();
+    // Pre-test cleanup by wallet, in FK order (F5).
+    sqlx::query("DELETE FROM commander_records WHERE player_wallet = $1")
+        .bind(&wallet_bytes).execute(&pool).await.ok();
     sqlx::query("DELETE FROM player_campaign_membership WHERE wallet_address = $1")
+        .bind(&wallet_bytes).execute(&pool).await.ok();
+    sqlx::query("DELETE FROM player_accounts WHERE wallet_address = $1")
         .bind(&wallet_bytes).execute(&pool).await.ok();
 
     // Seed player_accounts FK.
@@ -1110,6 +1114,105 @@ async fn apply_mission_xp_persists_rank_and_xp() {
         .bind(campaign_id).execute(&pool).await.ok();
     sqlx::query("DELETE FROM player_accounts WHERE wallet_address = $1")
         .bind(&wallet_bytes).execute(&pool).await.ok();
+}
+
+/// Brick 4c-1 (G3, Postgres) — the stress wrapper drives stress to 100 and the single
+/// `update_stress` statement sets `is_shattered`; no `set_shattered` call.
+#[tokio::test]
+async fn commander_stress_wrapper_shatters_in_one_write() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => {
+            eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test");
+            return;
+        }
+    };
+
+    let commander_repo = PostgresCommanderRepository::new(pool.clone());
+    let campaign_repo  = PostgresCampaignRepository::new(pool.clone());
+
+    let campaign = campaign_repo.create_campaign(&NewCampaignInstance {
+        sector_id: uuid::Uuid::new_v4(),
+        map_seed:  0x4C01_i64,
+    }).await.expect("create campaign failed");
+    let campaign_id = campaign.campaign_id;
+
+    // Wallet [13u8;32] — unique to this test (10–12 belong to the launch-route test).
+    let wallet_bytes = [13u8; 32].to_vec();
+
+    // Pre-test cleanup by wallet, in FK order (F5).
+    sqlx::query("DELETE FROM commander_records WHERE player_wallet = $1")
+        .bind(&wallet_bytes).execute(&pool).await.ok();
+    sqlx::query("DELETE FROM player_campaign_membership WHERE wallet_address = $1")
+        .bind(&wallet_bytes).execute(&pool).await.ok();
+    sqlx::query("DELETE FROM player_accounts WHERE wallet_address = $1")
+        .bind(&wallet_bytes).execute(&pool).await.ok();
+
+    sqlx::query(
+        "INSERT INTO player_accounts (wallet_address, trust_standing, gcn_balance)
+         VALUES ($1, 0, 0) ON CONFLICT (wallet_address) DO NOTHING"
+    )
+    .bind(&wallet_bytes)
+    .execute(&pool)
+    .await
+    .expect("player_accounts FK seed failed");
+
+    let record = mercs_server::commander_gen::generate_commander(
+        wallet_bytes.clone(),
+        campaign_id,
+        42u32,
+    );
+    let commander_id = record.commander_id;
+    commander_repo.create_commander(record).await.expect("create_commander failed");
+
+    commander_repo.update_stress(commander_id, 95).await.expect("update_stress failed");
+    let before = commander_repo.get_commander(commander_id).await.unwrap().unwrap();
+    assert_eq!(before.stress, 95);
+    assert!(!before.is_shattered, "95 must not shatter");
+
+    commander_repo
+        .apply_deployment_stress(commander_id, &sim_engine::config::SimConfig::default())
+        .await
+        .expect("apply_deployment_stress failed");
+
+    let after = commander_repo.get_commander(commander_id).await.unwrap().unwrap();
+    assert_eq!(after.stress, 100, "95 + default deployment penalty 10 caps at 100");
+    assert!(after.is_shattered, "update_stress must set is_shattered in the same write");
+    assert!(!after.is_kia, "Shattered is not Permadeath");
+
+    sqlx::query!("DELETE FROM commander_records WHERE commander_id = $1", commander_id)
+        .execute(&pool).await.ok();
+    sqlx::query("DELETE FROM campaign_instances WHERE campaign_id = $1")
+        .bind(campaign_id).execute(&pool).await.ok();
+    sqlx::query("DELETE FROM player_accounts WHERE wallet_address = $1")
+        .bind(&wallet_bytes).execute(&pool).await.ok();
+}
+
+/// Brick 4c-1 (G4, Postgres) — F3: every single-row mutator reports NotFound on a miss.
+#[tokio::test]
+async fn commander_mutators_unknown_id_return_not_found() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => {
+            eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test");
+            return;
+        }
+    };
+
+    let repo = PostgresCommanderRepository::new(pool.clone());
+    let id = uuid::Uuid::new_v4();
+    use mercs_server::repository::RepositoryError;
+
+    let r = repo.update_stress(id, 10).await;
+    assert!(matches!(r, Err(RepositoryError::NotFound)), "update_stress: {:?}", r);
+    let r = repo.update_rank_and_xp(id, 2, 100).await;
+    assert!(matches!(r, Err(RepositoryError::NotFound)), "update_rank_and_xp: {:?}", r);
+    let r = repo.set_veteran_trait(id, "Grizzled".into()).await;
+    assert!(matches!(r, Err(RepositoryError::NotFound)), "set_veteran_trait: {:?}", r);
+    let r = repo.set_shattered(id).await;
+    assert!(matches!(r, Err(RepositoryError::NotFound)), "set_shattered: {:?}", r);
+    let r = repo.set_kia(id).await;
+    assert!(matches!(r, Err(RepositoryError::NotFound)), "set_kia: {:?}", r);
 }
 
 #[tokio::test]
