@@ -44,10 +44,14 @@ As of 2026-10-08:
 - **Sections 5 and 6:** Not started.
 - **INF-1 (infrastructure, GAP-37):** Complete — `tracing` subscriber installed, reward-mult
   config hardened, workspace version `0.2.0`.
+- **INF-2 (infrastructure, GAP-38):** Complete — idempotent `mercs_server::init_tracing()`
+  (ANSI only on a TTY) with an install test; `RepeatWarn` suppresses repeat warnings at the
+  two background-task tick gates (per-item floods are GAP-39); stress-penalty env keys warn
+  on bad values; `logs/` untracked and gitignored.
 
-**115/115 tests green (68 `mercs_server` lib + 1 `aar_determinism` + 30 `db_infrastructure`
-+ 16 `sim_engine`; single-threaded, verified at `ec5eebc`). Workspace version `0.2.0`.
-Next brick: INF-2.** Any brick that changes what `resolve_mission` produces for
+**119/119 tests green (72 `mercs_server` lib + 1 `aar_determinism` + 30 `db_infrastructure`
++ 16 `sim_engine`; single-threaded, verified at `aed6ce9`). Workspace version `0.2.0`.
+Next brick: the mission-to-Commander wiring brick (created by the scoping session).** Any brick that changes what `resolve_mission` produces for
 a given seed bumps the workspace version in the same brick. 4b-1 reused `sim-engine`'s `OutcomeType` rather than
 defining a new enum, and writes **no input-log entry** — the rank-up entry was removed
 from scope. **ODQ-22 and ODQ-23 were ruled 2026-09-03 — engagement and mission outcomes
