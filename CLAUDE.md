@@ -27,7 +27,7 @@ Before writing any code, read the Phase 1 Alpha Foundation document to understan
 is already built. Do not guess — read it. The status block at the top of that document
 is the ground truth.
 
-As of 2026-10-07:
+As of 2026-10-08:
 
 - **Section 1 (Database Layer):** 1a (Postgres) and 1b (Redis) complete. **1c is NOT
   complete — brick 1c-2 is reopened (GAP-34).** The session integrity endpoint hashes a
@@ -38,13 +38,16 @@ As of 2026-10-07:
 - **Section 2 (Campaign State Machine):** 2a and 2b complete. 2c and 2d deferred until
   after Sections 3–5. Arch Audits 3 and 5 complete.
 - **Section 3 (Hex Map and Timers):** Complete — 3a-1, 3b-1, 3b-2, 3c-1, 3d-1, 3e-1.
-- **Section 4 (Commander Records):** In progress. 4a-1, 4b-0, 4b-1 and 4e-0 (state-based Wipeout, GAP-35 part 2) complete; 4a-2 unblocked.
+- **Section 4 (Commander Records):** In progress. 4a-1, 4b-0, 4b-1, 4e-0 (state-based Wipeout, GAP-35 part 2) and 4c-1
+  (stress persisted through `sim-engine`'s pure stress fns; `update_stress` sets Shattered at
+  100; five mutators return `NotFound` on a miss) complete; 4a-2 unblocked.
 - **Sections 5 and 6:** Not started.
 - **INF-1 (infrastructure, GAP-37):** Complete — `tracing` subscriber installed, reward-mult
   config hardened, workspace version `0.2.0`.
 
-**99/99 tests green (single-threaded, verified at `ddb4ff3`). Workspace version `0.2.0`.
-Next brick: 4c-1 — Stress.** Any brick that changes what `resolve_mission` produces for
+**115/115 tests green (68 `mercs_server` lib + 1 `aar_determinism` + 30 `db_infrastructure`
++ 16 `sim_engine`; single-threaded, verified at `ec5eebc`). Workspace version `0.2.0`.
+Next brick: INF-2.** Any brick that changes what `resolve_mission` produces for
 a given seed bumps the workspace version in the same brick. 4b-1 reused `sim-engine`'s `OutcomeType` rather than
 defining a new enum, and writes **no input-log entry** — the rank-up entry was removed
 from scope. **ODQ-22 and ODQ-23 were ruled 2026-09-03 — engagement and mission outcomes
