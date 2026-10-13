@@ -29,12 +29,14 @@ is the ground truth.
 
 As of 2026-10-13:
 
-- **Section 1 (Database Layer):** 1a (Postgres) and 1b (Redis) complete. **1c is NOT
-  complete — brick 1c-2 is reopened (GAP-34).** The session integrity endpoint hashes a
-  table nothing writes to: `append_entry` has zero production call sites while the read
-  path was repointed at Postgres. Arch Audit 4 complete. **Arch Audit 6 ran and its
-  conclusion is superseded** — not incomplete, and not clear either; the defect it
-  missed is its own subject.
+- **Section 1 (Database Layer):** 1a (Postgres) and 1b (Redis) complete. **1c-3 (the
+  GAP-34 fix) built at `bb49b3c`:** `session_start` (header + full request + timestamp)
+  is written to Postgres through `log_session_start` at all four session sites, and the WS
+  retreat `player_input` through `append_entry`. `combat_end`, `combat_tick` and
+  `collision_detected` are pruned. `SessionLogWriter`, `log_reader`, `LOG_DIR` and the
+  `.ndjson` files are retired, and the combat AAR reads the input log repository. Left
+  open: GAP-42 (retreat tick), GAP-43 (log ordering), GAP-44 (convoy dispatch). Arch
+  Audit 4 complete. **Arch Audit 6's conclusion is superseded** (it missed GAP-34).
 - **Section 2 (Campaign State Machine):** 2a and 2b complete. 2c and 2d deferred until
   after Sections 3–5. Arch Audits 3 and 5 complete.
 - **Section 3 (Hex Map and Timers):** Complete — 3a-1, 3b-1, 3b-2, 3c-1, 3d-1, 3e-1.
@@ -54,9 +56,9 @@ As of 2026-10-13:
   two background-task tick gates (per-item floods are GAP-39); stress-penalty env keys warn
   on bad values; `logs/` untracked and gitignored.
 
-**119/119 tests green (72 `mercs_server` lib + 1 `aar_determinism` + 30 `db_infrastructure`
-+ 16 `sim_engine`; single-threaded, verified at `aed6ce9`). Workspace version `0.2.0`.
-Next brick: 1c-3 (GAP-34), then 4g-1, then INF-3 (ruling D3, 2026-10-13).** Any brick that changes what `resolve_mission` produces for
+**122/122 tests green (73 `mercs_server` lib + 2 `aar_determinism` + 31 `db_infrastructure`
++ 16 `sim_engine`; single-threaded, verified at `bb49b3c`). Workspace version `0.2.0`.
+Next brick: 4g-1, then INF-3 (ruling D3, 2026-10-13).** Any brick that changes what `resolve_mission` produces for
 a given seed bumps the workspace version in the same brick. 4b-1 reused `sim-engine`'s `OutcomeType` rather than
 defining a new enum, and writes **no input-log entry** — the rank-up entry was removed
 from scope. **ODQ-22 and ODQ-23 were ruled 2026-09-03 — engagement and mission outcomes
@@ -116,8 +118,9 @@ without exception:
   recomputable from the seed plus the logged inputs, and logging it creates a second
   source of truth. *(Canon 2026-09-02; supersedes the former "and server decisions"
   wording, which licensed exactly what this forbids.)* Do NOT log full game states.
-  The log must be immutable and strictly ordered. Each
-  entry includes tick index, sequence number, and build version. The `input_logs` table
+  The log must be immutable and strictly ordered. Each entry includes its tick index and
+  sequence number; the build version is recorded once per session, in `session_configs`.
+  The `input_logs` table
   has DB-level triggers rejecting UPDATE and DELETE — this is load-bearing, not a
   convention.
 
