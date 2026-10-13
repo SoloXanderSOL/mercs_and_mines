@@ -27,7 +27,7 @@ Before writing any code, read the Phase 1 Alpha Foundation document to understan
 is already built. Do not guess — read it. The status block at the top of that document
 is the ground truth.
 
-As of 2026-10-08:
+As of 2026-10-13:
 
 - **Section 1 (Database Layer):** 1a (Postgres) and 1b (Redis) complete. **1c is NOT
   complete — brick 1c-2 is reopened (GAP-34).** The session integrity endpoint hashes a
@@ -40,8 +40,13 @@ As of 2026-10-08:
 - **Section 3 (Hex Map and Timers):** Complete — 3a-1, 3b-1, 3b-2, 3c-1, 3d-1, 3e-1.
 - **Section 4 (Commander Records):** In progress. 4a-1, 4b-0, 4b-1, 4e-0 (state-based Wipeout, GAP-35 part 2) and 4c-1
   (stress persisted through `sim-engine`'s pure stress fns; `update_stress` sets Shattered at
-  100; five mutators return `NotFound` on a miss) complete; 4a-2 unblocked.
+  100; five mutators return `NotFound` on a miss) complete; 4a-2 unblocked. **4g-1** (the
+  mission ↔ Commander wiring brick — not 4f, which is Campaign-End Wipe) and **4d-2** were
+  created by the 2026-10-13 scoping session; 4g-1 bumps to `0.3.0`.
 - **Sections 5 and 6:** Not started.
+- **Sections 7 (Personnel Entity Model) and 8 (Combat Engine to canon):** created
+  2026-10-13 (ruling D2), not started; both run before Section 6. Strike Mining and Base
+  Building moved into Phase 2 as §13/§14 (ruling D1).
 - **INF-1 (infrastructure, GAP-37):** Complete — `tracing` subscriber installed, reward-mult
   config hardened, workspace version `0.2.0`.
 - **INF-2 (infrastructure, GAP-38):** Complete — idempotent `mercs_server::init_tracing()`
@@ -51,7 +56,7 @@ As of 2026-10-08:
 
 **119/119 tests green (72 `mercs_server` lib + 1 `aar_determinism` + 30 `db_infrastructure`
 + 16 `sim_engine`; single-threaded, verified at `aed6ce9`). Workspace version `0.2.0`.
-Next brick: the mission-to-Commander wiring brick (created by the scoping session).** Any brick that changes what `resolve_mission` produces for
+Next brick: 1c-3 (GAP-34), then 4g-1, then INF-3 (ruling D3, 2026-10-13).** Any brick that changes what `resolve_mission` produces for
 a given seed bumps the workspace version in the same brick. 4b-1 reused `sim-engine`'s `OutcomeType` rather than
 defining a new enum, and writes **no input-log entry** — the rank-up entry was removed
 from scope. **ODQ-22 and ODQ-23 were ruled 2026-09-03 — engagement and mission outcomes
