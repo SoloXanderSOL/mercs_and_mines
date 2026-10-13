@@ -1282,7 +1282,7 @@ async fn input_log_is_append_only_and_queryable() {
         },
         shared::InputLogEntry {
             tick: 2, seq: 0,
-            event_type: "combat_end".into(),
+            event_type: "player_input".into(),
             player_id: None,
             payload: serde_json::json!({"outcome": "victory"}),
             narrative_event: None,
@@ -1302,7 +1302,7 @@ async fn input_log_is_append_only_and_queryable() {
     assert_eq!(retrieved[1].player_id, Some("wallet_abc".into()));
     assert_eq!(retrieved[1].narrative_event, Some("Unit moved north.".into()));
     assert_eq!(retrieved[2].tick, 2);
-    assert_eq!(retrieved[2].event_type, "combat_end");
+    assert_eq!(retrieved[2].event_type, "player_input");
 
     // Step 5: UPDATE must be blocked by the immutability trigger.
     let tamper = sqlx::query(
@@ -1559,7 +1559,7 @@ async fn sha256_integrity_matches_db_reconstruction() {
     // Append entries in non-sequential order to exercise the ordering guarantee.
     let entry_tick2 = shared::InputLogEntry {
         tick: 2, seq: 0,
-        event_type: "combat_end".into(),
+        event_type: "player_input".into(),
         player_id: None,
         payload: serde_json::json!({"outcome": "victory"}),
         narrative_event: None,
@@ -1573,7 +1573,7 @@ async fn sha256_integrity_matches_db_reconstruction() {
     };
     let entry_tick1_seq1 = shared::InputLogEntry {
         tick: 1, seq: 1,
-        event_type: "server_decision".into(),
+        event_type: "player_input".into(),
         player_id: None,
         payload: serde_json::json!({"roll": 42}),
         narrative_event: None,
@@ -1852,7 +1852,6 @@ async fn admin_launch_endpoint_fails_closed() {
 
     let config = Arc::new(mercs_server::config::Config::default());
     let state = Arc::new(mercs_server::state::AppState::new(
-        std::path::PathBuf::from("/tmp"),
         config,
     ));
     let uri = format!("/api/admin/campaign/{}/launch", uuid::Uuid::new_v4());
@@ -1912,7 +1911,6 @@ async fn mission_resolve_rejects_empty_squad() {
 
     let config = Arc::new(mercs_server::config::Config::default());
     let state = Arc::new(mercs_server::state::AppState::new(
-        std::path::PathBuf::from("/tmp"),
         config,
     ));
     let body = serde_json::json!({
@@ -1969,7 +1967,6 @@ async fn admin_launch_campaign_returns_200_then_409() {
     // Build an AppState backed by real repos for the router
     let config = Arc::new(mercs_server::config::Config::default());
     let mut state = mercs_server::state::AppState::new(
-        std::path::PathBuf::from("/tmp"),
         config,
     );
     state.campaign_repo   = Arc::new(PostgresCampaignRepository::new(pool.clone()));
@@ -2194,7 +2191,6 @@ async fn convoy_dispatch_creates_db_record_and_timer() {
     // Build AppState with real repos
     let config = Arc::new(mercs_server::config::Config::default());
     let mut state = mercs_server::state::AppState::new(
-        std::path::PathBuf::from("/tmp"),
         config,
     );
     state.campaign_repo  = Arc::new(PostgresCampaignRepository::new(pool.clone()));
@@ -2413,7 +2409,7 @@ async fn convoy_timer_fires_and_marks_arrived() {
     }).await.expect("add_hex_occupant failed");
 
     // Run expiry poll
-    let mut state = AppState::new(std::path::PathBuf::from("."), Arc::new(Config::default()));
+    let mut state = AppState::new(Arc::new(Config::default()));
     state.convoy_repo    = convoy_repo.clone();
     state.sector_repo    = sector_repo.clone();
     state.timer_repo     = timer_repo.clone();
@@ -2445,6 +2441,154 @@ async fn convoy_timer_fires_and_marks_arrived() {
     ]).await.ok();
     conn.srem::<_, _, ()>("sectors:all", &sector_id_str).await.ok();
     let _ = (convoy_id_str, sector_id_str);
+}
+
+/// Local copy of the AAR test's fixture (seed_override 42, max_ticks 25).
+fn alpha_vs_scout_payload() -> serde_json::Value {
+    serde_json::json!({
+        "section": {
+            "id": "alpha",
+            "name": "Alpha Section",
+            "max_strength": 5,
+            "current_strength": 5,
+            "individual_hp": 10,
+            "accuracy": 60,
+            "evasion": 20,
+            "weapon": {
+                "name": "Laser Carbine",
+                "ap": 4,
+                "base_damage": 8,
+                "tag": "Laser",
+                "accuracy": 0
+            },
+            "armor_at": 3,
+            "armor_tag": "LightArmor"
+        },
+        "vehicle": {
+            "id": "scout-1",
+            "name": "Armored Scout",
+            "hp": 40,
+            "max_hp": 40,
+            "at": 6,
+            "armor_tag": "HeavyArmor",
+            "evasion": 10,
+            "weapons": [{
+                "name": "Scout Cannon",
+                "ap": 6,
+                "base_damage": 12,
+                "tag": "Slug",
+                "accuracy": 0
+            }]
+        },
+        "seed_override": 42,
+        "max_ticks": 25,
+        "combat_initiation_type": "SPOTTED"
+    })
+}
+
+/// GAP-34 gate: a real route writes the input log in Postgres, the AAR replays it,
+/// and the integrity digest moves when a logged entry is altered.
+#[tokio::test]
+async fn combat_route_logs_to_postgres_and_integrity_detects_tamper() {
+    use std::sync::Arc;
+    use axum::{body::Body, http::{Request, StatusCode}};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => {
+            eprintln!("TEST_DATABASE_URL not set — skipping combat route input log test");
+            return;
+        }
+    };
+
+    let mut state = mercs_server::state::AppState::new(Arc::new(mercs_server::config::Config::default()));
+    state.input_log_repo = Arc::new(PostgresInputLogRepository::new(pool.clone()));
+    let app = mercs_server::routes::router(Arc::new(state));
+
+    async fn body_json(resp: axum::response::Response) -> serde_json::Value {
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+    let get = |uri: String| Request::builder().method("GET").uri(uri).body(Body::empty()).unwrap();
+
+    // Step 1: resolve a combat through the real route.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/combat/resolve")
+        .header("content-type", "application/json")
+        .body(Body::from(alpha_vs_scout_payload().to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "POST /api/combat/resolve failed");
+    let resolved = body_json(resp).await;
+    let sid_str = resolved["session_id"].as_str().expect("session_id missing").to_string();
+    let sid = uuid::Uuid::parse_str(&sid_str).unwrap();
+    let original_report = resolved["report"].clone();
+
+    // Step 2: exactly one session_start row, carrying the request and the timestamp.
+    let repo = PostgresInputLogRepository::new(pool.clone());
+    let entries = repo.get_entries_by_session(&sid).await.expect("get_entries_by_session failed");
+    assert_eq!(entries.len(), 1, "the route must log exactly one entry (session_start)");
+    assert_eq!(entries[0].event_type, "session_start");
+    assert_eq!((entries[0].tick, entries[0].seq), (0, 0));
+    assert_eq!(entries[0].payload["request"]["seed_override"], 42);
+    assert!(entries[0].payload["timestamp"].is_string(), "session_start must carry the timestamp");
+
+    // Step 3: the AAR replays the logged input to the same report.
+    let resp = app.clone().oneshot(get(format!("/api/combat/aar/{sid_str}"))).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "GET /api/combat/aar/:id failed");
+    let aar = body_json(resp).await;
+    assert_eq!(aar["report"], original_report, "AAR replay diverged from the original report");
+
+    // Step 4: integrity digest before tampering.
+    let resp = app.clone().oneshot(get(format!("/api/session/{sid_str}/integrity"))).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "GET /api/session/:id/integrity failed");
+    let h1 = body_json(resp).await["log_hash"].as_str().expect("log_hash missing").to_string();
+
+    // Step 5: tamper with the logged input. Re-enable triggers before checking the result.
+    sqlx::query("ALTER TABLE input_logs DISABLE TRIGGER ALL")
+        .execute(&pool).await.expect("disable triggers failed");
+    let tamper = sqlx::query(
+        "UPDATE input_logs SET payload = jsonb_set(payload, '{request,seed_override}', '43') WHERE session_id = $1",
+    )
+    .bind(sid)
+    .execute(&pool)
+    .await;
+    sqlx::query("ALTER TABLE input_logs ENABLE TRIGGER ALL")
+        .execute(&pool).await.expect("enable triggers failed");
+    assert_eq!(tamper.expect("tamper UPDATE failed").rows_affected(), 1);
+
+    // Step 6: the digest must move.
+    let resp = app.clone().oneshot(get(format!("/api/session/{sid_str}/integrity"))).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let h2 = body_json(resp).await["log_hash"].as_str().expect("log_hash missing").to_string();
+    assert_ne!(h1, h2, "integrity digest must change when a logged entry is altered");
+
+    // Step 7: an unknown session is 404.
+    let resp = app
+        .clone()
+        .oneshot(get(format!("/api/combat/aar/{}", uuid::Uuid::new_v4())))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // Step 8: cleanup.
+    sqlx::query("ALTER TABLE input_logs DISABLE TRIGGER ALL")
+        .execute(&pool).await.expect("disable triggers failed");
+    let del_logs = sqlx::query("DELETE FROM input_logs WHERE session_id = $1")
+        .bind(sid).execute(&pool).await;
+    sqlx::query("ALTER TABLE input_logs ENABLE TRIGGER ALL")
+        .execute(&pool).await.expect("enable triggers failed");
+    del_logs.expect("cleanup input_logs failed");
+    sqlx::query("ALTER TABLE session_configs DISABLE TRIGGER ALL")
+        .execute(&pool).await.expect("disable triggers failed");
+    let del_cfg = sqlx::query("DELETE FROM session_configs WHERE session_id = $1")
+        .bind(sid).execute(&pool).await;
+    sqlx::query("ALTER TABLE session_configs ENABLE TRIGGER ALL")
+        .execute(&pool).await.expect("enable triggers failed");
+    del_cfg.expect("cleanup session_configs failed");
 }
 
 #[tokio::test]
@@ -2492,7 +2636,7 @@ async fn convoy_ws_receives_arrived_event() {
     let sector_repo = Arc::new(RedisSectorStateRepository::new(conn.clone()));
     let log_repo    = Arc::new(InMemoryInputLogRepository::new());
 
-    let mut state = AppState::new(std::path::PathBuf::from("."), Arc::new(Config::default()));
+    let mut state = AppState::new(Arc::new(Config::default()));
     state.convoy_repo    = convoy_repo.clone();
     state.sector_repo    = sector_repo.clone();
     state.timer_repo     = timer_repo.clone();

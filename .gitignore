@@ -18,5 +18,5 @@ smoke_test.mjs
 # command locally drops it in the repo root where 'git add -A' would sweep it up.
 test-output.txt
 
-# Combat session logs, written at runtime by log_writer (LOG_DIR, default ./logs).
+# Legacy combat session logs (.ndjson), retired in 1c-3. Kept ignored so stale local copies are never committed.
 logs/

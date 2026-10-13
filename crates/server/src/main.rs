@@ -50,8 +50,7 @@ async fn main() {
 
     let config = Arc::new(Config::from_env());
     let bind_addr = config.server.bind_addr.clone();
-    let log_dir = std::env::var("LOG_DIR").unwrap_or_else(|_| "./logs".into());
-    let mut state = AppState::new(std::path::PathBuf::from(log_dir), config.clone());
+    let mut state = AppState::new(config.clone());
     state.account_repo    = Arc::new(PostgresAccountRepository::new(pool.clone()));
     state.campaign_repo   = Arc::new(PostgresCampaignRepository::new(pool.clone()));
     state.commander_repo  = Arc::new(PostgresCommanderRepository::new(pool.clone()));

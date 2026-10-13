@@ -159,27 +159,6 @@ pub async fn poll_expiry_once(state: &AppState, due_timers_warn: &mut RepeatWarn
                     convoy.destination_q, convoy.destination_r, pair
                 );
                 // TODO(phase-2): call resolveCombat here
-                if let Some(cid) = campaign_id {
-                    let collision_entry = shared::InputLogEntry {
-                        tick: 0,
-                        seq: 0,
-                        event_type: "collision_detected".to_string(),
-                        player_id: Some(bs58::encode(&pair.a.owner_wallet).into_string()),
-                        payload: serde_json::json!({
-                            "hex_q": convoy.destination_q,
-                            "hex_r": convoy.destination_r,
-                            "unit_a": pair.a.id,
-                            "unit_b": pair.b.id,
-                            "owner_b": bs58::encode(&pair.b.owner_wallet).into_string(),
-                        }),
-                        narrative_event: None,
-                    };
-                    if let Err(e) = state.input_log_repo.append_campaign_entry(&cid, &collision_entry).await {
-                        tracing::warn!(
-                            "failed to log collision_detected for campaign {}: {:?}", cid, e
-                        );
-                    }
-                }
             }
         }
         // TODO(phase-2): check_crossing_collision requires ConvoyRepository::list_in_transit — deferred

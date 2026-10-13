@@ -10,9 +10,10 @@ pub struct SessionIntegrity {
     pub log_hash:      String,
 }
 
-/// Reconstructs the session byte sequence from the DB (config header + ordered entries),
-/// then computes a SHA-256 digest. Byte-identical to the .ndjson file format written by
-/// SessionLogWriter: serde_json::to_string(&record) + "\n" per line.
+/// Reconstructs a session's byte sequence from the input log (the `session_configs`
+/// header, then `input_logs` entries ordered by `(tick, seq)`), one
+/// `serde_json::to_string` line plus "\n" each, and returns its SHA-256 digest.
+/// The input log is the only record of a session; no file mirrors it.
 pub async fn compute_session_integrity(
     repo: &(dyn InputLogRepository + Send + Sync),
     session_id: Uuid,

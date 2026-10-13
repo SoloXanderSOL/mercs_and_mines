@@ -40,12 +40,50 @@ use crate::api_types::{
     convoy_vehicle_from_class, CombatResolveRequest, MissionResolveRequest, PackAssaultRequest,
 };
 use crate::state::AppState;
-use crate::repository::CombatSession;
+use crate::repository::{CombatSession, InputLogRepository};
 
 type AppError = (StatusCode, Json<Value>);
 
 fn bad_request(msg: impl Into<String>) -> AppError {
     (StatusCode::BAD_REQUEST, Json(json!({"error": msg.into()})))
+}
+
+fn not_found(msg: impl Into<String>) -> AppError {
+    (StatusCode::NOT_FOUND, Json(json!({"error": msg.into()})))
+}
+
+fn internal_error(msg: impl Into<String>) -> AppError {
+    (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": msg.into()})))
+}
+
+/// Writes a session's header and its `session_start` entry to the input log.
+/// `session_start` carries the full request and the wall-clock timestamp handed to the
+/// resolver: for the one-shot routes it *is* the player's input, and it is what the AAR
+/// replays. Fire-and-forget: a failure is logged and the caller's response is unchanged.
+/// Without a header the entry could be neither hashed nor replayed, so a failed header
+/// write skips the entry.
+async fn log_session_start(
+    repo: &(dyn InputLogRepository + Send + Sync),
+    config: &shared::SessionConfig,
+    session_id: Uuid,
+    request: Value,
+    timestamp: &str,
+) {
+    if let Err(e) = repo.save_session_config(config).await {
+        tracing::warn!("failed to persist session config for {session_id}: {e}");
+        return;
+    }
+    let entry = shared::InputLogEntry {
+        tick: 0,
+        seq: 0,
+        event_type: "session_start".into(),
+        player_id: None,
+        payload: json!({ "request": request, "timestamp": timestamp }),
+        narrative_event: None,
+    };
+    if let Err(e) = repo.append_entry(&session_id, &entry).await {
+        tracing::warn!("failed to append session_start for {session_id}: {e}");
+    }
 }
 
 // ── Auth request types ─────────────────────────────────────────────────────
@@ -184,36 +222,7 @@ async fn post_mission_resolve(
         sector_tier: "Contested".into(),
         ruleset: "standard_v1".into(),
     };
-    if let Err(e) = state.input_log_repo.save_session_config(&config).await {
-        eprintln!("[routes] failed to persist session config: {e}");
-    }
-    if let Ok(mut w) = crate::log_writer::SessionLogWriter::create(
-        &state.log_dir, &session_id.to_string()
-    ).await {
-        w.write_header(&config).await;
-        w.append(&shared::InputLogEntry {
-            tick: 0, seq: 0,
-            event_type: "session_start".into(),
-            player_id: None,
-            payload: serde_json::json!({
-                "request":   req_payload,
-                "timestamp": &timestamp,
-            }),
-            narrative_event: None,
-        }).await;
-        match serde_json::to_value(&report) {
-            Ok(payload) => {
-                w.append(&shared::InputLogEntry {
-                    tick: 1, seq: 0,
-                    event_type: "combat_end".into(),
-                    player_id: None,
-                    payload,
-                    narrative_event: None,
-                }).await;
-            }
-            Err(e) => eprintln!("[routes] to_value failed for combat_end log entry: {e}"),
-        }
-    }
+    log_session_start(state.input_log_repo.as_ref(), &config, session_id, req_payload, &timestamp).await;
 
     Ok(Json(report))
 }
@@ -262,36 +271,7 @@ async fn post_combat_resolve(
         sector_tier: "Contested".into(),
         ruleset: "standard_v1".into(),
     };
-    if let Err(e) = state.input_log_repo.save_session_config(&config).await {
-        eprintln!("[routes] failed to persist session config: {e}");
-    }
-    if let Ok(mut w) = crate::log_writer::SessionLogWriter::create(
-        &state.log_dir, &session_id.to_string()
-    ).await {
-        w.write_header(&config).await;
-        w.append(&shared::InputLogEntry {
-            tick: 0, seq: 0,
-            event_type: "session_start".into(),
-            player_id: None,
-            payload: serde_json::json!({
-                "request":   req_payload,
-                "timestamp": &timestamp,
-            }),
-            narrative_event: None,
-        }).await;
-        match serde_json::to_value(&report) {
-            Ok(payload) => {
-                w.append(&shared::InputLogEntry {
-                    tick: 1, seq: 0,
-                    event_type: "combat_end".into(),
-                    player_id: None,
-                    payload,
-                    narrative_event: None,
-                }).await;
-            }
-            Err(e) => eprintln!("[routes] to_value failed for combat_end log entry: {e}"),
-        }
-    }
+    log_session_start(state.input_log_repo.as_ref(), &config, session_id, req_payload, &timestamp).await;
 
     Json(serde_json::json!({
         "session_id": session_id.to_string(),
@@ -337,36 +317,7 @@ async fn post_pack_assault(
         sector_tier: "Contested".into(),
         ruleset: "standard_v1".into(),
     };
-    if let Err(e) = state.input_log_repo.save_session_config(&config).await {
-        eprintln!("[routes] failed to persist session config: {e}");
-    }
-    if let Ok(mut w) = crate::log_writer::SessionLogWriter::create(
-        &state.log_dir, &session_id.to_string()
-    ).await {
-        w.write_header(&config).await;
-        w.append(&shared::InputLogEntry {
-            tick: 0, seq: 0,
-            event_type: "session_start".into(),
-            player_id: None,
-            payload: serde_json::json!({
-                "request":   req_payload,
-                "timestamp": &timestamp,
-            }),
-            narrative_event: None,
-        }).await;
-        match serde_json::to_value(&report) {
-            Ok(payload) => {
-                w.append(&shared::InputLogEntry {
-                    tick: 1, seq: 0,
-                    event_type: "combat_end".into(),
-                    player_id: None,
-                    payload,
-                    narrative_event: None,
-                }).await;
-            }
-            Err(e) => eprintln!("[routes] to_value failed for combat_end log entry: {e}"),
-        }
-    }
+    log_session_start(state.input_log_repo.as_ref(), &config, session_id, req_payload, &timestamp).await;
 
     Json(report)
 }
@@ -422,45 +373,61 @@ async fn get_combat_aar(
     State(state): State<Arc<AppState>>,
     Path(raw_id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
-    // Validate as UUID to prevent path traversal — log files are named by UUID only.
-    uuid::Uuid::parse_str(&raw_id)
+    let session_id = Uuid::parse_str(&raw_id)
         .map_err(|_| bad_request("session_id must be a valid UUID"))?;
 
-    let session = crate::log_reader::load_combat_session(&state.log_dir, &raw_id)
+    let repo = state.input_log_repo.as_ref();
+    let config = repo
+        .get_session_config(&session_id)
         .await
-        .map_err(|e| bad_request(format!("Could not load session log: {e}")))?;
+        .map_err(|e| internal_error(format!("input log read failed: {e}")))?
+        .ok_or_else(|| not_found("no input log for this session"))?;
+    let entries = repo
+        .get_entries_by_session(&session_id)
+        .await
+        .map_err(|e| internal_error(format!("input log read failed: {e}")))?;
+    let start = entries
+        .iter()
+        .find(|e| e.event_type == "session_start")
+        .ok_or_else(|| not_found("no session_start entry for this session"))?;
+    let request: CombatResolveRequest = serde_json::from_value(start.payload["request"].clone())
+        .map_err(|e| bad_request(format!("session_start is not a combat request: {e}")))?;
+    let timestamp = start.payload["timestamp"]
+        .as_str()
+        .ok_or_else(|| bad_request("session_start payload missing timestamp"))?
+        .to_string();
 
-    // Reconstruct resolver inputs from the stored log.
-    // seed_override forces the exact stored seed — this is the determinism guarantee.
-    let seed = session.config.seed as u32;
-    let initiation = session
-        .request
-        .combat_initiation_type
-        .unwrap_or(CombatInitiationType::Spotted);
-    let max_ticks = session.request.max_ticks.unwrap_or(state.config.server.default_max_ticks) as u32;
-    let defending: Vec<_> = session
-        .request
+    // Rebuild the resolver inputs exactly as post_combat_resolve built them.
+    // The stored seed is forced: this is the determinism guarantee.
+    let seed = config.seed as u32;
+    let initiation = request.combat_initiation_type.unwrap_or(CombatInitiationType::Spotted);
+    let max_ticks = request.max_ticks.unwrap_or(state.config.server.default_max_ticks) as u32;
+    let defending: Vec<_> = request
         .defending_convoy_vehicles
         .unwrap_or_default()
         .iter()
         .map(convoy_vehicle_from_class)
         .collect();
+    let mut section = request.section;
+    if let Some(mut cmd) = request.commander {
+        apply_commander_buffs(&mut cmd, &mut section);
+    }
 
     let report = resolve_combat(
-        &session.request.section,
-        &session.request.vehicle,
-        &session.timestamp,     // injected from log; never Utc::now()
+        &section,
+        &request.vehicle,
+        &timestamp,     // injected from the log; never Utc::now()
         max_ticks,
-        Some(seed),             // stored seed; guarantees deterministic output
+        Some(seed),
         initiation,
         defending,
         &state.config.sim,
     );
 
     Ok(Json(json!({
-        "session_id":    session.config.session_id,
-        "seed":          session.config.seed,
-        "build_version": session.config.build_version,
+        "session_id":    config.session_id,
+        "seed":          config.seed,
+        "build_version": config.build_version,
         "replayed_at":   Utc::now().to_rfc3339(),
         "report":        serde_json::to_value(&report).unwrap(),
     })))

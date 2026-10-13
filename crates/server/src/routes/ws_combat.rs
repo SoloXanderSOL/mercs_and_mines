@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::{
@@ -49,12 +48,11 @@ pub async fn ws_stream_handler(
         return StatusCode::GONE.into_response();
     }
 
-    let log_dir = state.log_dir.clone();
     let sim_cfg = state.config.sim.clone();
     let default_max_ticks = state.config.server.default_max_ticks;
     let input_log_repo = Arc::clone(&state.input_log_repo);
     ws.on_upgrade(move |socket| {
-        handle_ws(socket, session.params, session_id, log_dir, sim_cfg, default_max_ticks, input_log_repo)
+        handle_ws(socket, session.params, session_id, sim_cfg, default_max_ticks, input_log_repo)
     })
     .into_response()
 }
@@ -63,7 +61,6 @@ async fn handle_ws(
     mut socket: WebSocket,
     params: CombatResolveRequest,
     session_id: Uuid,
-    log_dir: PathBuf,
     sim_cfg: SimConfig,
     default_max_ticks: usize,
     input_log_repo: Arc<dyn InputLogRepository + Send + Sync>,
@@ -88,14 +85,6 @@ async fn handle_ws(
         apply_commander_buffs(&mut cmd, &mut section);
     }
 
-    // Open the log file. Failure is non-fatal — game session continues, error goes to stderr.
-    let mut log = match crate::log_writer::SessionLogWriter::create(
-        &log_dir, &session_id.to_string()
-    ).await {
-        Ok(w) => Some(w),
-        Err(e) => { eprintln!("[batch4] failed to create log for {session_id}: {e}"); None }
-    };
-
     let session_config = shared::SessionConfig {
         session_id: session_id.to_string(),
         build_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -106,23 +95,7 @@ async fn handle_ws(
         ruleset: "standard_v1".into(),
     };
 
-    if let Err(e) = input_log_repo.save_session_config(&session_config).await {
-        eprintln!("[ws_combat] failed to persist session config: {e}");
-    }
-    if let Some(w) = log.as_mut() {
-        w.write_header(&session_config).await;
-        w.append(&shared::InputLogEntry {
-            tick: 0,
-            seq: 0,
-            event_type: "session_start".into(),
-            player_id: None,
-            payload: serde_json::json!({
-                "request":   params_payload,
-                "timestamp": &timestamp,
-            }),
-            narrative_event: None,
-        }).await;
-    }
+    super::log_session_start(input_log_repo.as_ref(), &session_config, session_id, params_payload, &timestamp).await;
 
     let (tick_tx, mut tick_rx) = mpsc::channel::<CombatTickEvent>(TICK_CHANNEL_BUFFER);
     let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
@@ -159,16 +132,19 @@ async fn handle_ws(
                         {
                             if let Some(tx) = cancel_tx.take() {
                                 let _ = tx.send(());
-                            }
-                            if let Some(w) = log.as_mut() {
-                                w.append(&shared::InputLogEntry {
+                                // The logged tick is the last tick forwarded to the client, not necessarily the
+                                // tick at which the resolver honoured the cancel (GAP-42).
+                                let entry = shared::InputLogEntry {
                                     tick: last_tick,
                                     seq: 1,
                                     event_type: "player_input".into(),
                                     player_id: None,
                                     payload: serde_json::json!({"action": "retreat"}),
                                     narrative_event: None,
-                                }).await;
+                                };
+                                if let Err(e) = input_log_repo.append_entry(&session_id, &entry).await {
+                                    tracing::warn!("failed to append retreat for {session_id}: {e}");
+                                }
                             }
                         }
                     }
@@ -187,26 +163,7 @@ async fn handle_ws(
                     Some(event) => {
                         let ended = event.combat_ended;
 
-                        if let Some(w) = log.as_mut() {
-                            match serde_json::to_value(&event) {
-                                Ok(payload) => {
-                                    w.append(&shared::InputLogEntry {
-                                        tick: event.tick_index as u64,
-                                        seq: 0,
-                                        event_type: if event.combat_ended {
-                                            "combat_end".into()
-                                        } else {
-                                            "combat_tick".into()
-                                        },
-                                        player_id: None,
-                                        payload,
-                                        narrative_event: event.narrative.clone(),
-                                    }).await;
-                                }
-                                Err(e) => eprintln!("[ws_combat] to_value failed for tick log entry: {e}"),
-                            }
-                            last_tick = event.tick_index as u64;
-                        }
+                        last_tick = event.tick_index as u64;
 
                         match serde_json::to_string(&event) {
                             Ok(json) => {

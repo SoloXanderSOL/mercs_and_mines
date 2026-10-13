@@ -48,9 +48,8 @@ fn alpha_vs_scout_payload() -> serde_json::Value {
 
 #[tokio::test]
 async fn aar_replays_deterministically() {
-    let tmp = tempfile::tempdir().unwrap();
     let config = Arc::new(Config::default());
-    let state = Arc::new(AppState::new(tmp.path().to_path_buf(), config));
+    let state = Arc::new(AppState::new(config));
     let app = router(state);
 
     // ── Step 1: resolve combat, get session_id ─────────────────────────
@@ -115,5 +114,72 @@ async fn aar_replays_deterministically() {
         original["ticks"],
         replayed["ticks"],
         "tick-by-tick content mismatch — RNG stream diverged"
+    );
+}
+
+/// The AAR must apply the logged Commander's buffs exactly as the original combat did.
+#[tokio::test]
+async fn aar_replays_commander_buffed_combat() {
+    let commander = sim_engine::game_types::Commander {
+        id: "cmd-aar".into(),
+        name: "Test Commander".into(),
+        species: sim_engine::game_types::Species::HumanCorporate,
+        rank: 1,
+        skill: 1,
+        success_aura: 0,
+        quality_grade: sim_engine::game_types::QualityGrade::Standard,
+        ability: String::new(),
+        flavor_text: String::new(),
+        stress_level: 0, // Rested: buffs apply at 1.0x
+        is_kia: false,
+        is_shattered: false,
+        can_retreat: true,
+        passive_buffs: sim_engine::game_types::CommanderPassiveBuffs {
+            accuracy: 30,
+            evasion: 0,
+            damage_reduction: 0,
+        },
+        attached_unit_id: None,
+    };
+    let mut payload = alpha_vs_scout_payload();
+    payload["commander"] = serde_json::to_value(&commander).unwrap();
+
+    let state = Arc::new(AppState::new(Arc::new(Config::default())));
+    let app = router(state);
+
+    let resolve_resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/combat/resolve")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resolve_resp.status(), 200, "POST /api/combat/resolve failed");
+    let bytes = resolve_resp.into_body().collect().await.unwrap().to_bytes();
+    let resolve_json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let session_id = resolve_json["session_id"].as_str().expect("session_id missing");
+
+    let aar_resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri(&format!("/api/combat/aar/{}", session_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(aar_resp.status(), 200, "GET /api/combat/aar/:id failed");
+    let aar_bytes = aar_resp.into_body().collect().await.unwrap().to_bytes();
+    let aar_json: serde_json::Value = serde_json::from_slice(&aar_bytes).unwrap();
+
+    assert_eq!(
+        resolve_json["report"], aar_json["report"],
+        "AAR report diverged from the original buffed combat"
     );
 }

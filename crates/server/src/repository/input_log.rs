@@ -238,7 +238,10 @@ impl InputLogRepository for InMemoryInputLogRepository {
         &self,
         session_id: &Uuid,
     ) -> Result<Vec<shared::InputLogEntry>, RepositoryError> {
-        Ok(self.entries.get(session_id).map(|v| v.clone()).unwrap_or_default())
+        let mut entries = self.entries.get(session_id).map(|v| v.clone()).unwrap_or_default();
+        // Match Postgres (ORDER BY tick ASC, seq ASC). A stable sort keeps insertion order on ties.
+        entries.sort_by_key(|e| (e.tick, e.seq));
+        Ok(entries)
     }
 
     async fn save_session_config(
@@ -265,5 +268,38 @@ impl InputLogRepository for InMemoryInputLogRepository {
     ) -> Result<(), RepositoryError> {
         self.campaign_entries.entry(*campaign_id).or_default().push(entry.clone());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(tick: u64, seq: u32) -> shared::InputLogEntry {
+        shared::InputLogEntry {
+            tick,
+            seq,
+            event_type: "player_input".into(),
+            player_id: None,
+            payload: serde_json::json!({}),
+            narrative_event: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn in_memory_entries_return_in_tick_seq_order() {
+        let repo = InMemoryInputLogRepository::new();
+        let sid = Uuid::new_v4();
+        for (t, s) in [(2, 0), (1, 1), (0, 0), (1, 0)] {
+            repo.append_entry(&sid, &entry(t, s)).await.unwrap();
+        }
+        let got: Vec<(u64, u32)> = repo
+            .get_entries_by_session(&sid)
+            .await
+            .unwrap()
+            .iter()
+            .map(|e| (e.tick, e.seq))
+            .collect();
+        assert_eq!(got, vec![(0, 0), (1, 0), (1, 1), (2, 0)]);
     }
 }

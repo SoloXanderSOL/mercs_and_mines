@@ -1,5 +1,4 @@
 #![allow(unused)]
-use std::path::PathBuf;
 use std::sync::Arc;
 use dashmap::DashMap;
 use tokio::sync::mpsc::UnboundedSender;
@@ -31,7 +30,6 @@ pub struct PendingChallenge {
 pub struct AppState {
     pub session_repo:    Arc<dyn SessionStateRepository + Send + Sync>,
     pub input_log_repo:  Arc<dyn InputLogRepository + Send + Sync>,
-    pub log_dir: PathBuf,
     /// Active 2-hour sessions, keyed by token_id.
     pub sessions: DashMap<String, shared::SessionToken>,
     /// Pending TEEPIN challenges, keyed by wallet_address.
@@ -57,11 +55,10 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(log_dir: PathBuf, config: Arc<Config>) -> Self {
+    pub fn new(config: Arc<Config>) -> Self {
         Self {
             session_repo:        Arc::new(InMemorySessionStateRepository::new()),
             input_log_repo:      Arc::new(InMemoryInputLogRepository::new()),
-            log_dir,
             sessions:           DashMap::new(),
             pending_challenges: DashMap::new(),
             account_repo:        Arc::new(InMemoryAccountRepository::new()),

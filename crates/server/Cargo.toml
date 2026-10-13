@@ -12,7 +12,6 @@ name    = "mercs_server"
 path    = "src/lib.rs"
 
 [dev-dependencies]
-tempfile        = "3"
 http-body-util  = "0.1"
 tower           = { version = "0.4", features = ["util"] }
 sha2            = "0.10"

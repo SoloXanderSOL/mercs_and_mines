@@ -8,8 +8,6 @@ pub mod convoy_collision;
 pub mod convoy_expiry;
 pub mod lifecycle;
 pub mod map_gen;
-pub mod log_reader;
-pub mod log_writer;
 pub mod repeat_warn;
 pub mod repository;
 pub mod routes;
