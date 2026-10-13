@@ -24,7 +24,10 @@ env:
 jobs:
   build:
     name: Build
-    runs-on: ubuntu-latest
+    # Pinned to the droplet's Ubuntu release (24.04): the binary built here runs there,
+    # and a newer image can link a newer glibc than the host has (GAP-47). Move this pin,
+    # the deploy job's pin and the cache key together whenever the droplet is upgraded.
+    runs-on: ubuntu-24.04
     # Versions deliberately match production (Postgres 16, Redis 7): a CI database on a
     # different major version tests the wrong thing. No migration step is needed — the
     # harness runs sqlx::migrate!("../../migrations") against the pool itself.
@@ -69,8 +72,8 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          key: ${{ runner.os }}-ubuntu-24.04-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-ubuntu-24.04-cargo-
 
       - name: Run tests
         # --workspace covers every crate; --test-threads=1 is mandatory because the
@@ -128,7 +131,8 @@ jobs:
     # dispatching it from ANY branch builds that branch and ships it to the production
     # droplet. Deploy is main-only, full stop.
     if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    # Pinned with the build job for consistency (GAP-47); this job only runs scp/ssh/rsync.
+    runs-on: ubuntu-24.04
     steps:
       - name: Download server binary
         uses: actions/download-artifact@v7
