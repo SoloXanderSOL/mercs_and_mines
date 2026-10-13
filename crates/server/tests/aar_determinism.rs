@@ -134,9 +134,10 @@ async fn aar_replays_commander_buffed_combat() {
         is_kia: false,
         is_shattered: false,
         can_retreat: true,
+        // Evasion, not accuracy: no resolver reads section.accuracy yet (GAP-45).
         passive_buffs: sim_engine::game_types::CommanderPassiveBuffs {
-            accuracy: 30,
-            evasion: 0,
+            accuracy: 0,
+            evasion: 30,
             damage_reduction: 0,
         },
         attached_unit_id: None,
