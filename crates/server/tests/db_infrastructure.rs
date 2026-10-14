@@ -1904,6 +1904,8 @@ async fn admin_launch_endpoint_fails_closed() {
 /// A mission needs at least one unit (brick 4e-0, GAP-36 empty-squad half). The
 /// route refuses before the mission lookup, so nothing rolls and nothing is logged.
 /// Needs neither Postgres nor Redis — the default in-memory AppState is enough.
+/// Since 4g-1 the route needs a session and a `commander_id`; the body check runs
+/// before the Commander lookup, so the Commander need not exist.
 #[tokio::test]
 async fn mission_resolve_rejects_empty_squad() {
     use std::sync::Arc;
@@ -1911,18 +1913,21 @@ async fn mission_resolve_rejects_empty_squad() {
     use tower::ServiceExt;
 
     let config = Arc::new(mercs_server::config::Config::default());
-    let state = Arc::new(mercs_server::state::AppState::new(
+    let state = mercs_server::state::AppState::new(
         config,
-    ));
+    );
+    let token = insert_session(&state, [4u8; 32]);
+    let state = Arc::new(state);
     let body = serde_json::json!({
         "squad": { "units": [], "commander": null },
         "mission_id": "GUARD_DUTY",
-        "seed_override": 1,
+        "commander_id": uuid::Uuid::new_v4(),
     });
     let req = Request::builder()
         .method("POST")
         .uri("/api/mission/resolve")
         .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
         .body(Body::from(body.to_string()))
         .unwrap();
     let resp = mercs_server::routes::router(Arc::clone(&state)).oneshot(req).await.unwrap();
@@ -2971,4 +2976,361 @@ async fn convoy_ws_receives_arrived_event() {
     ]).await.ok();
     conn.srem::<_, _, ()>("sectors:all", &sector_id_str).await.ok();
     let _ = (convoy_id_str, sector_id_str);
+}
+
+// ── Brick 4g-1: POST /api/mission/resolve wired to Commander records ────────
+
+/// Inserts a live session for `wallet` and returns its bearer token.
+fn insert_session(state: &mercs_server::state::AppState, wallet: [u8; 32]) -> String {
+    let wallet_b58 = bs58::encode(wallet).into_string();
+    let token_id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().timestamp();
+    state.sessions.insert(token_id.clone(), shared::SessionToken {
+        token_id:       token_id.clone(),
+        account_id:     wallet_b58.clone(),
+        wallet_address: wallet_b58,
+        issued_at:      now,
+        expires_at:     now + 7200,
+    });
+    token_id
+}
+
+/// Test-only failure seam: delegates reads to `inner`, and fails every write while
+/// `fail_writes` is set. Lives here, not in production code.
+struct FailingInputLog {
+    inner: std::sync::Arc<dyn InputLogRepository + Send + Sync>,
+    fail_writes: bool,
+}
+
+impl FailingInputLog {
+    fn refuse(&self) -> Result<(), mercs_server::repository::RepositoryError> {
+        if self.fail_writes {
+            Err(mercs_server::repository::RepositoryError::Internal("FailingInputLog: forced write failure".into()))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl InputLogRepository for FailingInputLog {
+    async fn append_entry(&self, session_id: &uuid::Uuid, entry: &shared::InputLogEntry) -> Result<(), mercs_server::repository::RepositoryError> {
+        self.refuse()?;
+        self.inner.append_entry(session_id, entry).await
+    }
+    async fn get_entries_by_session(&self, session_id: &uuid::Uuid) -> Result<Vec<shared::InputLogEntry>, mercs_server::repository::RepositoryError> {
+        self.inner.get_entries_by_session(session_id).await
+    }
+    async fn save_session_config(&self, config: &shared::SessionConfig) -> Result<(), mercs_server::repository::RepositoryError> {
+        self.refuse()?;
+        self.inner.save_session_config(config).await
+    }
+    async fn get_session_config(&self, session_id: &uuid::Uuid) -> Result<Option<shared::SessionConfig>, mercs_server::repository::RepositoryError> {
+        self.inner.get_session_config(session_id).await
+    }
+    async fn append_campaign_entry(&self, campaign_id: &uuid::Uuid, entry: &shared::InputLogEntry) -> Result<(), mercs_server::repository::RepositoryError> {
+        self.refuse()?;
+        self.inner.append_campaign_entry(campaign_id, entry).await
+    }
+    async fn start_session(&self, config: &shared::SessionConfig, entry: &shared::InputLogEntry) -> Result<(), mercs_server::repository::RepositoryError> {
+        self.refuse()?;
+        self.inner.start_session(config, entry).await
+    }
+}
+
+/// One deployable unit, serialised from the sim types so the body always matches them.
+fn mission_unit_json() -> serde_json::Value {
+    use sim_engine::game_types::{Unit, UnitArchetype, UnitDefinition, UnitStatus};
+    serde_json::to_value(Unit {
+        id:         "u1".into(),
+        name:       "Grunt".into(),
+        definition: UnitDefinition {
+            archetype:         UnitArchetype::Vanguard,
+            emoji:             "V".into(),
+            hiring_cost:       0,
+            base_skill:        5,
+            monthly_upkeep:    0,
+            upkeep_extras:     String::new(),
+            hardpoints:        vec![],
+            success_mod:       10,
+            damage_shield_mod: 0,
+            loot_bonus:        0,
+            async_ability:     String::new(),
+            passive_trait:     String::new(),
+            flavor_text:       String::new(),
+        },
+        skill:      6,
+        xp:         0,
+        current_hp: 10,
+        max_hp:     10,
+        status:     UnitStatus::Ready,
+        equipment:  vec![],
+    })
+    .unwrap()
+}
+
+fn mission_body(commander_id: uuid::Uuid) -> serde_json::Value {
+    serde_json::json!({
+        "squad": { "units": [mission_unit_json()] },
+        "mission_id": "GUARD_DUTY",
+        "commander_id": commander_id,
+    })
+}
+
+/// A generated in-memory Commander owned by `wallet`. Returns its id.
+async fn seed_in_memory_commander(state: &mercs_server::state::AppState, wallet: [u8; 32], mutate: impl FnOnce(&mut CommanderRecord)) -> uuid::Uuid {
+    let mut rec = mercs_server::commander_gen::generate_commander(wallet.to_vec(), uuid::Uuid::new_v4(), 42);
+    mutate(&mut rec);
+    let id = rec.commander_id;
+    state.commander_repo.create_commander(rec).await.expect("create_commander failed");
+    id
+}
+
+/// POSTs to the mission route; returns the status and the raw body bytes.
+async fn post_mission(app: axum::Router, token: Option<&str>, body: &serde_json::Value) -> (axum::http::StatusCode, Vec<u8>) {
+    use axum::{body::Body, http::Request};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+    let mut req = Request::builder()
+        .method("POST")
+        .uri("/api/mission/resolve")
+        .header("content-type", "application/json");
+    if let Some(t) = token {
+        req = req.header("authorization", format!("Bearer {t}"));
+    }
+    let resp = app.oneshot(req.body(Body::from(body.to_string())).unwrap()).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes().to_vec();
+    (status, bytes)
+}
+
+fn default_state() -> mercs_server::state::AppState {
+    mercs_server::state::AppState::new(std::sync::Arc::new(mercs_server::config::Config::default()))
+}
+
+#[tokio::test]
+async fn mission_resolve_requires_a_session() {
+    let state = default_state();
+    let commander_id = seed_in_memory_commander(&state, [4u8; 32], |_| {}).await;
+    let app = mercs_server::routes::router(std::sync::Arc::new(state));
+    let (status, _) = post_mission(app, None, &mission_body(commander_id)).await;
+    assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+}
+
+/// Another wallet's Commander and an unknown id are indistinguishable.
+#[tokio::test]
+async fn mission_resolve_hides_another_wallets_commander() {
+    let state = default_state();
+    let theirs = seed_in_memory_commander(&state, [4u8; 32], |_| {}).await;
+    let my_token = insert_session(&state, [14u8; 32]);
+    let app = mercs_server::routes::router(std::sync::Arc::new(state));
+
+    let (s1, b1) = post_mission(app.clone(), Some(&my_token), &mission_body(theirs)).await;
+    let (s2, b2) = post_mission(app, Some(&my_token), &mission_body(uuid::Uuid::new_v4())).await;
+    assert_eq!(s1, axum::http::StatusCode::NOT_FOUND, "another wallet's Commander");
+    assert_eq!(s2, axum::http::StatusCode::NOT_FOUND, "unknown Commander");
+    assert_eq!(b1, b2, "the two 404 bodies must be byte-identical");
+}
+
+#[tokio::test]
+async fn mission_resolve_rejects_a_client_commander() {
+    use sim_engine::game_types::{Commander, CommanderPassiveBuffs, QualityGrade, Species};
+    let state = default_state();
+    let wallet = [4u8; 32];
+    let commander_id = seed_in_memory_commander(&state, wallet, |_| {}).await;
+    let token = insert_session(&state, wallet);
+    let app = mercs_server::routes::router(std::sync::Arc::new(state));
+
+    let full = serde_json::to_value(Commander {
+        id: "vance".into(), name: "Captain Vance".into(), species: Species::HumanCorporate,
+        rank: 5, skill: 10, success_aura: 999, quality_grade: QualityGrade::Basic,
+        ability: String::new(), flavor_text: String::new(), stress_level: 0,
+        is_kia: false, is_shattered: false, can_retreat: true,
+        passive_buffs: CommanderPassiveBuffs { accuracy: 0, evasion: 0, damage_reduction: 0 },
+        attached_unit_id: None,
+    }).unwrap();
+
+    for (label, commander) in [("full object", full), ("empty object", serde_json::json!({}))] {
+        let mut body = mission_body(commander_id);
+        body["squad"]["commander"] = commander;
+        let (status, _) = post_mission(app.clone(), Some(&token), &body).await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{label} must be refused");
+    }
+
+    let mut body = mission_body(commander_id);
+    body["squad"]["commander"] = serde_json::Value::Null;
+    let (status, bytes) = post_mission(app, Some(&token), &body).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "null means no client Commander: {}", String::from_utf8_lossy(&bytes));
+}
+
+#[tokio::test]
+async fn mission_resolve_rejects_seed_override() {
+    let state = default_state();
+    let wallet = [4u8; 32];
+    let commander_id = seed_in_memory_commander(&state, wallet, |_| {}).await;
+    let token = insert_session(&state, wallet);
+    let app = mercs_server::routes::router(std::sync::Arc::new(state));
+    let mut body = mission_body(commander_id);
+    body["seed_override"] = serde_json::json!(42);
+    let (status, _) = post_mission(app, Some(&token), &body).await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn mission_resolve_refuses_kia_and_shattered() {
+    let state = default_state();
+    let wallet = [4u8; 32];
+    let kia = seed_in_memory_commander(&state, wallet, |r| r.is_kia = true).await;
+    let shattered = seed_in_memory_commander(&state, wallet, |r| r.is_shattered = true).await;
+    let token = insert_session(&state, wallet);
+    let app = mercs_server::routes::router(std::sync::Arc::new(state));
+    for (label, id) in [("KIA", kia), ("Shattered", shattered)] {
+        let (status, bytes) = post_mission(app.clone(), Some(&token), &mission_body(id)).await;
+        assert_eq!(status, axum::http::StatusCode::CONFLICT, "{label}: {}", String::from_utf8_lossy(&bytes));
+    }
+}
+
+#[tokio::test]
+async fn mission_resolve_refuses_an_already_deployed_commander() {
+    let state = default_state();
+    let wallet = [4u8; 32];
+    let commander_id = seed_in_memory_commander(&state, wallet, |_| {}).await;
+    assert!(state.commander_repo.start_deployment(&NewDeployment {
+        deployment_id: uuid::Uuid::new_v4(),
+        commander_id,
+        session_id: uuid::Uuid::new_v4(),
+        mission_id: "GUARD_DUTY".into(),
+        started_at: chrono::Utc::now(),
+    }).await.unwrap());
+    let token = insert_session(&state, wallet);
+    let app = mercs_server::routes::router(std::sync::Arc::new(state));
+    let (status, _) = post_mission(app, Some(&token), &mission_body(commander_id)).await;
+    assert_eq!(status, axum::http::StatusCode::CONFLICT);
+}
+
+/// The log write is fallible on this route: a failure aborts the deployment, returns
+/// 500, and leaves every Commander effect unapplied.
+#[tokio::test]
+async fn mission_resolve_aborts_with_500_when_the_log_write_fails() {
+    let mut state = default_state();
+    state.input_log_repo = std::sync::Arc::new(FailingInputLog { inner: state.input_log_repo.clone(), fail_writes: true });
+    let wallet = [4u8; 32];
+    let commander_id = seed_in_memory_commander(&state, wallet, |r| { r.stress = 30; r.xp = 88; }).await;
+    let token = insert_session(&state, wallet);
+    let commanders = state.commander_repo.clone();
+    let app = mercs_server::routes::router(std::sync::Arc::new(state));
+
+    let (status, bytes) = post_mission(app, Some(&token), &mission_body(commander_id)).await;
+    assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR, "{}", String::from_utf8_lossy(&bytes));
+
+    let deps = commanders.list_deployments_by_commander(commander_id).await.unwrap();
+    assert_eq!(deps.len(), 1);
+    assert_eq!(deps[0].status, "aborted", "a failed log write must abort the deployment");
+    let rec = commanders.get_commander(commander_id).await.unwrap().unwrap();
+    assert_eq!((rec.stress, rec.xp, rec.rank), (30, 88, 1), "no effect may land without its logged input");
+}
+
+/// The combat route's policy is unchanged: its log write stays fire-and-forget.
+#[tokio::test]
+async fn combat_resolve_still_succeeds_when_its_log_write_fails() {
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+    let mut state = default_state();
+    state.input_log_repo = std::sync::Arc::new(FailingInputLog { inner: state.input_log_repo.clone(), fail_writes: true });
+    let app = mercs_server::routes::router(std::sync::Arc::new(state));
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/combat/resolve")
+        .header("content-type", "application/json")
+        .body(Body::from(alpha_vs_scout_payload().to_string()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+}
+
+/// 4g-1 end to end on Postgres: the input is logged, the effects are written in one
+/// atomic call, the deployment is closed, and the build version reaches the log.
+#[tokio::test]
+async fn mission_resolve_end_to_end_writes_effects() {
+    use sim_engine::game_types::{OutcomeType, UnitStatus};
+    use mercs_server::commander_gen::{mission_tier, rank_for_xp, xp_award};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    let wallet = [16u8; 32];
+    let (campaign_id, commander_id) = seed_commander_4g1(&pool, wallet, 20).await;
+    let commanders = PostgresCommanderRepository::new(pool.clone());
+    let logs = PostgresInputLogRepository::new(pool.clone());
+    let record = commanders.get_commander(commander_id).await.unwrap().unwrap();
+
+    let mut state = default_state();
+    state.commander_repo = std::sync::Arc::new(PostgresCommanderRepository::new(pool.clone()));
+    state.input_log_repo = std::sync::Arc::new(PostgresInputLogRepository::new(pool.clone()));
+    let token = insert_session(&state, wallet);
+    let sim_cfg = state.config.sim.clone();
+    let app = mercs_server::routes::router(std::sync::Arc::new(state));
+
+    let (status, bytes) = post_mission(app.clone(), Some(&token), &mission_body(commander_id)).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+    let resp: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let sid_str = resp["session_id"].as_str().expect("session_id missing").to_string();
+    let sid = uuid::Uuid::parse_str(&sid_str).unwrap();
+    let report = &resp["report"];
+    assert_eq!(report["score_breakdown"]["commander_bonus"], 0);
+    assert_eq!(report["commander_name"].as_str(), Some(record.name.as_str()));
+
+    // The log: header with the version and the real campaign, and the request body.
+    let config = logs.get_session_config(&sid).await.unwrap().expect("no session_configs header");
+    assert_eq!(config.build_version, "0.3.0", "R7 bump must reach the logged build_version");
+    assert_eq!(config.campaign_id, campaign_id);
+    let entries = logs.get_entries_by_session(&sid).await.unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].event_type, "session_start");
+    let request = &entries[0].payload["request"];
+    assert_eq!(request["commander_id"].as_str(), Some(commander_id.to_string().as_str()));
+    assert!(request.get("seed_override").is_none(), "the logged request carries no seed_override");
+
+    // The effects, recomputed here from the report with the same pure functions.
+    let outcome: OutcomeType = serde_json::from_value(report["outcome"].clone()).unwrap();
+    let units: Vec<sim_engine::game_types::UnitBattleResult> = serde_json::from_value(report["unit_results"].clone()).unwrap();
+    let kia = units.iter().filter(|u| matches!(u.final_status, UnitStatus::Kia)).count() as u32;
+    let difficulty = sim_engine::missions::missions()["GUARD_DUTY"].difficulty;
+    let want_stress = sim_engine::resolver::stress_after_casualties(
+        sim_engine::resolver::stress_after_deployment(20, &sim_cfg), kia, &sim_cfg);
+    let want_xp = record.xp + xp_award(mission_tier(difficulty), &outcome);
+    let after = commanders.get_commander(commander_id).await.unwrap().unwrap();
+    assert_eq!(after.stress, i16::from(want_stress));
+    assert_eq!(after.xp, want_xp);
+    assert_eq!(after.rank, rank_for_xp(want_xp));
+
+    let deps = commanders.list_deployments_by_commander(commander_id).await.unwrap();
+    assert_eq!(deps.len(), 1);
+    assert_eq!(deps[0].status, "resolved");
+    assert_eq!(deps[0].session_id, sid);
+    assert_eq!(deps[0].outcome.as_deref(), Some(outcome_db_str(&outcome)));
+    assert!(entries[0].payload["timestamp"].is_string());
+
+    // The response's session_id reaches the integrity route.
+    let req = axum::http::Request::builder()
+        .method("GET")
+        .uri(format!("/api/session/{sid_str}/integrity"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert!(body["log_hash"].as_str().is_some_and(|h| !h.is_empty()), "integrity digest missing");
+
+    // Cleanup: the immutable log rows, then the wallet's records.
+    sqlx::query("ALTER TABLE input_logs DISABLE TRIGGER ALL").execute(&pool).await.ok();
+    sqlx::query("DELETE FROM input_logs WHERE session_id = $1").bind(sid).execute(&pool).await.ok();
+    sqlx::query("ALTER TABLE input_logs ENABLE TRIGGER ALL").execute(&pool).await.ok();
+    sqlx::query("ALTER TABLE session_configs DISABLE TRIGGER ALL").execute(&pool).await.ok();
+    sqlx::query("DELETE FROM session_configs WHERE session_id = $1").bind(sid).execute(&pool).await.ok();
+    sqlx::query("ALTER TABLE session_configs ENABLE TRIGGER ALL").execute(&pool).await.ok();
+    clean_wallet_4g1(&pool, &wallet).await;
 }

@@ -26,9 +26,13 @@ use uuid::Uuid;
 
 use sim_engine::{
     equipment::equipment,
+    game_types::{Squad, UnitStatus},
     missions::missions,
     ore_run::run_ore_run,
-    resolver::{apply_commander_buffs, resolve_combat, resolve_mission, resolve_pack_assault},
+    resolver::{
+        apply_commander_buffs, resolve_combat, resolve_mission, resolve_pack_assault,
+        stress_after_casualties, stress_after_deployment,
+    },
     rng::generate_seed,
     scenario::Approach,
     types::CombatInitiationType,
@@ -39,8 +43,10 @@ use crate::auth::AuthSession;
 use crate::api_types::{
     convoy_vehicle_from_class, CombatResolveRequest, MissionResolveRequest, PackAssaultRequest,
 };
+use crate::commander_gen::{mission_tier, rank_for_xp, xp_award};
 use crate::state::AppState;
-use crate::repository::{CombatSession, InputLogRepository};
+use crate::repository::commander::{log_rank_up, stress_to_level};
+use crate::repository::{CombatSession, InputLogRepository, NewDeployment};
 
 type AppError = (StatusCode, Json<Value>);
 
@@ -56,10 +62,33 @@ fn internal_error(msg: impl Into<String>) -> AppError {
     (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": msg.into()})))
 }
 
+fn conflict(msg: impl Into<String>) -> AppError {
+    (StatusCode::CONFLICT, Json(json!({"error": msg.into()})))
+}
+
+fn unauthorized(msg: impl Into<String>) -> AppError {
+    (StatusCode::UNAUTHORIZED, Json(json!({"error": msg.into()})))
+}
+
+/// A session's first input-log entry. `session_start` carries the full request and the
+/// wall-clock timestamp handed to the resolver: for the one-shot routes it *is* the
+/// player's input, and it is what the AAR replays. Every caller builds it here, so the
+/// payload shape `{request, timestamp}` cannot drift between routes.
+fn session_start_entry(request: Value, timestamp: &str) -> shared::InputLogEntry {
+    shared::InputLogEntry {
+        tick: 0,
+        seq: 0,
+        event_type: "session_start".into(),
+        player_id: None,
+        payload: json!({ "request": request, "timestamp": timestamp }),
+        narrative_event: None,
+    }
+}
+
 /// Writes a session's header and its `session_start` entry to the input log.
-/// `session_start` carries the full request and the wall-clock timestamp handed to the
-/// resolver: for the one-shot routes it *is* the player's input, and it is what the AAR
-/// replays. Fire-and-forget: a failure is logged and the caller's response is unchanged.
+/// Policy by caller: combat / pack assault / WS: fire-and-forget — a failure is logged
+/// and the caller's response is unchanged. The mission route does not call this; it uses
+/// the fallible `InputLogRepository::start_session` before the roll (§4g item 9).
 /// Without a header the entry could be neither hashed nor replayed, so a failed header
 /// write skips the entry.
 async fn log_session_start(
@@ -73,14 +102,7 @@ async fn log_session_start(
         tracing::warn!("failed to persist session config for {session_id}: {e}");
         return;
     }
-    let entry = shared::InputLogEntry {
-        tick: 0,
-        seq: 0,
-        event_type: "session_start".into(),
-        player_id: None,
-        payload: json!({ "request": request, "timestamp": timestamp }),
-        narrative_event: None,
-    };
+    let entry = session_start_entry(request, timestamp);
     if let Err(e) = repo.append_entry(&session_id, &entry).await {
         tracing::warn!("failed to append session_start for {session_id}: {e}");
     }
@@ -195,36 +217,132 @@ async fn get_auth_session(
 
 // ── Simulation endpoints ───────────────────────────────────────────────────
 
+/// Marks a deployment `aborted` after a failure. A failed abort is logged, not returned:
+/// the next `start_deployment` for this Commander aborts the row once it is stale.
+async fn abort_deployment_or_log(state: &AppState, deployment_id: Uuid) {
+    if let Err(e) = state.commander_repo.abort_deployment(deployment_id).await {
+        tracing::error!(%deployment_id, "failed to abort deployment ({e}); the next start's stale rule heals it");
+    }
+}
+
+/// Mission ↔ Commander wiring (brick 4g-1, Phase_1_Section_4 §4g). Check order:
+/// 401 (extractor) → 400 (body) → 404 (unknown or not yours) → 409 (KIA, Shattered,
+/// already deployed) → active deployment → input log before the roll (500 on failure,
+/// deployment aborted) → resolve → one atomic write of stress, XP, rank and the close.
 async fn post_mission_resolve(
+    AuthSession(session): AuthSession,
     State(state): State<Arc<AppState>>,
     Json(req): Json<MissionResolveRequest>,
 ) -> Result<impl IntoResponse, AppError> {
+    // 400 — body shape. Refused fields are never silently ignored.
+    if req.squad.commander.is_some() {
+        return Err(bad_request("A mission cannot carry a client Commander; send commander_id"));
+    }
+    if req.seed_override.is_some() {
+        return Err(bad_request("seed_override is not accepted on this route"));
+    }
     if req.squad.units.is_empty() {
         return Err(bad_request("A mission needs at least one unit"));
     }
-    let req_payload = serde_json::to_value(&req).unwrap_or_default();
-
     let mission = missions()
         .get(req.mission_id.as_str())
         .ok_or_else(|| bad_request(format!("Unknown mission_id: {}", req.mission_id)))?;
 
-    let seed = req.seed_override.unwrap_or_else(generate_seed);
-    let timestamp = Utc::now().to_rfc3339();
-    let report = resolve_mission(&req.squad, mission, &timestamp, Some(seed), &state.config.sim);
+    // 404 — an unknown Commander and someone else's get the same body, so the route
+    // never confirms which UUIDs exist.
+    let wallet: Vec<u8> = bs58::decode(&session.wallet_address)
+        .into_vec()
+        .map_err(|_| unauthorized("session wallet is not valid base58"))?;
+    let rec = state
+        .commander_repo
+        .get_commander(req.commander_id)
+        .await
+        .map_err(|e| internal_error(format!("commander read failed: {e}")))?
+        .filter(|r| r.player_wallet == wallet)
+        .ok_or_else(|| not_found("Commander not found"))?;
 
+    // 409 — the flag gates deployment (§4g item 7).
+    if rec.is_kia {
+        return Err(conflict("Commander is KIA"));
+    }
+    if rec.is_shattered {
+        return Err(conflict("Commander is Shattered and cannot deploy until rehabilitated"));
+    }
+
+    // Everything the log needs is fixed before any write. The seed is the server's only.
+    let seed = generate_seed();
+    let now = Utc::now();
+    let timestamp = now.to_rfc3339();
     let session_id = Uuid::new_v4();
+    let deployment_id = Uuid::new_v4();
+    // The payload is the request body only — auth lives in the extractor, never in `req`.
+    let req_payload = serde_json::to_value(&req)
+        .map_err(|e| internal_error(format!("request serialization failed: {e}")))?;
+
+    let started = state
+        .commander_repo
+        .start_deployment(&NewDeployment {
+            deployment_id,
+            commander_id: rec.commander_id,
+            session_id,
+            mission_id: mission.id.clone(),
+            started_at: now,
+        })
+        .await
+        .map_err(|e| internal_error(format!("deployment write failed: {e}")))?;
+    if !started {
+        return Err(conflict("Commander is already deployed"));
+    }
+
+    // The input is logged before the roll: the log never holds fewer inputs than the
+    // database holds effects (§4g item 6.2).
     let config = shared::SessionConfig {
         session_id: session_id.to_string(),
         build_version: env!("CARGO_PKG_VERSION").to_string(),
         seed: seed as u64,
         sector_id: Uuid::nil(),
-        campaign_id: Uuid::nil(),
+        campaign_id: rec.campaign_id,
         sector_tier: "Contested".into(),
         ruleset: "standard_v1".into(),
     };
-    log_session_start(state.input_log_repo.as_ref(), &config, session_id, req_payload, &timestamp).await;
+    let entry = session_start_entry(req_payload, &timestamp);
+    if let Err(e) = state.input_log_repo.start_session(&config, &entry).await {
+        abort_deployment_or_log(&state, deployment_id).await;
+        return Err(internal_error(format!("input log write failed: {e}")));
+    }
 
-    Ok(Json(report))
+    // A record Commander adds 0 to the roll (§4g item 3): the sim sees no Commander.
+    let squad = Squad { units: req.squad.units, commander: None };
+    let cfg = &state.config.sim;
+    let mut report = resolve_mission(&squad, mission, &timestamp, Some(seed), cfg);
+
+    // Every effect is computed in Rust with the existing pure functions.
+    let kia = report
+        .unit_results
+        .iter()
+        .filter(|u| matches!(u.final_status, UnitStatus::Kia))
+        .count() as u32;
+    let stress = stress_after_casualties(stress_after_deployment(stress_to_level(rec.stress), cfg), kia, cfg);
+    let xp = rec.xp + xp_award(mission_tier(mission.difficulty), &report.outcome);
+    let rank = rank_for_xp(xp);
+
+    if let Err(e) = state
+        .commander_repo
+        .resolve_deployment(deployment_id, rec.commander_id, i16::from(stress), rank, xp, &report.outcome)
+        .await
+    {
+        // The input is already logged with no effects, which §4g item 6 permits.
+        abort_deployment_or_log(&state, deployment_id).await;
+        return Err(internal_error(format!("mission result write failed: {e}")));
+    }
+    log_rank_up(rec.commander_id, rec.rank, rank);
+
+    // Presentation only, after the resolve: the report names the record's Commander.
+    report.commander_name = Some(rec.name.clone());
+    Ok(Json(json!({
+        "session_id": session_id.to_string(),
+        "report":     serde_json::to_value(&report).unwrap(),
+    })))
 }
 
 async fn post_combat_resolve(

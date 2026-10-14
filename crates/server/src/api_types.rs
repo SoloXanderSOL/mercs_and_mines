@@ -4,7 +4,8 @@
 // Fuel rule: Hauler = 10 He3/hex (Gas Guzzler); all other classes = 5 He3/hex.
 
 use serde::{Deserialize, Serialize};
-use sim_engine::game_types::{Commander, Squad, VehicleClass};
+use sim_engine::game_types::{Commander, Unit, VehicleClass};
+use uuid::Uuid;
 use sim_engine::types::{CombatInitiationType, ConvoyVehicle, Pack, Section, Vehicle};
 
 pub fn convoy_vehicle_from_class(class: &VehicleClass) -> ConvoyVehicle {
@@ -22,11 +23,27 @@ pub fn convoy_vehicle_from_class(class: &VehicleClass) -> ConvoyVehicle {
     ConvoyVehicle { name: name.into(), fuel_cost_per_hex, radar_signature }
 }
 
+/// `POST /api/mission/resolve` (brick 4g-1). The Commander is named by `commander_id` and
+/// read from `commander_records`. The two `Option<Value>` fields exist only to be refused:
+/// `null` deserialises to `None`, so `Some(_)` means a non-null value was sent, and the
+/// route answers `400` rather than silently ignoring it.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct MissionResolveRequest {
-    pub squad: Squad,
+    pub squad: MissionSquadRequest,
     pub mission_id: String,
-    pub seed_override: Option<u32>,
+    pub commander_id: Uuid,
+    /// Refused on this route: a client-chosen seed would let a player replay a proven win.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_override: Option<serde_json::Value>,
+}
+
+/// The mission request's squad. The sim `Squad` is built from it with `commander: None`.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct MissionSquadRequest {
+    pub units: Vec<Unit>,
+    /// Refused on this route: a body carrying a Commander gets `400`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commander: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

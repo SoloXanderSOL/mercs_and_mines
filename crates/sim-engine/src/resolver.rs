@@ -1475,6 +1475,39 @@ mod tests {
         }
     }
 
+    /// Brick 4g-1's gate: the mission route now resolves with `commander: None`, and the
+    /// only output that may change is `commander_bonus` (client aura → 0). A zero-aura
+    /// Commander and no Commander must give identical reports on every seed — same
+    /// report_id (no draw moved), outcome, breakdown, unit results and rewards — apart
+    /// from `commander_name`. The structs have no PartialEq, so compare their JSON.
+    #[test]
+    fn mission_without_a_commander_matches_a_zero_aura_commander() {
+        let (squad, mission, cfg) = fixture();
+        let with_zero = Squad { units: squad.units.clone(), commander: Some(commander_at(0)) };
+        let mut aura_25 = commander_at(0);
+        aura_25.success_aura = 25;
+        let with_25 = Squad { units: squad.units.clone(), commander: Some(aura_25) };
+        fn json<T: serde::Serialize>(v: &T) -> serde_json::Value {
+            serde_json::to_value(v).expect("report fields serialise")
+        }
+
+        for seed in 0..1000u32 {
+            let none = resolve_mission(&squad, &mission, "2026-10-14T00:00:00Z", Some(seed), &cfg);
+            let zero = resolve_mission(&with_zero, &mission, "2026-10-14T00:00:00Z", Some(seed), &cfg);
+            assert_eq!(none.report_id, zero.report_id, "seed {}: report_id", seed);
+            assert_eq!(json(&none.outcome), json(&zero.outcome), "seed {}: outcome", seed);
+            assert_eq!(json(&none.score_breakdown), json(&zero.score_breakdown), "seed {}: score_breakdown", seed);
+            assert_eq!(json(&none.unit_results), json(&zero.unit_results), "seed {}: unit_results", seed);
+            assert_eq!(json(&none.rewards), json(&zero.rewards), "seed {}: rewards", seed);
+            assert_eq!(none.commander_name, None);
+            assert_eq!(zero.commander_name.as_deref(), Some("C"));
+            assert_eq!(none.score_breakdown.commander_bonus, 0, "seed {}", seed);
+
+            let aura = resolve_mission(&with_25, &mission, "2026-10-14T00:00:00Z", Some(seed), &cfg);
+            assert_eq!(aura.score_breakdown.commander_bonus, 25, "seed {}", seed);
+        }
+    }
+
     fn commander_at(stress_level: u8) -> Commander {
         Commander {
             id:               "c".to_string(),

@@ -119,6 +119,13 @@ pub fn xp_award(tier: u8, outcome: &OutcomeType) -> i32 {
     XP_TABLE[(tier - 1) as usize][col]
 }
 
+/// Mission tier (T1–T5) from a Phase 0 mission's `difficulty` (1–10): 1–2 → T1, 3–4 → T2,
+/// 5–6 → T3, 7–8 → T4, 9–10 → T5, clamped at both ends so `xp_award` never sees 0 or 6.
+/// Phase 0 bridge (§4g item 10); retire when the mission route reads a contract tier.
+pub fn mission_tier(difficulty: u8) -> u8 {
+    (difficulty.saturating_add(1) / 2).clamp(1, 5)
+}
+
 /// Rank derived from cumulative XP — never incremented. Thresholds 100 / 400 /
 /// 1100 / 2600 give ranks 2..=5; hard cap 5. Idempotent, so back-filled XP
 /// cannot drift the stored rank.
@@ -131,6 +138,28 @@ pub fn rank_for_xp(xp: i32) -> i16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mission_tier_maps_difficulty_bands() {
+        let expected: [(u8, u8); 10] = [(1, 1), (2, 1), (3, 2), (4, 2), (5, 3), (6, 3), (7, 4), (8, 4), (9, 5), (10, 5)];
+        for (difficulty, tier) in expected {
+            assert_eq!(mission_tier(difficulty), tier, "difficulty {}", difficulty);
+        }
+        assert_eq!(mission_tier(0), 1, "0 clamps up to T1");
+        assert_eq!(mission_tier(11), 5, "11 clamps down to T5");
+        assert_eq!(mission_tier(255), 5, "255 must not overflow");
+    }
+
+    #[test]
+    fn every_live_mission_has_a_tier_in_range() {
+        let missions = sim_engine::missions::missions();
+        assert!(!missions.is_empty());
+        for (id, m) in missions.iter() {
+            let tier = mission_tier(m.difficulty);
+            assert!((1..=5).contains(&tier), "mission {} difficulty {} → tier {}", id, m.difficulty, tier);
+            assert_eq!(xp_award(tier, &OutcomeType::Wipeout), 0);
+        }
+    }
 
     #[test]
     fn generate_commander_is_deterministic() {
