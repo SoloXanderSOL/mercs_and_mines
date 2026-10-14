@@ -12,6 +12,7 @@ pub mod repeat_warn;
 pub mod repository;
 pub mod routes;
 pub mod state;
+pub mod supervisor;
 
 /// Installs the global `tracing` subscriber: filter from `RUST_LOG` (default `info`),
 /// written to stderr, ANSI colour only when stderr is a terminal (journald and pipes get
