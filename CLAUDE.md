@@ -68,10 +68,16 @@ As of 2026-10-14:
   (ANSI only on a TTY) with an install test; `RepeatWarn` suppresses repeat warnings at the
   two background-task tick gates (per-item floods are GAP-39); stress-penalty env keys warn
   on bad values; `logs/` untracked and gitignored.
+- **INF-3a (infrastructure; Reviewer 4g-2 f1–3, GAP-46, Reviewer 4g-1 f4):** Built at
+  `ed9a3a1` — `resolve_deployment` locks `FOR NO KEY UPDATE`; the integrity route answers
+  404/500; no route serialises with `.unwrap()`; logged request payloads refuse the request
+  before logging instead of logging `null` (WS: 500 before the upgrade). Regenerate `.sqlx/`
+  with `cargo sqlx prepare --workspace -- --all-targets` (test-file queries live in the test
+  target).
 
-**148/148 tests green (80 `mercs_server` lib + 2 `aar_determinism` + 49 `db_infrastructure`
-+ 17 `sim_engine`; single-threaded, verified at `737939d`). Workspace version `0.3.0`.
-Production = `3edaca3` (0.3.0), deployed 2026-10-14. Next brick: INF-3a, then INF-3b
+**150/150 tests green (80 `mercs_server` lib + 2 `aar_determinism` + 51 `db_infrastructure`
++ 17 `sim_engine`; single-threaded, verified at `ed9a3a1`). Workspace version `0.3.0`.
+Production = `3edaca3` (0.3.0), deployed 2026-10-14. Next brick: INF-3b
 (INF-3, ruling D3, 2026-10-13).** Any brick that changes what `resolve_mission` produces for
 a given seed bumps the workspace version in the same brick. 4b-1 reused `sim-engine`'s `OutcomeType` rather than
 defining a new enum, and writes **no input-log entry** — the rank-up entry was removed
