@@ -12,83 +12,48 @@ fn env_str(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
-fn env_i64(key: &str, default: i64) -> i64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+/// Reads `key` as a `T`. Unset → `default`, silently. Set but unparseable (`str::parse`
+/// does not trim) → `default`, with a warning naming the key and the raw value. A value
+/// that parses is used exactly as before, so no environment changes what it yields.
+/// Takes a lookup closure so tests never touch the process environment.
+fn parse_or_warn<T: std::str::FromStr>(get: impl Fn(&str) -> Option<String>, key: &str, default: T) -> T {
+    let Some(raw) = get(key) else { return default };
+    match raw.parse::<T>() {
+        Ok(v) => v,
+        Err(_) => {
+            tracing::warn!("{} is set to {:?}, which does not parse as {}; ignoring it", key, raw, std::any::type_name::<T>());
+            default
+        }
+    }
 }
 
-fn env_u32(key: &str, default: u32) -> u32 {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+fn env_lookup(key: &str) -> Option<String> {
+    std::env::var(key).ok()
 }
 
-fn env_u64(key: &str, default: u64) -> u64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
-}
-
-fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
-}
-
-fn env_f64(key: &str, default: f64) -> f64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
-}
-
-fn env_i32(key: &str, default: i32) -> i32 {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
-}
+fn env_i64(key: &str, default: i64) -> i64 { parse_or_warn(env_lookup, key, default) }
+fn env_u32(key: &str, default: u32) -> u32 { parse_or_warn(env_lookup, key, default) }
+fn env_u64(key: &str, default: u64) -> u64 { parse_or_warn(env_lookup, key, default) }
+fn env_usize(key: &str, default: usize) -> usize { parse_or_warn(env_lookup, key, default) }
+fn env_f64(key: &str, default: f64) -> f64 { parse_or_warn(env_lookup, key, default) }
+fn env_i32(key: &str, default: i32) -> i32 { parse_or_warn(env_lookup, key, default) }
 
 pub(crate) const DECISIVE_SUCCESS_REWARD_MULT_KEY: &str = "DECISIVE_SUCCESS_REWARD_MULT";
-pub(crate) const LEGACY_FULL_SUCCESS_REWARD_MULT_KEY: &str = "FULL_SUCCESS_REWARD_MULT"; // TODO(phase-1-close): remove after one release
 
-/// Reads `key`, then `legacy_key`, then falls back to `default`. A value is usable
-/// only if it parses as `f64` AND is finite — `NaN`, `inf` and unparseable text all
-/// count as absent, with a warning, because a NaN multiplier silently pays 0.
+/// Reads `key`, falling back to `default`. A value is usable only if it parses as `f64`
+/// AND is finite — `NaN`, `inf` and unparseable text all count as absent, with a
+/// warning, because a NaN multiplier silently pays 0.
 /// Takes a lookup closure so tests never touch the process environment;
 /// `from_env` passes `|k| std::env::var(k).ok()`.
-fn f64_with_fallback(
-    get: impl Fn(&str) -> Option<String>,
-    key: &str,
-    legacy_key: &str,
-    default: f64,
-) -> f64 {
-    let usable = |k: &str| -> Option<f64> {
-        let raw = get(k)?;
-        match raw.parse::<f64>() {
-            Ok(v) if v.is_finite() => Some(v),
-            _ => {
-                tracing::warn!("{} is set to {:?}, which is not a finite number; ignoring it", k, raw);
-                None
-            }
+fn finite_f64_or_warn(get: impl Fn(&str) -> Option<String>, key: &str, default: f64) -> f64 {
+    let Some(raw) = get(key) else { return default };
+    match raw.parse::<f64>() {
+        Ok(v) if v.is_finite() => v,
+        _ => {
+            tracing::warn!("{} is set to {:?}, which is not a finite number; ignoring it", key, raw);
+            default
         }
-    };
-    if let Some(v) = usable(key) {
-        return v;
     }
-    if let Some(v) = usable(legacy_key) {
-        tracing::warn!(
-            "{} is deprecated; read as a fallback because {} is unset or unparseable — rename it",
-            legacy_key, key
-        );
-        return v;
-    }
-    default
 }
 
 /// Reads a `u32` stress penalty. Unset → `default`, silently. Set but not a `u32`
@@ -201,10 +166,9 @@ impl Config {
                 kia_base_chance_failure:      env_f64  ("KIA_BASE_CHANCE_FAILURE",      d.kia_base_chance_failure),
                 sawbones_trauma_chance:       env_f64  ("SAWBONES_TRAUMA_CHANCE",       d.sawbones_trauma_chance),
                 outcome_margin_threshold:     env_f64  ("OUTCOME_MARGIN_THRESHOLD",     d.outcome_margin_threshold),
-                decisive_success_reward_mult: f64_with_fallback(
+                decisive_success_reward_mult: finite_f64_or_warn(
                     |k| std::env::var(k).ok(),
                     DECISIVE_SUCCESS_REWARD_MULT_KEY,
-                    LEGACY_FULL_SUCCESS_REWARD_MULT_KEY,
                     d.decisive_success_reward_mult,
                 ),
                 squad_size_bonus_per_unit:    env_i32  ("SQUAD_SIZE_BONUS_PER_UNIT",    d.squad_size_bonus_per_unit),
@@ -236,8 +200,8 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::{
-        f64_with_fallback, u32_with_warn, ServerConfig, DECISIVE_SUCCESS_REWARD_MULT_KEY,
-        DEFAULT_BIND_ADDR, LEGACY_FULL_SUCCESS_REWARD_MULT_KEY,
+        finite_f64_or_warn, parse_or_warn, u32_with_warn, ServerConfig,
+        DECISIVE_SUCCESS_REWARD_MULT_KEY, DEFAULT_BIND_ADDR,
     };
     use std::collections::HashMap;
 
@@ -249,56 +213,55 @@ mod tests {
     }
 
     fn reward_mult(pairs: &[(&str, &str)]) -> f64 {
-        f64_with_fallback(
-            lookup(pairs),
-            DECISIVE_SUCCESS_REWARD_MULT_KEY,
-            LEGACY_FULL_SUCCESS_REWARD_MULT_KEY,
-            1.5,
-        )
+        finite_f64_or_warn(lookup(pairs), DECISIVE_SUCCESS_REWARD_MULT_KEY, 1.5)
     }
 
     #[test]
-    fn reward_mult_prefers_new_key() {
-        let v = reward_mult(&[
-            (DECISIVE_SUCCESS_REWARD_MULT_KEY, "2.0"),
-            (LEGACY_FULL_SUCCESS_REWARD_MULT_KEY, "3.0"),
-        ]);
-        assert_eq!(v, 2.0);
+    fn reward_mult_reads_key() {
+        assert_eq!(reward_mult(&[(DECISIVE_SUCCESS_REWARD_MULT_KEY, "2.0")]), 2.0);
     }
 
     #[test]
-    fn reward_mult_falls_back_to_legacy_key() {
-        assert_eq!(reward_mult(&[(LEGACY_FULL_SUCCESS_REWARD_MULT_KEY, "3.0")]), 3.0);
+    fn reward_mult_unparseable_counts_as_absent() {
+        assert_eq!(reward_mult(&[(DECISIVE_SUCCESS_REWARD_MULT_KEY, "not-a-number")]), 1.5);
     }
 
     #[test]
-    fn reward_mult_unparseable_new_key_counts_as_absent() {
-        let v = reward_mult(&[
-            (DECISIVE_SUCCESS_REWARD_MULT_KEY, "not-a-number"),
-            (LEGACY_FULL_SUCCESS_REWARD_MULT_KEY, "3.0"),
-        ]);
-        assert_eq!(v, 3.0);
-    }
-
-    #[test]
-    fn reward_mult_defaults_when_neither_key_set() {
+    fn reward_mult_defaults_when_unset() {
         assert_eq!(reward_mult(&[]), 1.5);
     }
 
     /// `"NaN"` and `"inf"` parse as f64 — they must still count as absent.
     #[test]
     fn reward_mult_non_finite_counts_as_absent() {
-        let v = reward_mult(&[
-            (DECISIVE_SUCCESS_REWARD_MULT_KEY, "NaN"),
-            (LEGACY_FULL_SUCCESS_REWARD_MULT_KEY, "1.25"),
-        ]);
-        assert_eq!(v, 1.25);
+        assert_eq!(reward_mult(&[(DECISIVE_SUCCESS_REWARD_MULT_KEY, "NaN")]), 1.5);
         assert_eq!(reward_mult(&[(DECISIVE_SUCCESS_REWARD_MULT_KEY, "inf")]), 1.5);
     }
 
+    /// GAP-40 part 1 — every numeric reader type warns and falls back on an unparseable
+    /// value, stays silent on an unset one, and uses a parseable one as given.
     #[test]
-    fn reward_mult_unparseable_legacy_key_falls_to_default() {
-        assert_eq!(reward_mult(&[(LEGACY_FULL_SUCCESS_REWARD_MULT_KEY, "1,5")]), 1.5);
+    fn env_readers_warn_and_fall_back() {
+        fn check<T: std::str::FromStr + PartialEq + std::fmt::Debug + Copy>(
+            default: T,
+            valid: (&str, T),
+            bad: &[&str],
+        ) {
+            let read = |pairs: &[(&str, &str)]| parse_or_warn(lookup(pairs), "K", default);
+            assert_eq!(read(&[]), default, "unset → default");
+            assert_eq!(read(&[("K", valid.0)]), valid.1);
+            for b in bad {
+                assert_eq!(read(&[("K", b)]), default, "{b:?} must fall back to the default");
+            }
+        }
+        let common = ["1,5", "", " 7", "abc"];
+        let unsigned = ["1,5", "", " 7", "abc", "-5"];
+        check::<u32>(10, ("7", 7), &unsigned);
+        check::<u64>(10, ("7", 7), &unsigned);
+        check::<usize>(10, ("7", 7), &unsigned);
+        check::<i32>(10, ("-7", -7), &common);
+        check::<i64>(10, ("-7", -7), &common);
+        check::<f64>(1.5, ("2.25", 2.25), &common);
     }
 
     /// INF-2 — a stress penalty that is set but unusable warns and falls back; one above

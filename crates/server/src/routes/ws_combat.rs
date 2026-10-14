@@ -36,7 +36,7 @@ pub async fn ws_stream_handler(
         Ok(Some(s)) => s,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
-            eprintln!("[session] consume_session error for {session_id}: {e}");
+            tracing::error!("[session] consume_session error for {session_id}: {e}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };

@@ -502,7 +502,7 @@ async fn post_combat_stream_start(
         created_at: Utc::now(),
     };
     if let Err(e) = state.session_repo.save_session(id, session).await {
-        eprintln!("[session] failed to save combat session {id}: {e}");
+        tracing::error!("[session] failed to save combat session {id}: {e}");
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "failed to create session"}))).into_response();
     }
     Json(json!({"session_id": id.to_string()})).into_response()
@@ -564,7 +564,7 @@ async fn get_combat_aar(
         .map_err(|e| bad_request(format!("session_start is not a combat request: {e}")))?;
     let timestamp = start.payload["timestamp"]
         .as_str()
-        .ok_or_else(|| bad_request("session_start payload missing timestamp"))?
+        .ok_or_else(|| internal_error("session_start payload missing timestamp"))?
         .to_string();
 
     // Rebuild the resolver inputs exactly as post_combat_resolve built them.

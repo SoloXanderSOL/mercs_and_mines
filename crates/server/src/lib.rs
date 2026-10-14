@@ -20,15 +20,21 @@ pub mod supervisor;
 /// `main` calls `dotenvy::dotenv()` first, so `RUST_LOG` from `.env` is honoured, and
 /// calls this before `Config::from_env()`, which logs.
 pub fn init_tracing() {
+    let _ = try_init_tracing();
+}
+
+/// As [`init_tracing`], but returns the error if a subscriber (or a `log` logger) is
+/// already installed, so `main` can fail loudly instead of running unlogged.
+pub fn try_init_tracing() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
     use std::io::IsTerminal;
-    let _ = tracing_subscriber::fmt()
+    tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .with_writer(std::io::stderr)
         .with_ansi(std::io::stderr().is_terminal())
-        .try_init();
+        .try_init()
 }
 
 #[cfg(test)]

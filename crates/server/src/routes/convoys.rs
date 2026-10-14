@@ -44,28 +44,35 @@ async fn dispatch_convoy(
     // Decode wallet: base58 string → Vec<u8> for DB storage, [u8; 32] for timer
     let owner_wallet: Vec<u8> = match bs58::decode(&token.wallet_address).into_vec() {
         Ok(v) => v,
-        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        Err(_) => return super::unauthorized("session wallet is not valid base58").into_response(),
     };
     let wallet_bytes: [u8; 32] = match owner_wallet.as_slice().try_into() {
         Ok(b) => b,
-        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        Err(_) => return super::unauthorized("session wallet is not a 32-byte key").into_response(),
     };
 
     // Look up campaign → derive sector_id
     let campaign = match state.campaign_repo.get_campaign(campaign_id).await {
         Ok(Some(c)) => c,
         Ok(None)    => return StatusCode::NOT_FOUND.into_response(),
-        Err(_)      => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Err(e)      => {
+            tracing::error!("dispatch_convoy: get_campaign failed for campaign {campaign_id}: {e}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
     };
     let sector_id = campaign.sector_id;
 
     // Terrain modifier — destination hex only (Phase 1 simplification)
     // TODO(phase-2): use full route waypoints for terrain modifier
-    let terrain_modifier = state.sector_repo
-        .get_sector(sector_id)
-        .await
-        .ok()
-        .flatten()
+    // A sector read error falls back to modifier 1.0, as before; it is logged, not refused.
+    let sector = match state.sector_repo.get_sector(sector_id).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("dispatch_convoy: get_sector failed for campaign {campaign_id} (sector {sector_id}); using terrain modifier 1.0: {e:?}");
+            None
+        }
+    };
+    let terrain_modifier = sector
         .and_then(|s| s.terrain.get(&format!("{},{}", req.destination_q, req.destination_r)).cloned())
         .map(|t| t.travel_time_modifier())
         .unwrap_or(1.0_f64);
@@ -108,7 +115,8 @@ async fn dispatch_convoy(
         // DB DEFAULT now() fills created_at on insert; field is required by Rust struct
         created_at:    Utc::now(),
     };
-    if let Err(_) = state.convoy_repo.create_convoy(record).await {
+    if let Err(e) = state.convoy_repo.create_convoy(record).await {
+        tracing::error!("dispatch_convoy: create_convoy failed for campaign {campaign_id}, convoy {convoy_id}: {e:?}");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
@@ -122,7 +130,8 @@ async fn dispatch_convoy(
         timer_type:    TimerType::ConvoyArrival,
         fires_at:      arrival_time,
     };
-    if let Err(_) = state.timer_repo.schedule_timer(timer).await {
+    if let Err(e) = state.timer_repo.schedule_timer(timer).await {
+        tracing::error!("dispatch_convoy: schedule_timer failed for campaign {campaign_id}, convoy {convoy_id}: {e:?}");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
@@ -132,7 +141,8 @@ async fn dispatch_convoy(
         owner_wallet: owner_wallet.clone(),
         unit_type:    req.vehicle_class.clone(),
     };
-    if let Err(_) = state.sector_repo.add_hex_occupant(sector_id, req.origin_q, req.origin_r, occupant).await {
+    if let Err(e) = state.sector_repo.add_hex_occupant(sector_id, req.origin_q, req.origin_r, occupant).await {
+        tracing::error!("dispatch_convoy: add_hex_occupant failed for campaign {campaign_id}, convoy {convoy_id}: {e:?}");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
@@ -145,7 +155,8 @@ async fn dispatch_convoy(
         payload:         serde_json::json!({ "convoy_id": convoy_id }),
         narrative_event: None,
     };
-    if let Err(_) = state.input_log_repo.append_campaign_entry(&campaign_id, &entry).await {
+    if let Err(e) = state.input_log_repo.append_campaign_entry(&campaign_id, &entry).await {
+        tracing::error!("dispatch_convoy: append_campaign_entry failed for campaign {campaign_id}, convoy {convoy_id}: {e:?}");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 

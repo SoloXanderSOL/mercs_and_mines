@@ -18,7 +18,7 @@ use redis::Client as RedisClient;
 #[tokio::main]
 async fn main() {
     dotenvy::dotenv().ok();
-    mercs_server::init_tracing();
+    mercs_server::try_init_tracing().expect("failed to install the tracing subscriber");
 
     let database_url = std::env::var("DATABASE_URL")
         .expect("DATABASE_URL must be set (add it to .env or the environment)");
@@ -48,7 +48,7 @@ async fn main() {
     let redis_mgr = redis::aio::ConnectionManager::new(redis_client)
         .await
         .expect("Failed to connect to Redis — is REDIS_URL correct and the server reachable?");
-    println!("Redis connection manager ready");
+    tracing::info!("Redis connection manager ready");
 
     let config = Arc::new(Config::from_env());
     let bind_addr = config.server.bind_addr.clone();
@@ -87,6 +87,6 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
         .unwrap_or_else(|_| panic!("Failed to bind {}", bind_addr));
-    println!("Mercs & Mines server listening on {}", bind_addr);
+    tracing::info!("Mercs & Mines server listening on {}", bind_addr);
     axum::serve(listener, app).await.expect("Server error");
 }

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -7,7 +8,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
 
 use crate::convoy_collision::check_same_hex_collision;
-use crate::repeat_warn::RepeatWarn;
+use crate::repeat_warn::{KeyedRepeatWarn, RepeatWarn};
 use crate::repository::{HexOccupant, TimerType};
 use crate::state::AppState;
 
@@ -23,7 +24,7 @@ pub enum ConvoyEvent {
 
 pub const EXPIRY_POLL_INTERVAL_SECS: u64 = 10;
 
-/// Repeat a persistent `get_due_timers` failure about once an hour (GAP-38).
+/// Repeat a persistent failure, per call or per convoy, about once an hour (GAP-38).
 pub const EXPIRY_WARN_EVERY_TICKS: u32 = (3600 / EXPIRY_POLL_INTERVAL_SECS) as u32;
 
 fn notify_player_convoy_arrived(
@@ -38,16 +39,48 @@ fn notify_player_convoy_arrived(
     }
 }
 
-pub async fn poll_expiry_once(state: &AppState, due_timers_warn: &mut RepeatWarn) {
+/// Repeat-warning state for the convoy expiry task: the due-timer scan, and one keyed
+/// counter (by timer id) per per-convoy failure site.
+#[derive(Debug)]
+pub struct ExpiryWarns {
+    pub due_timers: RepeatWarn,
+    pub mark_arrived: KeyedRepeatWarn,
+    pub get_convoy: KeyedRepeatWarn,
+    pub cancel_timer: KeyedRepeatWarn,
+    pub phantom: KeyedRepeatWarn,
+}
+
+impl ExpiryWarns {
+    pub fn new() -> Self {
+        Self {
+            due_timers: RepeatWarn::new(EXPIRY_WARN_EVERY_TICKS),
+            mark_arrived: KeyedRepeatWarn::new(EXPIRY_WARN_EVERY_TICKS),
+            get_convoy: KeyedRepeatWarn::new(EXPIRY_WARN_EVERY_TICKS),
+            cancel_timer: KeyedRepeatWarn::new(EXPIRY_WARN_EVERY_TICKS),
+            phantom: KeyedRepeatWarn::new(EXPIRY_WARN_EVERY_TICKS),
+        }
+    }
+}
+
+impl Default for ExpiryWarns {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Runs one scan of due timers and lands each arrived convoy. Every failure, of the scan
+/// or of one convoy, logs its first occurrence and then about once an hour, and logs its
+/// recovery once. Per-convoy counters are evicted when the timer leaves the due set.
+pub async fn poll_expiry_once(state: &AppState, warns: &mut ExpiryWarns) {
     let timers = match state.timer_repo.get_due_timers(Utc::now()).await {
         Ok(v) => {
-            if let Some(n) = due_timers_warn.ok() {
+            if let Some(n) = warns.due_timers.ok() {
                 tracing::info!("poll_expiry_once: get_due_timers recovered after {n} failed polls");
             }
             v
         }
         Err(e) => {
-            match due_timers_warn.fail() {
+            match warns.due_timers.fail() {
                 Some(1) => tracing::warn!("poll_expiry_once: get_due_timers failed: {e}"),
                 Some(n) => tracing::warn!("poll_expiry_once: get_due_timers still failing ({n} consecutive polls): {e}"),
                 None => {}
@@ -55,41 +88,88 @@ pub async fn poll_expiry_once(state: &AppState, due_timers_warn: &mut RepeatWarn
             return;
         }
     };
+    let live: HashSet<Uuid> = timers
+        .iter()
+        .filter(|t| matches!(t.timer_type, TimerType::ConvoyArrival))
+        .map(|t| t.timer_id)
+        .collect();
+    for keyed in [&mut warns.mark_arrived, &mut warns.get_convoy, &mut warns.cancel_timer, &mut warns.phantom] {
+        keyed.retain(&live);
+    }
 
     for timer in timers {
         match timer.timer_type {
             TimerType::ConvoyArrival => {}
             _ => continue, // other timer types managed by lifecycle task, not convoy expiry
         }
+        let id = timer.timer_id;
 
         // INVARIANT: timer_id == convoy_id — established in dispatch_convoy (3b-2)
-        if let Err(e) = state.convoy_repo.mark_arrived(timer.timer_id).await {
-            tracing::warn!("mark_arrived failed for convoy {}: {:?}", timer.timer_id, e);
-            continue;
-        }
-
-        let convoy = match state.convoy_repo.get_convoy(timer.timer_id).await {
-            Ok(Some(c)) => c,
-            Ok(None) => {
-                tracing::warn!(
-                    "ConvoyArrival timer {} fired but no convoy record found (phantom timer) — cleaning up",
-                    timer.timer_id
-                );
-                let _ = state.timer_repo.cancel_timer(timer.timer_id).await;
-                continue;
+        match state.convoy_repo.mark_arrived(id).await {
+            Ok(()) => {
+                if let Some(n) = warns.mark_arrived.ok(id) {
+                    tracing::info!("mark_arrived recovered for convoy {id} after {n} failed polls");
+                }
             }
             Err(e) => {
-                tracing::warn!("get_convoy failed for timer {}: {:?}", timer.timer_id, e);
+                match warns.mark_arrived.fail(id) {
+                    Some(1) => tracing::warn!("mark_arrived failed for convoy {id}: {e:?}"),
+                    Some(n) => tracing::warn!("mark_arrived still failing for convoy {id} ({n} consecutive polls): {e:?}"),
+                    None => {}
+                }
+                continue;
+            }
+        }
+
+        let convoy = match state.convoy_repo.get_convoy(id).await {
+            Ok(found) => {
+                if let Some(n) = warns.get_convoy.ok(id) {
+                    tracing::info!("get_convoy recovered for timer {id} after {n} failed polls");
+                }
+                match found {
+                    Some(c) => c,
+                    None => {
+                        let cleanup = match state.timer_repo.cancel_timer(id).await {
+                            Ok(()) => "timer cancelled".to_string(),
+                            Err(e) => format!("cancel_timer failed: {e:?}"),
+                        };
+                        match warns.phantom.fail(id) {
+                            Some(1) => tracing::warn!(
+                                "ConvoyArrival timer {id} fired but no convoy record found (phantom timer) — cleaning up: {cleanup}"
+                            ),
+                            Some(n) => tracing::warn!(
+                                "phantom ConvoyArrival timer {id} still due ({n} consecutive polls) — cleaning up: {cleanup}"
+                            ),
+                            None => {}
+                        }
+                        continue;
+                    }
+                }
+            }
+            Err(e) => {
+                match warns.get_convoy.fail(id) {
+                    Some(1) => tracing::warn!("get_convoy failed for timer {id}: {e:?}"),
+                    Some(n) => tracing::warn!("get_convoy still failing for timer {id} ({n} consecutive polls): {e:?}"),
+                    None => {}
+                }
                 continue;
             }
         };
 
-        if let Err(e) = state.timer_repo.cancel_timer(timer.timer_id).await {
-            tracing::warn!(
-                "cancel_timer failed for convoy {} — Redis keys may be stale: {:?}",
-                timer.timer_id, e
-            );
-            // don't abort — convoy is already marked arrived; continue with hex update
+        match state.timer_repo.cancel_timer(id).await {
+            Ok(()) => {
+                if let Some(n) = warns.cancel_timer.ok(id) {
+                    tracing::info!("cancel_timer recovered for convoy {id} after {n} failed polls");
+                }
+            }
+            Err(e) => {
+                match warns.cancel_timer.fail(id) {
+                    Some(1) => tracing::warn!("cancel_timer failed for convoy {id} — Redis keys may be stale: {e:?}"),
+                    Some(n) => tracing::warn!("cancel_timer still failing for convoy {id} ({n} consecutive polls) — Redis keys may be stale: {e:?}"),
+                    None => {}
+                }
+                // don't abort — convoy is already marked arrived; continue with hex update
+            }
         }
 
         let sector_opt = match state.sector_repo.get_sector(timer.sector_id).await {
@@ -195,9 +275,46 @@ pub async fn run_convoy_expiry_task(state: Arc<AppState>) {
     // TODO(phase-2): no saga/compensation for partial convoy dispatch failure —
     // orphaned in_transit=true records need a reconciliation sweep
     let mut interval = tokio::time::interval(Duration::from_secs(EXPIRY_POLL_INTERVAL_SECS));
-    let mut due_timers_warn = RepeatWarn::new(EXPIRY_WARN_EVERY_TICKS);
+    let mut warns = ExpiryWarns::new();
     loop {
         interval.tick().await;
-        poll_expiry_once(state.as_ref(), &mut due_timers_warn).await;
+        poll_expiry_once(state.as_ref(), &mut warns).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::repository::{DeploymentTimer, PostgresConvoyRepository, WalletAddress};
+
+    #[tokio::test]
+    async fn poll_expiry_suppresses_per_timer_and_evicts() {
+        // A closed lazy pool fails every query without a database (INF-3a pattern).
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused@127.0.0.1:1/unused")
+            .expect("lazy pool");
+        pool.close().await;
+
+        let mut state = AppState::new(Arc::new(Config::default()));
+        state.convoy_repo = Arc::new(PostgresConvoyRepository::new(pool));
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        for id in [a, b] {
+            state.timer_repo.schedule_timer(DeploymentTimer {
+                timer_id: id,
+                player_wallet: WalletAddress([0u8; 32]),
+                sector_id: Uuid::new_v4(),
+                timer_type: TimerType::ConvoyArrival,
+                fires_at: Utc::now() - chrono::Duration::seconds(1),
+            }).await.expect("in-memory schedule");
+        }
+        let mut warns = ExpiryWarns::new();
+
+        poll_expiry_once(&state, &mut warns).await;
+        assert_eq!(warns.mark_arrived.len(), 2, "each failing timer gets its own counter");
+
+        state.timer_repo.cancel_timer(a).await.expect("in-memory cancel");
+        poll_expiry_once(&state, &mut warns).await;
+        assert_eq!(warns.mark_arrived.len(), 1, "a timer that left the due set is evicted");
     }
 }

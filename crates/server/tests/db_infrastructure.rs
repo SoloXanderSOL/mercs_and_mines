@@ -1366,7 +1366,7 @@ async fn sector_lifecycle_task_transitions_active_to_ending() {
         .expect("ends_at backdate failed");
 
     // Run one poll cycle — should detect expired ends_at and transition to Ending.
-    mercs_server::lifecycle::poll_lifecycle_once(&repo, &mut mercs_server::repeat_warn::RepeatWarn::new(1)).await;
+    mercs_server::lifecycle::poll_lifecycle_once(&repo, &mut mercs_server::lifecycle::LifecycleWarns::new()).await;
 
     let updated = repo.get_campaign(campaign.campaign_id).await
         .expect("get failed")
@@ -2420,7 +2420,7 @@ async fn convoy_timer_fires_and_marks_arrived() {
     state.sector_repo    = sector_repo.clone();
     state.timer_repo     = timer_repo.clone();
     state.input_log_repo = log_repo.clone();
-    poll_expiry_once(&state, &mut mercs_server::repeat_warn::RepeatWarn::new(1)).await;
+    poll_expiry_once(&state, &mut mercs_server::convoy_expiry::ExpiryWarns::new()).await;
 
     // Assert: convoy is no longer in_transit
     let fetched = convoy_repo.get_convoy(convoy_id).await
@@ -3058,7 +3058,7 @@ async fn convoy_ws_receives_arrived_event() {
     }).await.expect("add_hex_occupant failed");
 
     // Run expiry — should fire ConvoyArrived into the injected sender
-    poll_expiry_once(&state, &mut mercs_server::repeat_warn::RepeatWarn::new(1)).await;
+    poll_expiry_once(&state, &mut mercs_server::convoy_expiry::ExpiryWarns::new()).await;
 
     // Assert: WS message received within 2 seconds
     let msg = tokio::time::timeout(
