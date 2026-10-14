@@ -2589,26 +2589,137 @@ async fn resolve_deployment_rolls_back_when_the_close_fails() {
     let (_campaign_id, commander_id) = seed_commander_4g1(&pool, wallet, 30).await;
     let repo = PostgresCommanderRepository::new(pool.clone());
 
+    use sim_engine::game_types::OutcomeType;
+    use sim_engine::resolver::{stress_after_casualties, stress_after_deployment};
+    use mercs_server::commander_gen::{rank_for_xp, xp_award};
+    let cfg = sim_engine::config::SimConfig::default();
+    let seeded = repo.get_commander(commander_id).await.unwrap().unwrap();
+
     let d = new_deployment_4g1(commander_id, chrono::Utc::now());
     assert!(repo.start_deployment(&d).await.unwrap());
-    repo.resolve_deployment(d.deployment_id, commander_id, 40, 2, 100, &sim_engine::game_types::OutcomeType::Success)
+    // First resolve: tier 5 Success, no casualties — stress 30 → 40, and a rank-up.
+    let eff = repo.resolve_deployment(d.deployment_id, commander_id, 0, 5, &OutcomeType::Success, &cfg)
         .await
         .expect("first resolve failed");
+    let want_xp = seeded.xp + xp_award(5, &OutcomeType::Success);
+    let want = (i16::from(stress_after_deployment(30, &cfg)), want_xp, rank_for_xp(want_xp), false);
     let before = repo.get_commander(commander_id).await.unwrap().unwrap();
-    assert_eq!((before.stress, before.xp, before.rank, before.is_shattered), (40, 100, 2, false));
+    assert_eq!((before.stress, before.xp, before.rank, before.is_shattered), want);
+    assert_eq!((eff.stress, eff.xp, eff.old_rank, eff.new_rank), (want.0, want.1, seeded.rank, want.2), "AppliedEffects is what committed");
 
-    // Second resolve on the now-closed deployment: stress 100 would shatter if it stuck.
+    // Second resolve on the now-closed deployment: from the locked 40, ten casualties
+    // drive stress to 100 — it would Shatter if it stuck.
+    let would_xp = before.xp + xp_award(5, &OutcomeType::Defeat);
+    let would_stress = stress_after_casualties(stress_after_deployment(40, &cfg), 10, &cfg);
+    assert_eq!(would_stress, 100, "precondition: the rolled-back write would Shatter");
+    assert!(would_xp > before.xp, "precondition: the rolled-back write would add XP");
     let r = repo
-        .resolve_deployment(d.deployment_id, commander_id, 100, 3, 500, &sim_engine::game_types::OutcomeType::Defeat)
+        .resolve_deployment(d.deployment_id, commander_id, 10, 5, &OutcomeType::Defeat, &cfg)
         .await;
     assert!(matches!(r, Err(mercs_server::repository::RepositoryError::NotFound)), "got {:?}", r);
 
     let after = repo.get_commander(commander_id).await.unwrap().unwrap();
-    assert_eq!((after.stress, after.xp, after.rank, after.is_shattered), (40, 100, 2, false),
+    assert_eq!((after.stress, after.xp, after.rank, after.is_shattered), want,
         "a failed close must roll back the stress and XP writes");
     let deps = repo.list_deployments_by_commander(commander_id).await.unwrap();
     assert_eq!(deps[0].status, "resolved");
     assert_eq!(deps[0].outcome.as_deref(), Some(outcome_db_str(&sim_engine::game_types::OutcomeType::Success)));
+
+    clean_wallet_4g1(&pool, &wallet).await;
+}
+
+/// 4g-2 test (b), Postgres: a Commander killed between start and resolve is refused
+/// under the row lock, and the rollback leaves everything as it was — the deployment
+/// stays `active` for the route to abort.
+#[tokio::test]
+async fn resolve_deployment_refuses_a_kia_commander() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    let wallet = [18u8; 32];
+    let (_campaign_id, commander_id) = seed_commander_4g1(&pool, wallet, 30).await;
+    let repo = PostgresCommanderRepository::new(pool.clone());
+    let cfg = sim_engine::config::SimConfig::default();
+
+    let d = new_deployment_4g1(commander_id, chrono::Utc::now());
+    assert!(repo.start_deployment(&d).await.unwrap());
+    repo.set_kia(commander_id).await.unwrap();
+    let before = repo.get_commander(commander_id).await.unwrap().unwrap();
+
+    let r = repo
+        .resolve_deployment(d.deployment_id, commander_id, 10, 5, &sim_engine::game_types::OutcomeType::Success, &cfg)
+        .await;
+    assert!(matches!(r, Err(mercs_server::repository::RepositoryError::Internal(_))), "got {:?}", r);
+
+    let after = repo.get_commander(commander_id).await.unwrap().unwrap();
+    assert_eq!((after.stress, after.xp, after.rank, after.is_shattered), (30, before.xp, before.rank, false),
+        "a refused resolve changes nothing");
+    let deps = repo.list_deployments_by_commander(commander_id).await.unwrap();
+    assert_eq!(deps.len(), 1);
+    assert_eq!(deps[0].status, "active");
+
+    clean_wallet_4g1(&pool, &wallet).await;
+}
+
+/// 4g-2 test (c): a stress write that commits while `resolve_deployment` is running is
+/// built on, not overwritten. `tx_a` holds the Commander row lock; the resolver must wait
+/// for it at its `SELECT … FOR UPDATE`, then compute from what `tx_a` committed.
+#[tokio::test]
+async fn resolve_deployment_builds_on_a_concurrent_stress_write() {
+    use sim_engine::game_types::OutcomeType;
+    use sim_engine::resolver::stress_after_deployment;
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    // Three connections are busy at once (tx_a, the resolver, the poll); the shared
+    // helper caps at 2, so this test has its own pool.
+    let url = std::env::var("TEST_DATABASE_URL").unwrap();
+    let wide = PgPoolOptions::new().max_connections(4).connect(&url).await.expect("wide pool");
+    let wallet = [17u8; 32];
+    let (_campaign_id, commander_id) = seed_commander_4g1(&pool, wallet, 20).await;
+    let cfg = sim_engine::config::SimConfig::default();
+    let expected = i16::from(stress_after_deployment(60, &cfg));
+    let stale = i16::from(stress_after_deployment(20, &cfg));
+    assert_ne!(expected, stale, "precondition: the two orders must be distinguishable");
+
+    let d = new_deployment_4g1(commander_id, chrono::Utc::now());
+    assert!(PostgresCommanderRepository::new(wide.clone()).start_deployment(&d).await.unwrap());
+
+    let mut tx_a = wide.begin().await.unwrap();
+    sqlx::query("UPDATE commander_records SET stress = 60 WHERE commander_id = $1")
+        .bind(commander_id)
+        .execute(&mut *tx_a)
+        .await
+        .unwrap();
+
+    let repo = PostgresCommanderRepository::new(wide.clone());
+    let task_cfg = cfg.clone();
+    let resolver = tokio::spawn(async move {
+        repo.resolve_deployment(d.deployment_id, commander_id, 0, 1, &OutcomeType::Success, &task_cfg).await
+    });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND datname = current_database()"
+        )
+        .fetch_one(&wide)
+        .await
+        .unwrap();
+        if waiting >= 1 {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "the resolver never blocked on the row lock");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    tx_a.commit().await.unwrap();
+
+    let eff = resolver.await.unwrap().expect("resolve failed");
+    let after = PostgresCommanderRepository::new(pool.clone()).get_commander(commander_id).await.unwrap().unwrap();
+    assert_eq!(after.stress, expected, "the concurrent write must be built on (stale would be {stale})");
+    assert_eq!(eff.stress, expected);
 
     clean_wallet_4g1(&pool, &wallet).await;
 }
@@ -3206,6 +3317,119 @@ async fn mission_resolve_refuses_an_already_deployed_commander() {
     let app = mercs_server::routes::router(std::sync::Arc::new(state));
     let (status, _) = post_mission(app, Some(&token), &mission_body(commander_id)).await;
     assert_eq!(status, axum::http::StatusCode::CONFLICT);
+}
+
+/// Test-only seam: forwards everything to `inner`, except that `start_deployment` first
+/// Shatters the Commander through a real writer. This puts a Shattering close between
+/// the route's first read and its deployment lock. Lives here, not in production code.
+struct ShatterOnStart {
+    inner: std::sync::Arc<dyn CommanderRepository + Send + Sync>,
+}
+
+#[async_trait::async_trait]
+impl CommanderRepository for ShatterOnStart {
+    async fn create_commander(&self, record: CommanderRecord) -> Result<(), mercs_server::repository::RepositoryError> {
+        self.inner.create_commander(record).await
+    }
+    async fn get_commander(&self, commander_id: uuid::Uuid) -> Result<Option<CommanderRecord>, mercs_server::repository::RepositoryError> {
+        self.inner.get_commander(commander_id).await
+    }
+    async fn update_stress(&self, commander_id: uuid::Uuid, stress: i16) -> Result<(), mercs_server::repository::RepositoryError> {
+        self.inner.update_stress(commander_id, stress).await
+    }
+    async fn update_rank_and_xp(&self, commander_id: uuid::Uuid, rank: i16, xp: i32) -> Result<(), mercs_server::repository::RepositoryError> {
+        self.inner.update_rank_and_xp(commander_id, rank, xp).await
+    }
+    async fn set_veteran_trait(&self, commander_id: uuid::Uuid, veteran_trait: String) -> Result<(), mercs_server::repository::RepositoryError> {
+        self.inner.set_veteran_trait(commander_id, veteran_trait).await
+    }
+    async fn set_shattered(&self, commander_id: uuid::Uuid) -> Result<(), mercs_server::repository::RepositoryError> {
+        self.inner.set_shattered(commander_id).await
+    }
+    async fn set_kia(&self, commander_id: uuid::Uuid) -> Result<(), mercs_server::repository::RepositoryError> {
+        self.inner.set_kia(commander_id).await
+    }
+    async fn list_commanders_by_campaign(&self, campaign_id: uuid::Uuid) -> Result<Vec<CommanderRecord>, mercs_server::repository::RepositoryError> {
+        self.inner.list_commanders_by_campaign(campaign_id).await
+    }
+    async fn delete_commanders_by_campaign(&self, campaign_id: uuid::Uuid) -> Result<u64, mercs_server::repository::RepositoryError> {
+        self.inner.delete_commanders_by_campaign(campaign_id).await
+    }
+    async fn start_deployment(&self, d: &NewDeployment) -> Result<bool, mercs_server::repository::RepositoryError> {
+        self.inner.update_stress(d.commander_id, 100).await?;
+        self.inner.start_deployment(d).await
+    }
+    async fn abort_deployment(&self, deployment_id: uuid::Uuid) -> Result<(), mercs_server::repository::RepositoryError> {
+        self.inner.abort_deployment(deployment_id).await
+    }
+    async fn resolve_deployment(
+        &self,
+        deployment_id: uuid::Uuid,
+        commander_id: uuid::Uuid,
+        kia: u32,
+        tier: u8,
+        outcome: &sim_engine::game_types::OutcomeType,
+        cfg: &sim_engine::config::SimConfig,
+    ) -> Result<mercs_server::repository::AppliedEffects, mercs_server::repository::RepositoryError> {
+        self.inner.resolve_deployment(deployment_id, commander_id, kia, tier, outcome, cfg).await
+    }
+    async fn list_deployments_by_commander(&self, commander_id: uuid::Uuid) -> Result<Vec<mercs_server::repository::DeploymentRecord>, mercs_server::repository::RepositoryError> {
+        self.inner.list_deployments_by_commander(commander_id).await
+    }
+}
+
+/// Shared body of 4g-2 test (a): the Commander is Shattered after the route's first
+/// read, so only the re-read under the deployment lock can refuse them. Expects 409,
+/// one `aborted` deployment, no logged session, and no effect beyond the Shatter.
+async fn assert_shattered_after_first_read_is_refused(
+    mut state: mercs_server::state::AppState,
+    wallet: [u8; 32],
+    commander_id: uuid::Uuid,
+) {
+    let seeded = state.commander_repo.get_commander(commander_id).await.unwrap().unwrap();
+    assert!(!seeded.is_shattered, "precondition: the first read sees a deployable Commander");
+    state.commander_repo = std::sync::Arc::new(ShatterOnStart { inner: state.commander_repo.clone() });
+    let token = insert_session(&state, wallet);
+    let commanders = state.commander_repo.clone();
+    let logs = state.input_log_repo.clone();
+    let app = mercs_server::routes::router(std::sync::Arc::new(state));
+
+    let (status, bytes) = post_mission(app, Some(&token), &mission_body(commander_id)).await;
+    assert_eq!(status, axum::http::StatusCode::CONFLICT, "{}", String::from_utf8_lossy(&bytes));
+    assert!(String::from_utf8_lossy(&bytes).contains("Shattered"), "{}", String::from_utf8_lossy(&bytes));
+
+    let deps = commanders.list_deployments_by_commander(commander_id).await.unwrap();
+    assert_eq!(deps.len(), 1);
+    assert_eq!(deps[0].status, "aborted", "a refused re-read must abort the deployment");
+    assert!(logs.get_session_config(&deps[0].session_id).await.unwrap().is_none(),
+        "a refused deployment must never log");
+    let rec = commanders.get_commander(commander_id).await.unwrap().unwrap();
+    assert_eq!((rec.stress, rec.is_shattered, rec.xp, rec.rank), (100, true, seeded.xp, seeded.rank));
+}
+
+/// 4g-2 test (a), in-memory.
+#[tokio::test]
+async fn mission_resolve_refuses_a_commander_shattered_after_the_first_read_in_memory() {
+    let state = default_state();
+    let wallet = [4u8; 32];
+    let commander_id = seed_in_memory_commander(&state, wallet, |r| r.stress = 20).await;
+    assert_shattered_after_first_read_is_refused(state, wallet, commander_id).await;
+}
+
+/// 4g-2 test (a), Postgres.
+#[tokio::test]
+async fn mission_resolve_refuses_a_commander_shattered_after_the_first_read_postgres() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    let wallet = [19u8; 32];
+    let (_campaign_id, commander_id) = seed_commander_4g1(&pool, wallet, 20).await;
+    let mut state = default_state();
+    state.commander_repo = std::sync::Arc::new(PostgresCommanderRepository::new(pool.clone()));
+    state.input_log_repo = std::sync::Arc::new(PostgresInputLogRepository::new(pool.clone()));
+    assert_shattered_after_first_read_is_refused(state, wallet, commander_id).await;
+    clean_wallet_4g1(&pool, &wallet).await;
 }
 
 /// The log write is fallible on this route: a failure aborts the deployment, returns

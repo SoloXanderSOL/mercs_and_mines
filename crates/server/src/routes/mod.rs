@@ -31,7 +31,6 @@ use sim_engine::{
     ore_run::run_ore_run,
     resolver::{
         apply_commander_buffs, resolve_combat, resolve_mission, resolve_pack_assault,
-        stress_after_casualties, stress_after_deployment,
     },
     rng::generate_seed,
     scenario::Approach,
@@ -43,9 +42,9 @@ use crate::auth::AuthSession;
 use crate::api_types::{
     convoy_vehicle_from_class, CombatResolveRequest, MissionResolveRequest, PackAssaultRequest,
 };
-use crate::commander_gen::{mission_tier, rank_for_xp, xp_award};
+use crate::commander_gen::mission_tier;
 use crate::state::AppState;
-use crate::repository::commander::{log_rank_up, stress_to_level};
+use crate::repository::commander::log_rank_up;
 use crate::repository::{CombatSession, InputLogRepository, NewDeployment};
 
 type AppError = (StatusCode, Json<Value>);
@@ -225,10 +224,23 @@ async fn abort_deployment_or_log(state: &AppState, deployment_id: Uuid) {
     }
 }
 
+/// The `409` for a Commander who may not deploy, KIA checked first.
+fn deploy_refusal(rec: &crate::repository::CommanderRecord) -> Option<AppError> {
+    if rec.is_kia {
+        return Some(conflict("Commander is KIA"));
+    }
+    if rec.is_shattered {
+        return Some(conflict("Commander is Shattered and cannot deploy until rehabilitated"));
+    }
+    None
+}
+
 /// Mission ↔ Commander wiring (brick 4g-1, Phase_1_Section_4 §4g). Check order:
 /// 401 (extractor) → 400 (body) → 404 (unknown or not yours) → 409 (KIA, Shattered,
-/// already deployed) → active deployment → input log before the roll (500 on failure,
-/// deployment aborted) → resolve → one atomic write of stress, XP, rank and the close.
+/// already deployed) → active deployment → re-read, 409 (KIA, Shattered; deployment
+/// aborted; 4g-2) → input log before the roll (500 on failure, deployment aborted) →
+/// resolve → one atomic write of stress, XP, rank and the close, computed from the
+/// locked Commander row.
 async fn post_mission_resolve(
     AuthSession(session): AuthSession,
     State(state): State<Arc<AppState>>,
@@ -261,12 +273,10 @@ async fn post_mission_resolve(
         .filter(|r| r.player_wallet == wallet)
         .ok_or_else(|| not_found("Commander not found"))?;
 
-    // 409 — the flag gates deployment (§4g item 7).
-    if rec.is_kia {
-        return Err(conflict("Commander is KIA"));
-    }
-    if rec.is_shattered {
-        return Err(conflict("Commander is Shattered and cannot deploy until rehabilitated"));
+    // 409 — the flag gates deployment (§4g item 7). A fast path: the re-read under the
+    // deployment lock below is the check that holds.
+    if let Some(refusal) = deploy_refusal(&rec) {
+        return Err(refusal);
     }
 
     // Everything the log needs is fixed before any write. The seed is the server's only.
@@ -294,6 +304,25 @@ async fn post_mission_resolve(
         return Err(conflict("Commander is already deployed"));
     }
 
+    // Re-read under the deployment lock (4g-2): another mission may have closed and
+    // Shattered this Commander, or a non-mission writer killed them, since the first read.
+    // A refusal here aborts before anything is logged or rolled.
+    let rec = match state.commander_repo.get_commander(req.commander_id).await {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            abort_deployment_or_log(&state, deployment_id).await;
+            return Err(internal_error("commander re-read found no record"));
+        }
+        Err(e) => {
+            abort_deployment_or_log(&state, deployment_id).await;
+            return Err(internal_error(format!("commander re-read failed: {e}")));
+        }
+    };
+    if let Some(refusal) = deploy_refusal(&rec) {
+        abort_deployment_or_log(&state, deployment_id).await;
+        return Err(refusal);
+    }
+
     // The input is logged before the roll: the log never holds fewer inputs than the
     // database holds effects (§4g item 6.2).
     let config = shared::SessionConfig {
@@ -316,26 +345,28 @@ async fn post_mission_resolve(
     let cfg = &state.config.sim;
     let mut report = resolve_mission(&squad, mission, &timestamp, Some(seed), cfg);
 
-    // Every effect is computed in Rust with the existing pure functions.
+    // The repository computes the effects from the Commander row it locks (4g-2); the
+    // route supplies only what the mission determined.
     let kia = report
         .unit_results
         .iter()
         .filter(|u| matches!(u.final_status, UnitStatus::Kia))
         .count() as u32;
-    let stress = stress_after_casualties(stress_after_deployment(stress_to_level(rec.stress), cfg), kia, cfg);
-    let xp = rec.xp + xp_award(mission_tier(mission.difficulty), &report.outcome);
-    let rank = rank_for_xp(xp);
+    let tier = mission_tier(mission.difficulty);
 
-    if let Err(e) = state
+    let eff = match state
         .commander_repo
-        .resolve_deployment(deployment_id, rec.commander_id, i16::from(stress), rank, xp, &report.outcome)
+        .resolve_deployment(deployment_id, rec.commander_id, kia, tier, &report.outcome, cfg)
         .await
     {
-        // The input is already logged with no effects, which §4g item 6 permits.
-        abort_deployment_or_log(&state, deployment_id).await;
-        return Err(internal_error(format!("mission result write failed: {e}")));
-    }
-    log_rank_up(rec.commander_id, rec.rank, rank);
+        Ok(eff) => eff,
+        Err(e) => {
+            // The input is already logged with no effects, which §4g item 6 permits.
+            abort_deployment_or_log(&state, deployment_id).await;
+            return Err(internal_error(format!("mission result write failed: {e}")));
+        }
+    };
+    log_rank_up(rec.commander_id, eff.old_rank, eff.new_rank);
 
     // Presentation only, after the resolve: the report names the record's Commander.
     report.commander_name = Some(rec.name.clone());

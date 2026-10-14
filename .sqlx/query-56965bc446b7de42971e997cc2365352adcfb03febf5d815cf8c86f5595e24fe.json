@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT stress, xp, rank, is_kia FROM commander_records WHERE commander_id = $1 FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "stress",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 1,
+        "name": "xp",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 2,
+        "name": "rank",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 3,
+        "name": "is_kia",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "56965bc446b7de42971e997cc2365352adcfb03febf5d815cf8c86f5595e24fe"
+}
