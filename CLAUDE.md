@@ -42,9 +42,18 @@ As of 2026-10-13:
 - **Section 3 (Hex Map and Timers):** Complete — 3a-1, 3b-1, 3b-2, 3c-1, 3d-1, 3e-1.
 - **Section 4 (Commander Records):** In progress. 4a-1, 4b-0, 4b-1, 4e-0 (state-based Wipeout, GAP-35 part 2) and 4c-1
   (stress persisted through `sim-engine`'s pure stress fns; `update_stress` sets Shattered at
-  100; five mutators return `NotFound` on a miss) complete; 4a-2 unblocked. **4g-1** (the
-  mission ↔ Commander wiring brick — not 4f, which is Campaign-End Wipe) and **4d-2** were
-  created by the 2026-10-13 scoping session; 4g-1 bumps to `0.3.0`.
+  100; five mutators return `NotFound` on a miss) complete; 4a-2 unblocked. **4g-1 built
+  (`1917f4c` storage + `21a76ab` route, 2026-10-14):** `POST /api/mission/resolve` requires
+  an `AuthSession`, names a `commander_id` read from `commander_records` (404 for unknown or
+  another wallet's; 409 for KIA, Shattered or already deployed; 400 for a non-null
+  `squad.commander` or `seed_override`), and logs `session_start` through the fallible
+  `InputLogRepository::start_session` **before** the roll. A record Commander adds 0 to the
+  roll. Stress, XP, rank and the deployment close are one `resolve_deployment` transaction.
+  `deployment_records` (migration 0016) holds one `active` row per Commander by partial
+  unique index; a stale `active` row (> 5 min) is aborted on the next start.
+  `commander_records.stress` has `CHECK (stress BETWEEN 0 AND 100)`. `mission_tier` is a
+  Phase 0 bridge from mission difficulty. Workspace `0.3.0`. **4d-2** was created by the
+  2026-10-13 scoping session.
 - **Sections 5 and 6:** Not started.
 - **Sections 7 (Personnel Entity Model) and 8 (Combat Engine to canon):** created
   2026-10-13 (ruling D2), not started; both run before Section 6. Strike Mining and Base
@@ -56,9 +65,9 @@ As of 2026-10-13:
   two background-task tick gates (per-item floods are GAP-39); stress-penalty env keys warn
   on bad values; `logs/` untracked and gitignored.
 
-**122/122 tests green (73 `mercs_server` lib + 2 `aar_determinism` + 31 `db_infrastructure`
-+ 16 `sim_engine`; single-threaded, verified at `bb49b3c`). Workspace version `0.2.0`.
-Next brick: 4g-1, then INF-3 (ruling D3, 2026-10-13).** Any brick that changes what `resolve_mission` produces for
+**143/143 tests green (79 `mercs_server` lib + 2 `aar_determinism` + 45 `db_infrastructure`
++ 17 `sim_engine`; single-threaded, verified at `21a76ab`). Workspace version `0.3.0`.
+Next brick: INF-3 (ruling D3, 2026-10-13).** Any brick that changes what `resolve_mission` produces for
 a given seed bumps the workspace version in the same brick. 4b-1 reused `sim-engine`'s `OutcomeType` rather than
 defining a new enum, and writes **no input-log entry** — the rank-up entry was removed
 from scope. **ODQ-22 and ODQ-23 were ruled 2026-09-03 — engagement and mission outcomes
@@ -187,8 +196,8 @@ begins.
 
 ## 5. WSL EXECUTION ENVIRONMENT
 
-The Bash tool dispatches to Windows (Git Bash / MSYS2), not WSL. Cargo on Windows fails
-on `openssl-sys`.
+The Bash tool dispatches to Windows (Git Bash / MSYS2), not WSL. Always run cargo with the
+Linux toolchain inside WSL, where the repo, `.env`, Postgres and Redis live.
 
 **PRIMARY pattern — inline -c (use this first):**
 
