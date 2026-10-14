@@ -45,7 +45,7 @@ use crate::api_types::{
 use crate::commander_gen::mission_tier;
 use crate::state::AppState;
 use crate::repository::commander::log_rank_up;
-use crate::repository::{CombatSession, InputLogRepository, NewDeployment};
+use crate::repository::{CombatSession, InputLogRepository, NewDeployment, RepositoryError};
 
 type AppError = (StatusCode, Json<Value>);
 
@@ -123,16 +123,22 @@ struct VerifyRequest {
 
 // ── Static data endpoints ──────────────────────────────────────────────────
 
-async fn get_missions() -> Json<Value> {
-    Json(serde_json::to_value(missions()).unwrap())
+async fn get_missions() -> Result<Json<Value>, AppError> {
+    let v = serde_json::to_value(missions())
+        .map_err(|e| internal_error(format!("missions serialization failed: {e}")))?;
+    Ok(Json(v))
 }
 
-async fn get_units() -> Json<Value> {
-    Json(serde_json::to_value(unit_definitions()).unwrap())
+async fn get_units() -> Result<Json<Value>, AppError> {
+    let v = serde_json::to_value(unit_definitions())
+        .map_err(|e| internal_error(format!("units serialization failed: {e}")))?;
+    Ok(Json(v))
 }
 
-async fn get_equipment() -> Json<Value> {
-    Json(serde_json::to_value(equipment()).unwrap())
+async fn get_equipment() -> Result<Json<Value>, AppError> {
+    let v = serde_json::to_value(equipment())
+        .map_err(|e| internal_error(format!("equipment serialization failed: {e}")))?;
+    Ok(Json(v))
 }
 
 // ── Auth endpoints ─────────────────────────────────────────────────────────
@@ -203,15 +209,19 @@ async fn post_auth_verify(
             gcn_ledger: vec![],
         })
         .await
-        .map_err(|e| bad_request(format!("account upsert: {e}")))?;
+        .map_err(|e| internal_error(format!("account upsert: {e}")))?;
 
-    Ok(Json(serde_json::to_value(&token).unwrap()))
+    let v = serde_json::to_value(&token)
+        .map_err(|e| internal_error(format!("session token serialization failed: {e}")))?;
+    Ok(Json(v))
 }
 
 async fn get_auth_session(
     AuthSession(token): AuthSession,
-) -> impl IntoResponse {
-    Json(serde_json::to_value(&token).unwrap())
+) -> Result<impl IntoResponse, AppError> {
+    let v = serde_json::to_value(&token)
+        .map_err(|e| internal_error(format!("session token serialization failed: {e}")))?;
+    Ok(Json(v))
 }
 
 // ── Simulation endpoints ───────────────────────────────────────────────────
@@ -370,18 +380,22 @@ async fn post_mission_resolve(
 
     // Presentation only, after the resolve: the report names the record's Commander.
     report.commander_name = Some(rec.name.clone());
+    let report_value = serde_json::to_value(&report)
+        .map_err(|e| internal_error(format!("report serialization failed: {e}")))?;
     Ok(Json(json!({
         "session_id": session_id.to_string(),
-        "report":     serde_json::to_value(&report).unwrap(),
+        "report":     report_value,
     })))
 }
 
 async fn post_combat_resolve(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CombatResolveRequest>,
-) -> impl IntoResponse {
-    // Serialize before combat_initiation_type is consumed by unwrap_or.
-    let req_payload = serde_json::to_value(&req).unwrap_or_default();
+) -> Result<impl IntoResponse, AppError> {
+    // Serialize before combat_initiation_type is consumed by unwrap_or. A failure refuses
+    // the request before anything is logged, so the log never holds a null request.
+    let req_payload = serde_json::to_value(&req)
+        .map_err(|e| internal_error(format!("request serialization failed: {e}")))?;
 
     let seed = req.seed_override.unwrap_or_else(generate_seed);
     let timestamp = Utc::now().to_rfc3339();
@@ -422,18 +436,22 @@ async fn post_combat_resolve(
     };
     log_session_start(state.input_log_repo.as_ref(), &config, session_id, req_payload, &timestamp).await;
 
-    Json(serde_json::json!({
+    let report_value = serde_json::to_value(&report)
+        .map_err(|e| internal_error(format!("report serialization failed: {e}")))?;
+    Ok(Json(serde_json::json!({
         "session_id": session_id.to_string(),
-        "report":     serde_json::to_value(&report).unwrap(),
-    }))
+        "report":     report_value,
+    })))
 }
 
 async fn post_pack_assault(
     State(state): State<Arc<AppState>>,
     Json(req): Json<PackAssaultRequest>,
-) -> impl IntoResponse {
-    // Serialize before combat_initiation_type is moved into resolve_pack_assault.
-    let req_payload = serde_json::to_value(&req).unwrap_or_default();
+) -> Result<impl IntoResponse, AppError> {
+    // Serialize before combat_initiation_type is moved into resolve_pack_assault. A failure
+    // refuses the request before anything is logged.
+    let req_payload = serde_json::to_value(&req)
+        .map_err(|e| internal_error(format!("request serialization failed: {e}")))?;
 
     let seed = req.seed_override.unwrap_or_else(generate_seed);
     let timestamp = Utc::now().to_rfc3339();
@@ -468,7 +486,7 @@ async fn post_pack_assault(
     };
     log_session_start(state.input_log_repo.as_ref(), &config, session_id, req_payload, &timestamp).await;
 
-    Json(report)
+    Ok(Json(report))
 }
 
 // ── Streaming combat session (requires auth) ───────────────────────────────
@@ -504,7 +522,10 @@ async fn get_session_integrity(
         session_id,
     )
     .await
-    .map_err(|e| bad_request(format!("Could not compute integrity: {e}")))?;
+    .map_err(|e| match e {
+        RepositoryError::NotFound    => not_found("no input log for this session"),
+        RepositoryError::Internal(m) => internal_error(format!("Could not compute integrity: {m}")),
+    })?;
 
     Ok(Json(json!({
         "session_id":    integrity.session_id,
@@ -573,12 +594,14 @@ async fn get_combat_aar(
         &state.config.sim,
     );
 
+    let report_value = serde_json::to_value(&report)
+        .map_err(|e| internal_error(format!("report serialization failed: {e}")))?;
     Ok(Json(json!({
         "session_id":    config.session_id,
         "seed":          config.seed,
         "build_version": config.build_version,
         "replayed_at":   Utc::now().to_rfc3339(),
-        "report":        serde_json::to_value(&report).unwrap(),
+        "report":        report_value,
     })))
 }
 
@@ -593,7 +616,7 @@ struct OreRunRequest {
 async fn post_ore_run_start(
     State(_state): State<Arc<AppState>>,
     Json(req): Json<OreRunRequest>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, AppError> {
     // TODO Phase 1: assign session_id and persist session config via save_session_config
     // before ore-run outcomes are attached to campaign resource events. The seed is
     // currently returned to the client but not anchored server-side — any run wired
@@ -601,11 +624,15 @@ async fn post_ore_run_start(
     let seed = req.seed_override.unwrap_or_else(generate_seed);
     let timestamp = Utc::now().to_rfc3339();
     let (result, ticks) = run_ore_run(req.approach, seed, &timestamp);
-    Json(json!({
-        "result": serde_json::to_value(&result).unwrap(),
-        "ticks":  serde_json::to_value(&ticks).unwrap(),
+    let result_value = serde_json::to_value(&result)
+        .map_err(|e| internal_error(format!("ore-run result serialization failed: {e}")))?;
+    let ticks_value = serde_json::to_value(&ticks)
+        .map_err(|e| internal_error(format!("ore-run ticks serialization failed: {e}")))?;
+    Ok(Json(json!({
+        "result": result_value,
+        "ticks":  ticks_value,
         "seed":   seed,
-    }))
+    })))
 }
 
 // ── Router ─────────────────────────────────────────────────────────────────

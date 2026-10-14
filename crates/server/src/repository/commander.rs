@@ -508,7 +508,7 @@ impl CommanderRepository for PostgresCommanderRepository {
         // The row lock is held to commit: any other writer of this Commander waits, and
         // the effects below are computed from what it committed before us.
         let row = sqlx::query!(
-            "SELECT stress, xp, rank, is_kia FROM commander_records WHERE commander_id = $1 FOR UPDATE",
+            "SELECT stress, xp, rank, is_kia FROM commander_records WHERE commander_id = $1 FOR NO KEY UPDATE",
             commander_id,
         )
         .fetch_optional(&mut *tx)

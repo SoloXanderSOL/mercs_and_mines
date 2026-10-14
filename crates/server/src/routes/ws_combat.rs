@@ -48,11 +48,21 @@ pub async fn ws_stream_handler(
         return StatusCode::GONE.into_response();
     }
 
+    // Serialize the logged request before the upgrade: a failure refuses the request with
+    // a 500 instead of logging a null payload, and nothing is logged.
+    let params_payload = match serde_json::to_value(&session.params) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("request serialization failed for {session_id}: {e}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
     let sim_cfg = state.config.sim.clone();
     let default_max_ticks = state.config.server.default_max_ticks;
     let input_log_repo = Arc::clone(&state.input_log_repo);
     ws.on_upgrade(move |socket| {
-        handle_ws(socket, session.params, session_id, sim_cfg, default_max_ticks, input_log_repo)
+        handle_ws(socket, session.params, params_payload, session_id, sim_cfg, default_max_ticks, input_log_repo)
     })
     .into_response()
 }
@@ -60,14 +70,12 @@ pub async fn ws_stream_handler(
 async fn handle_ws(
     mut socket: WebSocket,
     params: CombatResolveRequest,
+    params_payload: serde_json::Value,
     session_id: Uuid,
     sim_cfg: SimConfig,
     default_max_ticks: usize,
     input_log_repo: Arc<dyn InputLogRepository + Send + Sync>,
 ) {
-    // Serialize before any field is consumed by unwrap_or.
-    let params_payload = serde_json::to_value(&params).unwrap_or_default();
-
     let seed = params.seed_override.unwrap_or_else(generate_seed);
     let timestamp = Utc::now().to_rfc3339();
     let initiation = params.combat_initiation_type.unwrap_or(CombatInitiationType::Spotted);

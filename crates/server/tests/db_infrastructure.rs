@@ -2664,7 +2664,7 @@ async fn resolve_deployment_refuses_a_kia_commander() {
 
 /// 4g-2 test (c): a stress write that commits while `resolve_deployment` is running is
 /// built on, not overwritten. `tx_a` holds the Commander row lock; the resolver must wait
-/// for it at its `SELECT … FOR UPDATE`, then compute from what `tx_a` committed.
+/// for it at its `SELECT … FOR NO KEY UPDATE`, then compute from what `tx_a` committed.
 #[tokio::test]
 async fn resolve_deployment_builds_on_a_concurrent_stress_write() {
     use sim_engine::game_types::OutcomeType;
@@ -2688,6 +2688,10 @@ async fn resolve_deployment_builds_on_a_concurrent_stress_write() {
     assert!(PostgresCommanderRepository::new(wide.clone()).start_deployment(&d).await.unwrap());
 
     let mut tx_a = wide.begin().await.unwrap();
+    let tx_a_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *tx_a)
+        .await
+        .unwrap();
     sqlx::query("UPDATE commander_records SET stress = 60 WHERE commander_id = $1")
         .bind(commander_id)
         .execute(&mut *tx_a)
@@ -2703,8 +2707,9 @@ async fn resolve_deployment_builds_on_a_concurrent_stress_write() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         let waiting: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND datname = current_database()"
+            "SELECT count(*) FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))"
         )
+        .bind(tx_a_pid)
         .fetch_one(&wide)
         .await
         .unwrap();
@@ -2720,6 +2725,7 @@ async fn resolve_deployment_builds_on_a_concurrent_stress_write() {
     let after = PostgresCommanderRepository::new(pool.clone()).get_commander(commander_id).await.unwrap().unwrap();
     assert_eq!(after.stress, expected, "the concurrent write must be built on (stale would be {stale})");
     assert_eq!(eff.stress, expected);
+    wide.close().await;
 
     clean_wallet_4g1(&pool, &wallet).await;
 }
@@ -3217,6 +3223,42 @@ async fn post_mission(app: axum::Router, token: Option<&str>, body: &serde_json:
 
 fn default_state() -> mercs_server::state::AppState {
     mercs_server::state::AppState::new(std::sync::Arc::new(mercs_server::config::Config::default()))
+}
+
+/// GET of the integrity route; returns the status only.
+async fn get_integrity_status(app: axum::Router, session_id: uuid::Uuid) -> axum::http::StatusCode {
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("/api/session/{session_id}/integrity"))
+        .body(Body::empty())
+        .unwrap();
+    app.oneshot(req).await.unwrap().status()
+}
+
+/// INF-3a (GAP-46): an unknown session is `404`, not `400`.
+#[tokio::test]
+async fn integrity_route_answers_404_for_an_unknown_session() {
+    let app = mercs_server::routes::router(std::sync::Arc::new(default_state()));
+    let status = get_integrity_status(app, uuid::Uuid::new_v4()).await;
+    assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+}
+
+/// INF-3a (GAP-46): a log-store failure is `500`, not `400`. The store is a Postgres
+/// repository over a test-local pool that is already closed, so every read fails with
+/// `PoolClosed` → `RepositoryError::Internal`. No database is needed.
+#[tokio::test]
+async fn integrity_route_answers_500_when_the_log_store_fails() {
+    let closed = PgPoolOptions::new()
+        .connect_lazy("postgres://unused@127.0.0.1:1/unused")
+        .expect("lazy pool");
+    closed.close().await;
+    let mut state = default_state();
+    state.input_log_repo = std::sync::Arc::new(PostgresInputLogRepository::new(closed));
+    let app = mercs_server::routes::router(std::sync::Arc::new(state));
+    let status = get_integrity_status(app, uuid::Uuid::new_v4()).await;
+    assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
 }
 
 #[tokio::test]
