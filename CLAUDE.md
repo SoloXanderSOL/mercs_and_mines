@@ -52,8 +52,12 @@ As of 2026-10-13:
   `deployment_records` (migration 0016) holds one `active` row per Commander by partial
   unique index; a stale `active` row (> 5 min) is aborted on the next start.
   `commander_records.stress` has `CHECK (stress BETWEEN 0 AND 100)`. `mission_tier` is a
-  Phase 0 bridge from mission difficulty. Workspace `0.3.0`. **4d-2** was created by the
-  2026-10-13 scoping session.
+  Phase 0 bridge from mission difficulty. Workspace `0.3.0`. **4g-2 complete (`737939d`,
+  2026-10-14; Reviewer 4g-1 finding 1, the lost update):** the route re-reads the Commander
+  after `start_deployment` and refuses KIA/Shattered with 409 (deployment aborted) before
+  logging; `resolve_deployment(…, kia, tier, outcome, cfg)` computes stress, XP and rank
+  from a `SELECT … FOR UPDATE` row, refuses KIA (500), and returns `AppliedEffects`. No
+  bump (R7 does not fire). **4d-2** was created by the 2026-10-13 scoping session.
 - **Sections 5 and 6:** Not started.
 - **Sections 7 (Personnel Entity Model) and 8 (Combat Engine to canon):** created
   2026-10-13 (ruling D2), not started; both run before Section 6. Strike Mining and Base
@@ -65,9 +69,10 @@ As of 2026-10-13:
   two background-task tick gates (per-item floods are GAP-39); stress-penalty env keys warn
   on bad values; `logs/` untracked and gitignored.
 
-**143/143 tests green (79 `mercs_server` lib + 2 `aar_determinism` + 45 `db_infrastructure`
-+ 17 `sim_engine`; single-threaded, verified at `21a76ab`). Workspace version `0.3.0`.
-Next brick: INF-3 (ruling D3, 2026-10-13).** Any brick that changes what `resolve_mission` produces for
+**148/148 tests green (80 `mercs_server` lib + 2 `aar_determinism` + 49 `db_infrastructure`
++ 17 `sim_engine`; single-threaded, verified at `737939d`). Workspace version `0.3.0`.
+Next: the Director's pre-deploy production counts → push `dev` and deploy 0.3.0 → INF-3
+(ruling D3, 2026-10-13).** Any brick that changes what `resolve_mission` produces for
 a given seed bumps the workspace version in the same brick. 4b-1 reused `sim-engine`'s `OutcomeType` rather than
 defining a new enum, and writes **no input-log entry** — the rank-up entry was removed
 from scope. **ODQ-22 and ODQ-23 were ruled 2026-09-03 — engagement and mission outcomes
