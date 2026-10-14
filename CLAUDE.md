@@ -27,7 +27,7 @@ Before writing any code, read the Phase 1 Alpha Foundation document to understan
 is already built. Do not guess — read it. The status block at the top of that document
 is the ground truth.
 
-As of 2026-10-13:
+As of 2026-10-14:
 
 - **Section 1 (Database Layer):** 1a (Postgres) and 1b (Redis) complete. **1c-3 (the
   GAP-34 fix) built at `bb49b3c`:** `session_start` (header + full request + timestamp)
@@ -71,8 +71,8 @@ As of 2026-10-13:
 
 **148/148 tests green (80 `mercs_server` lib + 2 `aar_determinism` + 49 `db_infrastructure`
 + 17 `sim_engine`; single-threaded, verified at `737939d`). Workspace version `0.3.0`.
-Next: the Director's pre-deploy production counts → push `dev` and deploy 0.3.0 → INF-3
-(ruling D3, 2026-10-13).** Any brick that changes what `resolve_mission` produces for
+Production = `3edaca3` (0.3.0), deployed 2026-10-14. Next brick: INF-3a, then INF-3b
+(INF-3, ruling D3, 2026-10-13).** Any brick that changes what `resolve_mission` produces for
 a given seed bumps the workspace version in the same brick. 4b-1 reused `sim-engine`'s `OutcomeType` rather than
 defining a new enum, and writes **no input-log entry** — the rank-up entry was removed
 from scope. **ODQ-22 and ODQ-23 were ruled 2026-09-03 — engagement and mission outcomes
