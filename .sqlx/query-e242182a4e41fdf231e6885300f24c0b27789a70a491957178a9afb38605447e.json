@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE deployment_records SET status = 'resolved', outcome = $1, closed_at = now() WHERE deployment_id = $2 AND commander_id = $3 AND status = 'active'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e242182a4e41fdf231e6885300f24c0b27789a70a491957178a9afb38605447e"
+}

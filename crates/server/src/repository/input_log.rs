@@ -58,6 +58,15 @@ pub trait InputLogRepository: Send + Sync {
         campaign_id: &Uuid,
         entry: &shared::InputLogEntry,
     ) -> Result<(), RepositoryError>;
+
+    /// Writes a session's header and its first entry together, or neither (§4g item 9).
+    /// The mission route's fallible log write: it runs before the roll, and an `Err`
+    /// aborts the deployment. Keyed on `config.session_id`.
+    async fn start_session(
+        &self,
+        config: &shared::SessionConfig,
+        entry: &shared::InputLogEntry,
+    ) -> Result<(), RepositoryError>;
     // TODO(phase-2): add get_entries_by_campaign(&self, campaign_id: &Uuid)
     //   -> Result<Vec<InputLogEntry>, RepositoryError>
     // for replay and integrity audit of campaign-scoped log entries
@@ -203,6 +212,53 @@ impl InputLogRepository for PostgresInputLogRepository {
         .map_err(|e| RepositoryError::Internal(e.to_string()))?;
         Ok(())
     }
+
+    async fn start_session(
+        &self,
+        config: &shared::SessionConfig,
+        entry: &shared::InputLogEntry,
+    ) -> Result<(), RepositoryError> {
+        let session_uuid = Uuid::parse_str(&config.session_id)
+            .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        // Dropping `tx` without commit rolls back: no header lands without its entry.
+        let mut tx = self.pool.begin().await.map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        sqlx::query!(
+            r#"
+            INSERT INTO session_configs
+                (session_id, seed, build_version, sector_id, campaign_id, sector_tier, ruleset)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (session_id) DO NOTHING
+            "#,
+            session_uuid,
+            config.seed as i64,
+            config.build_version,
+            config.sector_id,
+            config.campaign_id,
+            config.sector_tier,
+            config.ruleset,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        sqlx::query!(
+            r#"
+            INSERT INTO input_logs (session_id, tick, seq, event_type, player_id, payload, narrative_event)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            "#,
+            session_uuid,
+            entry.tick as i64,
+            entry.seq as i64,
+            entry.event_type,
+            entry.player_id.as_deref(),
+            entry.payload.clone() as serde_json::Value,
+            entry.narrative_event.as_deref(),
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        tx.commit().await.map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        Ok(())
+    }
 }
 
 // ── In-memory implementation ──────────────────────────────────────────────────
@@ -267,6 +323,22 @@ impl InputLogRepository for InMemoryInputLogRepository {
         entry: &shared::InputLogEntry,
     ) -> Result<(), RepositoryError> {
         self.campaign_entries.entry(*campaign_id).or_default().push(entry.clone());
+        Ok(())
+    }
+
+    async fn start_session(
+        &self,
+        config: &shared::SessionConfig,
+        entry: &shared::InputLogEntry,
+    ) -> Result<(), RepositoryError> {
+        // The parse is the only fallible step, so it runs before anything is inserted.
+        let session_uuid = Uuid::parse_str(&config.session_id)
+            .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        // Hold the header slot's lock while the entry lands, so no reader sees one without the other.
+        let mut header = self.configs.entry(session_uuid).or_insert_with(|| config.clone());
+        *header = config.clone();
+        self.entries.entry(session_uuid).or_default().push(entry.clone());
+        drop(header);
         Ok(())
     }
 }

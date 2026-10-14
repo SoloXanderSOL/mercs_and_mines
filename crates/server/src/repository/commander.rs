@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
@@ -9,11 +12,78 @@ use uuid::Uuid;
 
 use super::RepositoryError;
 
-/// The `stress` column is SMALLINT with no CHECK constraint, so a stored value may sit
-/// outside 0..=100 (`create_commander` inserts unclamped). Clamp before handing it to
-/// the sim's u8 stress functions. The way back is a plain `i16::from(level)`.
-fn stress_to_level(stress: i16) -> u8 {
+/// Converts the SMALLINT `stress` column to the sim's u8 stress level. Migration 0016's
+/// `CHECK (stress BETWEEN 0 AND 100)` and `create_commander`'s clamp keep stored values in
+/// range; the clamp here is defence in depth. The way back is a plain `i16::from(level)`.
+pub fn stress_to_level(stress: i16) -> u8 {
     stress.clamp(0, 100) as u8
+}
+
+/// A one-shot mission's `active` row lives for milliseconds, so one older than this is a
+/// crash leftover. `start_deployment` aborts it before inserting (§4g item 10). Revisit
+/// when Phase 2 timed deployments make a long-lived `active` row legitimate.
+pub const STALE_DEPLOYMENT_AFTER: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// The `deployment_records.outcome` text. Exhaustive with no wildcard, so a new variant
+/// is a compile error here and in the migration's CHECK, never a silent `{:?}` string.
+pub fn outcome_db_str(o: &OutcomeType) -> &'static str {
+    match o {
+        OutcomeType::Success         => "Success",
+        OutcomeType::Defeat          => "Defeat",
+        OutcomeType::TacticalRetreat => "TacticalRetreat",
+        OutcomeType::Wipeout         => "Wipeout",
+    }
+}
+
+/// Rank-up side effects shared by `apply_mission_xp` and the mission route. Logs only;
+/// nothing here is written to the input log (a rank-up is recomputable).
+pub(crate) fn log_rank_up(commander_id: Uuid, from: i16, to: i16) {
+    if to > from {
+        tracing::info!(commander_id = %commander_id, from = from, to = to, "commander rank-up");
+        // TODO(phase-2): ranks 2-4 — implement Field Citations shortlist generation and
+        // citation_gate_pending resolution — see Commander_Field_Citations.md and Phase 2 §10.
+        if to == 5 {
+            // TODO(phase-2): offer Retirement Option — Commander_Field_Citations.md §4.
+            tracing::info!(commander_id = %commander_id, "rank 5 reached");
+        }
+    }
+}
+
+/// `create_commander` stores stress in 0..=100 and keeps `update_stress`'s invariant:
+/// a record that arrives at 100 is Shattered.
+fn clamp_new_record(mut r: CommanderRecord) -> CommanderRecord {
+    r.stress = r.stress.clamp(0, 100);
+    r.is_shattered = r.is_shattered || r.stress >= 100;
+    r
+}
+
+// ── Deployment records (brick 4g-1) ──────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct NewDeployment {
+    pub deployment_id: Uuid,
+    pub commander_id:  Uuid,
+    pub session_id:    Uuid,
+    pub mission_id:    String,
+    /// Supplied by the caller so the stale rule is testable without sleeping.
+    pub started_at:    DateTime<Utc>,
+}
+
+/// Mirrors `deployment_records`. `status` is `active` / `resolved` / `aborted`.
+#[derive(Debug, Clone)]
+pub struct DeploymentRecord {
+    pub deployment_id: Uuid,
+    pub commander_id:  Uuid,
+    pub session_id:    Uuid,
+    pub mission_id:    String,
+    pub status:        String,
+    pub outcome:       Option<String>,
+    pub started_at:    DateTime<Utc>,
+    pub closed_at:     Option<DateTime<Utc>>,
+}
+
+fn stale_cutoff(started_at: DateTime<Utc>) -> DateTime<Utc> {
+    started_at - chrono::Duration::seconds(STALE_DEPLOYMENT_AFTER.as_secs() as i64)
 }
 
 // ── CommanderRecord ──────────────────────────────────────────────────────────
@@ -58,6 +128,28 @@ pub trait CommanderRepository: Send + Sync {
     async fn list_commanders_by_campaign(&self, campaign_id: Uuid) -> Result<Vec<CommanderRecord>, RepositoryError>;
     async fn delete_commanders_by_campaign(&self, campaign_id: Uuid) -> Result<u64, RepositoryError>;
 
+    /// Records an `active` deployment. In one transaction it first aborts this Commander's
+    /// `active` row if it is older than `STALE_DEPLOYMENT_AFTER`, then inserts. Returns
+    /// `Ok(false)` when the Commander already has an `active` deployment: the partial
+    /// unique index `deployment_records_one_active` serialises each Commander.
+    async fn start_deployment(&self, d: &NewDeployment) -> Result<bool, RepositoryError>;
+    /// Marks an `active` deployment `aborted`. `NotFound` if it is not `active`.
+    async fn abort_deployment(&self, deployment_id: Uuid) -> Result<(), RepositoryError>;
+    /// The mission's atomic write (§4g item 6.5): stress (with `update_stress`'s Shattered
+    /// invariant), then rank and XP, then — last — the close of the `active` deployment.
+    /// Any statement touching 0 rows is `NotFound` and nothing is applied.
+    async fn resolve_deployment(
+        &self,
+        deployment_id: Uuid,
+        commander_id: Uuid,
+        stress: i16,
+        rank: i16,
+        xp: i32,
+        outcome: &OutcomeType,
+    ) -> Result<(), RepositoryError>;
+    /// Ordered by `started_at`.
+    async fn list_deployments_by_commander(&self, commander_id: Uuid) -> Result<Vec<DeploymentRecord>, RepositoryError>;
+
     /// Orchestration wrapper — Phase_1_Section_4 §4b. The arithmetic lives in
     /// commander_gen; this method only sequences one read and one existing write.
     async fn apply_mission_xp(
@@ -79,15 +171,7 @@ pub trait CommanderRepository: Send + Sync {
         // Shattered still earns: the mission that broke them still happened.
         let new_xp = rec.xp + crate::commander_gen::xp_award(tier, &outcome);
         let new_rank = crate::commander_gen::rank_for_xp(new_xp);
-        if new_rank > rec.rank {
-            tracing::info!(commander_id = %commander_id, from = rec.rank, to = new_rank, "commander rank-up");
-            // TODO(phase-2): ranks 2-4 — implement Field Citations shortlist generation and
-            // citation_gate_pending resolution — see Commander_Field_Citations.md and Phase 2 §10.
-            if new_rank == 5 {
-                // TODO(phase-2): offer Retirement Option — Commander_Field_Citations.md §4.
-                tracing::info!(commander_id = %commander_id, "rank 5 reached");
-            }
-        }
+        log_rank_up(commander_id, rec.rank, new_rank);
         self.update_rank_and_xp(commander_id, new_rank, new_xp).await
     }
 
@@ -144,6 +228,7 @@ impl PostgresCommanderRepository {
 #[async_trait]
 impl CommanderRepository for PostgresCommanderRepository {
     async fn create_commander(&self, r: CommanderRecord) -> Result<(), RepositoryError> {
+        let r = clamp_new_record(r);
         sqlx::query!(
             r#"INSERT INTO commander_records (
                 commander_id, campaign_id, player_wallet, name, rank, xp, stress,
@@ -213,7 +298,7 @@ impl CommanderRepository for PostgresCommanderRepository {
         // One statement: no update_stress call can leave stress at 100 without Shattered. The formula
         // stays in Rust; SQL only compares the already-clamped value. The literal is typed
         // SMALLINT so Postgres deduces one type for $1 (an int4 literal makes it ambiguous).
-        // (create_commander inserts its record verbatim and bypasses this).
+        // resolve_deployment runs this exact statement text inside its transaction.
         let result = sqlx::query!(
             "UPDATE commander_records SET stress = $1, is_shattered = is_shattered OR $1 >= 100::SMALLINT, updated_at = now() WHERE commander_id = $2",
             clamped,
@@ -332,17 +417,138 @@ impl CommanderRepository for PostgresCommanderRepository {
         .map_err(|e| RepositoryError::Internal(e.to_string()))?;
         Ok(result.rows_affected())
     }
+
+    async fn start_deployment(&self, d: &NewDeployment) -> Result<bool, RepositoryError> {
+        let mut tx = self.pool.begin().await.map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        sqlx::query!(
+            "UPDATE deployment_records SET status = 'aborted', closed_at = $2 WHERE commander_id = $1 AND status = 'active' AND started_at < $3",
+            d.commander_id,
+            d.started_at,
+            stale_cutoff(d.started_at),
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        let inserted = sqlx::query!(
+            "INSERT INTO deployment_records (deployment_id, commander_id, session_id, mission_id, status, started_at) VALUES ($1, $2, $3, $4, 'active', $5) ON CONFLICT (commander_id) WHERE status = 'active' DO NOTHING",
+            d.deployment_id,
+            d.commander_id,
+            d.session_id,
+            d.mission_id.clone(),
+            d.started_at,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        tx.commit().await.map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        Ok(inserted.rows_affected() == 1)
+    }
+
+    async fn abort_deployment(&self, deployment_id: Uuid) -> Result<(), RepositoryError> {
+        let result = sqlx::query!(
+            "UPDATE deployment_records SET status = 'aborted', closed_at = now() WHERE deployment_id = $1 AND status = 'active'",
+            deployment_id,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        if result.rows_affected() == 0 {
+            return Err(RepositoryError::NotFound);
+        }
+        Ok(())
+    }
+
+    async fn resolve_deployment(
+        &self,
+        deployment_id: Uuid,
+        commander_id: Uuid,
+        stress: i16,
+        rank: i16,
+        xp: i32,
+        outcome: &OutcomeType,
+    ) -> Result<(), RepositoryError> {
+        let clamped = i16::max(0, i16::min(100, stress));
+        // Dropping `tx` without commit rolls everything back, so every early return below
+        // leaves stress, XP, rank and the deployment exactly as they were.
+        let mut tx = self.pool.begin().await.map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        let r = sqlx::query!(
+            "UPDATE commander_records SET stress = $1, is_shattered = is_shattered OR $1 >= 100::SMALLINT, updated_at = now() WHERE commander_id = $2",
+            clamped,
+            commander_id,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        if r.rows_affected() == 0 {
+            return Err(RepositoryError::NotFound);
+        }
+        let r = sqlx::query!(
+            "UPDATE commander_records SET rank = $1, xp = $2, updated_at = now() WHERE commander_id = $3",
+            rank,
+            xp,
+            commander_id,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        if r.rows_affected() == 0 {
+            return Err(RepositoryError::NotFound);
+        }
+        // Last, and guarded on `active`: a closed or foreign deployment rolls back the above.
+        let r = sqlx::query!(
+            "UPDATE deployment_records SET status = 'resolved', outcome = $1, closed_at = now() WHERE deployment_id = $2 AND commander_id = $3 AND status = 'active'",
+            outcome_db_str(outcome),
+            deployment_id,
+            commander_id,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        if r.rows_affected() == 0 {
+            return Err(RepositoryError::NotFound);
+        }
+        tx.commit().await.map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn list_deployments_by_commander(&self, commander_id: Uuid) -> Result<Vec<DeploymentRecord>, RepositoryError> {
+        let rows = sqlx::query!(
+            r#"SELECT deployment_id, commander_id, session_id, mission_id, status, outcome, started_at, closed_at
+               FROM deployment_records WHERE commander_id = $1 ORDER BY started_at"#,
+            commander_id,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        Ok(rows.into_iter().map(|r| DeploymentRecord {
+            deployment_id: r.deployment_id,
+            commander_id:  r.commander_id,
+            session_id:    r.session_id,
+            mission_id:    r.mission_id,
+            status:        r.status,
+            outcome:       r.outcome,
+            started_at:    r.started_at,
+            closed_at:     r.closed_at,
+        }).collect())
+    }
 }
 
 // ── InMemoryCommanderRepository (unit-test stub) ─────────────────────────────
 
 pub struct InMemoryCommanderRepository {
     store: DashMap<Uuid, CommanderRecord>,
+    /// Every deployment method holds this one lock for its whole body, which stands in
+    /// for Postgres' transaction and the partial unique index.
+    deployments: Mutex<HashMap<Uuid, DeploymentRecord>>,
 }
 
 impl InMemoryCommanderRepository {
     pub fn new() -> Self {
-        Self { store: DashMap::new() }
+        Self { store: DashMap::new(), deployments: Mutex::new(HashMap::new()) }
+    }
+
+    fn lock_deployments(&self) -> Result<std::sync::MutexGuard<'_, HashMap<Uuid, DeploymentRecord>>, RepositoryError> {
+        self.deployments.lock().map_err(|e| RepositoryError::Internal(e.to_string()))
     }
 }
 
@@ -355,6 +561,7 @@ impl Default for InMemoryCommanderRepository {
 #[async_trait]
 impl CommanderRepository for InMemoryCommanderRepository {
     async fn create_commander(&self, record: CommanderRecord) -> Result<(), RepositoryError> {
+        let record = clamp_new_record(record);
         self.store.insert(record.commander_id, record);
         Ok(())
     }
@@ -413,6 +620,86 @@ impl CommanderRepository for InMemoryCommanderRepository {
             self.store.remove(&k);
         }
         Ok(count)
+    }
+
+    async fn start_deployment(&self, d: &NewDeployment) -> Result<bool, RepositoryError> {
+        let mut deps = self.lock_deployments()?;
+        // Mirrors the Postgres foreign key to commander_records.
+        if !self.store.contains_key(&d.commander_id) {
+            return Err(RepositoryError::Internal(format!(
+                "deployment_records.commander_id {} is not in commander_records", d.commander_id
+            )));
+        }
+        let cutoff = stale_cutoff(d.started_at);
+        for dep in deps.values_mut() {
+            if dep.commander_id == d.commander_id && dep.status == "active" && dep.started_at < cutoff {
+                dep.status = "aborted".into();
+                dep.closed_at = Some(d.started_at);
+            }
+        }
+        if deps.values().any(|dep| dep.commander_id == d.commander_id && dep.status == "active") {
+            return Ok(false);
+        }
+        deps.insert(d.deployment_id, DeploymentRecord {
+            deployment_id: d.deployment_id,
+            commander_id:  d.commander_id,
+            session_id:    d.session_id,
+            mission_id:    d.mission_id.clone(),
+            status:        "active".into(),
+            outcome:       None,
+            started_at:    d.started_at,
+            closed_at:     None,
+        });
+        Ok(true)
+    }
+
+    async fn abort_deployment(&self, deployment_id: Uuid) -> Result<(), RepositoryError> {
+        let mut deps = self.lock_deployments()?;
+        let dep = deps
+            .get_mut(&deployment_id)
+            .filter(|dep| dep.status == "active")
+            .ok_or(RepositoryError::NotFound)?;
+        dep.status = "aborted".into();
+        dep.closed_at = Some(Utc::now());
+        Ok(())
+    }
+
+    async fn resolve_deployment(
+        &self,
+        deployment_id: Uuid,
+        commander_id: Uuid,
+        stress: i16,
+        rank: i16,
+        xp: i32,
+        outcome: &OutcomeType,
+    ) -> Result<(), RepositoryError> {
+        let mut deps = self.lock_deployments()?;
+        // Validate everything before mutating anything: no partial write on any refusal.
+        let dep = deps
+            .get_mut(&deployment_id)
+            .filter(|dep| dep.commander_id == commander_id && dep.status == "active")
+            .ok_or(RepositoryError::NotFound)?;
+        let mut rec = self.store.get_mut(&commander_id).ok_or(RepositoryError::NotFound)?;
+        let clamped = i16::max(0, i16::min(100, stress));
+        rec.stress = clamped;
+        rec.is_shattered = rec.is_shattered || clamped >= 100;
+        rec.rank = rank;
+        rec.xp = xp;
+        dep.status = "resolved".into();
+        dep.outcome = Some(outcome_db_str(outcome).into());
+        dep.closed_at = Some(Utc::now());
+        Ok(())
+    }
+
+    async fn list_deployments_by_commander(&self, commander_id: Uuid) -> Result<Vec<DeploymentRecord>, RepositoryError> {
+        let deps = self.lock_deployments()?;
+        let mut out: Vec<DeploymentRecord> = deps
+            .values()
+            .filter(|dep| dep.commander_id == commander_id)
+            .cloned()
+            .collect();
+        out.sort_by_key(|dep| dep.started_at);
+        Ok(out)
     }
 }
 
@@ -609,6 +896,73 @@ mod tests {
         assert!(matches!(r, Err(RepositoryError::NotFound)), "got {:?}", r);
         let r = repo.apply_casualty_stress(Uuid::new_v4(), 1, &cfg).await;
         assert!(matches!(r, Err(RepositoryError::NotFound)), "got {:?}", r);
+    }
+
+    // ── deployments + create clamp (brick 4g-1) ──────────────────────────────
+
+    fn new_deployment(commander_id: Uuid, started_at: DateTime<Utc>) -> NewDeployment {
+        NewDeployment {
+            deployment_id: Uuid::new_v4(),
+            commander_id,
+            session_id: Uuid::new_v4(),
+            mission_id: "GUARD_DUTY".into(),
+            started_at,
+        }
+    }
+
+    #[tokio::test]
+    async fn in_memory_start_deployment_refuses_a_second_active_row() {
+        let (repo, id) = seeded_repo(0, 1, |_| {}).await;
+        let now = Utc::now();
+        assert!(repo.start_deployment(&new_deployment(id, now)).await.unwrap());
+        assert!(!repo.start_deployment(&new_deployment(id, now)).await.unwrap(), "second active row must be refused");
+        let deps = repo.list_deployments_by_commander(id).await.unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].status, "active");
+    }
+
+    #[tokio::test]
+    async fn in_memory_start_deployment_aborts_a_stale_active_row() {
+        let (repo, id) = seeded_repo(0, 1, |_| {}).await;
+        let now = Utc::now();
+        let stale = new_deployment(id, now - chrono::Duration::minutes(6));
+        assert!(repo.start_deployment(&stale).await.unwrap());
+        let fresh = new_deployment(id, now);
+        assert!(repo.start_deployment(&fresh).await.unwrap(), "a stale active row must not block the next start");
+        let deps = repo.list_deployments_by_commander(id).await.unwrap();
+        assert_eq!(deps.len(), 2);
+        assert_eq!(deps[0].deployment_id, stale.deployment_id);
+        assert_eq!(deps[0].status, "aborted");
+        assert_eq!(deps[0].closed_at, Some(now));
+        assert!(deps[0].outcome.is_none(), "an aborted deployment has no outcome");
+        assert_eq!(deps[1].status, "active");
+    }
+
+    #[tokio::test]
+    async fn in_memory_resolve_deployment_on_a_closed_row_changes_nothing() {
+        let (repo, id) = seeded_repo(88, 1, |r| r.stress = 30).await;
+        let d = new_deployment(id, Utc::now());
+        assert!(repo.start_deployment(&d).await.unwrap());
+        repo.abort_deployment(d.deployment_id).await.unwrap();
+        let r = repo.resolve_deployment(d.deployment_id, id, 100, 2, 100, &OutcomeType::Success).await;
+        assert!(matches!(r, Err(RepositoryError::NotFound)), "got {:?}", r);
+        let rec = repo.get_commander(id).await.unwrap().unwrap();
+        assert_eq!((rec.stress, rec.xp, rec.rank, rec.is_shattered), (30, 88, 1, false));
+        let deps = repo.list_deployments_by_commander(id).await.unwrap();
+        assert_eq!(deps[0].status, "aborted");
+    }
+
+    #[tokio::test]
+    async fn in_memory_create_commander_clamps_stress_and_shatters_at_100() {
+        let (repo, id) = seeded_repo(0, 1, |r| r.stress = 150).await;
+        let r = repo.get_commander(id).await.unwrap().unwrap();
+        assert_eq!(r.stress, 100);
+        assert!(r.is_shattered, "a record created at 100 is Shattered");
+
+        let (repo, id) = seeded_repo(0, 1, |r| r.stress = -5).await;
+        let r = repo.get_commander(id).await.unwrap().unwrap();
+        assert_eq!(r.stress, 0);
+        assert!(!r.is_shattered);
     }
 
     /// G4 (in-memory): F3 across all five single-row mutators.

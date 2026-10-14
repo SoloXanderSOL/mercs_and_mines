@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE deployment_records SET status = 'aborted', closed_at = $2 WHERE commander_id = $1 AND status = 'active' AND started_at < $3",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Timestamptz",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "680a9e581865b3dd09050ebaf32d55d875d82d71b9415bb9bc826a3e4d4e8b8a"
+}

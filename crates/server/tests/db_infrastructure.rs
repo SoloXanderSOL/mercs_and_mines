@@ -20,6 +20,7 @@ use mercs_server::repository::{
     DeploymentTimer, RedisTimerRepository, TimerRepository, TimerType,
     CombatSession, RedisSessionStateRepository, SessionStateRepository,
     ConvoyDbRecord, ConvoyRepository, PostgresConvoyRepository,
+    NewDeployment, outcome_db_str,
 };
 
 async fn test_pool() -> Option<sqlx::PgPool> {
@@ -2441,6 +2442,241 @@ async fn convoy_timer_fires_and_marks_arrived() {
     ]).await.ok();
     conn.srem::<_, _, ()>("sectors:all", &sector_id_str).await.ok();
     let _ = (convoy_id_str, sector_id_str);
+}
+
+// ── Brick 4g-1: deployment records, start_session, stress CHECK ─────────────
+
+/// Removes everything a 4g-1 test wallet owns, in FK order: deployment_records →
+/// section_records → commander_records (and their campaigns) → membership → player_accounts.
+/// `deployment_records.commander_id` is ON DELETE RESTRICT, so it must go first.
+async fn clean_wallet_4g1(pool: &sqlx::PgPool, wallet: &[u8]) {
+    sqlx::query("DELETE FROM deployment_records WHERE commander_id IN (SELECT commander_id FROM commander_records WHERE player_wallet = $1)")
+        .bind(wallet).execute(pool).await.expect("deployment_records cleanup failed");
+    sqlx::query("DELETE FROM section_records WHERE commander_id IN (SELECT commander_id FROM commander_records WHERE player_wallet = $1)")
+        .bind(wallet).execute(pool).await.ok();
+    let campaigns: Vec<uuid::Uuid> = sqlx::query_scalar("SELECT DISTINCT campaign_id FROM commander_records WHERE player_wallet = $1")
+        .bind(wallet).fetch_all(pool).await.unwrap_or_default();
+    sqlx::query("DELETE FROM commander_records WHERE player_wallet = $1")
+        .bind(wallet).execute(pool).await.expect("commander_records cleanup failed");
+    for c in campaigns {
+        sqlx::query("DELETE FROM campaign_instances WHERE campaign_id = $1")
+            .bind(c).execute(pool).await.ok();
+    }
+    sqlx::query("DELETE FROM player_campaign_membership WHERE wallet_address = $1")
+        .bind(wallet).execute(pool).await.ok();
+    sqlx::query("DELETE FROM player_accounts WHERE wallet_address = $1")
+        .bind(wallet).execute(pool).await.ok();
+}
+
+/// Pre-cleans `wallet`, then seeds its account, a campaign and one generated Commander
+/// at the given stress. Returns (campaign_id, commander_id).
+async fn seed_commander_4g1(pool: &sqlx::PgPool, wallet: [u8; 32], stress: i16) -> (uuid::Uuid, uuid::Uuid) {
+    clean_wallet_4g1(pool, &wallet).await;
+    sqlx::query(
+        "INSERT INTO player_accounts (wallet_address, trust_standing, gcn_balance)
+         VALUES ($1, 0, 0) ON CONFLICT (wallet_address) DO NOTHING"
+    )
+    .bind(wallet.to_vec())
+    .execute(pool)
+    .await
+    .expect("player_accounts FK seed failed");
+    let campaign = PostgresCampaignRepository::new(pool.clone())
+        .create_campaign(&NewCampaignInstance { sector_id: uuid::Uuid::new_v4(), map_seed: 0x4601_i64 })
+        .await
+        .expect("create campaign failed");
+    let mut record = mercs_server::commander_gen::generate_commander(wallet.to_vec(), campaign.campaign_id, 42u32);
+    record.stress = stress;
+    let commander_id = record.commander_id;
+    PostgresCommanderRepository::new(pool.clone())
+        .create_commander(record)
+        .await
+        .expect("create_commander failed");
+    (campaign.campaign_id, commander_id)
+}
+
+fn new_deployment_4g1(commander_id: uuid::Uuid, started_at: chrono::DateTime<chrono::Utc>) -> NewDeployment {
+    NewDeployment {
+        deployment_id: uuid::Uuid::new_v4(),
+        commander_id,
+        session_id: uuid::Uuid::new_v4(),
+        mission_id: "GUARD_DUTY".into(),
+        started_at,
+    }
+}
+
+/// 4g-1 — one active deployment per Commander is the database's rule, not the route's.
+/// Two racing starts produce exactly one `true`, and a raw second `active` INSERT (no
+/// ON CONFLICT) is rejected by the partial unique index itself.
+#[tokio::test]
+async fn deployment_second_active_row_is_refused_by_the_database() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    let wallet = [14u8; 32];
+    let (_campaign_id, commander_id) = seed_commander_4g1(&pool, wallet, 0).await;
+    let repo = PostgresCommanderRepository::new(pool.clone());
+
+    let now = chrono::Utc::now();
+    let (a, b) = (new_deployment_4g1(commander_id, now), new_deployment_4g1(commander_id, now));
+    let (ra, rb) = tokio::join!(repo.start_deployment(&a), repo.start_deployment(&b));
+    let (ra, rb) = (ra.expect("start a failed"), rb.expect("start b failed"));
+    assert!(ra ^ rb, "exactly one concurrent start must win (got {ra}, {rb})");
+
+    let raw = sqlx::query(
+        "INSERT INTO deployment_records (deployment_id, commander_id, session_id, mission_id, status, started_at)
+         VALUES ($1, $2, $3, 'GUARD_DUTY', 'active', now())"
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(commander_id)
+    .bind(uuid::Uuid::new_v4())
+    .execute(&pool)
+    .await;
+    let err = raw.expect_err("a second active row must violate deployment_records_one_active");
+    let code = err.as_database_error().and_then(|d| d.code()).map(|c| c.to_string());
+    assert_eq!(code.as_deref(), Some("23505"), "expected a unique violation, got {err}");
+
+    let deps = repo.list_deployments_by_commander(commander_id).await.unwrap();
+    assert_eq!(deps.iter().filter(|d| d.status == "active").count(), 1);
+
+    clean_wallet_4g1(&pool, &wallet).await;
+}
+
+/// 4g-1 — a crash leftover heals itself: the next start aborts an `active` row older
+/// than STALE_DEPLOYMENT_AFTER and then succeeds. A fresh `active` row is never touched.
+#[tokio::test]
+async fn deployment_stale_active_row_is_aborted_on_next_start() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    let wallet = [14u8; 32];
+    let (_campaign_id, commander_id) = seed_commander_4g1(&pool, wallet, 0).await;
+    let repo = PostgresCommanderRepository::new(pool.clone());
+
+    let now = chrono::Utc::now();
+    let stale = new_deployment_4g1(commander_id, now - chrono::Duration::minutes(6));
+    assert!(repo.start_deployment(&stale).await.unwrap());
+    // Four minutes later is not yet stale: refused.
+    assert!(!repo.start_deployment(&new_deployment_4g1(commander_id, now - chrono::Duration::minutes(2))).await.unwrap());
+    let fresh = new_deployment_4g1(commander_id, now);
+    assert!(repo.start_deployment(&fresh).await.unwrap(), "a stale active row must not block the next start");
+
+    let deps = repo.list_deployments_by_commander(commander_id).await.unwrap();
+    assert_eq!(deps.len(), 2);
+    assert_eq!((deps[0].deployment_id, deps[0].status.as_str()), (stale.deployment_id, "aborted"));
+    assert!(deps[0].closed_at.is_some() && deps[0].outcome.is_none(), "aborted: closed, no outcome");
+    assert_eq!((deps[1].deployment_id, deps[1].status.as_str()), (fresh.deployment_id, "active"));
+
+    clean_wallet_4g1(&pool, &wallet).await;
+}
+
+/// 4g-1 — the atomic write is atomic in Postgres. The close statement runs last and is
+/// guarded on `active`; on an already-resolved deployment it touches 0 rows, and the
+/// stress and XP statements that already ran are rolled back.
+#[tokio::test]
+async fn resolve_deployment_rolls_back_when_the_close_fails() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    let wallet = [15u8; 32];
+    let (_campaign_id, commander_id) = seed_commander_4g1(&pool, wallet, 30).await;
+    let repo = PostgresCommanderRepository::new(pool.clone());
+
+    let d = new_deployment_4g1(commander_id, chrono::Utc::now());
+    assert!(repo.start_deployment(&d).await.unwrap());
+    repo.resolve_deployment(d.deployment_id, commander_id, 40, 2, 100, &sim_engine::game_types::OutcomeType::Success)
+        .await
+        .expect("first resolve failed");
+    let before = repo.get_commander(commander_id).await.unwrap().unwrap();
+    assert_eq!((before.stress, before.xp, before.rank, before.is_shattered), (40, 100, 2, false));
+
+    // Second resolve on the now-closed deployment: stress 100 would shatter if it stuck.
+    let r = repo
+        .resolve_deployment(d.deployment_id, commander_id, 100, 3, 500, &sim_engine::game_types::OutcomeType::Defeat)
+        .await;
+    assert!(matches!(r, Err(mercs_server::repository::RepositoryError::NotFound)), "got {:?}", r);
+
+    let after = repo.get_commander(commander_id).await.unwrap().unwrap();
+    assert_eq!((after.stress, after.xp, after.rank, after.is_shattered), (40, 100, 2, false),
+        "a failed close must roll back the stress and XP writes");
+    let deps = repo.list_deployments_by_commander(commander_id).await.unwrap();
+    assert_eq!(deps[0].status, "resolved");
+    assert_eq!(deps[0].outcome.as_deref(), Some(outcome_db_str(&sim_engine::game_types::OutcomeType::Success)));
+
+    clean_wallet_4g1(&pool, &wallet).await;
+}
+
+/// 4g-1 — `start_session` writes the header and its entry together or not at all. The
+/// entry insert is forced to fail inside Postgres: `jsonb` rejects the `\u0000` escape.
+#[tokio::test]
+async fn start_session_leaves_no_header_when_the_entry_insert_fails() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    let repo = PostgresInputLogRepository::new(pool.clone());
+    let config_for = |sid: uuid::Uuid| shared::SessionConfig {
+        session_id:    sid.to_string(),
+        build_version: "test".into(),
+        seed:          7,
+        sector_id:     uuid::Uuid::nil(),
+        campaign_id:   uuid::Uuid::nil(),
+        sector_tier:   "Contested".into(),
+        ruleset:       "standard_v1".into(),
+    };
+    let entry_with = |payload: serde_json::Value| shared::InputLogEntry {
+        tick: 0, seq: 0, event_type: "session_start".into(), player_id: None, payload, narrative_event: None,
+    };
+
+    // Failure: the header insert runs, then the entry insert fails, and the header must not survive.
+    let bad_sid = uuid::Uuid::new_v4();
+    let r = repo.start_session(&config_for(bad_sid), &entry_with(serde_json::json!({ "x": "\u{0000}" }))).await;
+    assert!(r.is_err(), "jsonb must reject a NUL escape; the forced failure did not fire");
+    assert!(repo.get_session_config(&bad_sid).await.unwrap().is_none(), "orphan session_configs header left behind");
+    assert!(repo.get_entries_by_session(&bad_sid).await.unwrap().is_empty());
+
+    // Control: the same call with a clean payload writes both rows.
+    let ok_sid = uuid::Uuid::new_v4();
+    repo.start_session(&config_for(ok_sid), &entry_with(serde_json::json!({ "x": 1 }))).await.expect("start_session failed");
+    assert!(repo.get_session_config(&ok_sid).await.unwrap().is_some());
+    assert_eq!(repo.get_entries_by_session(&ok_sid).await.unwrap().len(), 1);
+
+    // Post-test cleanup of the immutable tables.
+    sqlx::query("ALTER TABLE input_logs DISABLE TRIGGER ALL").execute(&pool).await.ok();
+    sqlx::query("DELETE FROM input_logs WHERE session_id = $1").bind(ok_sid).execute(&pool).await.ok();
+    sqlx::query("ALTER TABLE input_logs ENABLE TRIGGER ALL").execute(&pool).await.ok();
+    sqlx::query("ALTER TABLE session_configs DISABLE TRIGGER ALL").execute(&pool).await.ok();
+    sqlx::query("DELETE FROM session_configs WHERE session_id = $1").bind(ok_sid).execute(&pool).await.ok();
+    sqlx::query("ALTER TABLE session_configs ENABLE TRIGGER ALL").execute(&pool).await.ok();
+}
+
+/// 4g-1 — migration 0016's CHECK rejects an out-of-range stress, and `create_commander`
+/// clamps on insert and applies the Shattered invariant.
+#[tokio::test]
+async fn commander_stress_check_rejects_out_of_range() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    let wallet = [15u8; 32];
+    let (_campaign_id, commander_id) = seed_commander_4g1(&pool, wallet, 150).await;
+    let repo = PostgresCommanderRepository::new(pool.clone());
+
+    let rec = repo.get_commander(commander_id).await.unwrap().unwrap();
+    assert_eq!(rec.stress, 100, "create_commander must clamp 150 to 100");
+    assert!(rec.is_shattered, "a record created at 100 is Shattered");
+
+    let raw = sqlx::query("UPDATE commander_records SET stress = 101 WHERE commander_id = $1")
+        .bind(commander_id)
+        .execute(&pool)
+        .await;
+    let err = raw.expect_err("stress 101 must violate commander_records_stress_range");
+    let code = err.as_database_error().and_then(|d| d.code()).map(|c| c.to_string());
+    assert_eq!(code.as_deref(), Some("23514"), "expected a check violation, got {err}");
+
+    clean_wallet_4g1(&pool, &wallet).await;
 }
 
 /// Local copy of the AAR test's fixture (seed_override 42, max_ticks 25).

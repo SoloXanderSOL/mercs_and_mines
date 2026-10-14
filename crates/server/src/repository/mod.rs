@@ -37,8 +37,9 @@ pub use campaign::{
 };
 pub use convoy::{ConvoyDbRecord, ConvoyRepository, InMemoryConvoyRepository, PostgresConvoyRepository};
 pub use commander::{
-    CommanderRecord, CommanderRepository,
-    InMemoryCommanderRepository, PostgresCommanderRepository,
+    outcome_db_str, CommanderRecord, CommanderRepository, DeploymentRecord,
+    InMemoryCommanderRepository, NewDeployment, PostgresCommanderRepository,
+    STALE_DEPLOYMENT_AFTER,
 };
 pub use postgres_account::PostgresAccountRepository;
 pub use section::{

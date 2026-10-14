@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO deployment_records (deployment_id, commander_id, session_id, mission_id, status, started_at) VALUES ($1, $2, $3, $4, 'active', $5) ON CONFLICT (commander_id) WHERE status = 'active' DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "5cc96a11bf5c3482a7072a18e2ac2c694bf78c1745dd2a5939571e87ec9b2291"
+}
