@@ -48,6 +48,8 @@ pub struct ExpiryWarns {
     pub get_convoy: KeyedRepeatWarn,
     pub cancel_timer: KeyedRepeatWarn,
     pub phantom: KeyedRepeatWarn,
+    /// Keyed by the raw zset member: a poisoned member may not be a UUID (GAP-53).
+    pub poisoned: KeyedRepeatWarn<String>,
 }
 
 impl ExpiryWarns {
@@ -58,6 +60,7 @@ impl ExpiryWarns {
             get_convoy: KeyedRepeatWarn::new(EXPIRY_WARN_EVERY_TICKS),
             cancel_timer: KeyedRepeatWarn::new(EXPIRY_WARN_EVERY_TICKS),
             phantom: KeyedRepeatWarn::new(EXPIRY_WARN_EVERY_TICKS),
+            poisoned: KeyedRepeatWarn::new(EXPIRY_WARN_EVERY_TICKS),
         }
     }
 }
@@ -72,7 +75,7 @@ impl Default for ExpiryWarns {
 /// or of one convoy, logs its first occurrence and then about once an hour, and logs its
 /// recovery once. Per-convoy counters are evicted when the timer leaves the due set.
 pub async fn poll_expiry_once(state: &AppState, warns: &mut ExpiryWarns) {
-    let timers = match state.timer_repo.get_due_timers(Utc::now()).await {
+    let scan = match state.timer_repo.get_due_timers(Utc::now()).await {
         Ok(v) => {
             if let Some(n) = warns.due_timers.ok() {
                 tracing::info!("poll_expiry_once: get_due_timers recovered after {n} failed polls");
@@ -88,6 +91,24 @@ pub async fn poll_expiry_once(state: &AppState, warns: &mut ExpiryWarns) {
             return;
         }
     };
+
+    // A poisoned member is taken out of the scan, so it cannot stall the good timers (GAP-53).
+    let poisoned_live: HashSet<String> = scan.poisoned.iter().map(|p| p.member.clone()).collect();
+    warns.poisoned.retain(&poisoned_live);
+    for p in &scan.poisoned {
+        let member = &p.member;
+        let quarantine = match state.timer_repo.quarantine_timer(member).await {
+            Ok(()) => "quarantined".to_string(),
+            Err(e) => format!("quarantine failed, retrying next poll: {e:?}"),
+        };
+        match warns.poisoned.fail(member.clone()) {
+            Some(1) => tracing::warn!("poisoned timer member {member:?} ({}) — {quarantine}", p.reason),
+            Some(n) => tracing::warn!("poisoned timer member {member:?} still due ({n} consecutive polls; {}) — {quarantine}", p.reason),
+            None => {}
+        }
+    }
+
+    let timers = scan.due;
     let live: HashSet<Uuid> = timers
         .iter()
         .filter(|t| matches!(t.timer_type, TimerType::ConvoyArrival))
@@ -286,7 +307,10 @@ pub async fn run_convoy_expiry_task(state: Arc<AppState>) {
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::repository::{DeploymentTimer, PostgresConvoyRepository, WalletAddress};
+    use crate::repository::{
+        DeploymentTimer, DueTimers, PoisonedTimer, PostgresConvoyRepository, RepositoryError,
+        TimerRepository, WalletAddress,
+    };
 
     #[tokio::test]
     async fn poll_expiry_suppresses_per_timer_and_evicts() {
@@ -316,5 +340,50 @@ mod tests {
         state.timer_repo.cancel_timer(a).await.expect("in-memory cancel");
         poll_expiry_once(&state, &mut warns).await;
         assert_eq!(warns.mark_arrived.len(), 1, "a timer that left the due set is evicted");
+    }
+
+    /// Reports `poisoned` members (none due) and records every quarantine call.
+    struct PoisonedScan {
+        poisoned: std::sync::Mutex<Vec<String>>,
+        quarantined: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl TimerRepository for PoisonedScan {
+        async fn schedule_timer(&self, _: DeploymentTimer) -> Result<(), RepositoryError> {
+            Ok(())
+        }
+        async fn cancel_timer(&self, _: Uuid) -> Result<(), RepositoryError> {
+            Ok(())
+        }
+        async fn get_due_timers(&self, _: chrono::DateTime<Utc>) -> Result<DueTimers, RepositoryError> {
+            let poisoned = self.poisoned.lock().unwrap().iter()
+                .map(|m| PoisonedTimer { member: m.clone(), reason: "test".into() })
+                .collect();
+            Ok(DueTimers { due: Vec::new(), poisoned })
+        }
+        async fn quarantine_timer(&self, member: &str) -> Result<(), RepositoryError> {
+            self.quarantined.lock().unwrap().push(member.to_string());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn poll_expiry_quarantines_poisoned_members() {
+        let stub = Arc::new(PoisonedScan {
+            poisoned: std::sync::Mutex::new(vec!["not-a-uuid".to_string()]),
+            quarantined: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut state = AppState::new(Arc::new(Config::default()));
+        state.timer_repo = stub.clone();
+        let mut warns = ExpiryWarns::new();
+
+        poll_expiry_once(&state, &mut warns).await;
+        assert_eq!(*stub.quarantined.lock().unwrap(), ["not-a-uuid"], "the poisoned member is quarantined");
+        assert_eq!(warns.poisoned.len(), 1, "the poisoned member is warned under its own key");
+
+        stub.poisoned.lock().unwrap().clear();
+        poll_expiry_once(&state, &mut warns).await;
+        assert_eq!(warns.poisoned.len(), 0, "a member that left the scan is evicted");
     }
 }

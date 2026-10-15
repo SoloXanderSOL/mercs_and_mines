@@ -762,7 +762,7 @@ async fn timer_repository_redis_is_correct() {
     repo.schedule_timer(timer_b.clone()).await.expect("schedule timer_b failed");
 
     // 2. get_due_timers(now) — only the past timer should be returned.
-    let due = repo.get_due_timers(now).await.expect("get_due_timers failed");
+    let due = repo.get_due_timers(now).await.expect("get_due_timers failed").due;
     assert_eq!(due.len(), 1, "expected exactly one due timer");
     assert_eq!(due[0].timer_id, timer_a_id, "due timer must be timer_a");
 
@@ -775,7 +775,7 @@ async fn timer_repository_redis_is_correct() {
 
     // 5. After cancel, scanning far-future window still returns only timer_a.
     let far_future = now + chrono::Duration::seconds(7200);
-    let after_cancel = repo.get_due_timers(far_future).await.expect("get_due_timers (far_future) failed");
+    let after_cancel = repo.get_due_timers(far_future).await.expect("get_due_timers (far_future) failed").due;
     assert_eq!(after_cancel.len(), 1, "only timer_a must remain after timer_b is cancelled");
     assert_eq!(after_cancel[0].timer_id, timer_a_id);
 
@@ -827,7 +827,8 @@ async fn cancel_timer_removes_from_both_sorted_sets() {
     // Verify it appears before cancel.
     let before = repo.get_due_timers(chrono::Utc::now() + chrono::Duration::seconds(60))
         .await
-        .expect("get_due_timers before cancel failed");
+        .expect("get_due_timers before cancel failed")
+        .due;
     assert!(before.iter().any(|t| t.timer_id == timer_id), "timer must appear before cancel");
 
     repo.cancel_timer(timer_id).await.expect("cancel_timer failed");
@@ -835,7 +836,8 @@ async fn cancel_timer_removes_from_both_sorted_sets() {
     // After cancel, a far-future scan must not return the cancelled timer.
     let after = repo.get_due_timers(chrono::Utc::now() + chrono::Duration::seconds(7200))
         .await
-        .expect("get_due_timers after cancel failed");
+        .expect("get_due_timers after cancel failed")
+        .due;
     assert!(
         !after.iter().any(|t| t.timer_id == timer_id),
         "cancelled timer must not appear in get_due_timers"
@@ -3920,4 +3922,162 @@ async fn strict_migrator_rejects_missing_applied_version() {
         matches!(r, Err(sqlx::migrate::MigrateError::VersionMissing(99999))),
         "with ignore_missing off the same migrator must refuse: {r:?}"
     );
+}
+
+// ── INF-5: GAP-53, poisoned timer members ────────────────────────────────────
+
+#[tokio::test]
+async fn get_due_timers_reports_poisoned_members() {
+    use redis::AsyncCommands;
+    let Some(url) = std::env::var("TEST_REDIS_URL").ok() else {
+        eprintln!("TEST_REDIS_URL not set — skipping Redis poisoned-timer test");
+        return;
+    };
+    let client = redis::Client::open(url).expect("Invalid TEST_REDIS_URL");
+    let mut conn = redis::aio::ConnectionManager::new(client).await.expect("Failed to connect to Redis");
+    let repo = RedisTimerRepository::new(conn.clone());
+
+    let sector_id = uuid::Uuid::new_v4();
+    let past = (chrono::Utc::now() - chrono::Duration::seconds(60)).timestamp() as f64;
+    let good_id = uuid::Uuid::new_v4();
+    let bad_uuid = format!("gap53-not-a-uuid-{}", uuid::Uuid::new_v4());
+    let bad_json = uuid::Uuid::new_v4().to_string();
+    let orphan = uuid::Uuid::new_v4().to_string();
+    let sector_zset = format!("sector:{sector_id}:timers");
+
+    repo.schedule_timer(DeploymentTimer {
+        timer_id:      good_id,
+        player_wallet: WalletAddress([9u8; 32]),
+        sector_id,
+        timer_type:    TimerType::ConvoyArrival,
+        fires_at:      chrono::Utc::now() - chrono::Duration::seconds(60),
+    }).await.expect("schedule good timer");
+    conn.zadd::<_, _, _, ()>("timers:global", &bad_uuid, past).await.expect("ZADD non-UUID");
+    conn.set::<_, _, ()>(format!("timer:{bad_json}"), "{not json").await.expect("SET bad payload");
+    conn.set::<_, _, ()>(format!("timer:{bad_json}:sector_id"), sector_id.to_string()).await.expect("SET bad reverse");
+    conn.zadd::<_, _, _, ()>(&sector_zset, &bad_json, past).await.expect("ZADD bad sector");
+    conn.zadd::<_, _, _, ()>("timers:global", &bad_json, past).await.expect("ZADD bad payload");
+    conn.zadd::<_, _, _, ()>("timers:global", &orphan, past).await.expect("ZADD orphan");
+
+    let scan = repo.get_due_timers(chrono::Utc::now()).await.expect("one bad member must not fail the scan");
+    assert!(scan.due.iter().any(|t| t.timer_id == good_id), "the good timer is still due");
+    let ours = [bad_uuid.as_str(), bad_json.as_str(), orphan.as_str()];
+    for m in ours {
+        assert!(scan.poisoned.iter().any(|p| p.member == m), "{m} must be reported as poisoned");
+    }
+    assert!(!scan.due.iter().any(|t| ours.contains(&t.timer_id.to_string().as_str())));
+
+    for m in ours {
+        repo.quarantine_timer(m).await.expect("quarantine");
+    }
+    for m in ours {
+        let score: Option<f64> = conn.zscore("timers:global", m).await.expect("ZSCORE");
+        assert!(score.is_none(), "{m} must leave timers:global");
+        let q: bool = conn.sismember("timers:quarantine", m).await.expect("SISMEMBER");
+        assert!(q, "{m} must be recorded in timers:quarantine");
+    }
+    let kept: bool = conn.exists(format!("timer:{bad_json}")).await.expect("EXISTS");
+    assert!(kept, "a poisoned payload is kept for hand recovery");
+    let in_sector: Option<f64> = conn.zscore(&sector_zset, &bad_json).await.expect("ZSCORE sector");
+    assert!(in_sector.is_none(), "the reverse lookup removes the member from its sector zset");
+
+    // Cleanup: this test's keys and quarantine members only.
+    repo.cancel_timer(good_id).await.ok();
+    conn.del::<_, ()>(vec![format!("timer:{bad_json}"), format!("timer:{bad_json}:sector_id"), sector_zset]).await.ok();
+    for m in ours {
+        conn.zrem::<_, _, ()>("timers:global", m).await.ok();
+        conn.srem::<_, _, ()>("timers:quarantine", m).await.ok();
+    }
+}
+
+#[tokio::test]
+async fn poisoned_member_does_not_stall_a_real_arrival() {
+    use std::sync::Arc;
+    use mercs_server::config::Config;
+    use mercs_server::convoy_expiry::{poll_expiry_once, ExpiryWarns};
+    use mercs_server::state::AppState;
+    use redis::AsyncCommands;
+
+    let Some(pool) = test_pool().await else {
+        eprintln!("TEST_DATABASE_URL not set — skipping");
+        return;
+    };
+    let Some(redis_url) = std::env::var("TEST_REDIS_URL").ok() else {
+        eprintln!("TEST_REDIS_URL not set — skipping");
+        return;
+    };
+    let client = redis::Client::open(redis_url).expect("Invalid TEST_REDIS_URL");
+    let mut conn = redis::aio::ConnectionManager::new(client).await.expect("Failed to connect to Redis");
+
+    let convoy_repo = Arc::new(PostgresConvoyRepository::new(pool.clone()));
+    let timer_repo  = Arc::new(RedisTimerRepository::new(conn.clone()));
+    let sector_repo = Arc::new(RedisSectorStateRepository::new(conn.clone()));
+
+    let convoy_id   = uuid::Uuid::new_v4();
+    let sector_id   = uuid::Uuid::new_v4();
+    let campaign_id = uuid::Uuid::new_v4();
+    sector_repo.upsert_sector(SectorState {
+        sector_id,
+        campaign_id,
+        occupation_status:   OccupationStatus::Neutral,
+        owner:               None,
+        deployed_unit_count: 0,
+        active_timer_ids:    vec![],
+        terrain:             std::collections::HashMap::new(),
+        magma_veins:         vec![],
+        hex_occupancy:       std::collections::HashMap::new(),
+    }).await.expect("upsert_sector");
+    // No account: convoy_records.owner_wallet has no FK.
+    convoy_repo.create_convoy(ConvoyDbRecord {
+        convoy_id,
+        sector_id,
+        owner_wallet:  vec![7u8; 32],
+        origin_q:      0,
+        origin_r:      0,
+        destination_q: 1,
+        destination_r: 0,
+        route:         serde_json::json!([{"q": 0, "r": 0}, {"q": 1, "r": 0}]),
+        arrival_time:  chrono::Utc::now() - chrono::Duration::seconds(1),
+        vehicle_class: "BehemothMegaTruck".to_string(),
+        cargo:         serde_json::json!({}),
+        in_transit:    true,
+        created_at:    chrono::Utc::now(),
+    }).await.expect("create_convoy");
+    timer_repo.schedule_timer(DeploymentTimer {
+        timer_id:      convoy_id,
+        player_wallet: WalletAddress([7u8; 32]),
+        sector_id,
+        timer_type:    TimerType::ConvoyArrival,
+        fires_at:      chrono::Utc::now() - chrono::Duration::seconds(1),
+    }).await.expect("schedule_timer");
+    let poisoned = format!("gap53-not-a-uuid-{}", uuid::Uuid::new_v4());
+    let past = (chrono::Utc::now() - chrono::Duration::seconds(60)).timestamp() as f64;
+    conn.zadd::<_, _, _, ()>("timers:global", &poisoned, past).await.expect("ZADD poisoned");
+
+    let mut state = AppState::new(Arc::new(Config::default()));
+    state.convoy_repo    = convoy_repo.clone();
+    state.sector_repo    = sector_repo.clone();
+    state.timer_repo     = timer_repo.clone();
+    state.input_log_repo = Arc::new(PostgresInputLogRepository::new(pool.clone()));
+    poll_expiry_once(&state, &mut ExpiryWarns::new()).await;
+
+    let landed = convoy_repo.get_convoy(convoy_id).await.expect("get_convoy").expect("convoy exists");
+    let left: Option<f64> = conn.zscore("timers:global", &poisoned).await.expect("ZSCORE");
+
+    // Cleanup before asserting, so a failure leaves no residue.
+    let cid = convoy_id.to_string();
+    conn.zrem::<_, _, ()>("timers:global", &poisoned).await.ok();
+    conn.srem::<_, _, ()>("timers:quarantine", &poisoned).await.ok();
+    conn.del::<_, ()>(vec![format!("timer:{cid}"), format!("timer:{cid}:sector_id")]).await.ok();
+    conn.zrem::<_, _, ()>("timers:global", &cid).await.ok();
+    conn.zrem::<_, _, ()>(format!("sector:{sector_id}:timers"), &cid).await.ok();
+    conn.del::<_, ()>(vec![format!("sector:{sector_id}:hex_state"), format!("sector:{sector_id}:player_presence")]).await.ok();
+    conn.srem::<_, _, ()>("sectors:all", sector_id.to_string()).await.ok();
+    sqlx::query("DELETE FROM convoy_records WHERE convoy_id = $1").bind(convoy_id).execute(&pool).await.ok();
+    sqlx::query("ALTER TABLE input_logs DISABLE TRIGGER ALL").execute(&pool).await.ok();
+    sqlx::query("DELETE FROM input_logs WHERE campaign_id = $1").bind(campaign_id).execute(&pool).await.ok();
+    sqlx::query("ALTER TABLE input_logs ENABLE TRIGGER ALL").execute(&pool).await.ok();
+
+    assert!(!landed.in_transit, "a poisoned member must not stall a real arrival");
+    assert!(left.is_none(), "the poisoned member must leave timers:global");
 }

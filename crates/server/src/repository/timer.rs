@@ -30,11 +30,30 @@ pub enum TimerType {
     DeploymentExpiry,
 }
 
+/// One scan of the due set (GAP-53): the timers that parsed, and the members that didn't.
+/// A poisoned member is reported, not fatal, so one bad entry cannot stall the rest.
+pub struct DueTimers {
+    pub due: Vec<DeploymentTimer>,
+    pub poisoned: Vec<PoisonedTimer>,
+}
+
+/// A due-set member that cannot be processed: a non-UUID member, a payload that does not
+/// deserialise, or a missing payload (an orphan). `member` is the raw zset member.
+pub struct PoisonedTimer {
+    pub member: String,
+    pub reason: String,
+}
+
 #[async_trait]
 pub trait TimerRepository: Send + Sync {
     async fn schedule_timer(&self, timer: DeploymentTimer) -> Result<(), RepositoryError>;
     async fn cancel_timer(&self, timer_id: Uuid) -> Result<(), RepositoryError>;
-    async fn get_due_timers(&self, now: DateTime<Utc>) -> Result<Vec<DeploymentTimer>, RepositoryError>;
+    /// Only a whole-scan fault is `Err`; per-member data faults go to `poisoned`.
+    async fn get_due_timers(&self, now: DateTime<Utc>) -> Result<DueTimers, RepositoryError>;
+    /// Takes a member out of the due scan without parsing its payload (GAP-53). The
+    /// payload key, if any, is kept for hand recovery; the member is recorded in
+    /// `timers:quarantine`.
+    async fn quarantine_timer(&self, member: &str) -> Result<(), RepositoryError>;
 }
 
 pub struct InMemoryTimerRepository(pub Arc<DashMap<Uuid, DeploymentTimer>>);
@@ -65,12 +84,20 @@ impl TimerRepository for InMemoryTimerRepository {
             .ok_or(RepositoryError::NotFound)
     }
 
-    async fn get_due_timers(&self, now: DateTime<Utc>) -> Result<Vec<DeploymentTimer>, RepositoryError> {
-        Ok(self.0
-            .iter()
-            .filter(|entry| entry.fires_at <= now)
-            .map(|entry| entry.value().clone())
-            .collect())
+    async fn get_due_timers(&self, now: DateTime<Utc>) -> Result<DueTimers, RepositoryError> {
+        // A typed map cannot hold a poisoned entry.
+        Ok(DueTimers {
+            due: self.0
+                .iter()
+                .filter(|entry| entry.fires_at <= now)
+                .map(|entry| entry.value().clone())
+                .collect(),
+            poisoned: Vec::new(),
+        })
+    }
+
+    async fn quarantine_timer(&self, _member: &str) -> Result<(), RepositoryError> {
+        Ok(())
     }
 }
 
@@ -154,7 +181,7 @@ impl TimerRepository for RedisTimerRepository {
             .map_err(|e| RepositoryError::Internal(e.to_string()))
     }
 
-    async fn get_due_timers(&self, now: DateTime<Utc>) -> Result<Vec<DeploymentTimer>, RepositoryError> {
+    async fn get_due_timers(&self, now: DateTime<Utc>) -> Result<DueTimers, RepositoryError> {
         use redis::AsyncCommands;
         let mut conn  = self.conn.clone();
         let now_score = now.timestamp() as f64;
@@ -164,18 +191,47 @@ impl TimerRepository for RedisTimerRepository {
             .await
             .map_err(|e| RepositoryError::Internal(e.to_string()))?;
 
-        let mut out = Vec::with_capacity(ids.len());
-        for id_str in ids {
-            let tid = id_str.parse::<Uuid>()
-                .map_err(|e| RepositoryError::Internal(format!("invalid timer id {id_str}: {e}")))?;
+        let mut out = DueTimers { due: Vec::with_capacity(ids.len()), poisoned: Vec::new() };
+        for member in ids {
+            let tid = match member.parse::<Uuid>() {
+                Ok(t) => t,
+                Err(e) => {
+                    out.poisoned.push(PoisonedTimer { reason: format!("invalid timer id: {e}"), member });
+                    continue;
+                }
+            };
+            // A connection error here is a whole-scan fault, not a data fault.
             let raw: Option<String> = conn.get(Self::timer_key(tid))
                 .await
                 .map_err(|e| RepositoryError::Internal(e.to_string()))?;
-            let Some(json) = raw else { continue };
-            let timer = serde_json::from_str::<DeploymentTimer>(&json)
-                .map_err(|e| RepositoryError::Internal(format!("deser timer {tid}: {e}")))?;
-            out.push(timer);
+            let Some(json) = raw else {
+                out.poisoned.push(PoisonedTimer { reason: "payload key missing (orphan member)".into(), member });
+                continue;
+            };
+            match serde_json::from_str::<DeploymentTimer>(&json) {
+                Ok(timer) => out.due.push(timer),
+                Err(e) => out.poisoned.push(PoisonedTimer { reason: format!("payload does not deserialise: {e}"), member }),
+            }
         }
         Ok(out)
+    }
+
+    async fn quarantine_timer(&self, member: &str) -> Result<(), RepositoryError> {
+        use redis::AsyncCommands;
+        let mut conn = self.conn.clone();
+        // Best effort: the reverse lookup names the sector zset, if the member has one.
+        let sector: Option<String> = conn
+            .get(format!("timer:{member}:sector_id"))
+            .await
+            .unwrap_or(None);
+        let mut pipe = redis::pipe();
+        pipe.zrem("timers:global", member).ignore();
+        if let Some(sid) = sector {
+            pipe.zrem(format!("sector:{sid}:timers"), member).ignore();
+        }
+        pipe.sadd("timers:quarantine", member).ignore();
+        pipe.query_async::<()>(&mut conn)
+            .await
+            .map_err(|e| RepositoryError::Internal(e.to_string()))
     }
 }

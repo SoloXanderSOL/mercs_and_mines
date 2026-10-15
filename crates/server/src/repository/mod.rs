@@ -58,7 +58,7 @@ pub use input_log::{
     InMemoryInputLogRepository, InputLogRepository, InputLogRow,
     PostgresInputLogRepository,
 };
-pub use timer::{DeploymentTimer, InMemoryTimerRepository, RedisTimerRepository, TimerRepository, TimerType};
+pub use timer::{DeploymentTimer, DueTimers, InMemoryTimerRepository, PoisonedTimer, RedisTimerRepository, TimerRepository, TimerType};
 pub use session::{
     CombatSession, InMemorySessionStateRepository, RedisSessionStateRepository,
     SessionStateRepository,

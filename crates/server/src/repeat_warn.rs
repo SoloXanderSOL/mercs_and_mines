@@ -6,6 +6,7 @@
 //! call site. Tick-counted with no clock, so it is testable without `tokio::time::pause`.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 
 use uuid::Uuid;
 
@@ -38,31 +39,32 @@ impl RepeatWarn {
 /// One `RepeatWarn` per item, for a failure site that runs once per item per tick.
 /// Use one per site, never one shared across sites: a shared counter would report
 /// site A's recovery when site B succeeds, just as it would across items.
+/// Keyed by `Uuid` unless a site's items have no id (a raw Redis member, GAP-53).
 #[derive(Debug)]
-pub struct KeyedRepeatWarn {
+pub struct KeyedRepeatWarn<K: Hash + Eq = Uuid> {
     every: u32,
-    map: HashMap<Uuid, RepeatWarn>,
+    map: HashMap<K, RepeatWarn>,
 }
 
-impl KeyedRepeatWarn {
+impl<K: Hash + Eq> KeyedRepeatWarn<K> {
     pub fn new(every: u32) -> Self {
         Self { every, map: HashMap::new() }
     }
 
     /// Records a failure for `key`; see [`RepeatWarn::fail`].
-    pub fn fail(&mut self, key: Uuid) -> Option<u32> {
+    pub fn fail(&mut self, key: K) -> Option<u32> {
         let every = self.every;
         self.map.entry(key).or_insert_with(|| RepeatWarn::new(every)).fail()
     }
 
     /// Records a success for `key`; see [`RepeatWarn::ok`]. An untracked key → `None`.
-    pub fn ok(&mut self, key: Uuid) -> Option<u32> {
+    pub fn ok(&mut self, key: K) -> Option<u32> {
         self.map.remove(&key).and_then(|mut w| w.ok())
     }
 
     /// Evicts every key not in `live` — call it with the tick's full due set, so an
     /// item that left the set stops holding a counter.
-    pub fn retain(&mut self, live: &HashSet<Uuid>) {
+    pub fn retain(&mut self, live: &HashSet<K>) {
         self.map.retain(|k, _| live.contains(k));
     }
 
@@ -98,6 +100,18 @@ mod tests {
         assert_eq!(w.len(), 1, "A left the due set and is evicted");
         assert_eq!(w.ok(a), None);
         assert_eq!(w.ok(b), Some(3));
+    }
+
+    #[test]
+    fn keyed_repeat_warn_accepts_string_keys() {
+        let mut w: KeyedRepeatWarn<String> = KeyedRepeatWarn::new(3);
+        assert_eq!(w.fail("not-a-uuid".to_string()), Some(1));
+        assert_eq!(w.fail("not-a-uuid".to_string()), None);
+        assert_eq!(w.fail("other".to_string()), Some(1));
+        assert_eq!(w.ok("not-a-uuid".to_string()), Some(2));
+        assert_eq!(w.len(), 1);
+        w.retain(&HashSet::new());
+        assert!(w.is_empty(), "a member that left the scan is evicted");
     }
 
     #[test]
