@@ -135,9 +135,61 @@ pub fn rank_for_xp(xp: i32) -> i16 {
     1 + RANK_THRESHOLDS.iter().filter(|&&t| xp >= t).count() as i16
 }
 
+/// What the Glorious check reads about a death (§4e step 3).
+/// `ticker_contribution_pct` is the mission's own Victory Ticker contribution in
+/// percentage points, the unit `apply_ticker_delta` uses. A Wipeout that met its
+/// objective passes its contribution through rather than zeroing it (ODQ-31).
+#[derive(Debug, Clone, Copy)]
+pub struct GloriousDeathCriteria {
+    pub rank: i16,
+    pub mission_tier: u8,
+    pub ticker_contribution_pct: f64,
+}
+
+/// Card_Game_Design_Overview §1a, Phase 1 criteria only (PvP, Story Event and Redemption Race are Phase 2+).
+pub fn is_glorious_death(c: &GloriousDeathCriteria) -> bool {
+    (c.rank >= 3 && c.mission_tier >= 4) || c.rank == 5 || c.ticker_contribution_pct >= 0.5
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn glorious(rank: i16, mission_tier: u8, ticker_contribution_pct: f64) -> bool {
+        is_glorious_death(&GloriousDeathCriteria { rank, mission_tier, ticker_contribution_pct })
+    }
+
+    #[test]
+    fn test_is_glorious_death_rank_three_on_tier_four_or_five() {
+        assert!(glorious(3, 4, 0.0));
+        assert!(glorious(3, 5, 0.0));
+        assert!(!glorious(3, 3, 0.0));
+    }
+
+    #[test]
+    fn test_is_glorious_death_rank_five_always() {
+        assert!(glorious(5, 1, 0.0));
+    }
+
+    #[test]
+    fn test_is_glorious_death_ticker_boundary() {
+        assert!(glorious(1, 1, 0.5));
+        assert!(!glorious(1, 1, 0.49));
+    }
+
+    /// ODQ-31: a pyrrhic win (objective taken, nobody walked home) is a Wipeout whose
+    /// ticker contribution still lands, so it can make the death Glorious.
+    #[test]
+    fn test_is_glorious_death_pyrrhic_wipeout_counts() {
+        assert!(glorious(1, 1, 0.75));
+    }
+
+    #[test]
+    fn test_is_glorious_death_ordinary_death_is_not() {
+        assert!(!glorious(2, 5, 0.0));
+        assert!(!glorious(4, 3, 0.0));
+        assert!(!glorious(1, 1, 0.0));
+    }
 
     #[test]
     fn mission_tier_maps_difficulty_bands() {

@@ -7,7 +7,9 @@ use dashmap::DashMap;
 use sim_engine::config::SimConfig;
 use sim_engine::game_types::OutcomeType;
 use sim_engine::resolver::{stress_after_casualties, stress_after_deployment};
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
+
+use crate::commander_gen::{is_glorious_death, GloriousDeathCriteria};
 use uuid::Uuid;
 
 use super::RepositoryError;
@@ -50,13 +52,16 @@ pub(crate) fn log_rank_up(commander_id: Uuid, from: i16, to: i16) {
 }
 
 /// The values `resolve_deployment` committed: the locked row's rank before the write,
-/// and the rank, stress and XP it wrote.
+/// the rank, stress and XP it wrote, and whether the mission killed the Commander
+/// (a `Wipeout`, §4e) and the death was Glorious (its card is foil).
 #[derive(Debug, Clone, Copy)]
 pub struct AppliedEffects {
     pub old_rank: i16,
     pub new_rank: i16,
     pub stress:   i16,
     pub xp:       i32,
+    pub is_kia:   bool,
+    pub glorious: bool,
 }
 
 /// The mission's effects on a Commander, computed from the values `resolve_deployment`
@@ -77,7 +82,31 @@ fn locked_row_effects(
         new_rank: crate::commander_gen::rank_for_xp(xp),
         stress:   i16::from(stress),
         xp,
+        is_kia:   false,
+        glorious: false,
     }
+}
+
+/// Permadeath reads one signal: `Wipeout` (§4e). The Glorious check reads the locked
+/// rank; a Wipeout pays 0 XP, so it equals the new rank. Returns `(died, glorious)`.
+fn death_effects(rank: i16, tier: u8, ticker_contribution_pct: f64, outcome: &OutcomeType) -> (bool, bool) {
+    let died = matches!(outcome, OutcomeType::Wipeout);
+    let glorious = died && is_glorious_death(&GloriousDeathCriteria { rank, mission_tier: tier, ticker_contribution_pct });
+    (died, glorious)
+}
+
+/// One queued death card in the in-memory backend; mirrors a `card_mint_pending` row.
+#[derive(Debug, Clone)]
+pub struct CardMintPending {
+    pub card_mint_id:   Uuid,
+    pub player_wallet:  Vec<u8>,
+    pub campaign_id:    Uuid,
+    pub commander_id:   Uuid,
+    pub deployment_id:  Uuid,
+    pub session_id:     Uuid,
+    pub commander_name: String,
+    pub rank:           i16,
+    pub foil:           bool,
 }
 
 /// `create_commander` stores stress in 0..=100 and keeps `update_stress`'s invariant:
@@ -171,14 +200,17 @@ pub trait CommanderRepository: Send + Sync {
     /// a write committed since the caller's read is built on, never overwritten (4g-2).
     /// A Shattered Commander is not refused: the mission still happened. Writes stress
     /// (with `update_stress`'s Shattered invariant), then rank and XP, then — last — the
-    /// close of the `active` deployment. Any statement touching 0 rows is `NotFound` and
-    /// nothing is applied. Returns what was committed.
+    /// close of the `active` deployment. On a `Wipeout` it also marks the Commander KIA
+    /// and queues a `card_mint_pending` card (foil if Glorious) before the close (§4e).
+    /// Any statement touching 0 rows is `NotFound` and nothing is applied. Returns what
+    /// was committed.
     async fn resolve_deployment(
         &self,
         deployment_id: Uuid,
         commander_id: Uuid,
         kia: u32,
         tier: u8,
+        ticker_contribution_pct: f64,
         outcome: &OutcomeType,
         cfg: &SimConfig,
     ) -> Result<AppliedEffects, RepositoryError>;
@@ -258,6 +290,50 @@ impl PostgresCommanderRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
+}
+
+/// The permadeath writes (§4e, R1), run only inside `resolve_deployment`'s locked
+/// transaction so §4c's writer rule holds: KIA, then the death card. The card is an
+/// account-scoped snapshot of the record and the fatal deployment, so it outlives the
+/// §4f campaign wipe. Not on the trait: the mission Wipeout is its only caller.
+async fn mark_commander_kia(
+    tx: &mut Transaction<'_, Postgres>,
+    commander_id: Uuid,
+    deployment_id: Uuid,
+    glorious: bool,
+) -> Result<(), RepositoryError> {
+    // `set_kia`'s statement, byte for byte, so the two share one `.sqlx/` cache file.
+    let r = sqlx::query!(
+        "UPDATE commander_records SET is_kia = TRUE, updated_at = now() WHERE commander_id = $1",
+        commander_id,
+    )
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+    if r.rows_affected() == 0 {
+        return Err(RepositoryError::NotFound);
+    }
+    // No `status = 'active'` guard: the close checks that, last.
+    let r = sqlx::query!(
+        r#"INSERT INTO card_mint_pending
+            (card_mint_id, player_wallet, campaign_id, commander_id, deployment_id, session_id, commander_name, rank, foil)
+        SELECT $1, c.player_wallet, c.campaign_id, c.commander_id, d.deployment_id, d.session_id, c.name, c.rank, $2
+        FROM commander_records c
+        JOIN deployment_records d ON d.commander_id = c.commander_id
+        WHERE c.commander_id = $3 AND d.deployment_id = $4"#,
+        Uuid::new_v4(),
+        glorious,
+        commander_id,
+        deployment_id,
+    )
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+    if r.rows_affected() == 0 {
+        return Err(RepositoryError::NotFound);
+    }
+    // TODO(phase-2): apply_roster_grief_spike(player_id, deceased_commander_id, mission_understrength_factor) — §4c; Commander_Stress_System §1.
+    Ok(())
 }
 
 #[async_trait]
@@ -499,11 +575,12 @@ impl CommanderRepository for PostgresCommanderRepository {
         commander_id: Uuid,
         kia: u32,
         tier: u8,
+        ticker_contribution_pct: f64,
         outcome: &OutcomeType,
         cfg: &SimConfig,
     ) -> Result<AppliedEffects, RepositoryError> {
         // Dropping `tx` without commit rolls everything back, so every early return below
-        // leaves stress, XP, rank and the deployment exactly as they were.
+        // leaves stress, XP, rank, KIA, the card queue and the deployment exactly as they were.
         let mut tx = self.pool.begin().await.map_err(|e| RepositoryError::Internal(e.to_string()))?;
         // The row lock is held to commit: any other writer of this Commander waits, and
         // the effects below are computed from what it committed before us.
@@ -518,7 +595,7 @@ impl CommanderRepository for PostgresCommanderRepository {
         if row.is_kia {
             return Err(RepositoryError::Internal("commander is KIA".into()));
         }
-        let eff = locked_row_effects(row.stress, row.xp, row.rank, kia, tier, outcome, cfg);
+        let mut eff = locked_row_effects(row.stress, row.xp, row.rank, kia, tier, outcome, cfg);
         // The two UPDATE texts are `update_stress`'s and `update_rank_and_xp`'s, unchanged.
         let r = sqlx::query!(
             "UPDATE commander_records SET stress = $1, is_shattered = is_shattered OR $1 >= 100::SMALLINT, updated_at = now() WHERE commander_id = $2",
@@ -543,6 +620,12 @@ impl CommanderRepository for PostgresCommanderRepository {
         if r.rows_affected() == 0 {
             return Err(RepositoryError::NotFound);
         }
+        let (died, glorious) = death_effects(row.rank, tier, ticker_contribution_pct, outcome);
+        if died {
+            mark_commander_kia(&mut tx, commander_id, deployment_id, glorious).await?;
+        }
+        eff.is_kia = died;
+        eff.glorious = glorious;
         // Last, and guarded on `active`: a closed or foreign deployment rolls back the above.
         let r = sqlx::query!(
             "UPDATE deployment_records SET status = 'resolved', outcome = $1, closed_at = now() WHERE deployment_id = $2 AND commander_id = $3 AND status = 'active'",
@@ -584,20 +667,34 @@ impl CommanderRepository for PostgresCommanderRepository {
 
 // ── InMemoryCommanderRepository (unit-test stub) ─────────────────────────────
 
+/// The data behind the in-memory deployment lock. The card queue lives here so that
+/// `resolve_deployment` writes KIA, the card and the close in one critical section.
+#[derive(Default)]
+struct DeploymentStore {
+    records: HashMap<Uuid, DeploymentRecord>,
+    cards:   Vec<CardMintPending>,
+}
+
 pub struct InMemoryCommanderRepository {
     store: DashMap<Uuid, CommanderRecord>,
     /// Every deployment method holds this one lock for its whole body, which stands in
     /// for Postgres' transaction and the partial unique index.
-    deployments: Mutex<HashMap<Uuid, DeploymentRecord>>,
+    deployments: Mutex<DeploymentStore>,
 }
 
 impl InMemoryCommanderRepository {
     pub fn new() -> Self {
-        Self { store: DashMap::new(), deployments: Mutex::new(HashMap::new()) }
+        Self { store: DashMap::new(), deployments: Mutex::new(DeploymentStore::default()) }
     }
 
-    fn lock_deployments(&self) -> Result<std::sync::MutexGuard<'_, HashMap<Uuid, DeploymentRecord>>, RepositoryError> {
+    fn lock_deployments(&self) -> Result<std::sync::MutexGuard<'_, DeploymentStore>, RepositoryError> {
         self.deployments.lock().map_err(|e| RepositoryError::Internal(e.to_string()))
+    }
+
+    /// The queued death cards, for tests. Not on the trait: nothing in production reads
+    /// the queue until Phase 2 §6d.
+    pub fn card_mint_pending(&self) -> Result<Vec<CardMintPending>, RepositoryError> {
+        Ok(self.lock_deployments()?.cards.clone())
     }
 }
 
@@ -680,16 +777,16 @@ impl CommanderRepository for InMemoryCommanderRepository {
             )));
         }
         let cutoff = stale_cutoff(d.started_at);
-        for dep in deps.values_mut() {
+        for dep in deps.records.values_mut() {
             if dep.commander_id == d.commander_id && dep.status == "active" && dep.started_at < cutoff {
                 dep.status = "aborted".into();
                 dep.closed_at = Some(d.started_at);
             }
         }
-        if deps.values().any(|dep| dep.commander_id == d.commander_id && dep.status == "active") {
+        if deps.records.values().any(|dep| dep.commander_id == d.commander_id && dep.status == "active") {
             return Ok(false);
         }
-        deps.insert(d.deployment_id, DeploymentRecord {
+        deps.records.insert(d.deployment_id, DeploymentRecord {
             deployment_id: d.deployment_id,
             commander_id:  d.commander_id,
             session_id:    d.session_id,
@@ -705,6 +802,7 @@ impl CommanderRepository for InMemoryCommanderRepository {
     async fn abort_deployment(&self, deployment_id: Uuid) -> Result<(), RepositoryError> {
         let mut deps = self.lock_deployments()?;
         let dep = deps
+            .records
             .get_mut(&deployment_id)
             .filter(|dep| dep.status == "active")
             .ok_or(RepositoryError::NotFound)?;
@@ -719,12 +817,14 @@ impl CommanderRepository for InMemoryCommanderRepository {
         commander_id: Uuid,
         kia: u32,
         tier: u8,
+        ticker_contribution_pct: f64,
         outcome: &OutcomeType,
         cfg: &SimConfig,
     ) -> Result<AppliedEffects, RepositoryError> {
         let mut deps = self.lock_deployments()?;
+        let DeploymentStore { records, cards } = &mut *deps;
         // Validate everything before mutating anything: no partial write on any refusal.
-        let dep = deps
+        let dep = records
             .get_mut(&deployment_id)
             .filter(|dep| dep.commander_id == commander_id && dep.status == "active")
             .ok_or(RepositoryError::NotFound)?;
@@ -733,11 +833,29 @@ impl CommanderRepository for InMemoryCommanderRepository {
         if rec.is_kia {
             return Err(RepositoryError::Internal("commander is KIA".into()));
         }
-        let eff = locked_row_effects(rec.stress, rec.xp, rec.rank, kia, tier, outcome, cfg);
+        let mut eff = locked_row_effects(rec.stress, rec.xp, rec.rank, kia, tier, outcome, cfg);
+        let (died, glorious) = death_effects(rec.rank, tier, ticker_contribution_pct, outcome);
         rec.stress = eff.stress;
         rec.is_shattered = rec.is_shattered || eff.stress >= 100;
         rec.rank = eff.new_rank;
         rec.xp = eff.xp;
+        if died {
+            rec.is_kia = true;
+            cards.push(CardMintPending {
+                card_mint_id:   Uuid::new_v4(),
+                player_wallet:  rec.player_wallet.clone(),
+                campaign_id:    rec.campaign_id,
+                commander_id,
+                deployment_id,
+                session_id:     dep.session_id,
+                commander_name: rec.name.clone(),
+                rank:           rec.rank,
+                foil:           glorious,
+            });
+            // TODO(phase-2): grief spike — see `mark_commander_kia` (Postgres section).
+        }
+        eff.is_kia = died;
+        eff.glorious = glorious;
         dep.status = "resolved".into();
         dep.outcome = Some(outcome_db_str(outcome).into());
         dep.closed_at = Some(Utc::now());
@@ -747,6 +865,7 @@ impl CommanderRepository for InMemoryCommanderRepository {
     async fn list_deployments_by_commander(&self, commander_id: Uuid) -> Result<Vec<DeploymentRecord>, RepositoryError> {
         let deps = self.lock_deployments()?;
         let mut out: Vec<DeploymentRecord> = deps
+            .records
             .values()
             .filter(|dep| dep.commander_id == commander_id)
             .cloned()
@@ -1002,7 +1121,7 @@ mod tests {
         let would_stress = stress_after_casualties(stress_after_deployment(30, &cfg), 12, &cfg);
         let would_rank = crate::commander_gen::rank_for_xp(88 + crate::commander_gen::xp_award(5, &OutcomeType::Success));
         assert_eq!((would_stress, would_rank > 1), (100, true), "precondition");
-        let r = repo.resolve_deployment(d.deployment_id, id, 12, 5, &OutcomeType::Success, &cfg).await;
+        let r = repo.resolve_deployment(d.deployment_id, id, 12, 5, 0.0, &OutcomeType::Success, &cfg).await;
         assert!(matches!(r, Err(RepositoryError::NotFound)), "got {:?}", r);
         let rec = repo.get_commander(id).await.unwrap().unwrap();
         assert_eq!((rec.stress, rec.xp, rec.rank, rec.is_shattered), (30, 88, 1, false));
@@ -1019,12 +1138,55 @@ mod tests {
         assert!(repo.start_deployment(&d).await.unwrap());
         repo.set_kia(id).await.unwrap();
         let cfg = SimConfig::default();
-        let r = repo.resolve_deployment(d.deployment_id, id, 10, 5, &OutcomeType::Success, &cfg).await;
+        let r = repo.resolve_deployment(d.deployment_id, id, 10, 5, 0.0, &OutcomeType::Success, &cfg).await;
         assert!(matches!(r, Err(RepositoryError::Internal(_))), "got {:?}", r);
         let rec = repo.get_commander(id).await.unwrap().unwrap();
         assert_eq!((rec.stress, rec.xp, rec.rank, rec.is_shattered), (30, 88, 1, false));
         let deps = repo.list_deployments_by_commander(id).await.unwrap();
         assert_eq!(deps[0].status, "active");
+    }
+
+    /// 4e-1: a Wipeout marks the Commander KIA and queues one snapshot card in the same
+    /// critical section. Rank 3 on a tier-4 mission is Glorious, so the card is foil.
+    #[tokio::test]
+    async fn test_mark_commander_kia_in_memory_wipeout_queues_one_card() {
+        let (repo, id) = seeded_repo(400, 3, |r| r.stress = 30).await;
+        let d = new_deployment(id, Utc::now());
+        assert!(repo.start_deployment(&d).await.unwrap());
+        let cfg = SimConfig::default();
+        let eff = repo
+            .resolve_deployment(d.deployment_id, id, 2, 4, 0.0, &OutcomeType::Wipeout, &cfg)
+            .await
+            .unwrap();
+        assert!(eff.is_kia && eff.glorious, "got {:?}", eff);
+        let rec = repo.get_commander(id).await.unwrap().unwrap();
+        assert!(rec.is_kia);
+        let cards = repo.card_mint_pending().unwrap();
+        assert_eq!(cards.len(), 1);
+        let card = &cards[0];
+        assert!(card.foil);
+        assert_eq!(
+            (&card.commander_name, &card.player_wallet, card.campaign_id, card.rank),
+            (&rec.name, &rec.player_wallet, rec.campaign_id, 3)
+        );
+        assert_eq!((card.commander_id, card.deployment_id, card.session_id), (id, d.deployment_id, d.session_id));
+        let deps = repo.list_deployments_by_commander(id).await.unwrap();
+        assert_eq!(deps[0].outcome.as_deref(), Some("Wipeout"));
+    }
+
+    #[tokio::test]
+    async fn test_mark_commander_kia_in_memory_non_wipeout_writes_nothing() {
+        let (repo, id) = seeded_repo(400, 3, |r| r.stress = 30).await;
+        let d = new_deployment(id, Utc::now());
+        assert!(repo.start_deployment(&d).await.unwrap());
+        let cfg = SimConfig::default();
+        let eff = repo
+            .resolve_deployment(d.deployment_id, id, 2, 4, 0.0, &OutcomeType::Defeat, &cfg)
+            .await
+            .unwrap();
+        assert!(!eff.is_kia && !eff.glorious, "got {:?}", eff);
+        assert!(!repo.get_commander(id).await.unwrap().unwrap().is_kia);
+        assert!(repo.card_mint_pending().unwrap().is_empty());
     }
 
     #[tokio::test]

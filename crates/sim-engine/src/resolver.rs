@@ -4,7 +4,7 @@
 // Outcome mapping (GAP-35, closed by brick 4e-0 — survival-based, Canon_Type_Reference §9).
 // classify_outcome applies these in order, after unit damage is resolved:
 //   1. zero units                  → Defeat (the route rejects this first; defence in depth)
-//   2. every unit KIA, win or lose → Wipeout
+//   2. no survivor (a survivor is neither KIA nor MIA), win or lose → Wipeout
 //   3. objective completed         → Success (a survivor is guaranteed by step 2)
 //   4. otherwise                   → Defeat
 //   TacticalRetreat                → reserved, never assigned on the mission path; the WS retreat is a separate ledger (ODQ-23)
@@ -330,13 +330,18 @@ fn calc_rewards(
     Rewards { credits, ore, loot_drop }
 }
 
+/// A survivor is a unit that is neither KIA nor MIA (ODQ-30, ruled 2026-10-14).
+pub(crate) fn is_survivor(u: &UnitBattleResult) -> bool {
+    !matches!(u.final_status, UnitStatus::Kia | UnitStatus::Mia)
+}
+
 /// Survival-based outcome — the rule order is load-bearing (header, Canon_Type_Reference §9).
 /// Pure: draws nothing, so where it is called cannot move an RNG draw.
 pub(crate) fn classify_outcome(is_success: bool, unit_results: &[UnitBattleResult]) -> OutcomeType {
     if unit_results.is_empty() {
         return OutcomeType::Defeat;
     }
-    if unit_results.iter().all(|u| matches!(u.final_status, UnitStatus::Kia)) {
+    if !unit_results.iter().any(is_survivor) {
         return OutcomeType::Wipeout;
     }
     if is_success {
@@ -397,7 +402,7 @@ pub fn resolve_mission(
         })
         .collect();
 
-    let any_survivor = unit_results.iter().any(|u| !matches!(u.final_status, UnitStatus::Kia));
+    let any_survivor = unit_results.iter().any(is_survivor);
     let outcome = classify_outcome(is_success, &unit_results);
 
     let rewards = calc_rewards(mission, is_success, any_survivor, margin, squad, &mut rng, cfg);
@@ -905,15 +910,6 @@ pub fn resolve_commander_stress(commander: &mut Commander, casualties: u32, cfg:
     clamp_and_check_shattered(commander);
 }
 
-/// Checks whether a Commander suffers Permadeath due to a total unit wipeout.
-/// Sets is_kia = true if unit_remaining_count == 0.
-/// NOTE: is_shattered is never touched here. These flags are fully independent.
-pub fn check_commander_permadeath(commander: &mut Commander, unit_remaining_count: u32) {
-    if unit_remaining_count == 0 {
-        commander.is_kia = true;
-    }
-}
-
 /// Retires a Rank 5 Commander to the AdvisorBoard.
 /// Returns Err if the Commander has not reached Rank 5.
 pub fn retire_commander(
@@ -1387,10 +1383,38 @@ mod tests {
     }
 
     #[test]
-    fn classify_outcome_all_kia_is_wipeout_win_or_lose() {
-        let all_kia = vec![unit_result(UnitStatus::Kia), unit_result(UnitStatus::Kia)];
-        assert!(matches!(classify_outcome(true, &all_kia), OutcomeType::Wipeout));
-        assert!(matches!(classify_outcome(false, &all_kia), OutcomeType::Wipeout));
+    fn classify_outcome_no_survivor_is_wipeout_win_or_lose() {
+        let wiped = vec![unit_result(UnitStatus::Kia), unit_result(UnitStatus::Kia)];
+        assert!(matches!(classify_outcome(true, &wiped), OutcomeType::Wipeout));
+        assert!(matches!(classify_outcome(false, &wiped), OutcomeType::Wipeout));
+    }
+
+    /// ODQ-30: MIA is not a survivor. Nothing emits `Mia` today, so this builds the
+    /// results by hand rather than going through `resolve_mission`.
+    #[test]
+    fn classify_outcome_all_mia_is_wipeout_and_pays_nothing() {
+        let missing = vec![unit_result(UnitStatus::Mia), unit_result(UnitStatus::Mia)];
+        assert!(matches!(classify_outcome(true, &missing), OutcomeType::Wipeout));
+
+        let (squad, mission, cfg) = fixture();
+        let mut rng = Rng::new(1);
+        let rewards = calc_rewards(&mission, true, missing.iter().any(is_survivor), 50.0, &squad, &mut rng, &cfg);
+        assert_eq!((rewards.credits, rewards.ore), (0, 0));
+        assert!(rewards.loot_drop.is_none());
+    }
+
+    #[test]
+    fn classify_outcome_mixed_kia_and_mia_is_wipeout() {
+        let mixed = vec![unit_result(UnitStatus::Kia), unit_result(UnitStatus::Mia)];
+        assert!(matches!(classify_outcome(true, &mixed), OutcomeType::Wipeout));
+        assert!(matches!(classify_outcome(false, &mixed), OutcomeType::Wipeout));
+
+        let with_survivor = vec![
+            unit_result(UnitStatus::Kia),
+            unit_result(UnitStatus::Mia),
+            unit_result(UnitStatus::Wounded),
+        ];
+        assert!(matches!(classify_outcome(true, &with_survivor), OutcomeType::Success));
     }
 
     #[test]

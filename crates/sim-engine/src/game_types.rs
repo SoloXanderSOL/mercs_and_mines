@@ -268,8 +268,8 @@ pub struct CommanderPassiveBuffs {
 }
 
 /// INVARIANT: is_kia and is_shattered are completely independent.
-///   is_kia       — Permadeath on total wipeout. Burns cNFT if minted. PERMANENT.
-///   is_shattered — stress_level hit 100. NOT permadeath. NEVER triggers cNFT burn.
+///   is_kia       — Permadeath: set when the Commander's mission ends in `Wipeout` (§4e). PERMANENT.
+///   is_shattered — stress_level hit 100. NOT permadeath.
 ///   can_retreat  — locked false when stress tier is BREAKING_POINT (71–99).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Commander {
@@ -351,7 +351,7 @@ pub struct ScoreBreakdown {
 
 /// Taxonomy is agency and survival, not roll margin. Canon_Type_Reference.md §9.
 /// `Success` needs the objective completed AND at least one unit alive. `Wipeout` is
-/// every unit KIA, win or lose, and pays nothing. A failure with survivors is `Defeat`.
+/// no survivor, win or lose (a survivor is neither KIA nor MIA), and pays nothing. A failure with survivors is `Defeat`.
 /// Assigned by `resolver::classify_outcome` from the post-damage unit results.
 /// `TacticalRetreat` is reserved and unreachable: the mission path has no retreat input (the streaming pipe's ClientCommand::Retreat is a separate ledger — ODQ-23),
 /// and nothing may assign it from a roll.

@@ -146,9 +146,10 @@ async fn get_equipment() -> Result<Json<Value>, AppError> {
     Ok(Json(v))
 }
 
-/// Public and stateless. `build_sha` is embedded at compile time from `MERCS_BUILD_SHA`
-/// (set by CI on the release build); the deploy script polls it to prove which build is
-/// serving. It reads the same constant the session headers log and writes nothing.
+/// Public and stateless; writes nothing. `version` is `CARGO_PKG_VERSION`, the value
+/// `session_configs.build_version` logs. `build_sha` is embedded at compile time from
+/// `MERCS_BUILD_SHA` (set by CI on the release build) so the deploy script can prove
+/// which build is serving; it is not recorded in the audit trail.
 async fn get_version() -> Json<Value> {
     Json(json!({
         "version":   env!("CARGO_PKG_VERSION"),
@@ -265,8 +266,8 @@ fn deploy_refusal(rec: &crate::repository::CommanderRecord) -> Option<AppError> 
 /// 401 (extractor) → 400 (body) → 404 (unknown or not yours) → 409 (KIA, Shattered,
 /// already deployed) → active deployment → re-read, 409 (KIA, Shattered; deployment
 /// aborted; 4g-2) → input log before the roll (500 on failure, deployment aborted) →
-/// resolve → one atomic write of stress, XP, rank and the close, computed from the
-/// locked Commander row.
+/// resolve → one atomic write of stress, XP, rank, (on a Wipeout) KIA and the death card,
+/// and the close, computed from the locked Commander row.
 async fn post_mission_resolve(
     AuthSession(session): AuthSession,
     State(state): State<Arc<AppState>>,
@@ -382,7 +383,8 @@ async fn post_mission_resolve(
 
     let eff = match state
         .commander_repo
-        .resolve_deployment(deployment_id, rec.commander_id, kia, tier, &report.outcome, cfg)
+        // §2c supplies the mission's ticker contribution; 0 until then (§4e R3).
+        .resolve_deployment(deployment_id, rec.commander_id, kia, tier, 0.0, &report.outcome, cfg)
         .await
     {
         Ok(eff) => eff,
@@ -398,9 +400,11 @@ async fn post_mission_resolve(
     report.commander_name = Some(rec.name.clone());
     let report_value = serde_json::to_value(&report)
         .map_err(|e| internal_error(format!("report serialization failed: {e}")))?;
+    // The death is a Commander effect, not sim output, so it sits beside `report` (§4e R4).
     Ok(Json(json!({
         "session_id": session_id.to_string(),
         "report":     report_value,
+        "commander":  {"kia": eff.is_kia, "glorious": eff.glorious},
     })))
 }
 

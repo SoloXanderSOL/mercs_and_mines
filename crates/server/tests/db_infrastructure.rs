@@ -2455,6 +2455,8 @@ async fn convoy_timer_fires_and_marks_arrived() {
 /// section_records → commander_records (and their campaigns) → membership → player_accounts.
 /// `deployment_records.commander_id` is ON DELETE RESTRICT, so it must go first.
 async fn clean_wallet_4g1(pool: &sqlx::PgPool, wallet: &[u8]) {
+    sqlx::query("DELETE FROM card_mint_pending WHERE player_wallet = $1")
+        .bind(wallet).execute(pool).await.expect("card_mint_pending cleanup failed");
     sqlx::query("DELETE FROM deployment_records WHERE commander_id IN (SELECT commander_id FROM commander_records WHERE player_wallet = $1)")
         .bind(wallet).execute(pool).await.expect("deployment_records cleanup failed");
     sqlx::query("DELETE FROM section_records WHERE commander_id IN (SELECT commander_id FROM commander_records WHERE player_wallet = $1)")
@@ -2598,7 +2600,7 @@ async fn resolve_deployment_rolls_back_when_the_close_fails() {
     let d = new_deployment_4g1(commander_id, chrono::Utc::now());
     assert!(repo.start_deployment(&d).await.unwrap());
     // First resolve: tier 5 Success, no casualties — stress 30 → 40, and a rank-up.
-    let eff = repo.resolve_deployment(d.deployment_id, commander_id, 0, 5, &OutcomeType::Success, &cfg)
+    let eff = repo.resolve_deployment(d.deployment_id, commander_id, 0, 5, 0.0, &OutcomeType::Success, &cfg)
         .await
         .expect("first resolve failed");
     let want_xp = seeded.xp + xp_award(5, &OutcomeType::Success);
@@ -2614,7 +2616,7 @@ async fn resolve_deployment_rolls_back_when_the_close_fails() {
     assert_eq!(would_stress, 100, "precondition: the rolled-back write would Shatter");
     assert!(would_xp > before.xp, "precondition: the rolled-back write would add XP");
     let r = repo
-        .resolve_deployment(d.deployment_id, commander_id, 10, 5, &OutcomeType::Defeat, &cfg)
+        .resolve_deployment(d.deployment_id, commander_id, 10, 5, 0.0, &OutcomeType::Defeat, &cfg)
         .await;
     assert!(matches!(r, Err(mercs_server::repository::RepositoryError::NotFound)), "got {:?}", r);
 
@@ -2648,7 +2650,7 @@ async fn resolve_deployment_refuses_a_kia_commander() {
     let before = repo.get_commander(commander_id).await.unwrap().unwrap();
 
     let r = repo
-        .resolve_deployment(d.deployment_id, commander_id, 10, 5, &sim_engine::game_types::OutcomeType::Success, &cfg)
+        .resolve_deployment(d.deployment_id, commander_id, 10, 5, 0.0, &sim_engine::game_types::OutcomeType::Success, &cfg)
         .await;
     assert!(matches!(r, Err(mercs_server::repository::RepositoryError::Internal(_))), "got {:?}", r);
 
@@ -2701,7 +2703,7 @@ async fn resolve_deployment_builds_on_a_concurrent_stress_write() {
     let repo = PostgresCommanderRepository::new(wide.clone());
     let task_cfg = cfg.clone();
     let resolver = tokio::spawn(async move {
-        repo.resolve_deployment(d.deployment_id, commander_id, 0, 1, &OutcomeType::Success, &task_cfg).await
+        repo.resolve_deployment(d.deployment_id, commander_id, 0, 1, 0.0, &OutcomeType::Success, &task_cfg).await
     });
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -2726,6 +2728,117 @@ async fn resolve_deployment_builds_on_a_concurrent_stress_write() {
     assert_eq!(after.stress, expected, "the concurrent write must be built on (stale would be {stale})");
     assert_eq!(eff.stress, expected);
     wide.close().await;
+
+    clean_wallet_4g1(&pool, &wallet).await;
+}
+
+/// 4e-1: the card rows for one wallet, read at runtime (no `.sqlx/` entry).
+/// (commander_id, deployment_id, session_id, campaign_id, commander_name, rank, foil)
+async fn card_rows_4e1(pool: &sqlx::PgPool, wallet: &[u8]) -> Vec<(uuid::Uuid, uuid::Uuid, uuid::Uuid, uuid::Uuid, String, i16, bool)> {
+    sqlx::query_as(
+        "SELECT commander_id, deployment_id, session_id, campaign_id, commander_name, rank, foil
+         FROM card_mint_pending WHERE player_wallet = $1"
+    )
+    .bind(wallet)
+    .fetch_all(pool)
+    .await
+    .expect("card_mint_pending read failed")
+}
+
+/// 4e-1: a Wipeout marks the Commander KIA and queues one snapshot card of the record
+/// and the fatal deployment, inside `resolve_deployment`'s transaction. Rank 1 on a
+/// tier-1 mission with no ticker contribution is not Glorious.
+#[tokio::test]
+async fn test_mark_commander_kia_writes_kia_and_a_snapshot_card() {
+    use sim_engine::game_types::OutcomeType;
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    let wallet = [21u8; 32];
+    let (campaign_id, commander_id) = seed_commander_4g1(&pool, wallet, 30).await;
+    let repo = PostgresCommanderRepository::new(pool.clone());
+    let cfg = sim_engine::config::SimConfig::default();
+    let seeded = repo.get_commander(commander_id).await.unwrap().unwrap();
+    assert_eq!(seeded.rank, 1, "precondition");
+
+    let d = new_deployment_4g1(commander_id, chrono::Utc::now());
+    assert!(repo.start_deployment(&d).await.unwrap());
+    let eff = repo
+        .resolve_deployment(d.deployment_id, commander_id, 2, 1, 0.0, &OutcomeType::Wipeout, &cfg)
+        .await
+        .expect("resolve failed");
+    assert!(eff.is_kia);
+    assert!(!eff.glorious);
+
+    let after = repo.get_commander(commander_id).await.unwrap().unwrap();
+    assert!(after.is_kia);
+    let cards = card_rows_4e1(&pool, &wallet).await;
+    assert_eq!(cards, vec![(commander_id, d.deployment_id, d.session_id, campaign_id, seeded.name.clone(), 1, false)]);
+    let deps = repo.list_deployments_by_commander(commander_id).await.unwrap();
+    assert_eq!(deps[0].status, "resolved");
+    assert_eq!(deps[0].outcome.as_deref(), Some(outcome_db_str(&OutcomeType::Wipeout)));
+
+    clean_wallet_4g1(&pool, &wallet).await;
+}
+
+/// 4e-1: any Rank 5 death is Glorious, so its card is foil.
+#[tokio::test]
+async fn test_mark_commander_kia_rank_five_card_is_foil() {
+    use sim_engine::game_types::OutcomeType;
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    let wallet = [22u8; 32];
+    let (_campaign_id, commander_id) = seed_commander_4g1(&pool, wallet, 30).await;
+    let repo = PostgresCommanderRepository::new(pool.clone());
+    let cfg = sim_engine::config::SimConfig::default();
+    // XP at the rank-5 threshold, so the resolve's rank_for_xp keeps rank 5.
+    repo.update_rank_and_xp(commander_id, 5, 2600).await.unwrap();
+
+    let d = new_deployment_4g1(commander_id, chrono::Utc::now());
+    assert!(repo.start_deployment(&d).await.unwrap());
+    let eff = repo
+        .resolve_deployment(d.deployment_id, commander_id, 2, 1, 0.0, &OutcomeType::Wipeout, &cfg)
+        .await
+        .expect("resolve failed");
+    assert!(eff.is_kia && eff.glorious, "got {:?}", eff);
+    let cards = card_rows_4e1(&pool, &wallet).await;
+    assert_eq!(cards.len(), 1);
+    assert_eq!((cards[0].5, cards[0].6), (5, true), "rank 5, foil");
+
+    clean_wallet_4g1(&pool, &wallet).await;
+}
+
+/// 4e-1: the KIA write and the card insert share the close's transaction. A second
+/// resolve on an already-closed deployment runs both, then the close touches 0 rows,
+/// and both roll back. The first resolve must not be a Wipeout, or the second would be
+/// refused as KIA before it reached the writes.
+#[tokio::test]
+async fn test_mark_commander_kia_rolls_back_with_the_close() {
+    use sim_engine::game_types::OutcomeType;
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    let wallet = [23u8; 32];
+    let (_campaign_id, commander_id) = seed_commander_4g1(&pool, wallet, 30).await;
+    let repo = PostgresCommanderRepository::new(pool.clone());
+    let cfg = sim_engine::config::SimConfig::default();
+
+    let d = new_deployment_4g1(commander_id, chrono::Utc::now());
+    assert!(repo.start_deployment(&d).await.unwrap());
+    repo.resolve_deployment(d.deployment_id, commander_id, 0, 1, 0.0, &OutcomeType::Success, &cfg)
+        .await
+        .expect("first resolve failed");
+
+    let r = repo
+        .resolve_deployment(d.deployment_id, commander_id, 2, 1, 0.0, &OutcomeType::Wipeout, &cfg)
+        .await;
+    assert!(matches!(r, Err(mercs_server::repository::RepositoryError::NotFound)), "got {:?}", r);
+    assert!(!repo.get_commander(commander_id).await.unwrap().unwrap().is_kia, "a failed close must roll back the KIA write");
+    assert!(card_rows_4e1(&pool, &wallet).await.is_empty(), "a failed close must roll back the card");
 
     clean_wallet_4g1(&pool, &wallet).await;
 }
@@ -3547,10 +3660,11 @@ impl CommanderRepository for ShatterOnStart {
         commander_id: uuid::Uuid,
         kia: u32,
         tier: u8,
+        ticker_contribution_pct: f64,
         outcome: &sim_engine::game_types::OutcomeType,
         cfg: &sim_engine::config::SimConfig,
     ) -> Result<mercs_server::repository::AppliedEffects, mercs_server::repository::RepositoryError> {
-        self.inner.resolve_deployment(deployment_id, commander_id, kia, tier, outcome, cfg).await
+        self.inner.resolve_deployment(deployment_id, commander_id, kia, tier, ticker_contribution_pct, outcome, cfg).await
     }
     async fn list_deployments_by_commander(&self, commander_id: uuid::Uuid) -> Result<Vec<mercs_server::repository::DeploymentRecord>, mercs_server::repository::RepositoryError> {
         self.inner.list_deployments_by_commander(commander_id).await
@@ -3716,6 +3830,19 @@ async fn mission_resolve_end_to_end_writes_effects() {
     assert_eq!(deps[0].session_id, sid);
     assert_eq!(deps[0].outcome.as_deref(), Some(outcome_db_str(&outcome)));
     assert!(entries[0].payload["timestamp"].is_string());
+
+    // The death (4e-1): the response reports it, and the record and card queue agree.
+    // The seed is the route's, so this checks whichever branch the roll took.
+    let died = matches!(outcome, OutcomeType::Wipeout);
+    assert_eq!(resp["commander"]["kia"].as_bool(), Some(died), "commander.kia must equal outcome == Wipeout");
+    assert!(resp["commander"]["glorious"].is_boolean());
+    assert_eq!(after.is_kia, died);
+    let cards: i64 = sqlx::query_scalar("SELECT count(*) FROM card_mint_pending WHERE player_wallet = $1")
+        .bind(&wallet[..])
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(cards, if died { 1 } else { 0 });
 
     // The response's session_id reaches the integrity route.
     let req = axum::http::Request::builder()
