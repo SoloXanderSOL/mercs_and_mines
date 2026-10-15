@@ -381,6 +381,18 @@ async fn post_mission_resolve(
         .count() as u32;
     let tier = mission_tier(mission.difficulty);
 
+    // Presentation only: the report names the record's Commander. Serialised before the
+    // resolve, so nothing fallible follows the commit that may kill the Commander
+    // (Reviewer 4e-1 F2).
+    report.commander_name = Some(rec.name.clone());
+    let report_value = match serde_json::to_value(&report) {
+        Ok(v) => v,
+        Err(e) => {
+            abort_deployment_or_log(&state, deployment_id).await;
+            return Err(internal_error(format!("report serialization failed: {e}")));
+        }
+    };
+
     let eff = match state
         .commander_repo
         // §2c supplies the mission's ticker contribution; 0 until then (§4e R3).
@@ -396,10 +408,6 @@ async fn post_mission_resolve(
     };
     log_rank_up(rec.commander_id, eff.old_rank, eff.new_rank);
 
-    // Presentation only, after the resolve: the report names the record's Commander.
-    report.commander_name = Some(rec.name.clone());
-    let report_value = serde_json::to_value(&report)
-        .map_err(|e| internal_error(format!("report serialization failed: {e}")))?;
     // The death is a Commander effect, not sim output, so it sits beside `report` (§4e R4).
     Ok(Json(json!({
         "session_id": session_id.to_string(),

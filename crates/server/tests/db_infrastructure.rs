@@ -2828,6 +2828,38 @@ async fn test_mark_commander_kia_rank_five_card_is_foil() {
     clean_wallet_4g1(&pool, &wallet).await;
 }
 
+/// Reviewer 4e-1 F1: the card stamps the locked rank. A Rank 5 Commander with low XP is
+/// re-ranked by the resolve's rank `UPDATE`, which runs before the card insert in the same
+/// transaction; the card must still say 5, the rank that made the death Glorious.
+#[tokio::test]
+async fn postgres_card_stamps_the_locked_rank() {
+    use sim_engine::game_types::OutcomeType;
+    let Some(pool) = test_pool().await else {
+        eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test");
+        return;
+    };
+    let wallet = [24u8; 32];
+    let (_campaign_id, commander_id) = seed_commander_4g1(&pool, wallet, 30).await;
+    let repo = PostgresCommanderRepository::new(pool.clone());
+    let cfg = sim_engine::config::SimConfig::default();
+    // An inconsistent pair: rank 5 with XP that rank_for_xp maps below 5.
+    repo.update_rank_and_xp(commander_id, 5, 0).await.unwrap();
+
+    let d = new_deployment_4g1(commander_id, chrono::Utc::now());
+    assert!(repo.start_deployment(&d).await.unwrap());
+    let eff = repo
+        .resolve_deployment(d.deployment_id, commander_id, 2, 1, 0.0, &OutcomeType::Wipeout, &cfg)
+        .await
+        .expect("resolve failed");
+    let cards = card_rows_4e1(&pool, &wallet).await;
+    clean_wallet_4g1(&pool, &wallet).await;
+
+    assert!(eff.is_kia && eff.glorious, "got {:?}", eff);
+    assert!(eff.new_rank < 5, "precondition: the resolve re-ranks from XP, got {:?}", eff);
+    assert_eq!(cards.len(), 1);
+    assert_eq!((cards[0].5, cards[0].6), (5, true), "the card stamps the rank the Commander died at");
+}
+
 /// 4e-1: the KIA write and the card insert share the close's transaction. A second
 /// resolve on an already-closed deployment runs both, then the close touches 0 rows,
 /// and both roll back. The first resolve must not be a Wipeout, or the second would be

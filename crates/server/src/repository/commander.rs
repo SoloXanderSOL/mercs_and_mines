@@ -301,6 +301,7 @@ async fn mark_commander_kia(
     commander_id: Uuid,
     deployment_id: Uuid,
     glorious: bool,
+    rank: i16,
 ) -> Result<(), RepositoryError> {
     // `set_kia`'s statement, byte for byte, so the two share one `.sqlx/` cache file.
     let r = sqlx::query!(
@@ -314,10 +315,13 @@ async fn mark_commander_kia(
         return Err(RepositoryError::NotFound);
     }
     // No `status = 'active'` guard: the close checks that, last.
+    // The rank is bound, not read from `c.rank`: inside this transaction that column
+    // already holds the recomputed rank, while the card (and Glorious) is the rank the
+    // Commander died at, the locked one (Reviewer 4e-1 F1).
     let r = sqlx::query!(
         r#"INSERT INTO card_mint_pending
             (card_mint_id, player_wallet, campaign_id, commander_id, deployment_id, session_id, commander_name, rank, foil)
-        SELECT $1, c.player_wallet, c.campaign_id, c.commander_id, d.deployment_id, d.session_id, c.name, c.rank, $2
+        SELECT $1, c.player_wallet, c.campaign_id, c.commander_id, d.deployment_id, d.session_id, c.name, $5, $2
         FROM commander_records c
         JOIN deployment_records d ON d.commander_id = c.commander_id
         WHERE c.commander_id = $3 AND d.deployment_id = $4"#,
@@ -325,6 +329,7 @@ async fn mark_commander_kia(
         glorious,
         commander_id,
         deployment_id,
+        rank,
     )
     .execute(&mut **tx)
     .await
@@ -622,7 +627,7 @@ impl CommanderRepository for PostgresCommanderRepository {
         }
         let (died, glorious) = death_effects(row.rank, tier, ticker_contribution_pct, outcome);
         if died {
-            mark_commander_kia(&mut tx, commander_id, deployment_id, glorious).await?;
+            mark_commander_kia(&mut tx, commander_id, deployment_id, glorious, row.rank).await?;
         }
         eff.is_kia = died;
         eff.glorious = glorious;
@@ -849,7 +854,7 @@ impl CommanderRepository for InMemoryCommanderRepository {
                 deployment_id,
                 session_id:     dep.session_id,
                 commander_name: rec.name.clone(),
-                rank:           rec.rank,
+                rank:           eff.old_rank, // the locked rank, as Postgres binds (F1)
                 foil:           glorious,
             });
             // TODO(phase-2): grief spike — see `mark_commander_kia` (Postgres section).
@@ -1172,6 +1177,26 @@ mod tests {
         assert_eq!((card.commander_id, card.deployment_id, card.session_id), (id, d.deployment_id, d.session_id));
         let deps = repo.list_deployments_by_commander(id).await.unwrap();
         assert_eq!(deps[0].outcome.as_deref(), Some("Wipeout"));
+    }
+
+    /// Reviewer 4e-1 F1: a Rank 5 Commander with low XP is re-ranked by the resolve, but
+    /// dies at Rank 5 (which is what makes the death Glorious), so the card says 5.
+    #[tokio::test]
+    async fn card_stamps_the_locked_rank() {
+        let (repo, id) = seeded_repo(0, 5, |r| r.stress = 30).await;
+        let d = new_deployment(id, Utc::now());
+        assert!(repo.start_deployment(&d).await.unwrap());
+        let cfg = SimConfig::default();
+        let eff = repo
+            .resolve_deployment(d.deployment_id, id, 2, 1, 0.0, &OutcomeType::Wipeout, &cfg)
+            .await
+            .unwrap();
+        assert!(eff.is_kia && eff.glorious, "got {:?}", eff);
+        assert!(eff.new_rank < 5, "precondition: the resolve re-ranks from XP, got {:?}", eff);
+        let cards = repo.card_mint_pending().unwrap();
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].rank, 5, "the card stamps the rank the Commander died at");
+        assert!(cards[0].foil);
     }
 
     #[tokio::test]
