@@ -1,8 +1,11 @@
 name: Release
 
+# GAP-32: CI runs on every push to dev and every pull request, not only on main. The
+# deploy job's main-only guard below is what keeps those runs off production.
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
+  pull_request:
   workflow_dispatch:
 
 env:
@@ -17,8 +20,8 @@ env:
   # Regenerate with `cargo sqlx prepare --workspace -- --all-targets` whenever a query
   # or migration changes, or the build fails here rather than at runtime.
   # The `-- --all-targets` is load-bearing: without it the command still exits 0 but
-  # writes a 44-file cache that omits every macro used from a test target, and the
-  # build then fails in CI (red run #58). The correct command produces 49 files.
+  # writes a smaller cache that omits every macro used from a test target, and the
+  # build then fails in CI (red run #58).
   SQLX_OFFLINE: true
 
 jobs:
@@ -108,6 +111,11 @@ jobs:
       - name: Build release binary
         # --locked enforces Cargo.lock exactly — required for build determinism.
         # The simulation output must be identical across every build of the same commit.
+        # MERCS_BUILD_SHA is embedded by option_env! and served at /api/version; the
+        # deploy script polls it to prove the new build is the one serving. A changed
+        # value is a tracked env-dep, so a cached target/ still rebuilds.
+        env:
+          MERCS_BUILD_SHA: ${{ github.sha }}
         run: cargo build --release --locked
 
       - name: Upload server binary
@@ -124,16 +132,46 @@ jobs:
           path: app/
           if-no-files-found: error
 
+  deploy-script:
+    name: Deploy script harness
+    # GAP-33: proves every branch of deploy/remote_deploy.sh's exit-code contract (0/1/2)
+    # against PATH shims, on every push and PR. No services and no toolchain: it runs in
+    # seconds, in parallel with build, and the deploy job needs it green.
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: shellcheck is present
+        # The runner image lists shellcheck; this step fails loudly if that ever changes,
+        # instead of the lint step below passing by not running.
+        run: shellcheck --version
+
+      - name: Lint deploy scripts
+        run: shellcheck deploy/remote_deploy.sh deploy/test_remote_deploy.sh
+
+      - name: Run deploy harness
+        run: bash deploy/test_remote_deploy.sh
+
   deploy:
     name: Deploy to DigitalOcean
-    needs: build
-    # This workflow also accepts workflow_dispatch. Without this condition, manually
-    # dispatching it from ANY branch builds that branch and ships it to the production
-    # droplet. Deploy is main-only, full stop.
+    needs: [build, deploy-script]
+    # This workflow also runs on dev pushes, pull requests and workflow_dispatch. Without
+    # this condition, any of those would ship a non-main build to the production droplet.
+    # Deploy is main-only, full stop.
     if: github.ref == 'refs/heads/main'
     # Pinned with the build job for consistency (GAP-47); this job only runs scp/ssh/rsync.
     runs-on: ubuntu-24.04
+    # Secrets reach steps only through env:, never interpolated into a run: body.
+    env:
+      DEPLOY_USER: ${{ secrets.DEV_SERVER_USER }}
+      DEPLOY_HOST: ${{ secrets.DEV_SERVER_HOST }}
+      APP_PATH: ${{ secrets.DEV_SERVER_APP_PATH }}
     steps:
+      - name: Checkout
+        # For deploy/remote_deploy.sh, which is streamed to the droplet below.
+        uses: actions/checkout@v5
+
       - name: Download server binary
         uses: actions/download-artifact@v7
         with:
@@ -146,106 +184,44 @@ jobs:
           path: app/
 
       - name: Configure SSH agent
+        env:
+          SSH_KEY: ${{ secrets.DEV_SERVER_SSH_KEY }}
+          SSH_PASSPHRASE: ${{ secrets.DEV_SERVER_SSH_PASSPHRASE }}
         run: |
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
-          printf '%s\n' "${{ secrets.DEV_SERVER_SSH_KEY }}" > ~/.ssh/deploy_key
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -H "${{ secrets.DEV_SERVER_HOST }}" >> ~/.ssh/known_hosts
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
           eval "$(ssh-agent -s)"
           echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> "$GITHUB_ENV"
           echo "SSH_AGENT_PID=$SSH_AGENT_PID"  >> "$GITHUB_ENV"
-          printf '%s\n' "${{ secrets.DEV_SERVER_SSH_PASSPHRASE }}" | ssh-add ~/.ssh/deploy_key
+          printf '%s\n' "$SSH_PASSPHRASE" | ssh-add ~/.ssh/deploy_key
 
       - name: Upload binary to server
         run: |
-          scp \
-            mercs-server \
-            "${{ secrets.DEV_SERVER_USER }}@${{ secrets.DEV_SERVER_HOST }}:${{ secrets.DEV_SERVER_APP_PATH }}/mercs-server.new"
-
-      # Preserve the last-known-good binary BEFORE the swap destroys it. Without this
-      # there is nothing to roll back to when the health check below fails.
-      - name: Back up current binary
-        env:
-          APP_PATH: ${{ secrets.DEV_SERVER_APP_PATH }}
-        run: |
-          ssh "${{ secrets.DEV_SERVER_USER }}@${{ secrets.DEV_SERVER_HOST }}" \
-            "APP_PATH='$APP_PATH' bash -s" <<'REMOTE'
-          set -euo pipefail
-          rm -f "$APP_PATH/mercs-server.prev"
-          if [ -f "$APP_PATH/mercs-server" ]; then
-            cp -a "$APP_PATH/mercs-server" "$APP_PATH/mercs-server.prev"
-            echo "Backed up current binary -> mercs-server.prev"
-          else
-            echo "No existing binary (first deploy) — nothing to back up."
-          fi
-          REMOTE
-
-      - name: Atomic swap and set permissions
-        run: |
-          ssh "${{ secrets.DEV_SERVER_USER }}@${{ secrets.DEV_SERVER_HOST }}" \
-            "mv ${{ secrets.DEV_SERVER_APP_PATH }}/mercs-server.new \
-                ${{ secrets.DEV_SERVER_APP_PATH }}/mercs-server \
-             && chmod +x ${{ secrets.DEV_SERVER_APP_PATH }}/mercs-server"
+          scp mercs-server "$DEPLOY_USER@$DEPLOY_HOST:$APP_PATH/mercs-server.new"
 
       # --exclude='_dev/' keeps app/_dev/ (base_demo.html and any future scratch pages)
       # off the public host. nginx also denies /_dev/ — belt and braces, both are canon.
+      # app/ goes up before the restart (as it always has); a rollback restores the
+      # binary only, not app/ (GAP-54).
       - name: Upload app directory to server
         run: |
           rsync -a --delete --exclude='_dev/' \
             app/ \
-            "${{ secrets.DEV_SERVER_USER }}@${{ secrets.DEV_SERVER_HOST }}:${{ secrets.DEV_SERVER_APP_PATH }}/app/"
+            "$DEPLOY_USER@$DEPLOY_HOST:$APP_PATH/app/"
 
-      # Restart, then prove the new binary actually serves before declaring victory.
-      # `systemctl restart` returns success the moment the process forks, so it is not
-      # evidence of anything on its own. Restart and health check are one remote script
-      # so that a restart failure funnels into the same rollback path.
-      #
-      # Probe is loopback: the binary binds 127.0.0.1:3000 and is not publicly
-      # reachable (Security_Mandate.md 2i). /api/units is unauthenticated and stateless,
-      # but main.rs connects Postgres and Redis and runs migrations BEFORE binding —
-      # so any 200 proves the whole startup path, not just that a process exists.
-      # 60s budget: a first boot against a fresh database also runs 15 migrations.
-      - name: Restart, health check, and roll back on failure
+      # Backup, swap, restart, SHA probe and rollback are one droplet-side script, tested
+      # by the deploy-script job. It exits 0 (deployed), 1 (failed, rollback verified) or
+      # 2 (rollback failed or impossible); any non-zero fails this step. The probe polls
+      # /api/version until build_sha == this commit, on loopback (the binary binds
+      # 127.0.0.1:3000; Security_Mandate.md 2i). The 60s budget covers a first boot
+      # against a fresh database, which runs every migration before binding.
+      - name: Deploy, verify build SHA, roll back on failure
         env:
-          APP_PATH: ${{ secrets.DEV_SERVER_APP_PATH }}
+          EXPECTED_SHA: ${{ github.sha }}
         run: |
-          ssh "${{ secrets.DEV_SERVER_USER }}@${{ secrets.DEV_SERVER_HOST }}" \
-            "APP_PATH='$APP_PATH' bash -s" <<'REMOTE'
-          set -uo pipefail
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" \
+            "APP_PATH='$APP_PATH' EXPECTED_SHA='$EXPECTED_SHA' bash -s" < deploy/remote_deploy.sh
 
-          HEALTH_URL='http://127.0.0.1:3000/api/units'
-          TIMEOUT_SECS=60
-
-          sudo systemctl reset-failed mercs-and-mines || true
-          if ! sudo systemctl restart mercs-and-mines; then
-            echo "systemctl restart returned non-zero — falling through to the health check."
-          fi
-
-          echo "Polling $HEALTH_URL for up to ${TIMEOUT_SECS}s..."
-          deadline=$(( SECONDS + TIMEOUT_SECS ))
-          while ! curl -sf --max-time 5 "$HEALTH_URL" >/dev/null 2>&1; do
-            if [ "$SECONDS" -ge "$deadline" ]; then
-              echo "::error::DEPLOY FAILED — $HEALTH_URL did not respond within ${TIMEOUT_SECS}s."
-              echo "----- last 50 journal lines -----"
-              sudo journalctl -u mercs-and-mines -n 50 --no-pager || true
-              echo "---------------------------------"
-
-              if [ -f "$APP_PATH/mercs-server.prev" ]; then
-                echo "Restoring mercs-server.prev..."
-                mv "$APP_PATH/mercs-server.prev" "$APP_PATH/mercs-server"
-                chmod +x "$APP_PATH/mercs-server"
-                sudo systemctl reset-failed mercs-and-mines || true
-                sudo systemctl restart mercs-and-mines || true
-                echo "::error::ROLLED BACK to the previous binary. Verify the service by hand before deploying again."
-              else
-                echo "::error::No mercs-server.prev exists (first deploy) — NO ROLLBACK POSSIBLE. The service is down."
-              fi
-              exit 1
-            fi
-            sleep 2
-          done
-
-          echo "Health check passed — new binary is serving."
-          rm -f "$APP_PATH/mercs-server.prev"
-          REMOTE
