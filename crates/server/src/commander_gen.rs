@@ -280,6 +280,17 @@ mod tests {
     }
 
     #[test]
+    fn generated_flaws_all_have_effects() {
+        let ctx = sim_engine::fatal_flaw::FatalFlawContext::default();
+        for f in FATAL_FLAWS {
+            assert!(
+                !sim_engine::fatal_flaw::evaluate_fatal_flaw(f, &sim_engine::game_types::StressTier::Rested, &ctx).is_empty(),
+                "rolled flaw {f:?} has no effects: spelling drift between FATAL_FLAWS and sim_engine::fatal_flaw"
+            );
+        }
+    }
+
+    #[test]
     fn generate_commander_specialization_is_canonical() {
         for seed in 0..50u32 {
             let r = generate_commander(vec![0u8; 32], Uuid::nil(), seed);

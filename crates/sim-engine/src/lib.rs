@@ -16,5 +16,6 @@ pub mod missions;
 pub mod equipment;
 pub mod scenario;
 pub mod ore_run;
+pub mod fatal_flaw;
 
 pub use game_types::UnitArchetype;
