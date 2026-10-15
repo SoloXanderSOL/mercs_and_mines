@@ -22,6 +22,7 @@ use mercs_server::repository::{
     ConvoyDbRecord, ConvoyRepository, PostgresConvoyRepository,
     NewDeployment, outcome_db_str,
 };
+use sim_engine::roster::{CommanderFlaw, CommanderOrigin, CommanderSpecialization, FactionBias};
 
 async fn test_pool() -> Option<sqlx::PgPool> {
     let url = std::env::var("TEST_DATABASE_URL").ok()?;
@@ -223,14 +224,13 @@ async fn commander_section_crud_is_correct() {
         rank:            1,
         xp:              0,
         stress:          0,
-        origin:          "Outer Rim".into(),
-        faction_bias:    "Trust".into(),
-        specialization:  "Heavy Weapons".into(),
-        fatal_flaw:      "Reckless".into(),
+        origin:          CommanderOrigin::Bearocrat.as_str().into(),
+        faction_bias:    FactionBias::TrustAsset.as_str().into(),
+        specialization:  CommanderSpecialization::Cannoneer.as_str().into(),
+        fatal_flaw:      CommanderFlaw::Cowardly.as_str().into(),
         veteran_trait:   None,
         is_shattered:    false,
         is_kia:          false,
-        is_nft:          false,
         prng_seed_state: 0xDEAD_i64,
         created_at:      chrono::Utc::now(),
         updated_at:      chrono::Utc::now(),
@@ -1021,17 +1021,12 @@ async fn commander_generate_and_persist() {
     assert_eq!(record.stress, 0);
     assert!(!record.is_shattered);
     assert!(!record.is_kia);
-    assert!(!record.is_nft);
     assert!(record.veteran_trait.is_none());
     assert_eq!(record.prng_seed_state, 42i64);
     assert_eq!(record.campaign_id, campaign_id);
 
-    let canonical_origins = [
-        "Human (Corporate)", "Human (Underhive)",
-        "Raccoon (Mod-Moped)", "Raccoon (Rocker-Chopper)", "Hamster Attachment",
-    ];
     assert!(
-        canonical_origins.contains(&record.origin.as_str()),
+        CommanderOrigin::ALL.iter().any(|o| o.as_str() == record.origin),
         "origin '{}' not canonical", record.origin
     );
 
@@ -2959,6 +2954,65 @@ async fn commander_stress_check_rejects_out_of_range() {
     let err = raw.expect_err("stress 101 must violate commander_records_stress_range");
     let code = err.as_database_error().and_then(|d| d.code()).map(|c| c.to_string());
     assert_eq!(code.as_deref(), Some("23514"), "expected a check violation, got {err}");
+
+    clean_wallet_4g1(&pool, &wallet).await;
+}
+
+/// Brick B — migration 0018's CHECKs reject an origin and a faction bias the previous
+/// binary's generator could write.
+#[tokio::test]
+async fn commander_roster_check_rejects_non_canonical_values() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    let wallet = [26u8; 32];
+    let (_campaign_id, commander_id) = seed_commander_4g1(&pool, wallet, 0).await;
+
+    let cases = [
+        ("origin", "UPDATE commander_records SET origin = 'Raccoon (Mod-Moped)' WHERE commander_id = $1", "commander_records_origin_canon"),
+        ("faction_bias", "UPDATE commander_records SET faction_bias = 'GUN Loyalist' WHERE commander_id = $1", "commander_records_faction_bias_canon"),
+    ];
+    for (column, sql, constraint) in cases {
+        let err = sqlx::query(sql)
+            .bind(commander_id)
+            .execute(&pool)
+            .await
+            .expect_err(&format!("a non-canonical {column} must violate {constraint}"));
+        let code = err.as_database_error().and_then(|d| d.code()).map(|c| c.to_string());
+        assert_eq!(code.as_deref(), Some("23514"), "{constraint}: expected a check violation, got {err}");
+    }
+
+    clean_wallet_4g1(&pool, &wallet).await;
+}
+
+/// Brick B drift guard — every roster value passes migration 0018's CHECKs, so the SQL
+/// lists and `sim_engine::roster` cannot diverge silently.
+#[tokio::test]
+async fn commander_roster_check_accepts_every_canonical_value() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    let wallet = [27u8; 32];
+    let (_campaign_id, commander_id) = seed_commander_4g1(&pool, wallet, 0).await;
+
+    for origin in CommanderOrigin::ALL {
+        sqlx::query("UPDATE commander_records SET origin = $2 WHERE commander_id = $1")
+            .bind(commander_id)
+            .bind(origin.as_str())
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("origin {:?} rejected by commander_records_origin_canon: {e}", origin.as_str()));
+    }
+    for bias in FactionBias::ALL {
+        sqlx::query("UPDATE commander_records SET faction_bias = $2 WHERE commander_id = $1")
+            .bind(commander_id)
+            .bind(bias.as_str())
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("faction_bias {:?} rejected by commander_records_faction_bias_canon: {e}", bias.as_str()));
+    }
 
     clean_wallet_4g1(&pool, &wallet).await;
 }

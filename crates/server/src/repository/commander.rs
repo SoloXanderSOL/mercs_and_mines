@@ -164,7 +164,6 @@ pub struct CommanderRecord {
     pub veteran_trait:   Option<String>,
     pub is_shattered:    bool,
     pub is_kia:          bool,
-    pub is_nft:          bool,
     pub prng_seed_state: i64,
     pub created_at:      DateTime<Utc>,
     pub updated_at:      DateTime<Utc>,
@@ -349,8 +348,8 @@ impl CommanderRepository for PostgresCommanderRepository {
             r#"INSERT INTO commander_records (
                 commander_id, campaign_id, player_wallet, name, rank, xp, stress,
                 origin, faction_bias, specialization, fatal_flaw, veteran_trait,
-                is_shattered, is_kia, is_nft, prng_seed_state
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)"#,
+                is_shattered, is_kia, prng_seed_state
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)"#,
             r.commander_id,
             r.campaign_id,
             r.player_wallet,
@@ -365,7 +364,6 @@ impl CommanderRepository for PostgresCommanderRepository {
             r.veteran_trait,
             r.is_shattered,
             r.is_kia,
-            r.is_nft,
             r.prng_seed_state,
         )
         .execute(&self.pool)
@@ -379,7 +377,7 @@ impl CommanderRepository for PostgresCommanderRepository {
             r#"SELECT
                 commander_id, campaign_id, player_wallet, name, rank, xp, stress,
                 origin, faction_bias, specialization, fatal_flaw, veteran_trait,
-                is_shattered, is_kia, is_nft, prng_seed_state, created_at, updated_at
+                is_shattered, is_kia, prng_seed_state, created_at, updated_at
                FROM commander_records WHERE commander_id = $1"#,
             commander_id
         )
@@ -402,7 +400,6 @@ impl CommanderRepository for PostgresCommanderRepository {
             veteran_trait:   r.veteran_trait,
             is_shattered:    r.is_shattered,
             is_kia:          r.is_kia,
-            is_nft:          r.is_nft,
             prng_seed_state: r.prng_seed_state,
             created_at:      r.created_at,
             updated_at:      r.updated_at,
@@ -493,7 +490,7 @@ impl CommanderRepository for PostgresCommanderRepository {
             r#"SELECT
                 commander_id, campaign_id, player_wallet, name, rank, xp, stress,
                 origin, faction_bias, specialization, fatal_flaw, veteran_trait,
-                is_shattered, is_kia, is_nft, prng_seed_state, created_at, updated_at
+                is_shattered, is_kia, prng_seed_state, created_at, updated_at
                FROM commander_records WHERE campaign_id = $1"#,
             campaign_id
         )
@@ -516,7 +513,6 @@ impl CommanderRepository for PostgresCommanderRepository {
             veteran_trait:   r.veteran_trait,
             is_shattered:    r.is_shattered,
             is_kia:          r.is_kia,
-            is_nft:          r.is_nft,
             prng_seed_state: r.prng_seed_state,
             created_at:      r.created_at,
             updated_at:      r.updated_at,
@@ -893,14 +889,13 @@ mod tests {
             rank:            1,
             xp:              0,
             stress:          50,
-            origin:          "unknown".into(),
-            faction_bias:    "none".into(),
-            specialization:  "none".into(),
-            fatal_flaw:      "none".into(),
+            origin:          sim_engine::roster::CommanderOrigin::HumanCorporate.as_str().into(),
+            faction_bias:    sim_engine::roster::FactionBias::UnionAgitator.as_str().into(),
+            specialization:  sim_engine::roster::CommanderSpecialization::TrenchSweeper.as_str().into(),
+            fatal_flaw:      sim_engine::roster::CommanderFlaw::Embezzler.as_str().into(),
             veteran_trait:   None,
             is_shattered:    false,
             is_kia:          false,
-            is_nft:          false,
             prng_seed_state: 0,
             created_at:      chrono::Utc::now(),
             updated_at:      chrono::Utc::now(),

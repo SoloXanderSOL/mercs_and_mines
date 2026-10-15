@@ -107,7 +107,6 @@ pub fn roll_loot(rng: &mut Rng, total_loot_bonus: u32, mission_difficulty: u8, c
     let item_name = pick_item_name(rng, &grade);
 
     Some(LootDrop {
-        is_nft_candidate: grade == QualityGrade::Elite, // hook for future Solana cNFT minting
         quality_grade: grade,
         item_name,
     })

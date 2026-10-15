@@ -11,6 +11,7 @@ pub use shared::{Coordinates, EntityVision};
 // Not used for deployable combat units.
 // ----------------------------------------------------------------
 
+/// Legacy client-sent sim type, kept unchanged because logged `session_start` payloads deserialise it (GAP-36 retires it); the canonical origin roster is `roster::CommanderOrigin`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Species {
     #[serde(rename = "Human (Corporate)")]
@@ -380,8 +381,6 @@ pub struct UnitBattleResult {
 pub struct LootDrop {
     pub quality_grade: QualityGrade,
     pub item_name: String,
-    /// True for Elite — future Solana cNFT hook.
-    pub is_nft_candidate: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

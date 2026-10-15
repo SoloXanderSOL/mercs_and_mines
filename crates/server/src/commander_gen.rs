@@ -3,52 +3,57 @@ use uuid::Uuid;
 
 use sim_engine::game_types::OutcomeType;
 use sim_engine::rng::Rng;
+use sim_engine::roster::{CommanderFlaw, CommanderOrigin, CommanderSpecialization, FactionBias};
 
 use crate::repository::commander::CommanderRecord;
 
-const ORIGINS: &[&str] = &[
-    "Human (Corporate)",
-    "Human (Underhive)",
-    "Raccoon (Mod-Moped)",
-    "Raccoon (Rocker-Chopper)",
-    "Hamster Attachment",
-];
+// TODO(4d-2): roll CommanderFlaw::ALL once evaluate_fatal_flaw is exhaustive over it. A Commander must never roll a flaw the game cannot enforce.
+const ROLLED_FLAWS: [CommanderFlaw; 3] = [CommanderFlaw::Embezzler, CommanderFlaw::Bloodthirsty, CommanderFlaw::Cowardly];
 
-const FACTION_BIAS: &[&str] = &[
-    "GUN Loyalist",
-    "Union Agitator",
-    "Cult of Bob Initiate",
-];
+const HUMAN_FIRST_NAMES: &[&str] = &["Vance", "Kira", "Dolan", "Metz", "Shen", "Yula"];
+const SHARED_SURNAMES: &[&str] = &["Ashmore", "Drek", "Volkov", "Jin", "Osei", "Colt"];
 
-const SPECS_MERC: &[&str] = &["Trench-Sweeper", "Armor-Adept", "Night-Stalker"];
-const SPECS_MINER: &[&str] = &["Deep-Driller", "Coolant-Jockey", "Shoring-Expert"];
+/// One uniform pick from `pool`: exactly one draw, including for a one-element pool.
+fn pick<T: Copy>(pool: &[T], rng: &mut Rng) -> T {
+    pool[rng.roll_int(0, (pool.len() - 1) as u32) as usize]
+}
 
-const FATAL_FLAWS: &[&str] = &["Embezzler", "Bloodthirsty", "Cowardly"];
-
-fn pick_name(origin: &str, rng: &mut Rng) -> String {
-    let first_names: &[&str] = match origin {
-        "Raccoon (Mod-Moped)" | "Raccoon (Rocker-Chopper)" => {
-            &["Scratch", "Gnash", "Rev", "Bolt", "Skid", "Crank"]
-        }
-        "Hamster Attachment" => &["Squeaks", "Nibbles", "Fluff", "Scurry", "Hatch", "Pinch"],
-        _ => &["Vance", "Kira", "Dolan", "Metz", "Shen", "Yula"],
+/// Name pools are provisional and playtest-flagged (Director-approved 2026-07-19). Science
+/// Ape names fill the surname slot, after the Pemberton-Simian precedent.
+fn pick_name(origin: CommanderOrigin, rng: &mut Rng) -> String {
+    let (first_names, surnames): (&[&str], &[&str]) = match origin {
+        CommanderOrigin::HumanCorporate | CommanderOrigin::HumanUnderhive => (HUMAN_FIRST_NAMES, SHARED_SURNAMES),
+        CommanderOrigin::Duck => (
+            &["Mallardus", "Drakewell", "Pondsworth", "Aylesbury", "Canardo", "Widgeon", "Brantley", "Scaup"],
+            SHARED_SURNAMES,
+        ),
+        CommanderOrigin::Bearocrat => (
+            &["Ursinus", "Kodiakov", "Bruinsworth", "Grizelda", "Paddingsley", "Ursaline", "Bearnard", "Clawford"],
+            SHARED_SURNAMES,
+        ),
+        CommanderOrigin::ScienceApe => (
+            HUMAN_FIRST_NAMES,
+            &["Darwin-Macaque", "Newton-Gibbon", "Tesla-Tamarin", "Hawking-Howler", "Curie-Capuchin", "Faraday-Baboon", "Kepler-Colobus", "Lovelace-Langur"],
+        ),
     };
-    let surnames: &[&str] = &["Ashmore", "Drek", "Volkov", "Jin", "Osei", "Colt"];
-    let first = first_names[rng.roll_int(0, (first_names.len() - 1) as u32) as usize];
-    let last = surnames[rng.roll_int(0, (surnames.len() - 1) as u32) as usize];
+    let first = pick(first_names, rng);
+    let last = pick(surnames, rng);
     format!("{} {}", first, last)
 }
 
 /// Generate a fully-populated `CommanderRecord` by rolling all five trait pillars
-/// from the seeded PRNG. Pure function — no I/O, no DB access.
+/// from the seeded PRNG and the canonical roster (`sim_engine::roster`). Pure function —
+/// no I/O, no DB access.
 ///
-/// Roll order (deterministic):
-///   1. origin        (5 variants)
-///   2. faction_bias  (3 variants)
-///   3. branch        (0 = Merc, 1 = Miner)
-///   4. specialization (3 variants in chosen branch)
-///   5. fatal_flaw    (3 variants)
-///   6. name          (2 rng calls inside pick_name)
+/// Roll order (deterministic; seven draws for every seed):
+///   1. origin          (`CommanderOrigin::ALL`, 5)
+///   2. bias parent     (`FactionBias::GROUPS`, 9)
+///   3. bias sect       (within that parent's group; drawn for every parent, so the
+///                       count is fixed — a one-value group still consumes a draw)
+///   4. specialization  (`CommanderSpecialization::ALL`, 12)
+///   5. fatal_flaw      (`ROLLED_FLAWS`, 3 until 4d-2)
+///   6. first name
+///   7. last name
 pub fn generate_commander(
     player_wallet: Vec<u8>,
     campaign_id:   Uuid,
@@ -56,16 +61,17 @@ pub fn generate_commander(
 ) -> CommanderRecord {
     let mut rng = Rng::new(rng_seed);
 
-    let origin = ORIGINS[rng.roll_int(0, (ORIGINS.len() - 1) as u32) as usize].to_string();
-    let faction_bias = FACTION_BIAS[rng.roll_int(0, (FACTION_BIAS.len() - 1) as u32) as usize].to_string();
+    let origin = pick(&CommanderOrigin::ALL, &mut rng);
+    let bias_group = pick(&FactionBias::GROUPS, &mut rng);
+    let faction_bias = pick(bias_group, &mut rng);
+    let specialization = pick(&CommanderSpecialization::ALL, &mut rng);
+    let fatal_flaw = pick(&ROLLED_FLAWS, &mut rng);
+    let name = pick_name(origin, &mut rng);
 
-    let branch = rng.roll_int(0, 1);
-    let spec_pool = if branch == 0 { SPECS_MERC } else { SPECS_MINER };
-    let specialization = spec_pool[rng.roll_int(0, (spec_pool.len() - 1) as u32) as usize].to_string();
-
-    let fatal_flaw = FATAL_FLAWS[rng.roll_int(0, (FATAL_FLAWS.len() - 1) as u32) as usize].to_string();
-
-    let name = pick_name(&origin, &mut rng);
+    let origin = origin.as_str().to_string();
+    let faction_bias = faction_bias.as_str().to_string();
+    let specialization = specialization.as_str().to_string();
+    let fatal_flaw = fatal_flaw.as_str().to_string();
 
     // TODO(phase-2): capture post-roll RNG state for full replay support
     CommanderRecord {
@@ -83,7 +89,6 @@ pub fn generate_commander(
         veteran_trait:   None,
         is_shattered:    false,
         is_kia:          false,
-        is_nft:          false,
         prng_seed_state: rng_seed as i64,
         created_at:      Utc::now(),
         updated_at:      Utc::now(),
@@ -248,7 +253,7 @@ mod tests {
         for seed in 0..50u32 {
             let r = generate_commander(vec![0u8; 32], Uuid::nil(), seed);
             assert!(
-                ORIGINS.contains(&r.origin.as_str()),
+                CommanderOrigin::from_db_str(&r.origin).is_some(),
                 "origin '{}' not in canonical list",
                 r.origin
             );
@@ -260,7 +265,7 @@ mod tests {
         for seed in 0..50u32 {
             let r = generate_commander(vec![0u8; 32], Uuid::nil(), seed);
             assert!(
-                FACTION_BIAS.contains(&r.faction_bias.as_str()),
+                FactionBias::from_db_str(&r.faction_bias).is_some(),
                 "faction_bias '{}' not in canonical list",
                 r.faction_bias
             );
@@ -272,7 +277,7 @@ mod tests {
         for seed in 0..50u32 {
             let r = generate_commander(vec![0u8; 32], Uuid::nil(), seed);
             assert!(
-                FATAL_FLAWS.contains(&r.fatal_flaw.as_str()),
+                ROLLED_FLAWS.iter().any(|f| f.as_str() == r.fatal_flaw),
                 "fatal_flaw '{}' not in canonical list",
                 r.fatal_flaw
             );
@@ -282,10 +287,10 @@ mod tests {
     #[test]
     fn generated_flaws_all_have_effects() {
         let ctx = sim_engine::fatal_flaw::FatalFlawContext::default();
-        for f in FATAL_FLAWS {
+        for f in ROLLED_FLAWS.map(CommanderFlaw::as_str) {
             assert!(
                 !sim_engine::fatal_flaw::evaluate_fatal_flaw(f, &sim_engine::game_types::StressTier::Rested, &ctx).is_empty(),
-                "rolled flaw {f:?} has no effects: spelling drift between FATAL_FLAWS and sim_engine::fatal_flaw"
+                "rolled flaw {f:?} has no effects: spelling drift between the roster and sim_engine::fatal_flaw"
             );
         }
     }
@@ -294,9 +299,8 @@ mod tests {
     fn generate_commander_specialization_is_canonical() {
         for seed in 0..50u32 {
             let r = generate_commander(vec![0u8; 32], Uuid::nil(), seed);
-            let all_specs: Vec<&str> = SPECS_MERC.iter().chain(SPECS_MINER.iter()).copied().collect();
             assert!(
-                all_specs.contains(&r.specialization.as_str()),
+                CommanderSpecialization::from_db_str(&r.specialization).is_some(),
                 "specialization '{}' not in canonical list",
                 r.specialization
             );
@@ -311,10 +315,36 @@ mod tests {
         assert_eq!(r.stress, 0);
         assert!(!r.is_shattered);
         assert!(!r.is_kia);
-        assert!(!r.is_nft);
         assert!(r.veteran_trait.is_none());
         assert_eq!(r.prng_seed_state, 999);
         assert!(!r.name.is_empty());
+    }
+
+    #[test]
+    fn generate_commander_emits_only_canonical_values() {
+        use std::collections::HashSet;
+        let (mut origins, mut biases, mut specs) = (HashSet::new(), HashSet::new(), HashSet::new());
+        for seed in 0..2000u32 {
+            let r = generate_commander(vec![0u8; 32], Uuid::nil(), seed);
+            let origin = CommanderOrigin::from_db_str(&r.origin).unwrap_or_else(|| panic!("seed {seed}: origin {:?}", r.origin));
+            let bias = FactionBias::from_db_str(&r.faction_bias).unwrap_or_else(|| panic!("seed {seed}: bias {:?}", r.faction_bias));
+            let spec = CommanderSpecialization::from_db_str(&r.specialization)
+                .unwrap_or_else(|| panic!("seed {seed}: specialization {:?}", r.specialization));
+            let flaw = CommanderFlaw::from_db_str(&r.fatal_flaw).unwrap_or_else(|| panic!("seed {seed}: flaw {:?}", r.fatal_flaw));
+            assert!(ROLLED_FLAWS.contains(&flaw), "seed {seed}: {flaw:?} is not a rolled flaw");
+            origins.insert(origin);
+            biases.insert(bias);
+            specs.insert(spec);
+        }
+        for o in CommanderOrigin::ALL {
+            assert!(origins.contains(&o), "origin {o:?} never rolled in 2000 seeds");
+        }
+        for b in FactionBias::ALL {
+            assert!(biases.contains(&b), "bias {b:?} never rolled in 2000 seeds");
+        }
+        for s in CommanderSpecialization::ALL {
+            assert!(specs.contains(&s), "specialization {s:?} never rolled in 2000 seeds");
+        }
     }
 
     // ── xp_award / rank_for_xp ───────────────────────────────────────────────
