@@ -109,10 +109,10 @@ As of 2026-10-15:
   scenarios) and `shellcheck` run in the `deploy-script` job on every push, and the deploy
   job needs it (GAP-33).
 
-**171/171 tests green (91 `mercs_server` lib + 2 `aar_determinism` + 59 `db_infrastructure`
-+ 19 `sim_engine`; single-threaded, verified at `c95e49d`). Workspace version `0.3.0`.
-Production = `e16aa00` (0.3.0), deployed 2026-10-15; `dev` is ahead with 4e-1, unpushed.
-Next: INF-5.** Any brick that changes what `resolve_mission` produces for
+**183/183 tests green (96 `mercs_server` lib + 2 `aar_determinism` + 66 `db_infrastructure`
++ 19 `sim_engine`; single-threaded, verified at `e676d73`). Workspace version `0.3.0`.
+Production = `ab7d2c8` (0.3.0), deployed 2026-10-15; `dev` is ahead with INF-5, unpushed.
+Next: 4d-1 / 4a-2.** Any brick that changes what `resolve_mission` produces for
 a given seed bumps the workspace version in the same brick. 4b-1 reused `sim-engine`'s `OutcomeType` rather than
 defining a new enum, and writes **no input-log entry** — the rank-up entry was removed
 from scope. **ODQ-22 and ODQ-23 were ruled 2026-09-03 — engagement and mission outcomes
@@ -228,10 +228,24 @@ begins.
 * **Relational DB (Postgres + sqlx):** Accounts, Commander records, campaign instances,
   transaction ledger, input logs. All schema changes are sqlx migrations — never
   hand-edited tables. Run `cargo sqlx migrate run` after every new migration before
-  `cargo build`. Use compile-time `sqlx::query!` macros throughout.
+  `cargo build`. Use compile-time `sqlx::query!` macros throughout. Migration rules
+  (GAP-57; a deploy can roll back to the previous binary after the new one migrated):
+  1. **Migrations are additive (expand/contract).** The previous release's binary must
+     run against the new schema: no drop or rename in the release that stops using a
+     column.
+  2. **Never edit an applied migration.** Its checksum is verified at boot
+     (`VersionMismatch`).
+  3. **No `-- no-transaction` migrations.** A failed one leaves a dirty row that
+     blocks every boot.
+  4. **The boot migrator ignores missing versions** (`mercs_server::boot_migrator()`), so a
+     rolled-back binary boots past a migration it doesn't embed. Test migrators stay strict.
 
 * **Key-Value Store (Redis):** Live Sector hex state, deployment timers (global sorted
-  set + per-sector sorted set for cancel path), active session state.
+  set + per-sector sorted set for cancel path), active session state. **Persisted Redis
+  types (`DeploymentTimer`, `TimerType`, `SectorState`) change additively only:** new
+  fields `#[serde(default)]` or `Option`, variants added and never renamed or removed. A
+  field may be removed only if it was already `#[serde(default)]`. Redis payloads outlive
+  deploys: a breaking change quarantines every in-flight timer (GAP-53).
 
 * **Input Log (Postgres, append-only):** Treat as a financial instrument. The
   `gcn_transaction_ledger` and `input_logs` tables have immutability triggers that
