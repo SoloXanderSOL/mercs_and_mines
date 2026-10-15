@@ -57,8 +57,13 @@ fn not_found(msg: impl Into<String>) -> AppError {
     (StatusCode::NOT_FOUND, Json(json!({"error": msg.into()})))
 }
 
+/// Every `500` built here leaves a journal line naming its call site, so an operator
+/// never sees a client-side `500` the server did not record.
+#[track_caller]
 fn internal_error(msg: impl Into<String>) -> AppError {
-    (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": msg.into()})))
+    let msg = msg.into();
+    tracing::error!(at = %std::panic::Location::caller(), "{msg}");
+    (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": msg})))
 }
 
 fn conflict(msg: impl Into<String>) -> AppError {
@@ -141,6 +146,16 @@ async fn get_equipment() -> Result<Json<Value>, AppError> {
     Ok(Json(v))
 }
 
+/// Public and stateless. `build_sha` is embedded at compile time from `MERCS_BUILD_SHA`
+/// (set by CI on the release build); the deploy script polls it to prove which build is
+/// serving. It reads the same constant the session headers log and writes nothing.
+async fn get_version() -> Json<Value> {
+    Json(json!({
+        "version":   env!("CARGO_PKG_VERSION"),
+        "build_sha": option_env!("MERCS_BUILD_SHA").unwrap_or("unknown"),
+    }))
+}
+
 // ── Auth endpoints ─────────────────────────────────────────────────────────
 
 async fn post_auth_challenge(
@@ -189,10 +204,8 @@ async fn post_auth_verify(
     crate::auth::verify_wallet_signature(&req.wallet_address, &req.challenge, &req.signature)
         .map_err(|e| bad_request(format!("signature invalid: {e}")))?;
 
-    // Issue the 2-hour session
-    let token = crate::auth::issue_session(&state, &req.wallet_address);
-
     // Upsert the player account (idempotent — subsequent logins preserve ledger and trust_standing).
+    // It runs before the session is issued, so a failed upsert leaves no live token (GAP-52).
     // Wallet address was verified by verify_wallet_signature above, so decode cannot fail here.
     let pubkey_bytes: [u8; 32] = bs58::decode(&req.wallet_address)
         .into_vec()
@@ -210,6 +223,9 @@ async fn post_auth_verify(
         })
         .await
         .map_err(|e| internal_error(format!("account upsert: {e}")))?;
+
+    // Issue the 2-hour session
+    let token = crate::auth::issue_session(&state, &req.wallet_address);
 
     let v = serde_json::to_value(&token)
         .map_err(|e| internal_error(format!("session token serialization failed: {e}")))?;
@@ -641,6 +657,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/api/missions",                  get(get_missions))
         .route("/api/units",                     get(get_units))
+        .route("/api/version",                   get(get_version))
         .route("/api/equipment",                 get(get_equipment))
         .route("/api/auth/challenge",            post(post_auth_challenge))
         .route("/api/auth/verify",               post(post_auth_verify))

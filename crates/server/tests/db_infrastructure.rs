@@ -3261,6 +3261,143 @@ async fn integrity_route_answers_500_when_the_log_store_fails() {
     assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
 }
 
+/// Sends `req` through a fresh router over `state`; returns the status and the body text.
+async fn send(
+    state: &std::sync::Arc<mercs_server::state::AppState>,
+    req: axum::http::Request<axum::body::Body>,
+) -> (axum::http::StatusCode, String) {
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+    let resp = mercs_server::routes::router(std::sync::Arc::clone(state)).oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8(bytes.to_vec()).unwrap())
+}
+
+fn post_json(uri: &str, body: serde_json::Value) -> axum::http::Request<axum::body::Body> {
+    axum::http::Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(body.to_string()))
+        .unwrap()
+}
+
+/// INF-4 (GAP-52): the auth tests' key. Wallet 20 is a signing-key seed, used in memory
+/// only; its derived public key is not `[20u8; 32]`.
+fn auth_test_key() -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(&[20u8; 32])
+}
+
+/// Requests a challenge for `wallet` through the real route; returns the challenge text.
+async fn fetch_challenge(state: &std::sync::Arc<mercs_server::state::AppState>, wallet: &str) -> String {
+    let (status, body) = send(state, post_json("/api/auth/challenge", serde_json::json!({ "wallet_address": wallet }))).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "challenge route: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    v["challenge"].as_str().expect("challenge text").to_string()
+}
+
+/// Signs `message` with `key` and posts it to the verify route against `challenge`.
+async fn verify_with(
+    state: &std::sync::Arc<mercs_server::state::AppState>,
+    key: &ed25519_dalek::SigningKey,
+    challenge: &str,
+    message: &str,
+) -> (axum::http::StatusCode, String) {
+    use ed25519_dalek::Signer;
+    let wallet = bs58::encode(key.verifying_key().to_bytes()).into_string();
+    let signature = bs58::encode(key.sign(message.as_bytes()).to_bytes()).into_string();
+    send(state, post_json("/api/auth/verify", serde_json::json!({
+        "wallet_address": wallet,
+        "challenge":      challenge,
+        "signature":      signature,
+    }))).await
+}
+
+/// INF-4: the version route is public and reports the compiled-in version and build SHA.
+#[tokio::test]
+async fn version_route_reports_version_and_build_sha() {
+    let state = std::sync::Arc::new(default_state());
+    let req = axum::http::Request::builder()
+        .method("GET")
+        .uri("/api/version")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let (status, body) = send(&state, req).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(v["build_sha"], option_env!("MERCS_BUILD_SHA").unwrap_or("unknown"));
+}
+
+/// INF-4 (GAP-52): a correctly signed challenge issues a session the server holds.
+#[tokio::test]
+async fn auth_verify_accepts_a_signed_challenge() {
+    let state = std::sync::Arc::new(default_state());
+    let key = auth_test_key();
+    let wallet = bs58::encode(key.verifying_key().to_bytes()).into_string();
+    let challenge = fetch_challenge(&state, &wallet).await;
+
+    let (status, body) = verify_with(&state, &key, &challenge, &challenge).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let token_id = v["token_id"].as_str().expect("token_id");
+    assert_eq!(v["wallet_address"], wallet.as_str());
+    assert!(state.sessions.contains_key(token_id), "the returned token must be a live session");
+}
+
+/// INF-4 (GAP-52): a signature over anything but the challenge is refused.
+#[tokio::test]
+async fn auth_verify_rejects_a_bad_signature() {
+    let state = std::sync::Arc::new(default_state());
+    let key = auth_test_key();
+    let wallet = bs58::encode(key.verifying_key().to_bytes()).into_string();
+    let challenge = fetch_challenge(&state, &wallet).await;
+
+    let (status, body) = verify_with(&state, &key, &challenge, "not the challenge").await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("signature invalid"), "wrong 400 arm: {body}");
+    assert!(state.sessions.is_empty(), "a refused verify issues no session");
+}
+
+/// INF-4 (GAP-52): an expired challenge is refused, even when correctly signed. The
+/// expiry is configured negative so the real challenge route issues one already expired.
+#[tokio::test]
+async fn auth_verify_rejects_an_expired_challenge() {
+    let mut config = mercs_server::config::Config::default();
+    config.server.challenge_expiry_secs = -1;
+    let state = std::sync::Arc::new(mercs_server::state::AppState::new(std::sync::Arc::new(config)));
+    let key = auth_test_key();
+    let wallet = bs58::encode(key.verifying_key().to_bytes()).into_string();
+    let challenge = fetch_challenge(&state, &wallet).await;
+
+    let (status, body) = verify_with(&state, &key, &challenge, &challenge).await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("challenge expired"), "wrong 400 arm: {body}");
+    assert!(state.sessions.is_empty(), "a refused verify issues no session");
+}
+
+/// INF-4 (GAP-52): a failed account upsert answers `500` and leaves no session behind.
+/// The account store is a Postgres repository over a closed pool; no database is needed.
+#[tokio::test]
+async fn auth_verify_answers_500_and_issues_no_session_when_the_upsert_fails() {
+    let closed = PgPoolOptions::new()
+        .connect_lazy("postgres://unused@127.0.0.1:1/unused")
+        .expect("lazy pool");
+    closed.close().await;
+    let mut state = default_state();
+    state.account_repo = std::sync::Arc::new(PostgresAccountRepository::new(closed));
+    let state = std::sync::Arc::new(state);
+    let key = auth_test_key();
+    let wallet = bs58::encode(key.verifying_key().to_bytes()).into_string();
+    let challenge = fetch_challenge(&state, &wallet).await;
+
+    let (status, body) = verify_with(&state, &key, &challenge, &challenge).await;
+    assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert!(body.contains("account upsert"), "wrong 500 arm: {body}");
+    assert!(state.sessions.is_empty(), "a 500 must not leave a live session");
+}
+
 #[tokio::test]
 async fn mission_resolve_requires_a_session() {
     let state = default_state();

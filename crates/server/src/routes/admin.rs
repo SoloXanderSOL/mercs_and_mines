@@ -8,6 +8,7 @@ use axum::{
     Router,
 };
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::campaign_init::{initialize_campaign, InitError};
@@ -34,7 +35,13 @@ fn admin_key_matches(headers: &HeaderMap, expected: Option<&str>) -> bool {
     headers
         .get("x-admin-key")
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|provided| provided == expected)
+        .is_some_and(|provided| {
+            // ODQ-20: compare fixed-length digests with a XOR-fold, so the time taken
+            // depends on neither the key's length nor the first differing byte.
+            let a = Sha256::digest(provided.as_bytes());
+            let b = Sha256::digest(expected.as_bytes());
+            a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+        })
 }
 
 async fn launch_campaign(
