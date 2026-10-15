@@ -58,6 +58,17 @@ As of 2026-10-15:
   logging; `resolve_deployment(…, kia, tier, outcome, cfg)` computes stress, XP and rank
   from a `SELECT … FOR UPDATE` row, refuses KIA (500), and returns `AppliedEffects`. No
   bump (R7 does not fire). **4d-2** was created by the 2026-10-13 scoping session.
+  **4e-1 built (`c95e49d`, 2026-10-15; permadeath):** a mission `Wipeout` marks the
+  Commander KIA and queues one `card_mint_pending` card (foil if Glorious) inside
+  `resolve_deployment`'s locked transaction, before the close, through the private
+  `mark_commander_kia` helper (no trait method). `card_mint_pending` (migration 0017) is an
+  account-scoped snapshot whose only FK is the wallet, so it survives the §4f wipe.
+  `is_survivor` (neither KIA nor MIA, ODQ-30) drives `classify_outcome` and `any_survivor`;
+  `check_commander_permadeath` is deleted. `is_glorious_death` lives in `commander_gen`;
+  the route passes a ticker contribution of `0.0` until §2c. The mission response gains
+  `commander: {kia, glorious}`. No input-log entry, no R7 bump. Test cleanup order:
+  `card_mint_pending` → `deployment_records` → `section_records` → `commander_records` →
+  membership → `player_accounts`.
 - **Sections 5 and 6:** Not started.
 - **Sections 7 (Personnel Entity Model) and 8 (Combat Engine to canon):** created
   2026-10-13 (ruling D2), not started; both run before Section 6. Strike Mining and Base
@@ -98,10 +109,10 @@ As of 2026-10-15:
   scenarios) and `shellcheck` run in the `deploy-script` job on every push, and the deploy
   job needs it (GAP-33).
 
-**159/159 tests green (84 `mercs_server` lib + 2 `aar_determinism` + 56 `db_infrastructure`
-+ 17 `sim_engine`; single-threaded, verified at `55ebb5c`). Workspace version `0.3.0`.
-Production = `ae6df19` (0.3.0), deployed 2026-10-14; `dev` is ahead with INF-4, unpushed.
-Next: 4e-1.** Any brick that changes what `resolve_mission` produces for
+**171/171 tests green (91 `mercs_server` lib + 2 `aar_determinism` + 59 `db_infrastructure`
++ 19 `sim_engine`; single-threaded, verified at `c95e49d`). Workspace version `0.3.0`.
+Production = `e16aa00` (0.3.0), deployed 2026-10-15; `dev` is ahead with 4e-1, unpushed.
+Next: INF-5.** Any brick that changes what `resolve_mission` produces for
 a given seed bumps the workspace version in the same brick. 4b-1 reused `sim-engine`'s `OutcomeType` rather than
 defining a new enum, and writes **no input-log entry** — the rank-up entry was removed
 from scope. **ODQ-22 and ODQ-23 were ruled 2026-09-03 — engagement and mission outcomes
@@ -271,15 +282,15 @@ constraints — parallel execution causes FK-23503 failures that are not caused 
 code under test. Any test report produced without `--test-threads=1` is unreliable and
 must be re-run before reporting results to the Director.
 
-**Test wallets:** `tests/` uses wallet seeds 0–9, 13–19 and 88, with 10–12 taken by a
-range literal (`(10u8..=12)`). **20 is the auth tests' signing-key seed**
+**Test wallets:** `tests/` uses wallet seeds 0–9, 13–19, 21–23 and 88, with 10–12 taken by
+a range literal (`(10u8..=12)`). **20 is the auth tests' signing-key seed**
 (`SigningKey::from_bytes(&[20u8; 32])`). It is used in memory only, and its derived
-public key is not `[20u8; 32]`. The next free seed is **21**.
+public key is not `[20u8; 32]`. The next free seed is **24**.
 
 **Deploy harness:** `bash deploy/test_remote_deploy.sh` runs the real deploy script
 against shims (about 12 s, no root or network needed). Run it after any change under
 `deploy/`. The `deploy-script` CI job also lints both scripts with `shellcheck`, which is
-not installed in WSL.
+also installed in WSL (0.9.0): run it before committing any `deploy/` change.
 
 If a system package is missing (redis-server, libssl-dev, etc.), do not attempt
 `apt install`. Surface it to the Director with a single copy-pasteable sudo command.
