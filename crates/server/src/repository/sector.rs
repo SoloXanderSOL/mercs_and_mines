@@ -29,8 +29,6 @@ pub struct SectorState {
     pub owner: Option<WalletAddress>,
     pub deployed_unit_count: u32,
     #[serde(default)]
-    pub active_timer_ids: Vec<Uuid>,
-    #[serde(default)]
     pub terrain: HashMap<String, HexTerrain>,
     #[serde(default)]
     pub magma_veins: Vec<MagmaVeinNode>,

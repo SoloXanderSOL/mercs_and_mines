@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use super::input_log::insert_campaign_entry;
 use super::RepositoryError;
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -24,9 +25,27 @@ pub struct ConvoyDbRecord {
 
 #[async_trait]
 pub trait ConvoyRepository: Send + Sync {
+    /// Inserts the convoy row alone. A test fixture: production dispatch goes through
+    /// [`ConvoyRepository::dispatch_convoy`], which logs the dispatch with it.
     async fn create_convoy(&self, record: ConvoyDbRecord) -> Result<Uuid, RepositoryError>;
     async fn get_convoy(&self, convoy_id: Uuid) -> Result<Option<ConvoyDbRecord>, RepositoryError>;
-    async fn mark_arrived(&self, convoy_id: Uuid) -> Result<(), RepositoryError>;
+    /// Writes the convoy and its `convoy_dispatched` log row together, or neither (GAP-44).
+    async fn dispatch_convoy(
+        &self,
+        record: ConvoyDbRecord,
+        campaign_id: Uuid,
+        entry: &shared::InputLogEntry,
+    ) -> Result<(), RepositoryError>;
+    /// Lands an in-transit convoy and writes its `convoy_arrived` log row together (GAP-44).
+    /// `Some` only on the call that landed it; `None` if it had already landed or does not
+    /// exist, and then nothing is written. The `in_transit` guard makes the entry
+    /// exactly-once however often the arrival is retried.
+    async fn land_convoy(
+        &self,
+        convoy_id: Uuid,
+        campaign_id: Uuid,
+        entry: &shared::InputLogEntry,
+    ) -> Result<Option<ConvoyDbRecord>, RepositoryError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -43,7 +62,10 @@ impl ConvoyRepository for InMemoryConvoyRepository {
     async fn get_convoy(&self, _: Uuid) -> Result<Option<ConvoyDbRecord>, RepositoryError> {
         unimplemented!()
     }
-    async fn mark_arrived(&self, _: Uuid) -> Result<(), RepositoryError> {
+    async fn dispatch_convoy(&self, _: ConvoyDbRecord, _: Uuid, _: &shared::InputLogEntry) -> Result<(), RepositoryError> {
+        unimplemented!()
+    }
+    async fn land_convoy(&self, _: Uuid, _: Uuid, _: &shared::InputLogEntry) -> Result<Option<ConvoyDbRecord>, RepositoryError> {
         unimplemented!()
     }
 }
@@ -62,31 +84,37 @@ impl PostgresConvoyRepository {
     }
 }
 
-#[async_trait]
-impl ConvoyRepository for PostgresConvoyRepository {
-    async fn create_convoy(&self, record: ConvoyDbRecord) -> Result<Uuid, RepositoryError> {
-        sqlx::query!(
+/// The one convoy `INSERT`, on the pool (fixture) or inside the dispatch transaction.
+async fn insert_convoy<'e, E: sqlx::PgExecutor<'e>>(exec: E, record: &ConvoyDbRecord) -> Result<(), RepositoryError> {
+    sqlx::query!(
             r#"INSERT INTO convoy_records (
                 convoy_id, sector_id, owner_wallet,
                 origin_q, origin_r, destination_q, destination_r,
                 route, arrival_time, vehicle_class, cargo, in_transit
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)"#,
-            record.convoy_id,
-            record.sector_id,
-            record.owner_wallet,
-            record.origin_q,
-            record.origin_r,
-            record.destination_q,
-            record.destination_r,
-            record.route,
-            record.arrival_time,
-            record.vehicle_class,
-            record.cargo,
-            record.in_transit,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        record.convoy_id,
+        record.sector_id,
+        record.owner_wallet,
+        record.origin_q,
+        record.origin_r,
+        record.destination_q,
+        record.destination_r,
+        record.route.clone(),
+        record.arrival_time,
+        record.vehicle_class,
+        record.cargo.clone(),
+        record.in_transit,
+    )
+    .execute(exec)
+    .await
+    .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+    Ok(())
+}
+
+#[async_trait]
+impl ConvoyRepository for PostgresConvoyRepository {
+    async fn create_convoy(&self, record: ConvoyDbRecord) -> Result<Uuid, RepositoryError> {
+        insert_convoy(&self.pool, &record).await?;
         Ok(record.convoy_id)
     }
 
@@ -104,14 +132,42 @@ impl ConvoyRepository for PostgresConvoyRepository {
         .map_err(|e| RepositoryError::Internal(e.to_string()))
     }
 
-    async fn mark_arrived(&self, convoy_id: Uuid) -> Result<(), RepositoryError> {
-        sqlx::query!(
-            "UPDATE convoy_records SET in_transit = false WHERE convoy_id = $1",
+    async fn dispatch_convoy(
+        &self,
+        record: ConvoyDbRecord,
+        campaign_id: Uuid,
+        entry: &shared::InputLogEntry,
+    ) -> Result<(), RepositoryError> {
+        // Dropping `tx` without commit rolls back: no convoy without its log row, or the reverse.
+        let mut tx = self.pool.begin().await.map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        insert_convoy(&mut *tx, &record).await?;
+        insert_campaign_entry(&mut *tx, &campaign_id, entry).await?;
+        tx.commit().await.map_err(|e| RepositoryError::Internal(e.to_string()))
+    }
+
+    async fn land_convoy(
+        &self,
+        convoy_id: Uuid,
+        campaign_id: Uuid,
+        entry: &shared::InputLogEntry,
+    ) -> Result<Option<ConvoyDbRecord>, RepositoryError> {
+        let mut tx = self.pool.begin().await.map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        let landed = sqlx::query_as!(
+            ConvoyDbRecord,
+            r#"UPDATE convoy_records SET in_transit = false
+               WHERE convoy_id = $1 AND in_transit
+               RETURNING convoy_id, sector_id, owner_wallet,
+                         origin_q, origin_r, destination_q, destination_r,
+                         route, arrival_time, vehicle_class, cargo, in_transit, created_at"#,
             convoy_id
         )
-        .execute(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| RepositoryError::Internal(e.to_string()))?;
-        Ok(())
+        // Already landed (or no such convoy): write nothing, so a retry never duplicates the entry.
+        let Some(convoy) = landed else { return Ok(None) };
+        insert_campaign_entry(&mut *tx, &campaign_id, entry).await?;
+        tx.commit().await.map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        Ok(Some(convoy))
     }
 }

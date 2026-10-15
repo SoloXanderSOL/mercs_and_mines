@@ -76,6 +76,32 @@ pub trait InputLogRepository: Send + Sync {
 
 // ── Postgres implementation ───────────────────────────────────────────────────
 
+/// The one campaign-scoped log `INSERT`, on any executor: the pool for a standalone
+/// append, or a transaction when the entry must commit with a state change (GAP-44).
+pub(crate) async fn insert_campaign_entry<'e, E: sqlx::PgExecutor<'e>>(
+    exec: E,
+    campaign_id: &Uuid,
+    entry: &shared::InputLogEntry,
+) -> Result<(), RepositoryError> {
+    sqlx::query!(
+            r#"
+            INSERT INTO input_logs (session_id, campaign_id, tick, seq, event_type, player_id, payload, narrative_event)
+            VALUES (NULL, $1, $2, $3, $4, $5, $6, $7)
+            "#,
+        campaign_id,
+        entry.tick as i64,
+        entry.seq as i64,
+        entry.event_type,
+        entry.player_id.as_deref(),
+        entry.payload.clone() as serde_json::Value,
+        entry.narrative_event.as_deref(),
+    )
+    .execute(exec)
+    .await
+    .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+    Ok(())
+}
+
 pub struct PostgresInputLogRepository {
     pool: sqlx::PgPool,
 }
@@ -194,23 +220,7 @@ impl InputLogRepository for PostgresInputLogRepository {
         campaign_id: &Uuid,
         entry: &shared::InputLogEntry,
     ) -> Result<(), RepositoryError> {
-        sqlx::query!(
-            r#"
-            INSERT INTO input_logs (session_id, campaign_id, tick, seq, event_type, player_id, payload, narrative_event)
-            VALUES (NULL, $1, $2, $3, $4, $5, $6, $7)
-            "#,
-            campaign_id,
-            entry.tick as i64,
-            entry.seq as i64,
-            entry.event_type,
-            entry.player_id.as_deref(),
-            entry.payload.clone() as serde_json::Value,
-            entry.narrative_event.as_deref(),
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| RepositoryError::Internal(e.to_string()))?;
-        Ok(())
+        insert_campaign_entry(&self.pool, campaign_id, entry).await
     }
 
     async fn start_session(

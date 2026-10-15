@@ -32,8 +32,6 @@ fn notify_player_convoy_arrived(
     campaign_id: Uuid,
     event:       ConvoyEvent,
 ) {
-    // NOTE: may fire more than once per convoy if mark_arrived succeeds but timer cleanup
-    // fails on the next retry — client must treat convoy_arrived as idempotent.
     if let Some(sender) = senders.get(&campaign_id) {
         let _ = sender.send(event);
     }
@@ -44,7 +42,8 @@ fn notify_player_convoy_arrived(
 #[derive(Debug)]
 pub struct ExpiryWarns {
     pub due_timers: RepeatWarn,
-    pub mark_arrived: KeyedRepeatWarn,
+    pub sector: KeyedRepeatWarn,
+    pub land: KeyedRepeatWarn,
     pub get_convoy: KeyedRepeatWarn,
     pub cancel_timer: KeyedRepeatWarn,
     pub phantom: KeyedRepeatWarn,
@@ -56,7 +55,8 @@ impl ExpiryWarns {
     pub fn new() -> Self {
         Self {
             due_timers: RepeatWarn::new(EXPIRY_WARN_EVERY_TICKS),
-            mark_arrived: KeyedRepeatWarn::new(EXPIRY_WARN_EVERY_TICKS),
+            sector: KeyedRepeatWarn::new(EXPIRY_WARN_EVERY_TICKS),
+            land: KeyedRepeatWarn::new(EXPIRY_WARN_EVERY_TICKS),
             get_convoy: KeyedRepeatWarn::new(EXPIRY_WARN_EVERY_TICKS),
             cancel_timer: KeyedRepeatWarn::new(EXPIRY_WARN_EVERY_TICKS),
             phantom: KeyedRepeatWarn::new(EXPIRY_WARN_EVERY_TICKS),
@@ -114,42 +114,81 @@ pub async fn poll_expiry_once(state: &AppState, warns: &mut ExpiryWarns) {
         .filter(|t| matches!(t.timer_type, TimerType::ConvoyArrival))
         .map(|t| t.timer_id)
         .collect();
-    for keyed in [&mut warns.mark_arrived, &mut warns.get_convoy, &mut warns.cancel_timer, &mut warns.phantom] {
+    for keyed in [&mut warns.sector, &mut warns.land, &mut warns.get_convoy, &mut warns.cancel_timer, &mut warns.phantom] {
         keyed.retain(&live);
     }
 
+    // Per convoy (GAP-44): resolve the campaign, then land and log in one transaction,
+    // then the Redis side effects, and cancel the timer last. A retry after any failure
+    // re-runs only what has not happened: the log row is written exactly once.
     for timer in timers {
         match timer.timer_type {
             TimerType::ConvoyArrival => {}
-            _ => continue, // other timer types managed by lifecycle task, not convoy expiry
+            _ => continue, // no consumer yet for other timer types
         }
         let id = timer.timer_id;
 
-        // INVARIANT: timer_id == convoy_id — established in dispatch_convoy (3b-2)
-        match state.convoy_repo.mark_arrived(id).await {
-            Ok(()) => {
-                if let Some(n) = warns.mark_arrived.ok(id) {
-                    tracing::info!("mark_arrived recovered for convoy {id} after {n} failed polls");
+        // 1. The campaign the arrival is logged under. Without it nothing is written,
+        //    and the next poll retries.
+        let sector = match state.sector_repo.get_sector(timer.sector_id).await {
+            Ok(Some(s)) => {
+                if let Some(n) = warns.sector.ok(id) {
+                    tracing::info!("sector lookup recovered for convoy {id} after {n} failed polls");
                 }
+                s
             }
-            Err(e) => {
-                match warns.mark_arrived.fail(id) {
-                    Some(1) => tracing::warn!("mark_arrived failed for convoy {id}: {e:?}"),
-                    Some(n) => tracing::warn!("mark_arrived still failing for convoy {id} ({n} consecutive polls): {e:?}"),
+            found => {
+                let why = match found {
+                    Err(e) => format!("get_sector failed: {e:?}"),
+                    _ => format!("sector {} not found in Redis", timer.sector_id),
+                };
+                match warns.sector.fail(id) {
+                    Some(1) => tracing::warn!("convoy {id} not landed — {why}"),
+                    Some(n) => tracing::warn!("convoy {id} still not landed ({n} consecutive polls) — {why}"),
                     None => {}
                 }
                 continue;
             }
-        }
+        };
+        let cid = sector.campaign_id;
 
-        let convoy = match state.convoy_repo.get_convoy(id).await {
-            Ok(found) => {
-                if let Some(n) = warns.get_convoy.ok(id) {
-                    tracing::info!("get_convoy recovered for timer {id} after {n} failed polls");
+        // 2. Land and log together. INVARIANT: timer_id == convoy_id (3b-2).
+        let entry = shared::InputLogEntry {
+            tick: 0,
+            seq: 0,
+            event_type: "convoy_arrived".to_string(),
+            player_id: Some(bs58::encode(timer.player_wallet.0).into_string()),
+            payload: serde_json::json!({ "convoy_id": id }),
+            narrative_event: None,
+        };
+        let landed = match state.convoy_repo.land_convoy(id, cid, &entry).await {
+            Ok(l) => {
+                if let Some(n) = warns.land.ok(id) {
+                    tracing::info!("land_convoy recovered for convoy {id} after {n} failed polls");
                 }
-                match found {
-                    Some(c) => c,
-                    None => {
+                l
+            }
+            Err(e) => {
+                match warns.land.fail(id) {
+                    Some(1) => tracing::warn!("land_convoy failed for convoy {id}: {e:?}"),
+                    Some(n) => tracing::warn!("land_convoy still failing for convoy {id} ({n} consecutive polls): {e:?}"),
+                    None => {}
+                }
+                continue;
+            }
+        };
+
+        match landed {
+            // 3. Landed by this call: the side effects run here and only here.
+            Some(convoy) => land_side_effects(state, &sector, cid, &convoy).await,
+            // 4. Nothing landed: either an earlier poll landed it and only the cancel is
+            //    outstanding, or there is no convoy at all (a phantom timer).
+            None => match state.convoy_repo.get_convoy(id).await {
+                Ok(found) => {
+                    if let Some(n) = warns.get_convoy.ok(id) {
+                        tracing::info!("get_convoy recovered for timer {id} after {n} failed polls");
+                    }
+                    if found.is_none() {
                         let cleanup = match state.timer_repo.cancel_timer(id).await {
                             Ok(()) => "timer cancelled".to_string(),
                             Err(e) => format!("cancel_timer failed: {e:?}"),
@@ -166,17 +205,19 @@ pub async fn poll_expiry_once(state: &AppState, warns: &mut ExpiryWarns) {
                         continue;
                     }
                 }
-            }
-            Err(e) => {
-                match warns.get_convoy.fail(id) {
-                    Some(1) => tracing::warn!("get_convoy failed for timer {id}: {e:?}"),
-                    Some(n) => tracing::warn!("get_convoy still failing for timer {id} ({n} consecutive polls): {e:?}"),
-                    None => {}
+                Err(e) => {
+                    match warns.get_convoy.fail(id) {
+                        Some(1) => tracing::warn!("get_convoy failed for timer {id}: {e:?}"),
+                        Some(n) => tracing::warn!("get_convoy still failing for timer {id} ({n} consecutive polls): {e:?}"),
+                        None => {}
+                    }
+                    continue;
                 }
-                continue;
-            }
-        };
+            },
+        }
 
+        // 5. Cancel last. If it fails, the next poll's land_convoy returns None, so only
+        //    this cancel is retried.
         match state.timer_repo.cancel_timer(id).await {
             Ok(()) => {
                 if let Some(n) = warns.cancel_timer.ok(id) {
@@ -189,112 +230,74 @@ pub async fn poll_expiry_once(state: &AppState, warns: &mut ExpiryWarns) {
                     Some(n) => tracing::warn!("cancel_timer still failing for convoy {id} ({n} consecutive polls) — Redis keys may be stale: {e:?}"),
                     None => {}
                 }
-                // don't abort — convoy is already marked arrived; continue with hex update
             }
-        }
-
-        let sector_opt = match state.sector_repo.get_sector(timer.sector_id).await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(
-                    "get_sector Redis error for timer {}: {:?} — skipping log and WS notify",
-                    timer.timer_id, e
-                );
-                None
-            }
-        };
-        let campaign_id = sector_opt.as_ref().map(|s| s.campaign_id);
-        if campaign_id.is_none() {
-            tracing::warn!(
-                "sector {} not found in Redis for ConvoyArrival timer {} — skipping log entry",
-                timer.sector_id, timer.timer_id
-            );
-        }
-
-        if let Err(e) = state.sector_repo
-            .remove_hex_occupant(timer.sector_id, convoy.origin_q, convoy.origin_r, convoy.convoy_id)
-            .await
-        {
-            tracing::warn!("remove_hex_occupant failed for convoy {}: {:?}", convoy.convoy_id, e);
-        }
-
-        let occupant = HexOccupant {
-            id: convoy.convoy_id,
-            owner_wallet: convoy.owner_wallet.clone(),
-            unit_type: convoy.vehicle_class.clone(),
-        };
-        // NOTE: arrival at impassable terrain is possible if sector was cold at dispatch time.
-        // TODO(phase-2): validate the route fully before dispatch.
-        if let Err(e) = state.sector_repo
-            .add_hex_occupant(
-                timer.sector_id,
-                convoy.destination_q,
-                convoy.destination_r,
-                occupant,
-            )
-            .await
-        {
-            tracing::warn!("add_hex_occupant failed for convoy {}: {:?}", convoy.convoy_id, e);
-        }
-        // TODO: active_timer_ids on SectorState is not updated by schedule_timer or cancel_timer — pre-existing debt
-
-        // Same-hex collision check: build post-update occupants in memory from pre-update sector state
-        // (sector_opt is pre-update — sector was read before remove/add_hex_occupant)
-        if let Some(ref sector) = sector_opt {
-            let dest_key = format!("{},{}", convoy.destination_q, convoy.destination_r);
-            let mut occupants: Vec<HexOccupant> = sector
-                .hex_occupancy
-                .get(&dest_key)
-                .cloned()
-                .unwrap_or_default();
-            let arriving_occupant = HexOccupant {
-                id:           convoy.convoy_id,
-                owner_wallet: convoy.owner_wallet.clone(),
-                unit_type:    convoy.vehicle_class.clone(),
-            };
-            occupants.push(arriving_occupant);
-
-            if let Some(pair) = check_same_hex_collision(&occupants) {
-                tracing::warn!(
-                    "collision detected at ({},{}): {:?}",
-                    convoy.destination_q, convoy.destination_r, pair
-                );
-                // TODO(phase-2): call resolveCombat here
-            }
-        }
-        // TODO(phase-2): check_crossing_collision requires ConvoyRepository::list_in_transit — deferred
-
-        if let Some(cid) = campaign_id {
-            let player_id = bs58::encode(&convoy.owner_wallet).into_string();
-            let entry = shared::InputLogEntry {
-                tick: 0,
-                seq: 0,
-                event_type: "convoy_arrived".to_string(),
-                player_id: Some(player_id),
-                payload: serde_json::json!({ "convoy_id": convoy.convoy_id }),
-                narrative_event: None,
-            };
-            if let Err(e) = state.input_log_repo.append_campaign_entry(&cid, &entry).await {
-                tracing::warn!(
-                    "append_campaign_entry failed for convoy {}: {:?}",
-                    convoy.convoy_id, e
-                );
-            }
-
-            let event = ConvoyEvent::ConvoyArrived {
-                convoy_id:     convoy.convoy_id,
-                destination_q: convoy.destination_q,
-                destination_r: convoy.destination_r,
-                cargo:         convoy.cargo.clone(),
-            };
-            notify_player_convoy_arrived(&state.convoy_event_senders, cid, event);
         }
     }
 }
 
+/// The Redis side of an arrival, run once by the poll that landed the convoy: move the
+/// occupant, check same-hex collision, notify. Failures are warned, never retried, since
+/// the arrival itself is already committed and logged.
+async fn land_side_effects(
+    state:  &AppState,
+    sector: &crate::repository::SectorState,
+    cid:    Uuid,
+    convoy: &crate::repository::ConvoyDbRecord,
+) {
+    let sector_id = convoy.sector_id;
+    if let Err(e) = state.sector_repo
+        .remove_hex_occupant(sector_id, convoy.origin_q, convoy.origin_r, convoy.convoy_id)
+        .await
+    {
+        tracing::warn!("remove_hex_occupant failed for convoy {}: {:?}", convoy.convoy_id, e);
+    }
+
+    let occupant = HexOccupant {
+        id: convoy.convoy_id,
+        owner_wallet: convoy.owner_wallet.clone(),
+        unit_type: convoy.vehicle_class.clone(),
+    };
+    // NOTE: arrival at impassable terrain is possible if sector was cold at dispatch time.
+    // TODO(phase-2): validate the route fully before dispatch.
+    if let Err(e) = state.sector_repo
+        .add_hex_occupant(sector_id, convoy.destination_q, convoy.destination_r, occupant)
+        .await
+    {
+        tracing::warn!("add_hex_occupant failed for convoy {}: {:?}", convoy.convoy_id, e);
+    }
+
+    // Same-hex collision check: build post-update occupants in memory from pre-update sector state
+    // (`sector` is pre-update — it was read before remove/add_hex_occupant)
+    let dest_key = format!("{},{}", convoy.destination_q, convoy.destination_r);
+    let mut occupants: Vec<HexOccupant> = sector
+        .hex_occupancy
+        .get(&dest_key)
+        .cloned()
+        .unwrap_or_default();
+    occupants.push(HexOccupant {
+        id:           convoy.convoy_id,
+        owner_wallet: convoy.owner_wallet.clone(),
+        unit_type:    convoy.vehicle_class.clone(),
+    });
+    if let Some(pair) = check_same_hex_collision(&occupants) {
+        tracing::warn!(
+            "collision detected at ({},{}): {:?}",
+            convoy.destination_q, convoy.destination_r, pair
+        );
+        // TODO(phase-2): call resolveCombat here
+    }
+    // TODO(phase-2): check_crossing_collision requires ConvoyRepository::list_in_transit — deferred
+
+    let event = ConvoyEvent::ConvoyArrived {
+        convoy_id:     convoy.convoy_id,
+        destination_q: convoy.destination_q,
+        destination_r: convoy.destination_r,
+        cargo:         convoy.cargo.clone(),
+    };
+    notify_player_convoy_arrived(&state.convoy_event_senders, cid, event);
+}
+
 pub async fn run_convoy_expiry_task(state: Arc<AppState>) {
-    // TODO(phase-2): no saga/compensation for partial convoy dispatch failure —
-    // orphaned in_transit=true records need a reconciliation sweep
     let mut interval = tokio::time::interval(Duration::from_secs(EXPIRY_POLL_INTERVAL_SECS));
     let mut warns = ExpiryWarns::new();
     loop {
@@ -308,8 +311,8 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::repository::{
-        DeploymentTimer, DueTimers, PoisonedTimer, PostgresConvoyRepository, RepositoryError,
-        TimerRepository, WalletAddress,
+        DeploymentTimer, DueTimers, OccupationStatus, PoisonedTimer, PostgresConvoyRepository,
+        RepositoryError, SectorState, TimerRepository, WalletAddress,
     };
 
     #[tokio::test]
@@ -324,10 +327,22 @@ mod tests {
         state.convoy_repo = Arc::new(PostgresConvoyRepository::new(pool));
         let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
         for id in [a, b] {
+            // Each timer's sector exists, so the poll reaches land_convoy, which fails.
+            let sector_id = Uuid::new_v4();
+            state.sector_repo.upsert_sector(SectorState {
+                sector_id,
+                campaign_id: Uuid::new_v4(),
+                occupation_status: OccupationStatus::Neutral,
+                owner: None,
+                deployed_unit_count: 0,
+                terrain: Default::default(),
+                magma_veins: vec![],
+                hex_occupancy: Default::default(),
+            }).await.expect("in-memory upsert_sector");
             state.timer_repo.schedule_timer(DeploymentTimer {
                 timer_id: id,
                 player_wallet: WalletAddress([0u8; 32]),
-                sector_id: Uuid::new_v4(),
+                sector_id,
                 timer_type: TimerType::ConvoyArrival,
                 fires_at: Utc::now() - chrono::Duration::seconds(1),
             }).await.expect("in-memory schedule");
@@ -335,11 +350,11 @@ mod tests {
         let mut warns = ExpiryWarns::new();
 
         poll_expiry_once(&state, &mut warns).await;
-        assert_eq!(warns.mark_arrived.len(), 2, "each failing timer gets its own counter");
+        assert_eq!(warns.land.len(), 2, "each failing timer gets its own counter");
 
         state.timer_repo.cancel_timer(a).await.expect("in-memory cancel");
         poll_expiry_once(&state, &mut warns).await;
-        assert_eq!(warns.mark_arrived.len(), 1, "a timer that left the due set is evicted");
+        assert_eq!(warns.land.len(), 1, "a timer that left the due set is evicted");
     }
 
     /// Reports `poisoned` members (none due) and records every quarantine call.

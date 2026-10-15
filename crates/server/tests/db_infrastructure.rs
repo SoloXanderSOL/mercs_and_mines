@@ -629,7 +629,6 @@ async fn sector_state_repository_redis_is_correct() {
         occupation_status: OccupationStatus::Neutral,
         owner: None,
         deployed_unit_count: 3,
-        active_timer_ids: vec![],
         terrain: std::collections::HashMap::new(),
         magma_veins: vec![],
         hex_occupancy: std::collections::HashMap::new(),
@@ -705,18 +704,33 @@ async fn convoy_record_crud() {
     assert_eq!(fetched.vehicle_class, "BehemothMegaTruck");
     assert_eq!(fetched.owner_wallet, vec![7u8; 32]);
 
-    // mark_arrived
-    repo.mark_arrived(convoy_id).await.expect("mark_arrived failed");
+    // land_convoy — lands once, and a second call lands nothing
+    let campaign_id = uuid::Uuid::new_v4();
+    let entry = shared::InputLogEntry {
+        tick: 0,
+        seq: 0,
+        event_type: "convoy_arrived".to_string(),
+        player_id: None,
+        payload: serde_json::json!({ "convoy_id": convoy_id }),
+        narrative_event: None,
+    };
+    let landed = repo.land_convoy(convoy_id, campaign_id, &entry).await.expect("land_convoy failed");
+    assert_eq!(landed.map(|c| c.convoy_id), Some(convoy_id), "the first land returns the convoy");
+    let again = repo.land_convoy(convoy_id, campaign_id, &entry).await.expect("second land_convoy failed");
+    assert!(again.is_none(), "an already-landed convoy is not landed again");
 
     // get — verify in_transit flipped
-    let fetched2 = repo.get_convoy(convoy_id).await.expect("get_convoy failed").expect("convoy not found after mark_arrived");
-    assert!(!fetched2.in_transit, "in_transit must be false after mark_arrived");
+    let fetched2 = repo.get_convoy(convoy_id).await.expect("get_convoy failed").expect("convoy not found after land_convoy");
+    assert!(!fetched2.in_transit, "in_transit must be false after land_convoy");
 
     // cleanup
     sqlx::query!("DELETE FROM convoy_records WHERE convoy_id = $1", convoy_id)
         .execute(&pool)
         .await
         .expect("cleanup DELETE failed");
+    sqlx::query("ALTER TABLE input_logs DISABLE TRIGGER ALL").execute(&pool).await.ok();
+    sqlx::query("DELETE FROM input_logs WHERE campaign_id = $1").bind(campaign_id).execute(&pool).await.ok();
+    sqlx::query("ALTER TABLE input_logs ENABLE TRIGGER ALL").execute(&pool).await.ok();
 }
 
 #[tokio::test]
@@ -2108,7 +2122,6 @@ async fn hex_occupancy_add_remove_roundtrips() {
         occupation_status: OccupationStatus::Neutral,
         owner: None,
         deployed_unit_count: 0,
-        active_timer_ids: vec![],
         terrain: std::collections::HashMap::new(),
         magma_veins: vec![],
         hex_occupancy: std::collections::HashMap::new(),
@@ -2240,7 +2253,6 @@ async fn convoy_dispatch_creates_db_record_and_timer() {
         occupation_status:   OccupationStatus::Neutral,
         owner:               None,
         deployed_unit_count: 0,
-        active_timer_ids:    vec![],
         terrain,
         magma_veins:         vec![],
         hex_occupancy:       std::collections::HashMap::new(),
@@ -2372,7 +2384,6 @@ async fn convoy_timer_fires_and_marks_arrived() {
         occupation_status:   OccupationStatus::Neutral,
         owner:               None,
         deployed_unit_count: 0,
-        active_timer_ids:    vec![],
         terrain:             std::collections::HashMap::new(),
         magma_veins:         vec![],
         hex_occupancy:       std::collections::HashMap::new(),
@@ -2433,6 +2444,10 @@ async fn convoy_timer_fires_and_marks_arrived() {
     // ── Cleanup ───────────────────────────────────────────────────────────────
     sqlx::query!("DELETE FROM convoy_records WHERE convoy_id = $1", convoy_id)
         .execute(&pool).await.expect("cleanup convoy_records");
+    // land_convoy writes the convoy_arrived row to Postgres (GAP-44), whatever log repo the state holds.
+    sqlx::query("ALTER TABLE input_logs DISABLE TRIGGER ALL").execute(&pool).await.ok();
+    sqlx::query("DELETE FROM input_logs WHERE campaign_id = $1").bind(campaign_id).execute(&pool).await.ok();
+    sqlx::query("ALTER TABLE input_logs ENABLE TRIGGER ALL").execute(&pool).await.ok();
 
     let convoy_id_str = convoy_id.to_string();
     let sector_id_str = sector_id.to_string();
@@ -3128,7 +3143,6 @@ async fn convoy_ws_receives_arrived_event() {
         occupation_status:   OccupationStatus::Neutral,
         owner:               None,
         deployed_unit_count: 0,
-        active_timer_ids:    vec![],
         terrain:             std::collections::HashMap::new(),
         magma_veins:         vec![],
         hex_occupancy:       std::collections::HashMap::new(),
@@ -3193,6 +3207,10 @@ async fn convoy_ws_receives_arrived_event() {
     // ── Cleanup ───────────────────────────────────────────────────────────────
     sqlx::query!("DELETE FROM convoy_records WHERE convoy_id = $1", convoy_id)
         .execute(&pool).await.expect("cleanup convoy_records");
+    // land_convoy writes the convoy_arrived row to Postgres (GAP-44), whatever log repo the state holds.
+    sqlx::query("ALTER TABLE input_logs DISABLE TRIGGER ALL").execute(&pool).await.ok();
+    sqlx::query("DELETE FROM input_logs WHERE campaign_id = $1").bind(campaign_id).execute(&pool).await.ok();
+    sqlx::query("ALTER TABLE input_logs ENABLE TRIGGER ALL").execute(&pool).await.ok();
 
     let convoy_id_str = convoy_id.to_string();
     let sector_id_str = sector_id.to_string();
@@ -4022,7 +4040,6 @@ async fn poisoned_member_does_not_stall_a_real_arrival() {
         occupation_status:   OccupationStatus::Neutral,
         owner:               None,
         deployed_unit_count: 0,
-        active_timer_ids:    vec![],
         terrain:             std::collections::HashMap::new(),
         magma_veins:         vec![],
         hex_occupancy:       std::collections::HashMap::new(),
@@ -4080,4 +4097,185 @@ async fn poisoned_member_does_not_stall_a_real_arrival() {
 
     assert!(!landed.in_transit, "a poisoned member must not stall a real arrival");
     assert!(left.is_none(), "the poisoned member must leave timers:global");
+}
+
+// ── INF-5: GAP-44, convoy dispatch and arrival ───────────────────────────────
+
+/// A Postgres + Redis app state with one campaign, its sector blob, and a signed-in
+/// session for wallet 25 (session only: dispatch writes no account-keyed row).
+struct ConvoyFixture {
+    pool:        sqlx::PgPool,
+    conn:        redis::aio::ConnectionManager,
+    state:       std::sync::Arc<mercs_server::state::AppState>,
+    campaign_id: uuid::Uuid,
+    sector_id:   uuid::Uuid,
+    token_id:    String,
+}
+
+async fn convoy_fixture() -> Option<ConvoyFixture> {
+    use std::sync::Arc;
+    let pool = test_pool().await?;
+    let redis_url = std::env::var("TEST_REDIS_URL").ok()?;
+    let client = redis::Client::open(redis_url).expect("Invalid TEST_REDIS_URL");
+    let conn = redis::aio::ConnectionManager::new(client).await.expect("Failed to connect to Redis");
+
+    let mut state = mercs_server::state::AppState::new(Arc::new(mercs_server::config::Config::default()));
+    state.campaign_repo  = Arc::new(PostgresCampaignRepository::new(pool.clone()));
+    state.convoy_repo    = Arc::new(PostgresConvoyRepository::new(pool.clone()));
+    state.sector_repo    = Arc::new(RedisSectorStateRepository::new(conn.clone()));
+    state.timer_repo     = Arc::new(RedisTimerRepository::new(conn.clone()));
+    state.input_log_repo = Arc::new(PostgresInputLogRepository::new(pool.clone()));
+
+    let wallet_b58 = bs58::encode([25u8; 32]).into_string();
+    let token_id = format!("inf5-convoy-{}", uuid::Uuid::new_v4());
+    let now = chrono::Utc::now().timestamp();
+    state.sessions.insert(token_id.clone(), shared::SessionToken {
+        token_id:       token_id.clone(),
+        account_id:     wallet_b58.clone(),
+        wallet_address: wallet_b58,
+        issued_at:      now,
+        expires_at:     now + 7200,
+    });
+
+    let campaign = PostgresCampaignRepository::new(pool.clone())
+        .create_campaign(&NewCampaignInstance { sector_id: uuid::Uuid::new_v4(), map_seed: 25_i64 })
+        .await
+        .expect("create_campaign");
+    state.sector_repo.upsert_sector(SectorState {
+        sector_id:           campaign.sector_id,
+        campaign_id:         campaign.campaign_id,
+        occupation_status:   OccupationStatus::Neutral,
+        owner:               None,
+        deployed_unit_count: 0,
+        terrain:             std::collections::HashMap::new(),
+        magma_veins:         vec![],
+        hex_occupancy:       std::collections::HashMap::new(),
+    }).await.expect("upsert_sector");
+
+    Some(ConvoyFixture {
+        pool,
+        conn,
+        state: Arc::new(state),
+        campaign_id: campaign.campaign_id,
+        sector_id: campaign.sector_id,
+        token_id,
+    })
+}
+
+/// POSTs a dispatch from (3,-2) to (5,3) and returns the new convoy's id.
+async fn dispatch_via_route(f: &ConvoyFixture) -> uuid::Uuid {
+    use axum::{body::Body, http::{Request, StatusCode}};
+    use tower::ServiceExt;
+    let body = serde_json::json!({
+        "origin_q": 3, "origin_r": -2,
+        "destination_q": 5, "destination_r": 3,
+        "vehicle_class": "BehemothMegaTruck",
+        "cargo": {"magma_ore": 5}
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/campaign/{}/convoy/dispatch", f.campaign_id))
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {}", f.token_id))
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = mercs_server::routes::router(std::sync::Arc::clone(&f.state)).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED, "dispatch must return 201");
+    let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    json["convoy_id"].as_str().unwrap().parse().unwrap()
+}
+
+async fn clean_convoy_fixture(f: &ConvoyFixture, convoy_id: uuid::Uuid) {
+    use redis::AsyncCommands;
+    let mut conn = f.conn.clone();
+    let cid = convoy_id.to_string();
+    conn.del::<_, ()>(vec![format!("timer:{cid}"), format!("timer:{cid}:sector_id")]).await.ok();
+    conn.zrem::<_, _, ()>("timers:global", &cid).await.ok();
+    conn.zrem::<_, _, ()>(format!("sector:{}:timers", f.sector_id), &cid).await.ok();
+    conn.del::<_, ()>(vec![format!("sector:{}:hex_state", f.sector_id), format!("sector:{}:player_presence", f.sector_id)]).await.ok();
+    conn.srem::<_, _, ()>("sectors:all", f.sector_id.to_string()).await.ok();
+    sqlx::query("DELETE FROM convoy_records WHERE convoy_id = $1").bind(convoy_id).execute(&f.pool).await.ok();
+    sqlx::query("ALTER TABLE input_logs DISABLE TRIGGER ALL").execute(&f.pool).await.ok();
+    sqlx::query("DELETE FROM input_logs WHERE campaign_id = $1").bind(f.campaign_id).execute(&f.pool).await.ok();
+    sqlx::query("ALTER TABLE input_logs ENABLE TRIGGER ALL").execute(&f.pool).await.ok();
+    sqlx::query("DELETE FROM campaign_instances WHERE campaign_id = $1").bind(f.campaign_id).execute(&f.pool).await.ok();
+}
+
+#[tokio::test]
+async fn convoy_dispatch_logs_full_request_with_convoy() {
+    let Some(f) = convoy_fixture().await else {
+        eprintln!("TEST_DATABASE_URL or TEST_REDIS_URL not set — skipping");
+        return;
+    };
+    let convoy_id = dispatch_via_route(&f).await;
+
+    let convoy = PostgresConvoyRepository::new(f.pool.clone()).get_convoy(convoy_id).await.expect("get_convoy");
+    let rows: Vec<(serde_json::Value,)> = sqlx::query_as(
+        "SELECT payload FROM input_logs WHERE campaign_id = $1 AND event_type = 'convoy_dispatched'",
+    )
+    .bind(f.campaign_id)
+    .fetch_all(&f.pool)
+    .await
+    .expect("read convoy_dispatched");
+    clean_convoy_fixture(&f, convoy_id).await;
+
+    let convoy = convoy.expect("the convoy row exists");
+    assert_eq!(rows.len(), 1, "exactly one convoy_dispatched row");
+    let p = rows[0].0.as_object().expect("payload is an object");
+    let mut keys: Vec<&str> = p.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["arrival_time", "cargo", "convoy_id", "destination_q", "destination_r", "origin_q", "origin_r", "vehicle_class"],
+        "the payload carries exactly the 8 keys"
+    );
+    assert_eq!(p["convoy_id"], serde_json::json!(convoy_id));
+    assert_eq!((p["origin_q"].as_i64(), p["origin_r"].as_i64()), (Some(3), Some(-2)));
+    assert_eq!((p["destination_q"].as_i64(), p["destination_r"].as_i64()), (Some(5), Some(3)));
+    assert_eq!(p["vehicle_class"], "BehemothMegaTruck");
+    assert_eq!(p["cargo"], serde_json::json!({"magma_ore": 5}));
+    let logged: chrono::DateTime<chrono::Utc> =
+        serde_json::from_value(p["arrival_time"].clone()).expect("arrival_time is a timestamp");
+    // Postgres stores microseconds; the logged value keeps chrono's full precision.
+    assert!((logged - convoy.arrival_time).num_microseconds().unwrap().abs() < 1, "logged arrival_time matches the row");
+}
+
+#[tokio::test]
+async fn convoy_arrival_is_logged_once() {
+    use mercs_server::convoy_expiry::{poll_expiry_once, ExpiryWarns};
+    let Some(f) = convoy_fixture().await else {
+        eprintln!("TEST_DATABASE_URL or TEST_REDIS_URL not set — skipping");
+        return;
+    };
+    let convoy_id = dispatch_via_route(&f).await;
+    // Make it due now (same id: schedule_timer overwrites the payload and both scores).
+    let due = DeploymentTimer {
+        timer_id:      convoy_id,
+        player_wallet: WalletAddress([25u8; 32]),
+        sector_id:     f.sector_id,
+        timer_type:    TimerType::ConvoyArrival,
+        fires_at:      chrono::Utc::now() - chrono::Duration::seconds(1),
+    };
+    f.state.timer_repo.schedule_timer(due.clone()).await.expect("make due");
+    let mut warns = ExpiryWarns::new();
+    poll_expiry_once(&f.state, &mut warns).await;
+
+    // A failed cancel leaves the timer due: simulate it, and poll again.
+    f.state.timer_repo.schedule_timer(due).await.expect("re-schedule (failed cancel)");
+    poll_expiry_once(&f.state, &mut warns).await;
+
+    let (arrived,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM input_logs WHERE campaign_id = $1 AND event_type = 'convoy_arrived' AND payload->>'convoy_id' = $2",
+    )
+    .bind(f.campaign_id)
+    .bind(convoy_id.to_string())
+    .fetch_one(&f.pool)
+    .await
+    .expect("count convoy_arrived");
+    let convoy = PostgresConvoyRepository::new(f.pool.clone()).get_convoy(convoy_id).await.expect("get_convoy");
+    clean_convoy_fixture(&f, convoy_id).await;
+
+    assert_eq!(arrived, 1, "a retried arrival must not log convoy_arrived twice");
+    assert!(!convoy.expect("convoy exists").in_transit, "the convoy stays landed");
 }

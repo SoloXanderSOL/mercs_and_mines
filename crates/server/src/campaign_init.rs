@@ -100,7 +100,6 @@ pub async fn initialize_campaign(
         occupation_status: OccupationStatus::Neutral,
         owner: None,
         deployed_unit_count: 0,
-        active_timer_ids: vec![],
         hex_occupancy: std::collections::HashMap::new(),
     }).await.map_err(InitError::RepositoryError)?;
 
