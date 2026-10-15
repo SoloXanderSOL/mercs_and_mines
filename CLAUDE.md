@@ -109,10 +109,10 @@ As of 2026-10-15:
   scenarios) and `shellcheck` run in the `deploy-script` job on every push, and the deploy
   job needs it (GAP-33).
 
-**183/183 tests green (96 `mercs_server` lib + 2 `aar_determinism` + 66 `db_infrastructure`
-+ 19 `sim_engine`; single-threaded, verified at `e676d73`). Workspace version `0.3.0`.
-Production = `ab7d2c8` (0.3.0), deployed 2026-10-15; `dev` is ahead with INF-5, unpushed.
-Next: 4d-1 / 4a-2.** Any brick that changes what `resolve_mission` produces for
+**192/192 tests green (98 `mercs_server` lib + 2 `aar_determinism` + 68 `db_infrastructure`
++ 24 `sim_engine`; single-threaded, verified at `4e6a8f1`). Workspace version `0.3.0`.
+Production = `a6329f7` (0.3.0), deployed 2026-10-15; `dev` is ahead with 4d-1, unpushed.
+Next: 4d-2 / 4a-2.** Any brick that changes what `resolve_mission` produces for
 a given seed bumps the workspace version in the same brick. 4b-1 reused `sim-engine`'s `OutcomeType` rather than
 defining a new enum, and writes **no input-log entry** — the rank-up entry was removed
 from scope. **ODQ-22 and ODQ-23 were ruled 2026-09-03 — engagement and mission outcomes
@@ -232,7 +232,10 @@ begins.
   (GAP-57; a deploy can roll back to the previous binary after the new one migrated):
   1. **Migrations are additive (expand/contract).** The previous release's binary must
      run against the new schema: no drop or rename in the release that stops using a
-     column.
+     column. **Expand only:** every new column is nullable or has a default, and there is
+     no drop, rename or type change. Since `boot_migrator()`, this is the only thing
+     keeping a rollback correct: the previous binary boots against any newer schema, and
+     a `NOT NULL` column without a default boots fine, then fails every old-binary insert.
   2. **Never edit an applied migration.** Its checksum is verified at boot
      (`VersionMismatch`).
   3. **No `-- no-transaction` migrations.** A failed one leaves a dirty row that
@@ -245,7 +248,10 @@ begins.
   types (`DeploymentTimer`, `TimerType`, `SectorState`) change additively only:** new
   fields `#[serde(default)]` or `Option`, variants added and never renamed or removed. A
   field may be removed only if it was already `#[serde(default)]`. Redis payloads outlive
-  deploys: a breaking change quarantines every in-flight timer (GAP-53).
+  deploys: a breaking change quarantines every in-flight timer (GAP-53). **Timer write
+  order:** payload `SET` before index `ZADD`; index `ZREM` before payload `DEL`; never
+  `DEL` a payload whose member may still be due. `schedule_timer`, `cancel_timer` and
+  `quarantine_timer` (which keeps the payload) already follow it.
 
 * **Input Log (Postgres, append-only):** Treat as a financial instrument. The
   `gcn_transaction_ledger` and `input_logs` tables have immutability triggers that
@@ -296,10 +302,10 @@ constraints — parallel execution causes FK-23503 failures that are not caused 
 code under test. Any test report produced without `--test-threads=1` is unreliable and
 must be re-run before reporting results to the Director.
 
-**Test wallets:** `tests/` uses wallet seeds 0–9, 13–19, 21–23 and 88, with 10–12 taken by
+**Test wallets:** `tests/` uses wallet seeds 0–9, 13–19, 21–25 and 88, with 10–12 taken by
 a range literal (`(10u8..=12)`). **20 is the auth tests' signing-key seed**
 (`SigningKey::from_bytes(&[20u8; 32])`). It is used in memory only, and its derived
-public key is not `[20u8; 32]`. The next free seed is **24**.
+public key is not `[20u8; 32]`. The next free seed is **26**.
 
 **Deploy harness:** `bash deploy/test_remote_deploy.sh` runs the real deploy script
 against shims (about 12 s, no root or network needed). Run it after any change under
