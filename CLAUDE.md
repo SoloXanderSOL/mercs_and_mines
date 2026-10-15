@@ -27,7 +27,7 @@ Before writing any code, read the Phase 1 Alpha Foundation document to understan
 is already built. Do not guess — read it. The status block at the top of that document
 is the ground truth.
 
-As of 2026-10-14:
+As of 2026-10-15:
 
 - **Section 1 (Database Layer):** 1a (Postgres) and 1b (Redis) complete. **1c-3 (the
   GAP-34 fix) built at `bb49b3c`:** `session_start` (header + full request + timestamp)
@@ -83,11 +83,25 @@ As of 2026-10-14:
   `try_init_tracing()` (GAP-40); `dispatch_convoy` logs its 500s and answers 401 for an
   undecodable token wallet; the AAR's missing-timestamp arm is a 500; the legacy
   `FULL_SUCCESS_REWARD_MULT` key is retired.
+- **INF-4 (infrastructure; GAP-32, GAP-33, GAP-52, ODQ-20):** Built at `55ebb5c` +
+  `49dd10a` — public `GET /api/version` → `{version, build_sha}` (`build_sha` from
+  `option_env!("MERCS_BUILD_SHA")`, set by CI on the release build; `"unknown"` locally);
+  the admin key is compared as SHA-256 digests with a XOR-fold (ODQ-20); `post_auth_verify`
+  upserts the account before issuing the session, so a `500` leaves no live token (GAP-52,
+  with four auth-verify route tests); `internal_error` is `#[track_caller]` and logs every
+  `500` it builds. CI runs on pushes to `main` and `dev` and on every pull request (GAP-32);
+  deploy is still main-only. The droplet-side deploy is `deploy/remote_deploy.sh`: it reads
+  the running build's SHA, swaps, restarts, polls `/api/version` until `build_sha` equals the
+  commit, and rolls back with explicit checks. Its exit codes are a contract: **0** deployed,
+  **1** failed with the rollback verified (by SHA, or by health only when the old SHA was
+  unreadable), **2** rollback failed or impossible. `deploy/test_remote_deploy.sh` (8 stub
+  scenarios) and `shellcheck` run in the `deploy-script` job on every push, and the deploy
+  job needs it (GAP-33).
 
-**154/154 tests green (84 `mercs_server` lib + 2 `aar_determinism` + 51 `db_infrastructure`
-+ 17 `sim_engine`; single-threaded, verified at `a90dc11`). Workspace version `0.3.0`.
-Production = `3edaca3` (0.3.0), deployed 2026-10-14. Next: the CI-hardening commit
-(GAP-32/33 + version probe + ODQ-20 + GAP-52).** Any brick that changes what `resolve_mission` produces for
+**159/159 tests green (84 `mercs_server` lib + 2 `aar_determinism` + 56 `db_infrastructure`
++ 17 `sim_engine`; single-threaded, verified at `55ebb5c`). Workspace version `0.3.0`.
+Production = `ae6df19` (0.3.0), deployed 2026-10-14; `dev` is ahead with INF-4, unpushed.
+Next: 4e-1.** Any brick that changes what `resolve_mission` produces for
 a given seed bumps the workspace version in the same brick. 4b-1 reused `sim-engine`'s `OutcomeType` rather than
 defining a new enum, and writes **no input-log entry** — the rank-up entry was removed
 from scope. **ODQ-22 and ODQ-23 were ruled 2026-09-03 — engagement and mission outcomes
@@ -256,6 +270,16 @@ Several integration tests share wallet addresses and have `ON DELETE RESTRICT` F
 constraints — parallel execution causes FK-23503 failures that are not caused by the
 code under test. Any test report produced without `--test-threads=1` is unreliable and
 must be re-run before reporting results to the Director.
+
+**Test wallets:** `tests/` uses wallet seeds 0–9, 13–19 and 88, with 10–12 taken by a
+range literal (`(10u8..=12)`). **20 is the auth tests' signing-key seed**
+(`SigningKey::from_bytes(&[20u8; 32])`). It is used in memory only, and its derived
+public key is not `[20u8; 32]`. The next free seed is **21**.
+
+**Deploy harness:** `bash deploy/test_remote_deploy.sh` runs the real deploy script
+against shims (about 12 s, no root or network needed). Run it after any change under
+`deploy/`. The `deploy-script` CI job also lints both scripts with `shellcheck`, which is
+not installed in WSL.
 
 If a system package is missing (redis-server, libssl-dev, etc.), do not attempt
 `apt install`. Surface it to the Director with a single copy-pasteable sudo command.
