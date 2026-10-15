@@ -109,10 +109,10 @@ As of 2026-10-15:
   scenarios) and `shellcheck` run in the `deploy-script` job on every push, and the deploy
   job needs it (GAP-33).
 
-**192/192 tests green (98 `mercs_server` lib + 2 `aar_determinism` + 68 `db_infrastructure`
-+ 24 `sim_engine`; single-threaded, verified at `4e6a8f1`). Workspace version `0.3.0`.
-Production = `a6329f7` (0.3.0), deployed 2026-10-15; `dev` is ahead with 4d-1, unpushed.
-Next: 4d-2 / 4a-2.** Any brick that changes what `resolve_mission` produces for
+**196/196 tests green (99 `mercs_server` lib + 2 `aar_determinism` + 70 `db_infrastructure`
++ 25 `sim_engine`; single-threaded, verified at `cb9312d`). Workspace version `0.3.0`.
+Production = `8d5dad3` (0.3.0), deployed 2026-10-15; `dev` is ahead with Brick B, unpushed.
+Next: 4a-2 / 4d-2.** Any brick that changes what `resolve_mission` produces for
 a given seed bumps the workspace version in the same brick. 4b-1 reused `sim-engine`'s `OutcomeType` rather than
 defining a new enum, and writes **no input-log entry** — the rank-up entry was removed
 from scope. **ODQ-22 and ODQ-23 were ruled 2026-09-03 — engagement and mission outcomes
@@ -242,6 +242,11 @@ begins.
      blocks every boot.
   4. **The boot migrator ignores missing versions** (`mercs_server::boot_migrator()`), so a
      rolled-back binary boots past a migration it doesn't embed. Test migrators stay strict.
+  5. **A new constraint must accept every value the previous binary can write, unless that
+     write has no production caller; the migration's header names that writer.** Never
+     `NOT VALID`: a constraint validates existing rows and fails the migration loudly.
+
+  Commander roster strings live in `sim_engine::roster`, mirrored by `0018`'s CHECKs.
 
 * **Key-Value Store (Redis):** Live Sector hex state, deployment timers (global sorted
   set + per-sector sorted set for cancel path), active session state. **Persisted Redis
@@ -255,7 +260,11 @@ begins.
 
 * **Input Log (Postgres, append-only):** Treat as a financial instrument. The
   `gcn_transaction_ledger` and `input_logs` tables have immutability triggers that
-  reject UPDATE and DELETE at the DB level. Do not work around them.
+  reject UPDATE and DELETE at the DB level. Do not work around them. **Types deserialised
+  from a logged payload change additively only:** variants are added, never renamed or
+  removed, or the AAR can no longer replay sessions that were valid when played. Current
+  examples: `CombatResolveRequest` and everything inside it, including the sim `Commander`
+  and `Species`.
 
 ---
 
