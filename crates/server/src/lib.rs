@@ -37,6 +37,14 @@ pub fn try_init_tracing() -> Result<(), Box<dyn std::error::Error + Send + Sync 
         .try_init()
 }
 
+/// The boot migrator (GAP-57): tolerates applied migrations this binary doesn't embed,
+/// so a rollback across an additive migration can boot.
+pub fn boot_migrator() -> sqlx::migrate::Migrator {
+    let mut m = sqlx::migrate!("../../migrations");
+    m.set_ignore_missing(true);
+    m
+}
+
 #[cfg(test)]
 mod tests {
     /// INF-2 — the subscriber is actually installed (INF-1 finding 1). No other lib test

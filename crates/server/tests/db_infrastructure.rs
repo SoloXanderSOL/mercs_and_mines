@@ -3864,3 +3864,60 @@ async fn mission_resolve_end_to_end_writes_effects() {
     sqlx::query("ALTER TABLE session_configs ENABLE TRIGGER ALL").execute(&pool).await.ok();
     clean_wallet_4g1(&pool, &wallet).await;
 }
+
+// ── INF-5: GAP-57, the boot migrator ─────────────────────────────────────────
+
+/// Runs `m` against the test DB with a fake applied migration (99999) that no binary
+/// embeds, inside a transaction that is rolled back. Locking is off: `run_direct` returns
+/// `VersionMissing` before its `unlock()`, and a session advisory lock left on a pooled
+/// connection would block the next `test_pool()` migrate forever.
+async fn run_with_fake_applied_version(
+    pool: &sqlx::PgPool,
+    m: &sqlx::migrate::Migrator,
+) -> Result<(), sqlx::migrate::MigrateError> {
+    let mut tx = pool.begin().await.expect("begin");
+    // Runtime query: `_sqlx_migrations` is sqlx's own table, so no `.sqlx/` cache file.
+    sqlx::query(
+        "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
+         VALUES (99999, 'gap57-fake', TRUE, '\\x00'::bytea, 0)",
+    )
+    .execute(&mut *tx)
+    .await
+    .expect("insert fake applied migration");
+    let r = m.run_direct(&mut *tx).await;
+    tx.rollback().await.expect("rollback");
+    let (left,): (i64,) = sqlx::query_as("SELECT count(*) FROM _sqlx_migrations WHERE version = 99999")
+        .fetch_one(pool)
+        .await
+        .expect("count fake row");
+    assert_eq!(left, 0, "the fake applied migration must not survive the rollback");
+    r
+}
+
+#[tokio::test]
+async fn boot_migrator_tolerates_missing_applied_version() {
+    let Some(pool) = test_pool().await else {
+        eprintln!("TEST_DATABASE_URL not set — skipping");
+        return;
+    };
+    let mut m = mercs_server::boot_migrator();
+    m.set_locking(false);
+    let r = run_with_fake_applied_version(&pool, &m).await;
+    assert!(r.is_ok(), "the boot migrator must ignore an applied version it doesn't embed: {r:?}");
+}
+
+#[tokio::test]
+async fn strict_migrator_rejects_missing_applied_version() {
+    let Some(pool) = test_pool().await else {
+        eprintln!("TEST_DATABASE_URL not set — skipping");
+        return;
+    };
+    let mut m = mercs_server::boot_migrator();
+    m.set_ignore_missing(false);
+    m.set_locking(false);
+    let r = run_with_fake_applied_version(&pool, &m).await;
+    assert!(
+        matches!(r, Err(sqlx::migrate::MigrateError::VersionMissing(99999))),
+        "with ignore_missing off the same migrator must refuse: {r:?}"
+    );
+}

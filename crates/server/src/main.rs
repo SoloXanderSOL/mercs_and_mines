@@ -35,7 +35,8 @@ async fn main() {
     drop(_probe);
 
     // Migrations directory: migrations/ at workspace root (two levels above crates/server/).
-    sqlx::migrate!("../../migrations")
+    // Lenient on applied versions it doesn't embed, so a rollback can boot (GAP-57).
+    mercs_server::boot_migrator()
         .run(&pool)
         .await
         .expect("Database migrations failed");
