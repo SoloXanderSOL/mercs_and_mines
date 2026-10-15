@@ -222,12 +222,13 @@ mod tests {
 
     /// State with one campaign, a signed-in session and in-memory timers; the default
     /// convoy repository is the in-memory stub, which panics if any convoy write is tried.
-    fn dispatch_state() -> (AppState, Uuid) {
+    fn dispatch_state() -> (AppState, Uuid, Uuid) {
         let campaign_id = Uuid::new_v4();
+        let sector_id = Uuid::new_v4();
         let mut state = AppState::new(Arc::new(Config::default()));
         state.campaign_repo = Arc::new(OneCampaign(CampaignInstance {
             campaign_id,
-            sector_id: Uuid::new_v4(),
+            sector_id,
             map_seed: 1,
             state: CampaignLifecycle::Active,
             victory_tickers: serde_json::json!({}),
@@ -245,7 +246,7 @@ mod tests {
             issued_at: now,
             expires_at: now + 600,
         });
-        (state, campaign_id)
+        (state, campaign_id, sector_id)
     }
 
     async fn dispatch(state: Arc<AppState>, campaign_id: Uuid, to: (i32, i32)) -> StatusCode {
@@ -270,7 +271,7 @@ mod tests {
             .connect_lazy("postgres://unused@127.0.0.1:1/unused")
             .expect("lazy pool");
         pool.close().await;
-        let (mut state, campaign_id) = dispatch_state();
+        let (mut state, campaign_id, sector_id) = dispatch_state();
         state.convoy_repo = Arc::new(PostgresConvoyRepository::new(pool));
         let timers = Arc::new(crate::repository::InMemoryTimerRepository::new());
         state.timer_repo = timers.clone();
@@ -279,10 +280,10 @@ mod tests {
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(timers.0.len(), 1, "a failed dispatch write keeps its timer for the phantom path");
         let timer = timers.0.iter().next().expect("the kept timer");
-        assert!(
-            matches!(timer.timer_type, TimerType::ConvoyArrival) && timer.timer_id == *timer.key(),
-            "the kept timer is the convoy's arrival timer"
-        );
+        assert!(matches!(timer.timer_type, TimerType::ConvoyArrival), "the kept timer is a convoy arrival timer");
+        assert_eq!(timer.sector_id, sector_id, "the kept timer is in the dispatching campaign's sector");
+        assert_eq!(timer.player_wallet.0, [5u8; 32], "the kept timer belongs to the dispatching wallet");
+        assert!(timer.fires_at > Utc::now(), "the kept timer fires in the future");
     }
 
     /// No convoy row exists: dispatch fails, and the arrival poll finds nothing to land.
@@ -306,7 +307,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_dispatch_timer_is_cancelled_by_the_phantom_path() {
-        let (mut state, campaign_id) = dispatch_state();
+        let (mut state, campaign_id, _) = dispatch_state();
         state.convoy_repo = Arc::new(NoConvoyRows);
         let timers = Arc::new(crate::repository::InMemoryTimerRepository::new());
         state.timer_repo = timers.clone();
@@ -341,7 +342,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_refuses_zero_distance() {
-        let (mut state, campaign_id) = dispatch_state();
+        let (mut state, campaign_id, _) = dispatch_state();
         let timers = Arc::new(crate::repository::InMemoryTimerRepository::new());
         state.timer_repo = timers.clone();
 
