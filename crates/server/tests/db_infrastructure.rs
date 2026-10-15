@@ -4041,6 +4041,66 @@ async fn get_due_timers_reports_poisoned_members() {
 }
 
 #[tokio::test]
+async fn quarantine_timer_errs_when_the_reverse_lookup_fails() {
+    use redis::AsyncCommands;
+    let Some(url) = std::env::var("TEST_REDIS_URL").ok() else {
+        eprintln!("TEST_REDIS_URL not set — skipping Redis quarantine-lookup-error test");
+        return;
+    };
+    let client = redis::Client::open(url).expect("Invalid TEST_REDIS_URL");
+    let mut conn = redis::aio::ConnectionManager::new(client).await.expect("Failed to connect to Redis");
+    let repo = RedisTimerRepository::new(conn.clone());
+
+    let member = format!("f3-wrongtype-{}", uuid::Uuid::new_v4());
+    let reverse = format!("timer:{member}:sector_id");
+    let past = (chrono::Utc::now() - chrono::Duration::seconds(60)).timestamp() as f64;
+    // A set where a string is expected: the reverse-lookup GET fails with WRONGTYPE.
+    conn.sadd::<_, _, ()>(&reverse, "x").await.expect("SADD wrong-type reverse key");
+    conn.zadd::<_, _, _, ()>("timers:global", &member, past).await.expect("ZADD member");
+
+    let result = repo.quarantine_timer(&member).await;
+    assert!(result.is_err(), "a failed reverse lookup must return Err, got {result:?}");
+    let score: Option<f64> = conn.zscore("timers:global", &member).await.expect("ZSCORE");
+    assert!(score.is_some(), "nothing is written before the lookup succeeds: the member stays in timers:global");
+    let q: bool = conn.sismember("timers:quarantine", &member).await.expect("SISMEMBER");
+    assert!(!q, "the member must not be quarantined when the lookup failed");
+
+    // Cleanup: this test's key and members only; never DEL timers:quarantine.
+    conn.del::<_, ()>(&reverse).await.ok();
+    conn.zrem::<_, _, ()>("timers:global", &member).await.ok();
+    conn.srem::<_, _, ()>("timers:quarantine", &member).await.ok();
+}
+
+#[tokio::test]
+async fn quarantine_size_counts_quarantined_members() {
+    use redis::AsyncCommands;
+    use mercs_server::repository::timer::quarantine_size;
+    let Some(url) = std::env::var("TEST_REDIS_URL").ok() else {
+        eprintln!("TEST_REDIS_URL not set — skipping Redis quarantine-size test");
+        return;
+    };
+    let client = redis::Client::open(url).expect("Invalid TEST_REDIS_URL");
+    let mut conn = redis::aio::ConnectionManager::new(client).await.expect("Failed to connect to Redis");
+    let repo = RedisTimerRepository::new(conn.clone());
+
+    let member = format!("boot-quarantine-{}", uuid::Uuid::new_v4());
+    let past = (chrono::Utc::now() - chrono::Duration::seconds(60)).timestamp() as f64;
+    conn.zadd::<_, _, _, ()>("timers:global", &member, past).await.expect("ZADD member");
+
+    // timers:quarantine is a global key other tests write too, so assert deltas only.
+    let before = quarantine_size(&mut conn).await.expect("SCARD before");
+    repo.quarantine_timer(&member).await.expect("quarantine");
+    let after = quarantine_size(&mut conn).await.expect("SCARD after");
+    assert_eq!(after, before + 1, "one quarantined member adds one");
+    conn.srem::<_, _, ()>("timers:quarantine", &member).await.expect("SREM");
+    let restored = quarantine_size(&mut conn).await.expect("SCARD restored");
+    assert_eq!(restored, before, "removing it restores the count");
+
+    // Cleanup: this test's member only (quarantine already removed it from timers:global).
+    conn.zrem::<_, _, ()>("timers:global", &member).await.ok();
+}
+
+#[tokio::test]
 async fn poisoned_member_does_not_stall_a_real_arrival() {
     use std::sync::Arc;
     use mercs_server::config::Config;
@@ -4269,8 +4329,9 @@ async fn convoy_dispatch_logs_full_request_with_convoy() {
     assert_eq!(p["cargo"], serde_json::json!({"magma_ore": 5}));
     let logged: chrono::DateTime<chrono::Utc> =
         serde_json::from_value(p["arrival_time"].clone()).expect("arrival_time is a timestamp");
-    // Postgres stores microseconds; the logged value keeps chrono's full precision.
-    assert!((logged - convoy.arrival_time).num_microseconds().unwrap().abs() < 1, "logged arrival_time matches the row");
+    // Dispatch truncates arrival_time to µs, the precision Postgres stores, so the log
+    // and the row agree exactly (Reviewer INF-5 F5).
+    assert_eq!(logged, convoy.arrival_time, "logged arrival_time matches the row exactly");
 }
 
 #[tokio::test]

@@ -7,7 +7,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use chrono::{Duration, Utc};
+use chrono::{Duration, SubsecRound, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -92,7 +92,9 @@ async fn dispatch_convoy(
     // TODO(phase-2): vehicle class speed modifiers
     let speed_modifier = 1.0_f64;
     let travel_mins = (hex_dist as f64) * 20.0 * terrain_modifier * speed_modifier;
-    let arrival_time = Utc::now() + Duration::minutes(travel_mins as i64);
+    // Truncated to µs, the precision Postgres stores, so the log row, the convoy record
+    // and the timer payload all carry the same instant (Reviewer INF-5 F5).
+    let arrival_time = (Utc::now() + Duration::minutes(travel_mins as i64)).trunc_subsecs(6);
 
     // Generate convoy_id — INVARIANT: this is also used as timer_id (see schedule_timer below)
     let convoy_id = Uuid::new_v4();
@@ -139,7 +141,10 @@ async fn dispatch_convoy(
     };
     // Write order (GAP-44): the Redis timer, then the convoy and its log row in one
     // transaction, then the cosmetic origin marker. Each failure leaves either nothing or
-    // a timer with no convoy, which the expiry poll's phantom path removes.
+    // a timer with no convoy. A failed dispatch keeps its timer deliberately (Reviewer
+    // INF-5 F2): the commit may have landed even though it reported an error, so at fire
+    // time the expiry poll lands the convoy if the row exists, and its phantom path
+    // cancels the timer if not.
 
     // 1. The arrival timer.
     // INVARIANT: timer_id == convoy_id so poll_expiry_once (3c-1) can land the convoy
@@ -158,9 +163,6 @@ async fn dispatch_convoy(
 
     // 2. The convoy and its `convoy_dispatched` row, together or not at all.
     if let Err(e) = state.convoy_repo.dispatch_convoy(record, campaign_id, &entry).await {
-        if let Err(ce) = state.timer_repo.cancel_timer(convoy_id).await {
-            tracing::warn!("dispatch_convoy: cancel_timer after a failed dispatch failed for convoy {convoy_id} (the phantom path will remove it): {ce:?}");
-        }
         return super::internal_error(format!("dispatch_convoy: dispatch write failed for campaign {campaign_id}, convoy {convoy_id}: {e:?}")).into_response();
     }
 
@@ -182,9 +184,11 @@ async fn dispatch_convoy(
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::convoy_expiry::{poll_expiry_once, ExpiryWarns};
     use crate::repository::{
-        CampaignInstance, CampaignLifecycle, CampaignRepository, NewCampaignInstance,
-        PostgresConvoyRepository, VictoryTickerType,
+        CampaignInstance, CampaignLifecycle, CampaignRepository, ConvoyRepository,
+        NewCampaignInstance, OccupationStatus, PostgresConvoyRepository, RepositoryError,
+        SectorState, VictoryTickerType,
     };
     use axum::body::Body;
     use axum::http::Request;
@@ -260,7 +264,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_db_failure_cancels_the_timer() {
+    async fn dispatch_db_failure_keeps_the_timer_for_the_phantom_path() {
         // A closed lazy pool fails every query without a database (INF-3a pattern).
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://unused@127.0.0.1:1/unused")
@@ -273,7 +277,66 @@ mod tests {
 
         let status = dispatch(Arc::new(state), campaign_id, (1, 0)).await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert!(timers.0.is_empty(), "a failed dispatch write must cancel the timer it scheduled");
+        assert_eq!(timers.0.len(), 1, "a failed dispatch write keeps its timer for the phantom path");
+        let timer = timers.0.iter().next().expect("the kept timer");
+        assert!(
+            matches!(timer.timer_type, TimerType::ConvoyArrival) && timer.timer_id == *timer.key(),
+            "the kept timer is the convoy's arrival timer"
+        );
+    }
+
+    /// No convoy row exists: dispatch fails, and the arrival poll finds nothing to land.
+    struct NoConvoyRows;
+
+    #[async_trait::async_trait]
+    impl ConvoyRepository for NoConvoyRows {
+        async fn create_convoy(&self, _: ConvoyDbRecord) -> Result<Uuid, RepositoryError> {
+            unimplemented!()
+        }
+        async fn get_convoy(&self, _: Uuid) -> Result<Option<ConvoyDbRecord>, RepositoryError> {
+            Ok(None)
+        }
+        async fn dispatch_convoy(&self, _: ConvoyDbRecord, _: Uuid, _: &shared::InputLogEntry) -> Result<(), RepositoryError> {
+            Err(RepositoryError::Internal("test: dispatch write fails".into()))
+        }
+        async fn land_convoy(&self, _: Uuid, _: Uuid, _: &shared::InputLogEntry) -> Result<Option<ConvoyDbRecord>, RepositoryError> {
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_dispatch_timer_is_cancelled_by_the_phantom_path() {
+        let (mut state, campaign_id) = dispatch_state();
+        state.convoy_repo = Arc::new(NoConvoyRows);
+        let timers = Arc::new(crate::repository::InMemoryTimerRepository::new());
+        state.timer_repo = timers.clone();
+        let state = Arc::new(state);
+
+        let status = dispatch(state.clone(), campaign_id, (1, 0)).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+
+        // The phantom path is reached only once the timer's sector resolves (GAP-59).
+        let sector_id = {
+            let mut timer = timers.0.iter_mut().next().expect("the kept timer");
+            // poll_expiry_once reads the wall clock, so move the timer into the past.
+            timer.fires_at = Utc::now() - Duration::seconds(1);
+            timer.sector_id
+        };
+        state.sector_repo.upsert_sector(SectorState {
+            sector_id,
+            campaign_id,
+            occupation_status: OccupationStatus::Neutral,
+            owner: None,
+            deployed_unit_count: 0,
+            terrain: Default::default(),
+            magma_veins: vec![],
+            hex_occupancy: Default::default(),
+        }).await.expect("in-memory upsert_sector");
+
+        let mut warns = ExpiryWarns::new();
+        poll_expiry_once(&state, &mut warns).await;
+        assert!(timers.0.is_empty(), "the phantom path cancels a timer whose convoy row does not exist");
+        assert_eq!(warns.phantom.len(), 1, "the cleanup is warned as a phantom timer");
     }
 
     #[tokio::test]

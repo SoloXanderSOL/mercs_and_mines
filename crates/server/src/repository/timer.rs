@@ -219,12 +219,19 @@ impl TimerRepository for RedisTimerRepository {
     async fn quarantine_timer(&self, member: &str) -> Result<(), RepositoryError> {
         use redis::AsyncCommands;
         let mut conn = self.conn.clone();
-        // Best effort: the reverse lookup names the sector zset, if the member has one.
+        // The reverse lookup names the sector zset, if the member has one. A lookup error
+        // returns before any write, so the next poll retries the whole quarantine instead
+        // of leaving the member in its sector zset (Reviewer INF-5 F3).
         let sector: Option<String> = conn
             .get(format!("timer:{member}:sector_id"))
             .await
-            .unwrap_or(None);
+            .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        // MULTI/EXEC: no other client sees the member half-moved. It is isolation, not
+        // rollback: a command that fails inside EXEC does not undo the others. redis-rs
+        // 0.27 still reports that failure as `Err` (it checks every EXEC reply, `.ignore()`d
+        // or not, before discarding them).
         let mut pipe = redis::pipe();
+        pipe.atomic();
         pipe.zrem("timers:global", member).ignore();
         if let Some(sid) = sector {
             pipe.zrem(format!("sector:{sid}:timers"), member).ignore();
@@ -234,4 +241,13 @@ impl TimerRepository for RedisTimerRepository {
             .await
             .map_err(|e| RepositoryError::Internal(e.to_string()))
     }
+}
+
+/// The number of members in `timers:quarantine`. Read once at boot so a non-empty
+/// quarantine is visible in the journal; a free function, not a repository method.
+pub async fn quarantine_size(conn: &mut redis::aio::ConnectionManager) -> Result<u64, RepositoryError> {
+    use redis::AsyncCommands;
+    conn.scard("timers:quarantine")
+        .await
+        .map_err(|e| RepositoryError::Internal(e.to_string()))
 }

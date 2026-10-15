@@ -51,6 +51,14 @@ async fn main() {
         .expect("Failed to connect to Redis — is REDIS_URL correct and the server reachable?");
     tracing::info!("Redis connection manager ready");
 
+    // Visibility only: a quarantined timer never fires, so say so at every boot.
+    let mut quarantine_conn = redis_mgr.clone();
+    match mercs_server::repository::timer::quarantine_size(&mut quarantine_conn).await {
+        Ok(0) => {}
+        Ok(n) => tracing::warn!("{n} timer member(s) in timers:quarantine — they will never fire; inspect and resolve by hand"),
+        Err(e) => tracing::warn!("could not read the size of timers:quarantine: {e:?}"),
+    }
+
     let config = Arc::new(Config::from_env());
     let bind_addr = config.server.bind_addr.clone();
     let mut state = AppState::new(config.clone());
