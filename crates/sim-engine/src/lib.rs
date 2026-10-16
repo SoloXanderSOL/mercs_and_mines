@@ -17,6 +17,7 @@ pub mod equipment;
 pub mod scenario;
 pub mod ore_run;
 pub mod fatal_flaw;
+pub mod foreman_flaw;
 pub mod roster;
 pub mod grade;
 

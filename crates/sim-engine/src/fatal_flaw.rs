@@ -52,9 +52,12 @@ pub enum FatalFlawEffect {
     AccuracyPerTick { delta: i32, percent: u8 },
     /// Martinet, Breaking Point: per-Tick chance of a Stability hit (ODQ-36).
     StabilityPerTick { delta: i32, percent: u8 },
-    /// Stability at deployment (Glory Hound +, Doomsayer −; Pillar 4, Stress §2).
+    /// The led unit's morale stat at deployment: Section Stability (Commander) or Crew Morale
+    /// (Foreman). Glory Hound +, Doomsayer −; Pillar 4, Stress §2. The consumer applies it to
+    /// its own unit.
     DeploymentStability { delta: i32 },
-    /// Doomsayer: casualty and hazard Stability losses reduced, in basis points.
+    /// Doomsayer: casualty and hazard losses to the led unit's morale stat (Section Stability
+    /// or Crew Morale) reduced, in basis points.
     CasualtyStabilityLossReduction { basis_points: u16 },
     /// Martinet: between-mission Stability recovery rate, in basis points (negative = slower).
     StabilityRecovery { basis_points: i32 },
@@ -107,6 +110,51 @@ pub enum FatalFlawEffect {
     SermonOnEntry { conversion_percent: u8 },
     /// Doomsayer, Breaking Point: per-advance-order refusal chance, and how long it holds.
     AdvanceOrderRefusal { percent: u8, ticks: u8 },
+
+    // ── Foreman extraction effects (7a-1, ODQ-38). Consumers: Phase 2 §13 Strike Mining,
+    //    unless noted. ──
+    /// High-Grader: share of each ore haul skimmed, in basis points. Ore, not Credits:
+    /// never Embezzler's `PayoutSkim`.
+    OreSkim { basis_points: u16 },
+    /// Extraction yield, in basis points (Seam-Fever +, Deep-Ear's off-vein drift −).
+    YieldModifier { basis_points: i32 },
+    /// Seam-Fever: accident and cave-in checks roll at +N percentage points.
+    AccidentCheck { percent_points: u8 },
+    /// Cave-Shy: miner KIA reduced, in basis points.
+    MinerKiaReduction { basis_points: u16 },
+    /// Cave-Shy: chance each Hold-or-Fold window ends early.
+    HoldOrFoldEarlyEnd { percent: u8 },
+    /// Superstitious: flat, passive Crew Morale modifier, always active (not at-deployment).
+    /// Consumer: Phase 2 §13 Crew Morale.
+    CrewMorale { delta: i32 },
+    /// Per-extraction chance of losing Ticks of extraction (Superstitious' omen delay,
+    /// Deep-Ear's listening halt, Prospector's Itch's rig relocation).
+    ExtractionDelay { ticks: u8, percent: u8 },
+    /// Prospector's Itch: per-mission chance of surfacing a bonus vein lead.
+    VeinLead { percent: u8 },
+    /// Prospector's Itch, Breaking Point: per-extraction chance the dig converts to an
+    /// unscouted site, hazard ratings unknown.
+    UnscoutedSiteConversion { percent: u8 },
+    /// Waste-Not: equipment recovery chance, +N percentage points on all outcomes.
+    /// Consumer: the Equipment Recovery roll (7d-1 builds it; Phase 2 §13 applies this).
+    EquipmentRecovery { percent_points: u8 },
+    /// Waste-Not: each refurbished item's breakdown chance starts at `start_percent` and
+    /// rises by `step_percent_points` per mission in service, capped at `cap_percent`. The
+    /// consumer owns each item's missions-in-service count.
+    RefurbishedBreakdown { start_percent: u8, step_percent_points: u8, cap_percent: u8 },
+    /// Waste-Not, Breaking Point: per-extraction rig-failure check.
+    RigFailureCheck { percent: u8 },
+    /// Deep-Ear: eruption and vein-collapse warnings surface this many Ticks earlier, every
+    /// time (unlike Squeak-Touched's `HazardWarning`, which is a chance).
+    WarningLead { ticks: u8 },
+    /// Deep-Ear: `VOID_CALLER_RELATION` per deployed campaign day, in tenths of a point.
+    /// The consumer owns any accumulation onto the relation's own scale.
+    VoidCallerRelationPerDay { tenths: i16 },
+    /// Deep-Ear, Breaking Point: site event risk, +N percentage points per extraction.
+    SiteEventRisk { percent_points: u8 },
+    /// Deep-Ear, Breaking Point: a Void-Caller delegation arrives once, on entering Breaking
+    /// Point. The consumer owns the "once".
+    VoidCallerDelegationOnEntry,
 }
 
 use FatalFlawEffect::*;
@@ -134,7 +182,7 @@ pub fn evaluate_fatal_flaw(flaw: CommanderFlaw, tier: &StressTier, _context: &Fa
 }
 
 /// `base`, followed by `more`.
-fn then(mut base: Vec<FatalFlawEffect>, more: &[FatalFlawEffect]) -> Vec<FatalFlawEffect> {
+pub(crate) fn then(mut base: Vec<FatalFlawEffect>, more: &[FatalFlawEffect]) -> Vec<FatalFlawEffect> {
     base.extend_from_slice(more);
     base
 }
