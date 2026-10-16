@@ -2982,6 +2982,8 @@ async fn commander_roster_check_rejects_non_canonical_values() {
         ("origin", "UPDATE commander_records SET origin = 'Raccoon (Mod-Moped)' WHERE commander_id = $1", "commander_records_origin_canon"),
         ("faction_bias", "UPDATE commander_records SET faction_bias = 'GUN Loyalist' WHERE commander_id = $1", "commander_records_faction_bias_canon"),
         ("commander_grade", "UPDATE commander_records SET commander_grade = 'Legendary' WHERE commander_id = $1", "commander_records_commander_grade_canon"),
+        ("fatal_flaw", "UPDATE commander_records SET fatal_flaw = 'Reckless' WHERE commander_id = $1", "commander_records_fatal_flaw_canon"),
+        ("specialization", "UPDATE commander_records SET specialization = 'Marksmans Eye' WHERE commander_id = $1", "commander_records_specialization_canon"),
     ];
     for (column, sql, constraint) in cases {
         let err = sqlx::query(sql)
@@ -3031,12 +3033,101 @@ async fn commander_roster_check_accepts_every_canonical_value() {
             .await
             .unwrap_or_else(|e| panic!("commander_grade {:?} rejected by commander_records_commander_grade_canon: {e}", grade.as_str()));
     }
+    for flaw in CommanderFlaw::ALL {
+        sqlx::query("UPDATE commander_records SET fatal_flaw = $2 WHERE commander_id = $1")
+            .bind(commander_id)
+            .bind(flaw.as_str())
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("fatal_flaw {:?} rejected by commander_records_fatal_flaw_canon: {e}", flaw.as_str()));
+    }
+    for spec in CommanderSpecialization::ALL {
+        sqlx::query("UPDATE commander_records SET specialization = $2 WHERE commander_id = $1")
+            .bind(commander_id)
+            .bind(spec.as_str())
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("specialization {:?} rejected by commander_records_specialization_canon: {e}", spec.as_str()));
+    }
 
     clean_wallet_4g1(&pool, &wallet).await;
 }
 
+/// The `'…'::text` literals of a `pg_get_constraintdef` IN-list, with `''` unescaped.
+fn constraint_literals(def: &str) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    let mut rest = def;
+    while let Some(start) = rest.find('\'') {
+        let body = &rest[start + 1..];
+        let mut value = String::new();
+        let mut chars = body.char_indices().peekable();
+        let mut end = None;
+        while let Some((i, c)) = chars.next() {
+            if c == '\'' {
+                if matches!(chars.peek(), Some((_, '\''))) {
+                    chars.next();
+                    value.push('\'');
+                } else {
+                    end = Some(i);
+                    break;
+                }
+            } else {
+                value.push(c);
+            }
+        }
+        let end = end.unwrap_or_else(|| panic!("unterminated literal in {def}"));
+        out.insert(value);
+        rest = &body[end + 1..];
+    }
+    out
+}
+
+/// 4d-2 (Reviewer Brick B F2, CF3): every `*_canon` CHECK on `commander_records` lists
+/// exactly its roster enum's strings, in both directions, and there are exactly five.
+#[tokio::test]
+async fn commander_roster_checks_match_the_roster_both_ways() {
+    use std::collections::BTreeSet;
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    let rows = sqlx::query!(
+        r#"SELECT conname::text AS "conname!", pg_get_constraintdef(oid) AS "def!"
+           FROM pg_constraint
+           WHERE conrelid = 'commander_records'::regclass AND contype = 'c' AND conname::text LIKE '%\_canon'"#
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("pg_constraint read failed");
+
+    fn strings(all: impl IntoIterator<Item = &'static str>) -> BTreeSet<String> {
+        all.into_iter().map(str::to_string).collect()
+    }
+    let expected: [(&str, BTreeSet<String>); 5] = [
+        ("commander_records_origin_canon", strings(CommanderOrigin::ALL.map(CommanderOrigin::as_str))),
+        ("commander_records_faction_bias_canon", strings(FactionBias::ALL.map(FactionBias::as_str))),
+        ("commander_records_commander_grade_canon", strings(CommanderGrade::ALL.map(CommanderGrade::as_str))),
+        ("commander_records_fatal_flaw_canon", strings(CommanderFlaw::ALL.map(CommanderFlaw::as_str))),
+        ("commander_records_specialization_canon", strings(CommanderSpecialization::ALL.map(CommanderSpecialization::as_str))),
+    ];
+
+    let names: BTreeSet<&str> = rows.iter().map(|r| r.conname.as_str()).collect();
+    let want_names: BTreeSet<&str> = expected.iter().map(|(n, _)| *n).collect();
+    assert_eq!(names, want_names, "the *_canon CHECKs on commander_records must be exactly the five guarded here");
+
+    for (name, roster) in &expected {
+        let def = &rows.iter().find(|r| r.conname == *name).unwrap().def;
+        let sql = constraint_literals(def);
+        let sql_only: Vec<_> = sql.difference(roster).collect();
+        let roster_only: Vec<_> = roster.difference(&sql).collect();
+        assert!(sql_only.is_empty(), "{name}: in SQL, not in roster: {sql_only:?}");
+        assert!(roster_only.is_empty(), "{name}: in roster, not in SQL: {roster_only:?}");
+    }
+}
+
 /// 4a-2 — `commander_grade` round-trips through `create_commander`, `get_commander` and
-/// `list_commanders_by_campaign` unchanged.
+/// `list_commanders_by_campaign` unchanged, and is never recomputed from the traits
+/// (4d-2, Reviewer 4a-2 F3: a hand-built record, not the generator).
 #[tokio::test]
 async fn test_commander_grade_round_trips() {
     let pool = match test_pool().await {
@@ -3044,19 +3135,57 @@ async fn test_commander_grade_round_trips() {
         None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
     };
     let wallet = [28u8; 32];
-    let (campaign_id, commander_id) = seed_commander_4g1(&pool, wallet, 0).await;
+    clean_wallet_4g1(&pool, &wallet).await;
+
+    // The fixture's traits grade to Standard Issue (TQS 10 + 8 + 12 = 30); it is stored as
+    // Heroic, so a read that recomputed the Grade from the traits would fail.
+    use sim_engine::grade::commander_tqs;
+    let tqs = commander_tqs(CommanderOrigin::Duck, CommanderSpecialization::Cannoneer, CommanderFlaw::Bloodthirsty);
+    assert_eq!(tqs, 30);
+    assert_eq!(CommanderGrade::from_tqs(tqs), CommanderGrade::StandardIssue, "the fixture must stay sharp");
+
+    sqlx::query(
+        "INSERT INTO player_accounts (wallet_address, trust_standing, gcn_balance)
+         VALUES ($1, 0, 0) ON CONFLICT (wallet_address) DO NOTHING"
+    )
+    .bind(wallet.to_vec())
+    .execute(&pool)
+    .await
+    .expect("player_accounts FK seed failed");
+    let campaign_id = PostgresCampaignRepository::new(pool.clone())
+        .create_campaign(&NewCampaignInstance { sector_id: uuid::Uuid::new_v4(), map_seed: 0x4D02_i64 })
+        .await
+        .expect("create campaign failed")
+        .campaign_id;
+    let commander_id = uuid::Uuid::new_v4();
     let repo = PostgresCommanderRepository::new(pool.clone());
+    repo.create_commander(CommanderRecord {
+        commander_id,
+        campaign_id,
+        player_wallet:   wallet.to_vec(),
+        name:            "Cpl. Mallardus Drek".into(),
+        rank:            1,
+        xp:              0,
+        stress:          0,
+        origin:          CommanderOrigin::Duck.as_str().into(),
+        faction_bias:    FactionBias::GunLoyalist.as_str().into(),
+        specialization:  CommanderSpecialization::Cannoneer.as_str().into(),
+        fatal_flaw:      CommanderFlaw::Bloodthirsty.as_str().into(),
+        veteran_trait:   None,
+        is_shattered:    false,
+        is_kia:          false,
+        prng_seed_state: 0x4D02_i64,
+        commander_grade: Some(CommanderGrade::Heroic.as_str().into()),
+        created_at:      chrono::Utc::now(),
+        updated_at:      chrono::Utc::now(),
+    }).await.expect("create_commander failed");
 
     let fetched = repo.get_commander(commander_id).await.unwrap().expect("commander not found");
-    let grade = fetched.commander_grade.clone().expect("a generated Commander carries a Grade");
-    assert!(CommanderGrade::from_db_str(&grade).is_some(), "stored grade {grade:?} is not canonical");
-    // seed_commander_4g1 generates from seed 42; regenerate to get the value it wrote.
-    let written = mercs_server::commander_gen::generate_commander(wallet.to_vec(), campaign_id, 42u32).commander_grade;
-    assert_eq!(fetched.commander_grade, written, "get_commander must return the Grade create_commander was given");
+    assert_eq!(fetched.commander_grade.as_deref(), Some("Heroic"), "get_commander must return the stored Grade");
 
     let listed = repo.list_commanders_by_campaign(campaign_id).await.unwrap();
     assert_eq!(listed.len(), 1);
-    assert_eq!(listed[0].commander_grade.as_deref(), Some(grade.as_str()));
+    assert_eq!(listed[0].commander_grade.as_deref(), Some("Heroic"), "list_commanders_by_campaign must return the stored Grade");
 
     clean_wallet_4g1(&pool, &wallet).await;
 }

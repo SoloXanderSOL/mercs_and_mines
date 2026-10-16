@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT conname::text AS \"conname!\", pg_get_constraintdef(oid) AS \"def!\"\n           FROM pg_constraint\n           WHERE conrelid = 'commander_records'::regclass AND contype = 'c' AND conname::text LIKE '%\\_canon'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "conname!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "def!",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "5f6eb646f246aa64f2729fba84eade6b87f820e684ce28f17102fd378ac249c5"
+}

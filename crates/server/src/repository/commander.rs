@@ -107,6 +107,8 @@ pub struct CardMintPending {
     pub commander_name: String,
     pub rank:           i16,
     pub foil:           bool,
+    /// Copied from the Commander row, as Postgres copies `c.commander_grade` (Reviewer 4a-2 F2).
+    pub commander_grade: Option<String>,
 }
 
 /// `create_commander` stores stress in 0..=100 and keeps `update_stress`'s invariant:
@@ -861,6 +863,7 @@ impl CommanderRepository for InMemoryCommanderRepository {
                 commander_name: rec.name.clone(),
                 rank:           eff.old_rank, // the locked rank, as Postgres binds (F1)
                 foil:           glorious,
+                commander_grade: rec.commander_grade.clone(),
             });
             // TODO(phase-2): grief spike — see `mark_commander_kia` (Postgres section).
         }
@@ -1180,6 +1183,8 @@ mod tests {
             (&rec.name, &rec.player_wallet, rec.campaign_id, 3)
         );
         assert_eq!((card.commander_id, card.deployment_id, card.session_id), (id, d.deployment_id, d.session_id));
+        assert!(rec.commander_grade.is_some(), "precondition: the seeded Commander carries a Grade");
+        assert_eq!(card.commander_grade, rec.commander_grade, "the card copies the Commander's Grade (F2)");
         let deps = repo.list_deployments_by_commander(id).await.unwrap();
         assert_eq!(deps[0].outcome.as_deref(), Some("Wipeout"));
     }
