@@ -7,26 +7,6 @@ use crate::types::{ConvoyVehicle, Pack};
 pub use shared::{Coordinates, EntityVision};
 
 // ----------------------------------------------------------------
-// SPECIES — Commander / Advisor origins only.
-// Not used for deployable combat units.
-// ----------------------------------------------------------------
-
-/// Legacy client-sent sim type, kept unchanged because logged `session_start` payloads deserialise it (GAP-36 retires it); the canonical origin roster is `roster::CommanderOrigin`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum Species {
-    #[serde(rename = "Human (Corporate)")]
-    HumanCorporate,
-    #[serde(rename = "Human (Underhive)")]
-    HumanUnderhive,
-    #[serde(rename = "Raccoon (Mod-Moped)")]
-    RaccoonModMoped,
-    #[serde(rename = "Raccoon (Rocker-Chopper)")]
-    RaccoonRockerChopper,
-    #[serde(rename = "Hamster Attachment")]
-    HamsterAttachment,
-}
-
-// ----------------------------------------------------------------
 // UNIT CLASS — combat formation type, not individual merc role.
 // Controls combat resolution logic (headcount model, scatter rules, etc.)
 // ----------------------------------------------------------------
@@ -276,7 +256,6 @@ pub struct CommanderPassiveBuffs {
 pub struct Commander {
     pub id: String,
     pub name: String,
-    pub species: Species,
     /// 1–5: Corporal → Regimental Colonel
     pub rank: u8,
     pub skill: u8,

@@ -3643,7 +3643,7 @@ async fn mission_resolve_hides_another_wallets_commander() {
 
 #[tokio::test]
 async fn mission_resolve_rejects_a_client_commander() {
-    use sim_engine::game_types::{Commander, CommanderPassiveBuffs, QualityGrade, Species};
+    use sim_engine::game_types::{Commander, CommanderPassiveBuffs, QualityGrade};
     let state = default_state();
     let wallet = [4u8; 32];
     let commander_id = seed_in_memory_commander(&state, wallet, |_| {}).await;
@@ -3651,7 +3651,7 @@ async fn mission_resolve_rejects_a_client_commander() {
     let app = mercs_server::routes::router(std::sync::Arc::new(state));
 
     let full = serde_json::to_value(Commander {
-        id: "vance".into(), name: "Captain Vance".into(), species: Species::HumanCorporate,
+        id: "vance".into(), name: "Captain Vance".into(),
         rank: 5, skill: 10, success_aura: 999, quality_grade: QualityGrade::Basic,
         ability: String::new(), flavor_text: String::new(), stress_level: 0,
         is_kia: false, is_shattered: false, can_retreat: true,

@@ -123,7 +123,6 @@ async fn aar_replays_commander_buffed_combat() {
     let commander = sim_engine::game_types::Commander {
         id: "cmd-aar".into(),
         name: "Test Commander".into(),
-        species: sim_engine::game_types::Species::HumanCorporate,
         rank: 1,
         skill: 1,
         success_aura: 0,

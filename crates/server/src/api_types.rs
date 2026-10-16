@@ -66,3 +66,43 @@ pub struct PackAssaultRequest {
     pub max_ticks: Option<usize>,
     pub seed_override: Option<u32>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The sim `Commander.species` field was removed in 4a-2. A logged `session_start`
+    /// payload that still carries the key must deserialise (serde ignores the unknown
+    /// key), so the removal cannot break an AAR replay. The value is a removed variant.
+    #[test]
+    fn combat_resolve_request_ignores_a_legacy_species_key() {
+        let logged = serde_json::json!({
+            "section": {
+                "id": "alpha", "name": "Alpha Section", "max_strength": 5, "current_strength": 5,
+                "individual_hp": 10, "accuracy": 60, "evasion": 20,
+                "weapon": { "name": "Laser Carbine", "ap": 4, "base_damage": 8, "tag": "Laser", "accuracy": 0 },
+                "armor_at": 3, "armor_tag": "LightArmor"
+            },
+            "vehicle": {
+                "id": "scout-1", "name": "Armored Scout", "hp": 40, "max_hp": 40, "at": 6,
+                "armor_tag": "HeavyArmor", "evasion": 10,
+                "weapons": [{ "name": "Scout Cannon", "ap": 6, "base_damage": 12, "tag": "Slug", "accuracy": 0 }]
+            },
+            "max_ticks": 25,
+            "seed_override": 42,
+            "combat_initiation_type": "SPOTTED",
+            "defending_convoy_vehicles": null,
+            "commander": {
+                "id": "cmd-legacy", "name": "Legacy Commander", "species": "Hamster Attachment",
+                "rank": 1, "skill": 1, "success_aura": 0, "quality_grade": "Standard",
+                "ability": "", "flavor_text": "", "stress_level": 0,
+                "is_kia": false, "is_shattered": false, "can_retreat": true,
+                "passive_buffs": { "accuracy": 0, "evasion": 30, "damage_reduction": 0 },
+                "attached_unit_id": null
+            }
+        });
+        let req: CombatResolveRequest = serde_json::from_value(logged)
+            .expect("a logged payload carrying the removed species key must still deserialise");
+        assert_eq!(req.commander.expect("commander present").name, "Legacy Commander");
+    }
+}

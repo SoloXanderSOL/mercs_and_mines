@@ -1265,7 +1265,7 @@ pub async fn resolve_combat_streaming(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::game_types::{CommanderPassiveBuffs, QualityGrade, Species, UnitDefinition};
+    use crate::game_types::{CommanderPassiveBuffs, QualityGrade, UnitDefinition};
 
     /// Fixed fixture, tuned so `success_probability` lands exactly on 50.0:
     ///   base_skill_score  (8/10 × 50) =  40.0
@@ -1536,7 +1536,6 @@ mod tests {
         Commander {
             id:               "c".to_string(),
             name:             "C".to_string(),
-            species:          Species::HumanCorporate,
             rank:             1,
             skill:            5,
             success_aura:     0,
