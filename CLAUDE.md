@@ -40,7 +40,7 @@ As of 2026-10-15:
 - **Section 2 (Campaign State Machine):** 2a and 2b complete. 2c and 2d deferred until
   after Sections 3–5. Arch Audits 3 and 5 complete.
 - **Section 3 (Hex Map and Timers):** Complete — 3a-1, 3b-1, 3b-2, 3c-1, 3d-1, 3e-1.
-- **Section 4 (Commander Records):** In progress. 4a-1, 4b-0, 4b-1, 4e-0 (state-based Wipeout, GAP-35 part 2) and 4c-1
+- **Section 4 (Commander Records):** Complete (closed 2026-10-16; 4f deferred to 2c/2d). 4a-1, 4b-0, 4b-1, 4e-0 (state-based Wipeout, GAP-35 part 2) and 4c-1
   (stress persisted through `sim-engine`'s pure stress fns; `update_stress` sets Shattered at
   100; five mutators return `NotFound` on a miss) complete. **4a-2 complete (`f95969b`,
   `90b0cd2`, `322c53d`, 2026-10-16; Commander Grade):** the Commander_Grade_System §3 tables
@@ -86,11 +86,20 @@ As of 2026-10-15:
   the route passes a ticker contribution of `0.0` until §2c. The mission response gains
   `commander: {kia, glorious}`. No input-log entry, no R7 bump. Test cleanup order:
   `card_mint_pending` → `deployment_records` → `section_records` → `commander_records` →
-  membership → `player_accounts`.
+  `foreman_records` (since 7a-1) → membership → `player_accounts`.
 - **Sections 5 and 6:** Not started.
 - **Sections 7 (Personnel Entity Model) and 8 (Combat Engine to canon):** created
-  2026-10-13 (ruling D2), not started; both run before Section 6. Strike Mining and Base
-  Building moved into Phase 2 as §13/§14 (ruling D1).
+  2026-10-13 (ruling D2); both run before Section 6. Strike Mining and Base Building moved
+  into Phase 2 as §13/§14 (ruling D1). **Section 7 in progress: 7a-1 built (2026-10-16;
+  Mining Foreman).** The class-neutral generation helpers live in `field_leader_gen`, where
+  `pick_band` refuses an overflowing `u32` sum, an all-zero vector and a non-zero weight on an
+  empty band (Reviewer 4d-2 F1/F2). `generate_foreman` is band-first over
+  `sim_engine::grade::foreman_combinations` with the same `DEFAULT_GRADE_WEIGHTS`.
+  `sim_engine::foreman_flaw::evaluate_foreman_flaw` returns `FatalFlawEffect` (47 variants;
+  ODQ-38 numbers; the three shared flaws route through the Commander fns, F3), with no
+  production caller. Migration `0022` adds `foreman_records`, with five roster CHECKs under the
+  per-table guard `roster_checks_match_the_roster_both_ways`. `ForemanRepository` has Postgres
+  and in-memory impls and no `AppState` field (§5a adds it). Section 8 not started.
 - **INF-1 (infrastructure, GAP-37):** Complete — `tracing` subscriber installed, reward-mult
   config hardened, workspace version `0.2.0`.
 - **INF-2 (infrastructure, GAP-38):** Complete — idempotent `mercs_server::init_tracing()`
@@ -127,10 +136,10 @@ As of 2026-10-15:
   scenarios) and `shellcheck` run in the `deploy-script` job on every push, and the deploy
   job needs it (GAP-33).
 
-**214/214 tests green (102 `mercs_server` lib + 2 `aar_determinism` + 72 `db_infrastructure`
-+ 38 `sim_engine`; single-threaded, verified at `a723ad6`). Workspace version `0.3.0`.
-Production = `0d93283` (0.3.0, 4a-2); `dev` is ahead with 4d-2, unpushed. Next: see the
-Phase 1 document (Section 4's brick table is complete).** Any brick that changes what `resolve_mission` produces for
+**239/239 tests green (112 `mercs_server` lib + 2 `aar_determinism` + 74 `db_infrastructure`
++ 51 `sim_engine`; single-threaded, verified at `24e910c`). Workspace version `0.3.0`.
+Production = `cc272b1` (0.3.0, 4d-2); `.prev` = `0d93283`; `dev` is ahead with 7a-1,
+unpushed. Next: see the Phase 1 document.** Any brick that changes what `resolve_mission` produces for
 a given seed bumps the workspace version in the same brick. 4b-1 reused `sim-engine`'s `OutcomeType` rather than
 defining a new enum, and writes **no input-log entry** — the rank-up entry was removed
 from scope. **ODQ-22 and ODQ-23 were ruled 2026-09-03 — engagement and mission outcomes
@@ -342,10 +351,15 @@ constraints — parallel execution causes FK-23503 failures that are not caused 
 code under test. Any test report produced without `--test-threads=1` is unreliable and
 must be re-run before reporting results to the Director.
 
-**Test wallets:** `tests/` uses wallet seeds 0–9, 13–19, 21–28 and 88, with 10–12 taken by
+**Test wallets:** `tests/` uses wallet seeds 0–9, 13–19, 21–30 and 88, with 10–12 taken by
 a range literal (`(10u8..=12)`). **20 is the auth tests' signing-key seed**
 (`SigningKey::from_bytes(&[20u8; 32])`). It is used in memory only, and its derived
-public key is not `[20u8; 32]`. The next free seed is **29**.
+public key is not `[20u8; 32]`. The next free seed is **31**.
+
+**Independent oracle:** A gate's expected value is never read from the code it checks. Pin
+it to a literal taken from canon or from a measurement made before the change (4d-2 N3: a
+frequency test that derived its target from `DEFAULT_GRADE_WEIGHTS` passed under the
+mutation).
 
 **Deploy harness:** `bash deploy/test_remote_deploy.sh` runs the real deploy script
 against shims (about 12 s, no root or network needed). Run it after any change under
