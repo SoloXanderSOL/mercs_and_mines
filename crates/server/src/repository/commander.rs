@@ -165,6 +165,10 @@ pub struct CommanderRecord {
     pub is_shattered:    bool,
     pub is_kia:          bool,
     pub prng_seed_state: i64,
+    /// The spawn Grade's display string (`roster::CommanderGrade::as_str`). Nullable only
+    /// for the expand step: every Field Leader carries one. Not parsed here (CF3): the
+    /// first reader that needs the enum parses it, and a `None` there is an integrity `500`.
+    pub commander_grade: Option<String>,
     pub created_at:      DateTime<Utc>,
     pub updated_at:      DateTime<Utc>,
 }
@@ -173,6 +177,8 @@ pub struct CommanderRecord {
 
 #[async_trait]
 pub trait CommanderRepository: Send + Sync {
+    /// Stores `commander_grade` as given. It never recomputes or validates the Grade against
+    /// the traits: Story Event characters are hand-graded with any combination (Grade §6).
     async fn create_commander(&self, record: CommanderRecord) -> Result<(), RepositoryError>;
     async fn get_commander(&self, commander_id: Uuid) -> Result<Option<CommanderRecord>, RepositoryError>;
     /// Clamps to 0..=100 and sets `is_shattered` in the same write when the clamped
@@ -319,8 +325,8 @@ async fn mark_commander_kia(
     // Commander died at, the locked one (Reviewer 4e-1 F1).
     let r = sqlx::query!(
         r#"INSERT INTO card_mint_pending
-            (card_mint_id, player_wallet, campaign_id, commander_id, deployment_id, session_id, commander_name, rank, foil)
-        SELECT $1, c.player_wallet, c.campaign_id, c.commander_id, d.deployment_id, d.session_id, c.name, $5, $2
+            (card_mint_id, player_wallet, campaign_id, commander_id, deployment_id, session_id, commander_name, rank, foil, commander_grade)
+        SELECT $1, c.player_wallet, c.campaign_id, c.commander_id, d.deployment_id, d.session_id, c.name, $5, $2, c.commander_grade
         FROM commander_records c
         JOIN deployment_records d ON d.commander_id = c.commander_id
         WHERE c.commander_id = $3 AND d.deployment_id = $4"#,
@@ -348,8 +354,8 @@ impl CommanderRepository for PostgresCommanderRepository {
             r#"INSERT INTO commander_records (
                 commander_id, campaign_id, player_wallet, name, rank, xp, stress,
                 origin, faction_bias, specialization, fatal_flaw, veteran_trait,
-                is_shattered, is_kia, prng_seed_state
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)"#,
+                is_shattered, is_kia, prng_seed_state, commander_grade
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)"#,
             r.commander_id,
             r.campaign_id,
             r.player_wallet,
@@ -365,6 +371,7 @@ impl CommanderRepository for PostgresCommanderRepository {
             r.is_shattered,
             r.is_kia,
             r.prng_seed_state,
+            r.commander_grade,
         )
         .execute(&self.pool)
         .await
@@ -377,7 +384,7 @@ impl CommanderRepository for PostgresCommanderRepository {
             r#"SELECT
                 commander_id, campaign_id, player_wallet, name, rank, xp, stress,
                 origin, faction_bias, specialization, fatal_flaw, veteran_trait,
-                is_shattered, is_kia, prng_seed_state, created_at, updated_at
+                is_shattered, is_kia, prng_seed_state, commander_grade, created_at, updated_at
                FROM commander_records WHERE commander_id = $1"#,
             commander_id
         )
@@ -401,6 +408,7 @@ impl CommanderRepository for PostgresCommanderRepository {
             is_shattered:    r.is_shattered,
             is_kia:          r.is_kia,
             prng_seed_state: r.prng_seed_state,
+            commander_grade: r.commander_grade,
             created_at:      r.created_at,
             updated_at:      r.updated_at,
         }))
@@ -490,7 +498,7 @@ impl CommanderRepository for PostgresCommanderRepository {
             r#"SELECT
                 commander_id, campaign_id, player_wallet, name, rank, xp, stress,
                 origin, faction_bias, specialization, fatal_flaw, veteran_trait,
-                is_shattered, is_kia, prng_seed_state, created_at, updated_at
+                is_shattered, is_kia, prng_seed_state, commander_grade, created_at, updated_at
                FROM commander_records WHERE campaign_id = $1"#,
             campaign_id
         )
@@ -514,6 +522,7 @@ impl CommanderRepository for PostgresCommanderRepository {
             is_shattered:    r.is_shattered,
             is_kia:          r.is_kia,
             prng_seed_state: r.prng_seed_state,
+            commander_grade: r.commander_grade,
             created_at:      r.created_at,
             updated_at:      r.updated_at,
         }).collect())
@@ -897,6 +906,7 @@ mod tests {
             is_shattered:    false,
             is_kia:          false,
             prng_seed_state: 0,
+            commander_grade: Some(sim_engine::roster::CommanderGrade::StandardIssue.as_str().into()),
             created_at:      chrono::Utc::now(),
             updated_at:      chrono::Utc::now(),
         }

@@ -2,8 +2,9 @@ use chrono::Utc;
 use uuid::Uuid;
 
 use sim_engine::game_types::OutcomeType;
+use sim_engine::grade::commander_tqs;
 use sim_engine::rng::Rng;
-use sim_engine::roster::{CommanderFlaw, CommanderOrigin, CommanderSpecialization, FactionBias};
+use sim_engine::roster::{CommanderFlaw, CommanderGrade, CommanderOrigin, CommanderSpecialization, FactionBias};
 
 use crate::repository::commander::CommanderRecord;
 
@@ -54,6 +55,13 @@ fn pick_name(origin: CommanderOrigin, rng: &mut Rng) -> String {
 ///   5. fatal_flaw      (`ROLLED_FLAWS`, 3 until 4d-2)
 ///   6. first name
 ///   7. last name
+///
+/// The spawn Grade (brick 4a-2) is read from the rolled origin, specialization and flaw
+/// through `sim_engine::grade` and consumes no draw.
+///
+/// Per-seed output is **not** a contract (CF4). `prng_seed_state` is provenance, not a
+/// reproduction key: the row is the record, and nothing regenerates a Commander from its
+/// seed, so the order of `ALL`/`GROUPS` and the draw sequence may change between releases.
 pub fn generate_commander(
     player_wallet: Vec<u8>,
     campaign_id:   Uuid,
@@ -68,12 +76,20 @@ pub fn generate_commander(
     let fatal_flaw = pick(&ROLLED_FLAWS, &mut rng);
     let name = pick_name(origin, &mut rng);
 
+    // TQS is computed and discarded; only the Grade is stored.
+    let grade = CommanderGrade::from_tqs(commander_tqs(origin, specialization, fatal_flaw));
+    // TODO(phase-1-§5): broadcast sector notification when grade == Heroic via WebSocket once Multiplayer Sync is live
+    // TODO(phase-2-§6c): include commander_grade in the memorial snapshot payload (GAP-22)
+    // TODO(phase-2-§10b): expose grade as filterable field on Headhunter Market listings
+
     let origin = origin.as_str().to_string();
     let faction_bias = faction_bias.as_str().to_string();
     let specialization = specialization.as_str().to_string();
     let fatal_flaw = fatal_flaw.as_str().to_string();
 
-    // TODO(phase-2): capture post-roll RNG state for full replay support
+    // TODO(phase-2): if full replay of generation is ever needed, per-seed output becomes a
+    // contract here: capture the post-roll RNG state, and freeze the order of `ALL`/`GROUPS`
+    // and the draw sequence (CF4).
     CommanderRecord {
         commander_id:    Uuid::new_v4(),
         campaign_id,
@@ -90,6 +106,7 @@ pub fn generate_commander(
         is_shattered:    false,
         is_kia:          false,
         prng_seed_state: rng_seed as i64,
+        commander_grade: Some(grade.as_str().to_string()),
         created_at:      Utc::now(),
         updated_at:      Utc::now(),
     }
@@ -345,6 +362,28 @@ mod tests {
         for s in CommanderSpecialization::ALL {
             assert!(specs.contains(&s), "specialization {s:?} never rolled in 2000 seeds");
         }
+    }
+
+    /// Every origin gets a Grade, and it is the grading function's readout of the rolled
+    /// traits. Until 4d-2 the rolled flaws cap TQS at 72 (Distinguished); the enumeration
+    /// tests in `sim_engine::grade` cover the high bands.
+    #[test]
+    fn test_generate_commander_grade_set_for_every_origin() {
+        use std::collections::HashSet;
+        let mut seen = HashSet::new();
+        for seed in 0..2000u32 {
+            let r = generate_commander(vec![0u8; 32], Uuid::nil(), seed);
+            let origin = CommanderOrigin::from_db_str(&r.origin).unwrap();
+            let spec = CommanderSpecialization::from_db_str(&r.specialization).unwrap();
+            let flaw = CommanderFlaw::from_db_str(&r.fatal_flaw).unwrap();
+            let expected = CommanderGrade::from_tqs(commander_tqs(origin, spec, flaw));
+            assert_eq!(r.commander_grade.as_deref(), Some(expected.as_str()), "seed {seed}");
+            seen.insert(origin);
+            if seen.len() == CommanderOrigin::ALL.len() {
+                return;
+            }
+        }
+        panic!("not every origin rolled in 2000 seeds: {seen:?}");
     }
 
     // ── xp_award / rank_for_xp ───────────────────────────────────────────────

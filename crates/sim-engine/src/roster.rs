@@ -1,14 +1,16 @@
-// Canonical Commander roster (Brick B; GAP-6, ruling R3).
-// Ref: Commander_and_Advisor_System.md (species roster, Faction Bias table, Sect Layer);
-//      Mercenary_Commander_System.md (Specializations, Fatal Flaws).
-//
-// The single source of truth for Commander roster strings. Migration `0018`'s CHECK
-// constraints on `commander_records.origin` and `faction_bias` mirror `CommanderOrigin`
-// and `FactionBias`; a drift-guard test writes every value through them. The Foreman
-// pools are a separate roster and do not live here.
-//
-// No serde derive: the database boundary uses `as_str()`, and these types must never
-// become part of a logged payload by accident.
+//! Canonical Commander roster (Brick B; GAP-6, ruling R3).
+//! Ref: Commander_and_Advisor_System.md (species roster, Faction Bias table, Sect Layer);
+//!      Mercenary_Commander_System.md (Specializations, Fatal Flaws);
+//!      Commander_Grade_System.md §2, §3b–§3c (Grades, Foreman pools).
+//!
+//! The single source of truth for Commander roster strings. Migration `0018`'s CHECK
+//! constraints on `commander_records.origin` and `faction_bias` mirror `CommanderOrigin`
+//! and `FactionBias`, and `0019`'s `commander_grade` CHECK mirrors `CommanderGrade`;
+//! drift-guard tests write every value through them. The Foreman pools live here too:
+//! they are graded (`crate::grade`) but have no generator until 7a-1.
+//!
+//! No serde derive: the database boundary uses `as_str()`, and these types must never
+//! become part of a logged payload by accident.
 
 macro_rules! roster_enum {
     ($(#[$meta:meta])* $name:ident, $n:literal { $($variant:ident => $text:literal),+ $(,)? }) => {
@@ -120,6 +122,55 @@ roster_enum! {
     }
 }
 
+roster_enum! {
+    /// A Field Leader's spawn Grade, read from the Trait Quality Score (Commander_Grade_System
+    /// §2, §3a). Shares the bare name `Elite` with `QualityGrade`: always write the variants
+    /// fully qualified.
+    CommanderGrade, 5 {
+        StandardIssue => "Standard Issue",
+        Notable       => "Notable",
+        Distinguished => "Distinguished",
+        Elite         => "Elite",
+        Heroic        => "Heroic",
+    }
+}
+
+roster_enum! {
+    /// A Mining Foreman's Specialization (the 13-spec pool, Commander_Grade_System §3b).
+    ForemanSpecialization, 13 {
+        DeepDriller       => "Deep-Driller",
+        ShoringExpert     => "Shoring-Expert",
+        LaborRelations    => "Labor Relations",
+        TectonicWhisperer => "Tectonic Whisperer",
+        BlackMarketAuger  => "Black Market Auger",
+        ConvoyHardener    => "Convoy Hardener",
+        OreGrader         => "Ore Grader",
+        SalvageOperator   => "Salvage Operator",
+        CoolantJockey     => "Coolant-Jockey",
+        RushDriller       => "Rush-Driller",
+        VeinReader        => "Vein-Reader",
+        MagmaTapper       => "Magma Tapper",
+        CrewPsychologist  => "Crew Psychologist",
+    }
+}
+
+roster_enum! {
+    /// A Mining Foreman's Fatal Flaw (the 10-flaw pool, Commander_Grade_System §3c). Doomsayer,
+    /// Cult of Bob and Squeak-Touched are shared with `CommanderFlaw` under the same strings.
+    ForemanFlaw, 10 {
+        Superstitious    => "Superstitious",
+        Doomsayer        => "Doomsayer",
+        CultOfBob        => "Cult of Bob",
+        SqueakTouched    => "Squeak-Touched",
+        WasteNot         => "Waste-Not",
+        CaveShy          => "Cave-Shy",
+        ProspectorsItch  => "Prospector's Itch",
+        DeepEar          => "Deep-Ear",
+        HighGrader       => "High-Grader",
+        SeamFever        => "Seam-Fever",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,6 +197,9 @@ mod tests {
         check(FactionBias::ALL, 12, FactionBias::as_str, FactionBias::from_db_str);
         check(CommanderSpecialization::ALL, 12, CommanderSpecialization::as_str, CommanderSpecialization::from_db_str);
         check(CommanderFlaw::ALL, 12, CommanderFlaw::as_str, CommanderFlaw::from_db_str);
+        check(CommanderGrade::ALL, 5, CommanderGrade::as_str, CommanderGrade::from_db_str);
+        check(ForemanSpecialization::ALL, 13, ForemanSpecialization::as_str, ForemanSpecialization::from_db_str);
+        check(ForemanFlaw::ALL, 10, ForemanFlaw::as_str, ForemanFlaw::from_db_str);
 
         let flattened: Vec<FactionBias> = FactionBias::GROUPS.iter().flat_map(|g| g.iter().copied()).collect();
         assert_eq!(flattened, FactionBias::ALL.to_vec(), "GROUPS must hold every bias once, in ALL order");

@@ -22,7 +22,7 @@ use mercs_server::repository::{
     ConvoyDbRecord, ConvoyRepository, PostgresConvoyRepository,
     NewDeployment, outcome_db_str,
 };
-use sim_engine::roster::{CommanderFlaw, CommanderOrigin, CommanderSpecialization, FactionBias};
+use sim_engine::roster::{CommanderFlaw, CommanderGrade, CommanderOrigin, CommanderSpecialization, FactionBias};
 
 async fn test_pool() -> Option<sqlx::PgPool> {
     let url = std::env::var("TEST_DATABASE_URL").ok()?;
@@ -232,6 +232,7 @@ async fn commander_section_crud_is_correct() {
         is_shattered:    false,
         is_kia:          false,
         prng_seed_state: 0xDEAD_i64,
+        commander_grade: Some(CommanderGrade::Distinguished.as_str().into()),
         created_at:      chrono::Utc::now(),
         updated_at:      chrono::Utc::now(),
     }).await.expect("create_commander failed");
@@ -2787,6 +2788,14 @@ async fn test_mark_commander_kia_writes_kia_and_a_snapshot_card() {
     assert!(after.is_kia);
     let cards = card_rows_4e1(&pool, &wallet).await;
     assert_eq!(cards, vec![(commander_id, d.deployment_id, d.session_id, campaign_id, seeded.name.clone(), 1, false)]);
+    // 4a-2: the card carries the dead Commander's Grade (Commander_Grade_System §4c).
+    let card_grade: Option<String> = sqlx::query_scalar("SELECT commander_grade FROM card_mint_pending WHERE player_wallet = $1")
+        .bind(&wallet[..])
+        .fetch_one(&pool)
+        .await
+        .expect("card grade read failed");
+    assert!(seeded.commander_grade.is_some(), "precondition: a generated Commander carries a Grade");
+    assert_eq!(card_grade, seeded.commander_grade, "the card must copy the Commander's Grade");
     let deps = repo.list_deployments_by_commander(commander_id).await.unwrap();
     assert_eq!(deps[0].status, "resolved");
     assert_eq!(deps[0].outcome.as_deref(), Some(outcome_db_str(&OutcomeType::Wipeout)));
@@ -2972,6 +2981,7 @@ async fn commander_roster_check_rejects_non_canonical_values() {
     let cases = [
         ("origin", "UPDATE commander_records SET origin = 'Raccoon (Mod-Moped)' WHERE commander_id = $1", "commander_records_origin_canon"),
         ("faction_bias", "UPDATE commander_records SET faction_bias = 'GUN Loyalist' WHERE commander_id = $1", "commander_records_faction_bias_canon"),
+        ("commander_grade", "UPDATE commander_records SET commander_grade = 'Legendary' WHERE commander_id = $1", "commander_records_commander_grade_canon"),
     ];
     for (column, sql, constraint) in cases {
         let err = sqlx::query(sql)
@@ -3013,6 +3023,40 @@ async fn commander_roster_check_accepts_every_canonical_value() {
             .await
             .unwrap_or_else(|e| panic!("faction_bias {:?} rejected by commander_records_faction_bias_canon: {e}", bias.as_str()));
     }
+    for grade in CommanderGrade::ALL {
+        sqlx::query("UPDATE commander_records SET commander_grade = $2 WHERE commander_id = $1")
+            .bind(commander_id)
+            .bind(grade.as_str())
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("commander_grade {:?} rejected by commander_records_commander_grade_canon: {e}", grade.as_str()));
+    }
+
+    clean_wallet_4g1(&pool, &wallet).await;
+}
+
+/// 4a-2 — `commander_grade` round-trips through `create_commander`, `get_commander` and
+/// `list_commanders_by_campaign` unchanged.
+#[tokio::test]
+async fn test_commander_grade_round_trips() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    let wallet = [28u8; 32];
+    let (campaign_id, commander_id) = seed_commander_4g1(&pool, wallet, 0).await;
+    let repo = PostgresCommanderRepository::new(pool.clone());
+
+    let fetched = repo.get_commander(commander_id).await.unwrap().expect("commander not found");
+    let grade = fetched.commander_grade.clone().expect("a generated Commander carries a Grade");
+    assert!(CommanderGrade::from_db_str(&grade).is_some(), "stored grade {grade:?} is not canonical");
+    // seed_commander_4g1 generates from seed 42; regenerate to get the value it wrote.
+    let written = mercs_server::commander_gen::generate_commander(wallet.to_vec(), campaign_id, 42u32).commander_grade;
+    assert_eq!(fetched.commander_grade, written, "get_commander must return the Grade create_commander was given");
+
+    let listed = repo.list_commanders_by_campaign(campaign_id).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].commander_grade.as_deref(), Some(grade.as_str()));
 
     clean_wallet_4g1(&pool, &wallet).await;
 }
