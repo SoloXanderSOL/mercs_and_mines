@@ -51,7 +51,16 @@ As of 2026-10-15:
   a CHECK); TQS is never stored, and the draw count stays 7. The death card copies the
   Grade (`card_mint_pending.commander_grade`). Per-seed generator output is not a contract
   (CF4). The sim `Commander.species` field and `Species` enum are gone; `is_nft` is dropped
-  (0020). No R7 bump. **4g-1 built
+  (0020). No R7 bump. **4d-2 complete (`1f87d98`, `291b4ba`, `a723ad6`, 2026-10-16;
+  completes Section 4's brick table, with 4f deferred to 2c/2d):** `evaluate_fatal_flaw`
+  takes `CommanderFlaw` and matches exhaustively on flaw × `StressTier` for all twelve flaws
+  (ODQ-36 numbers; declarative, no draws; still no production caller, so no R7 bump). The
+  first host brick that calls it inside a logged sim entry point bumps the version and logs
+  the flaw and tier in `session_start`. `generate_commander` is band-first: a Grade band from
+  `DEFAULT_GRADE_WEIGHTS` `[50, 30, 15, 4, 1]`, then a uniform pick from
+  `sim_engine::grade::commander_combinations` (6 draws; all 12 flaws roll). `0021` adds the
+  `fatal_flaw`/`specialization` CHECKs, and a two-way `pg_get_constraintdef` guard checks all
+  five roster CHECKs. **4g-1 built
   (`1917f4c` storage + `21a76ab` route, 2026-10-14):** `POST /api/mission/resolve` requires
   an `AuthSession`, names a `commander_id` read from `commander_records` (404 for unknown or
   another wallet's; 409 for KIA, Shattered or already deployed; 400 for a non-null
@@ -118,9 +127,10 @@ As of 2026-10-15:
   scenarios) and `shellcheck` run in the `deploy-script` job on every push, and the deploy
   job needs it (GAP-33).
 
-**203/203 tests green (101 `mercs_server` lib + 2 `aar_determinism` + 71 `db_infrastructure`
-+ 29 `sim_engine`; single-threaded, verified at `322c53d`). Workspace version `0.3.0`.
-Production = `8e74c74` (0.3.0); `dev` is ahead with 4a-2, unpushed. Next: 4d-2.** Any brick that changes what `resolve_mission` produces for
+**214/214 tests green (102 `mercs_server` lib + 2 `aar_determinism` + 72 `db_infrastructure`
++ 38 `sim_engine`; single-threaded, verified at `a723ad6`). Workspace version `0.3.0`.
+Production = `0d93283` (0.3.0, 4a-2); `dev` is ahead with 4d-2, unpushed. Next: see the
+Phase 1 document (Section 4's brick table is complete).** Any brick that changes what `resolve_mission` produces for
 a given seed bumps the workspace version in the same brick. 4b-1 reused `sim-engine`'s `OutcomeType` rather than
 defining a new enum, and writes **no input-log entry** — the rank-up entry was removed
 from scope. **ODQ-22 and ODQ-23 were ruled 2026-09-03 — engagement and mission outcomes
@@ -278,7 +288,13 @@ begins.
   from a logged payload change additively only.** Variants are added, never renamed or
   removed. A new field is `Option` or `#[serde(default)]`. A field may be removed only if
   nothing reads it and the type does not deny unknown fields: old payloads still
-  deserialise, and replay is unchanged. Current examples: `CombatResolveRequest` and
+  deserialise, and replay is unchanged. **The rollback binary (`.prev`) must also
+  deserialise what this release logs:** a removed field must already be `Option` or
+  `#[serde(default)]` in `.prev`, so a removal takes two releases (make it optional, then
+  remove it); and a new variant must not be logged until the release after `.prev` knows
+  it, unless the brick states that no production caller logs it yet; the brick that adds
+  the first production caller then checks that `.prev` knows the variant. Deserialising is
+  the guarantee; replay equality across a version bump is not. Current examples: `CombatResolveRequest` and
   everything inside it, including the sim `Commander`.
 
 ---
