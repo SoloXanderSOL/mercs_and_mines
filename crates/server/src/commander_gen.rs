@@ -4,62 +4,12 @@ use uuid::Uuid;
 use sim_engine::game_types::OutcomeType;
 use sim_engine::grade::{commander_combinations, commander_tqs};
 use sim_engine::rng::Rng;
-use sim_engine::roster::{CommanderGrade, CommanderOrigin, FactionBias};
+use sim_engine::roster::CommanderGrade;
 
+use crate::field_leader_gen::{pick, pick_band, pick_faction_bias, pick_name};
 use crate::repository::commander::CommanderRecord;
 
-/// Spawn-Grade weights in `CommanderGrade::ALL` order (Standard Issue … Heroic): the
-/// Commander_Grade_System §2 frequency targets, ~50/30/15/4/1. §3e's flat distribution
-/// cannot hit them, so the generator draws the band first. Pool Degradation
-/// (Commander_Anti_Exploit_Systems Mechanic 4) will pass its own vector to
-/// `generate_commander_with_weights`.
-pub const DEFAULT_GRADE_WEIGHTS: [u32; 5] = [50, 30, 15, 4, 1];
-
-const HUMAN_FIRST_NAMES: &[&str] = &["Vance", "Kira", "Dolan", "Metz", "Shen", "Yula"];
-const SHARED_SURNAMES: &[&str] = &["Ashmore", "Drek", "Volkov", "Jin", "Osei", "Colt"];
-
-/// One uniform pick from `pool`: exactly one draw, including for a one-element pool.
-fn pick<T: Copy>(pool: &[T], rng: &mut Rng) -> T {
-    pool[rng.roll_int(0, (pool.len() - 1) as u32) as usize]
-}
-
-/// Name pools are provisional and playtest-flagged (Director-approved 2026-07-19). Science
-/// Ape names fill the surname slot, after the Pemberton-Simian precedent.
-fn pick_name(origin: CommanderOrigin, rng: &mut Rng) -> String {
-    let (first_names, surnames): (&[&str], &[&str]) = match origin {
-        CommanderOrigin::HumanCorporate | CommanderOrigin::HumanUnderhive => (HUMAN_FIRST_NAMES, SHARED_SURNAMES),
-        CommanderOrigin::Duck => (
-            &["Mallardus", "Drakewell", "Pondsworth", "Aylesbury", "Canardo", "Widgeon", "Brantley", "Scaup"],
-            SHARED_SURNAMES,
-        ),
-        CommanderOrigin::Bearocrat => (
-            &["Ursinus", "Kodiakov", "Bruinsworth", "Grizelda", "Paddingsley", "Ursaline", "Bearnard", "Clawford"],
-            SHARED_SURNAMES,
-        ),
-        CommanderOrigin::ScienceApe => (
-            HUMAN_FIRST_NAMES,
-            &["Darwin-Macaque", "Newton-Gibbon", "Tesla-Tamarin", "Hawking-Howler", "Curie-Capuchin", "Faraday-Baboon", "Kepler-Colobus", "Lovelace-Langur"],
-        ),
-    };
-    let first = pick(first_names, rng);
-    let last = pick(surnames, rng);
-    format!("{} {}", first, last)
-}
-
-/// One weighted pick of a Grade band: exactly one draw. A zero-weight band is never chosen.
-fn pick_band(weights: &[u32; 5], rng: &mut Rng) -> CommanderGrade {
-    let total: u32 = weights.iter().sum();
-    assert!(total > 0, "grade weights must not all be zero");
-    let roll = rng.roll_int(0, total - 1);
-    let mut cumulative = 0;
-    for (grade, &w) in CommanderGrade::ALL.iter().zip(weights) {
-        cumulative += w;
-        if roll < cumulative {
-            return *grade;
-        }
-    }
-    unreachable!("roll {roll} below total {total} always lands in a band")
-}
+pub use crate::field_leader_gen::DEFAULT_GRADE_WEIGHTS;
 
 /// `generate_commander_with_weights` with `DEFAULT_GRADE_WEIGHTS`.
 pub fn generate_commander(
@@ -97,10 +47,10 @@ pub fn generate_commander_with_weights(
 ) -> CommanderRecord {
     let mut rng = Rng::new(rng_seed);
 
-    let band = pick_band(weights, &mut rng);
+    let band_sizes = CommanderGrade::ALL.map(|g| commander_combinations(g).len());
+    let band = pick_band(weights, band_sizes, &mut rng);
     let (origin, specialization, fatal_flaw) = pick(&commander_combinations(band), &mut rng);
-    let bias_group = pick(&FactionBias::GROUPS, &mut rng);
-    let faction_bias = pick(bias_group, &mut rng);
+    let faction_bias = pick_faction_bias(&mut rng);
     let name = pick_name(origin, &mut rng);
 
     // TQS is computed and discarded; only the Grade is stored.
@@ -204,7 +154,7 @@ pub fn is_glorious_death(c: &GloriousDeathCriteria) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sim_engine::roster::{CommanderFlaw, CommanderSpecialization};
+    use sim_engine::roster::{CommanderFlaw, CommanderOrigin, CommanderSpecialization, FactionBias};
 
     fn glorious(rank: i16, mission_tier: u8, ticker_contribution_pct: f64) -> bool {
         is_glorious_death(&GloriousDeathCriteria { rank, mission_tier, ticker_contribution_pct })
@@ -406,34 +356,14 @@ mod tests {
         panic!("not every origin rolled in 2000 seeds: {seen:?}");
     }
 
-    /// `DEFAULT_GRADE_WEIGHTS` is indexed in `CommanderGrade::ALL` order. Over 10 000 seeds
-    /// each band's count lies within 4σ of its binomial expectation under the canon targets
-    /// (Commander_Grade_System §2), written here independently of the const, so a changed
-    /// default fails this test.
+    /// `DEFAULT_GRADE_WEIGHTS` is indexed in `CommanderGrade::ALL` order; the band counts
+    /// track the canon targets, which the shared helper holds as a literal.
     #[test]
     fn generate_commander_band_frequencies_track_weights() {
-        const CANON_TARGETS: [u32; 5] = [50, 30, 15, 4, 1];
-        assert_eq!(CommanderGrade::ALL[0], CommanderGrade::StandardIssue);
-        assert_eq!(CommanderGrade::ALL[4], CommanderGrade::Heroic);
-        const N: u32 = 10_000;
-        let mut counts = [0u32; 5];
-        for seed in 0..N {
+        crate::field_leader_gen::assert_band_frequencies("Commander", |seed| {
             let r = generate_commander(vec![0u8; 32], Uuid::nil(), seed);
-            let grade = CommanderGrade::from_db_str(r.commander_grade.as_deref().unwrap()).unwrap();
-            counts[CommanderGrade::ALL.iter().position(|&g| g == grade).unwrap()] += 1;
-        }
-        println!("Grade counts over {N} seeds (Standard Issue … Heroic): {counts:?}");
-        let total: u32 = CANON_TARGETS.iter().sum();
-        for (i, &observed) in counts.iter().enumerate() {
-            let p = CANON_TARGETS[i] as f64 / total as f64;
-            let expected = N as f64 * p;
-            let tolerance = 4.0 * (N as f64 * p * (1.0 - p)).sqrt();
-            assert!(
-                (observed as f64 - expected).abs() <= tolerance,
-                "{:?}: observed {observed}, expected {expected} ± {tolerance:.0}",
-                CommanderGrade::ALL[i]
-            );
-        }
+            CommanderGrade::from_db_str(r.commander_grade.as_deref().unwrap()).unwrap()
+        });
     }
 
     #[test]
