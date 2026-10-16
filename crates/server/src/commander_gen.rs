@@ -2,14 +2,18 @@ use chrono::Utc;
 use uuid::Uuid;
 
 use sim_engine::game_types::OutcomeType;
-use sim_engine::grade::commander_tqs;
+use sim_engine::grade::{commander_combinations, commander_tqs};
 use sim_engine::rng::Rng;
-use sim_engine::roster::{CommanderFlaw, CommanderGrade, CommanderOrigin, CommanderSpecialization, FactionBias};
+use sim_engine::roster::{CommanderGrade, CommanderOrigin, FactionBias};
 
 use crate::repository::commander::CommanderRecord;
 
-// TODO(4d-2): roll CommanderFlaw::ALL once evaluate_fatal_flaw is exhaustive over it. A Commander must never roll a flaw the game cannot enforce.
-const ROLLED_FLAWS: [CommanderFlaw; 3] = [CommanderFlaw::Embezzler, CommanderFlaw::Bloodthirsty, CommanderFlaw::Cowardly];
+/// Spawn-Grade weights in `CommanderGrade::ALL` order (Standard Issue … Heroic): the
+/// Commander_Grade_System §2 frequency targets, ~50/30/15/4/1. §3e's flat distribution
+/// cannot hit them, so the generator draws the band first. Pool Degradation
+/// (Commander_Anti_Exploit_Systems Mechanic 4) will pass its own vector to
+/// `generate_commander_with_weights`.
+pub const DEFAULT_GRADE_WEIGHTS: [u32; 5] = [50, 30, 15, 4, 1];
 
 const HUMAN_FIRST_NAMES: &[&str] = &["Vance", "Kira", "Dolan", "Metz", "Shen", "Yula"];
 const SHARED_SURNAMES: &[&str] = &["Ashmore", "Drek", "Volkov", "Jin", "Osei", "Colt"];
@@ -42,42 +46,66 @@ fn pick_name(origin: CommanderOrigin, rng: &mut Rng) -> String {
     format!("{} {}", first, last)
 }
 
-/// Generate a fully-populated `CommanderRecord` by rolling all five trait pillars
-/// from the seeded PRNG and the canonical roster (`sim_engine::roster`). Pure function —
-/// no I/O, no DB access.
-///
-/// Roll order (deterministic; seven draws for every seed):
-///   1. origin          (`CommanderOrigin::ALL`, 5)
-///   2. bias parent     (`FactionBias::GROUPS`, 9)
-///   3. bias sect       (within that parent's group; drawn for every parent, so the
-///                       count is fixed — a one-value group still consumes a draw)
-///   4. specialization  (`CommanderSpecialization::ALL`, 12)
-///   5. fatal_flaw      (`ROLLED_FLAWS`, 3 until 4d-2)
-///   6. first name
-///   7. last name
-///
-/// The spawn Grade (brick 4a-2) is read from the rolled origin, specialization and flaw
-/// through `sim_engine::grade` and consumes no draw.
-///
-/// Per-seed output is **not** a contract (CF4). `prng_seed_state` is provenance, not a
-/// reproduction key: the row is the record, and nothing regenerates a Commander from its
-/// seed, so the order of `ALL`/`GROUPS` and the draw sequence may change between releases.
+/// One weighted pick of a Grade band: exactly one draw. A zero-weight band is never chosen.
+fn pick_band(weights: &[u32; 5], rng: &mut Rng) -> CommanderGrade {
+    let total: u32 = weights.iter().sum();
+    assert!(total > 0, "grade weights must not all be zero");
+    let roll = rng.roll_int(0, total - 1);
+    let mut cumulative = 0;
+    for (grade, &w) in CommanderGrade::ALL.iter().zip(weights) {
+        cumulative += w;
+        if roll < cumulative {
+            return *grade;
+        }
+    }
+    unreachable!("roll {roll} below total {total} always lands in a band")
+}
+
+/// `generate_commander_with_weights` with `DEFAULT_GRADE_WEIGHTS`.
 pub fn generate_commander(
     player_wallet: Vec<u8>,
     campaign_id:   Uuid,
     rng_seed:      u32,
 ) -> CommanderRecord {
+    generate_commander_with_weights(player_wallet, campaign_id, rng_seed, &DEFAULT_GRADE_WEIGHTS)
+}
+
+/// Generate a fully-populated `CommanderRecord` from the seeded PRNG and the canonical
+/// roster (`sim_engine::roster`), band-first (4d-2). Pure function — no I/O, no DB access.
+///
+/// Roll order (deterministic; six draws for every seed):
+///   1. Grade band      (weighted by `weights`, in `CommanderGrade::ALL` order)
+///   2. combination     (uniform within `commander_combinations(band)`: origin,
+///                       specialization and fatal flaw together, all 12 flaws)
+///   3. bias parent     (`FactionBias::GROUPS`, 9)
+///   4. bias sect       (within that parent's group; drawn for every parent, so the
+///                       count is fixed — a one-value group still consumes a draw)
+///   5. first name
+///   6. last name
+///
+/// The stored Grade is still read from the traits through `sim_engine::grade`; it equals
+/// the drawn band by construction.
+///
+/// Per-seed output is **not** a contract (CF4). `prng_seed_state` is provenance, not a
+/// reproduction key: the row is the record, and nothing regenerates a Commander from its
+/// seed, so the order of `ALL`/`GROUPS` and the draw sequence may change between releases.
+pub fn generate_commander_with_weights(
+    player_wallet: Vec<u8>,
+    campaign_id:   Uuid,
+    rng_seed:      u32,
+    weights:       &[u32; 5],
+) -> CommanderRecord {
     let mut rng = Rng::new(rng_seed);
 
-    let origin = pick(&CommanderOrigin::ALL, &mut rng);
+    let band = pick_band(weights, &mut rng);
+    let (origin, specialization, fatal_flaw) = pick(&commander_combinations(band), &mut rng);
     let bias_group = pick(&FactionBias::GROUPS, &mut rng);
     let faction_bias = pick(bias_group, &mut rng);
-    let specialization = pick(&CommanderSpecialization::ALL, &mut rng);
-    let fatal_flaw = pick(&ROLLED_FLAWS, &mut rng);
     let name = pick_name(origin, &mut rng);
 
     // TQS is computed and discarded; only the Grade is stored.
     let grade = CommanderGrade::from_tqs(commander_tqs(origin, specialization, fatal_flaw));
+    debug_assert_eq!(grade, band, "a combination must grade to the band it was drawn from");
     // TODO(phase-1-§5): broadcast sector notification when grade == Heroic via WebSocket once Multiplayer Sync is live
     // TODO(phase-2-§6c): include commander_grade in the memorial snapshot payload (GAP-22)
     // TODO(phase-2-§10b): expose grade as filterable field on Headhunter Market listings
@@ -176,6 +204,7 @@ pub fn is_glorious_death(c: &GloriousDeathCriteria) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sim_engine::roster::{CommanderFlaw, CommanderSpecialization};
 
     fn glorious(rank: i16, mission_tier: u8, ticker_contribution_pct: f64) -> bool {
         is_glorious_death(&GloriousDeathCriteria { rank, mission_tier, ticker_contribution_pct })
@@ -294,7 +323,7 @@ mod tests {
         for seed in 0..50u32 {
             let r = generate_commander(vec![0u8; 32], Uuid::nil(), seed);
             assert!(
-                ROLLED_FLAWS.iter().any(|f| f.as_str() == r.fatal_flaw),
+                CommanderFlaw::from_db_str(&r.fatal_flaw).is_some(),
                 "fatal_flaw '{}' not in canonical list",
                 r.fatal_flaw
             );
@@ -329,7 +358,7 @@ mod tests {
     #[test]
     fn generate_commander_emits_only_canonical_values() {
         use std::collections::HashSet;
-        let (mut origins, mut biases, mut specs) = (HashSet::new(), HashSet::new(), HashSet::new());
+        let (mut origins, mut biases, mut specs, mut flaws) = (HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new());
         for seed in 0..2000u32 {
             let r = generate_commander(vec![0u8; 32], Uuid::nil(), seed);
             let origin = CommanderOrigin::from_db_str(&r.origin).unwrap_or_else(|| panic!("seed {seed}: origin {:?}", r.origin));
@@ -337,10 +366,13 @@ mod tests {
             let spec = CommanderSpecialization::from_db_str(&r.specialization)
                 .unwrap_or_else(|| panic!("seed {seed}: specialization {:?}", r.specialization));
             let flaw = CommanderFlaw::from_db_str(&r.fatal_flaw).unwrap_or_else(|| panic!("seed {seed}: flaw {:?}", r.fatal_flaw));
-            assert!(ROLLED_FLAWS.contains(&flaw), "seed {seed}: {flaw:?} is not a rolled flaw");
             origins.insert(origin);
             biases.insert(bias);
             specs.insert(spec);
+            flaws.insert(flaw);
+        }
+        for f in CommanderFlaw::ALL {
+            assert!(flaws.contains(&f), "flaw {f:?} never rolled in 2000 seeds");
         }
         for o in CommanderOrigin::ALL {
             assert!(origins.contains(&o), "origin {o:?} never rolled in 2000 seeds");
@@ -354,8 +386,7 @@ mod tests {
     }
 
     /// Every origin gets a Grade, and it is the grading function's readout of the rolled
-    /// traits. Until 4d-2 the rolled flaws cap TQS at 72 (Distinguished); the enumeration
-    /// tests in `sim_engine::grade` cover the high bands.
+    /// traits (never a hard-coded band; CF4).
     #[test]
     fn test_generate_commander_grade_set_for_every_origin() {
         use std::collections::HashSet;
@@ -373,6 +404,46 @@ mod tests {
             }
         }
         panic!("not every origin rolled in 2000 seeds: {seen:?}");
+    }
+
+    /// `DEFAULT_GRADE_WEIGHTS` is indexed in `CommanderGrade::ALL` order. Over 10 000 seeds
+    /// each band's count lies within 4σ of its binomial expectation under the canon targets
+    /// (Commander_Grade_System §2), written here independently of the const, so a changed
+    /// default fails this test.
+    #[test]
+    fn generate_commander_band_frequencies_track_weights() {
+        const CANON_TARGETS: [u32; 5] = [50, 30, 15, 4, 1];
+        assert_eq!(CommanderGrade::ALL[0], CommanderGrade::StandardIssue);
+        assert_eq!(CommanderGrade::ALL[4], CommanderGrade::Heroic);
+        const N: u32 = 10_000;
+        let mut counts = [0u32; 5];
+        for seed in 0..N {
+            let r = generate_commander(vec![0u8; 32], Uuid::nil(), seed);
+            let grade = CommanderGrade::from_db_str(r.commander_grade.as_deref().unwrap()).unwrap();
+            counts[CommanderGrade::ALL.iter().position(|&g| g == grade).unwrap()] += 1;
+        }
+        println!("Grade counts over {N} seeds (Standard Issue … Heroic): {counts:?}");
+        let total: u32 = CANON_TARGETS.iter().sum();
+        for (i, &observed) in counts.iter().enumerate() {
+            let p = CANON_TARGETS[i] as f64 / total as f64;
+            let expected = N as f64 * p;
+            let tolerance = 4.0 * (N as f64 * p * (1.0 - p)).sqrt();
+            assert!(
+                (observed as f64 - expected).abs() <= tolerance,
+                "{:?}: observed {observed}, expected {expected} ± {tolerance:.0}",
+                CommanderGrade::ALL[i]
+            );
+        }
+    }
+
+    #[test]
+    fn generate_commander_with_weights_honours_a_single_band() {
+        for (weights, grade) in [([0, 0, 0, 0, 1], CommanderGrade::Heroic), ([1, 0, 0, 0, 0], CommanderGrade::StandardIssue)] {
+            for seed in 0..200u32 {
+                let r = generate_commander_with_weights(vec![0u8; 32], Uuid::nil(), seed, &weights);
+                assert_eq!(r.commander_grade.as_deref(), Some(grade.as_str()), "seed {seed}, weights {weights:?}");
+            }
+        }
     }
 
     // ── xp_award / rank_for_xp ───────────────────────────────────────────────

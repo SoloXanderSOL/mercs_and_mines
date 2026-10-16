@@ -223,6 +223,23 @@ pub fn foreman_tqs(origin: CommanderOrigin, spec: ForemanSpecialization, flaw: F
         + coherence(FOREMAN_COHERENT, FOREMAN_CONTRADICTORY, flaw, spec)
 }
 
+/// Every Commander (origin, specialization, flaw) combination whose spawn Grade is `grade`,
+/// in fixed `ALL × ALL × ALL` order (origin outer, flaw inner). The five bands partition
+/// the 720 combinations. The generator draws a band, then a combination from this list.
+pub fn commander_combinations(grade: CommanderGrade) -> Vec<(CommanderOrigin, CommanderSpecialization, CommanderFlaw)> {
+    let mut out = Vec::new();
+    for origin in CommanderOrigin::ALL {
+        for spec in CommanderSpecialization::ALL {
+            for flaw in CommanderFlaw::ALL {
+                if CommanderGrade::from_tqs(commander_tqs(origin, spec, flaw)) == grade {
+                    out.push((origin, spec, flaw));
+                }
+            }
+        }
+    }
+    out
+}
+
 impl CommanderGrade {
     /// The Grade band for a TQS (§3a): 0–39 / 40–59 / 60–74 / 75–89 / 90–100.
     pub fn from_tqs(tqs: u8) -> CommanderGrade {
@@ -286,9 +303,16 @@ mod tests {
 
     /// §3e: exactly four Commander combinations reach Heroic. The count vector pins the
     /// whole flat distribution, so any table edit shows up here.
+    ///
+    /// Read through the production `commander_combinations`, so the pin guards the
+    /// generator's lists too.
     #[test]
     fn commander_enumeration_yields_the_four_heroic_archetypes() {
-        let (counts, heroic) = enumerate(&CommanderSpecialization::ALL, &CommanderFlaw::ALL, commander_tqs);
+        let counts: [usize; 5] = CommanderGrade::ALL.map(|g| commander_combinations(g).len());
+        let heroic: Vec<_> = commander_combinations(CommanderGrade::Heroic)
+            .into_iter()
+            .map(|(o, s, f)| (o, s, f, commander_tqs(o, s, f)))
+            .collect();
         println!("Commander per-grade counts (of 720): {counts:?}");
         assert_eq!(counts.iter().sum::<usize>(), 720);
         let got: HashSet<_> = heroic.into_iter().collect();
@@ -302,6 +326,24 @@ mod tests {
         .collect();
         assert_eq!(got, want, "Commander Heroic archetypes");
         assert_eq!(counts, [62, 411, 204, 39, 4], "Commander per-grade counts");
+    }
+
+    /// The five bands' lists hold all 720 combinations, each in exactly one band, and every
+    /// listed combination grades to its band.
+    #[test]
+    fn commander_combinations_partition_every_combination() {
+        let mut seen = HashSet::new();
+        let mut total = 0;
+        for grade in CommanderGrade::ALL {
+            for (o, s, f) in commander_combinations(grade) {
+                assert!(commander_tqs(o, s, f) <= 100);
+                assert_eq!(CommanderGrade::from_tqs(commander_tqs(o, s, f)), grade, "{o:?}/{s:?}/{f:?}");
+                assert!(seen.insert((o, s, f)), "{o:?}/{s:?}/{f:?} listed in two bands");
+                total += 1;
+            }
+        }
+        assert_eq!(total, 720);
+        assert_eq!(seen.len(), 720);
     }
 
     /// §3e: exactly three Foreman combinations reach Heroic.
