@@ -21,8 +21,12 @@ use mercs_server::repository::{
     CombatSession, RedisSessionStateRepository, SessionStateRepository,
     ConvoyDbRecord, ConvoyRepository, PostgresConvoyRepository,
     NewDeployment, outcome_db_str,
+    ForemanRepository, PostgresForemanRepository,
 };
-use sim_engine::roster::{CommanderFlaw, CommanderGrade, CommanderOrigin, CommanderSpecialization, FactionBias};
+use sim_engine::roster::{
+    CommanderFlaw, CommanderGrade, CommanderOrigin, CommanderSpecialization, FactionBias, ForemanFlaw,
+    ForemanSpecialization,
+};
 
 async fn test_pool() -> Option<sqlx::PgPool> {
     let url = std::env::var("TEST_DATABASE_URL").ok()?;
@@ -2474,10 +2478,15 @@ async fn clean_wallet_4g1(pool: &sqlx::PgPool, wallet: &[u8]) {
         .bind(wallet).execute(pool).await.expect("deployment_records cleanup failed");
     sqlx::query("DELETE FROM section_records WHERE commander_id IN (SELECT commander_id FROM commander_records WHERE player_wallet = $1)")
         .bind(wallet).execute(pool).await.ok();
-    let campaigns: Vec<uuid::Uuid> = sqlx::query_scalar("SELECT DISTINCT campaign_id FROM commander_records WHERE player_wallet = $1")
+    let campaigns: Vec<uuid::Uuid> = sqlx::query_scalar(
+        "SELECT campaign_id FROM commander_records WHERE player_wallet = $1
+         UNION SELECT campaign_id FROM foreman_records WHERE player_wallet = $1"
+    )
         .bind(wallet).fetch_all(pool).await.unwrap_or_default();
     sqlx::query("DELETE FROM commander_records WHERE player_wallet = $1")
         .bind(wallet).execute(pool).await.expect("commander_records cleanup failed");
+    sqlx::query("DELETE FROM foreman_records WHERE player_wallet = $1")
+        .bind(wallet).execute(pool).await.expect("foreman_records cleanup failed");
     for c in campaigns {
         sqlx::query("DELETE FROM campaign_instances WHERE campaign_id = $1")
             .bind(c).execute(pool).await.ok();
@@ -3082,46 +3091,75 @@ fn constraint_literals(def: &str) -> std::collections::BTreeSet<String> {
     out
 }
 
-/// 4d-2 (Reviewer Brick B F2, CF3): every `*_canon` CHECK on `commander_records` lists
-/// exactly its roster enum's strings, in both directions, and there are exactly five.
-#[tokio::test]
-async fn commander_roster_checks_match_the_roster_both_ways() {
+/// The `*_canon` CHECKs each roster table must carry: constraint name → the roster enum's
+/// strings. One row per table; a new roster table adds a row here (7a-2: `advisor_records`).
+fn roster_check_expectations() -> Vec<(&'static str, Vec<(&'static str, std::collections::BTreeSet<String>)>)> {
+    fn strings(all: impl IntoIterator<Item = &'static str>) -> std::collections::BTreeSet<String> {
+        all.into_iter().map(str::to_string).collect()
+    }
+    vec![
+        ("commander_records", vec![
+            ("commander_records_origin_canon", strings(CommanderOrigin::ALL.map(CommanderOrigin::as_str))),
+            ("commander_records_faction_bias_canon", strings(FactionBias::ALL.map(FactionBias::as_str))),
+            ("commander_records_commander_grade_canon", strings(CommanderGrade::ALL.map(CommanderGrade::as_str))),
+            ("commander_records_fatal_flaw_canon", strings(CommanderFlaw::ALL.map(CommanderFlaw::as_str))),
+            ("commander_records_specialization_canon", strings(CommanderSpecialization::ALL.map(CommanderSpecialization::as_str))),
+        ]),
+        ("foreman_records", vec![
+            ("foreman_records_origin_canon", strings(CommanderOrigin::ALL.map(CommanderOrigin::as_str))),
+            ("foreman_records_faction_bias_canon", strings(FactionBias::ALL.map(FactionBias::as_str))),
+            ("foreman_records_specialization_canon", strings(ForemanSpecialization::ALL.map(ForemanSpecialization::as_str))),
+            ("foreman_records_fatal_flaw_canon", strings(ForemanFlaw::ALL.map(ForemanFlaw::as_str))),
+            ("foreman_records_foreman_grade_canon", strings(CommanderGrade::ALL.map(CommanderGrade::as_str))),
+        ]),
+    ]
+}
+
+/// Asserts that `table`'s `*_canon` CHECKs are exactly `expected`, each listing exactly its
+/// roster's strings in both directions. Reads through `conn` so a test transaction can
+/// mutate a constraint first (7a-1 N4).
+async fn assert_roster_checks_match(
+    conn: &mut sqlx::PgConnection,
+    table: &str,
+    expected: &[(&'static str, std::collections::BTreeSet<String>)],
+) {
     use std::collections::BTreeSet;
-    let pool = match test_pool().await {
-        Some(p) => p,
-        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
-    };
     let rows = sqlx::query!(
         r#"SELECT conname::text AS "conname!", pg_get_constraintdef(oid) AS "def!"
            FROM pg_constraint
-           WHERE conrelid = 'commander_records'::regclass AND contype = 'c' AND conname::text LIKE '%\_canon'"#
+           WHERE conrelid = $1::text::regclass AND contype = 'c' AND conname::text LIKE '%\_canon'"#,
+        table
     )
-    .fetch_all(&pool)
+    .fetch_all(&mut *conn)
     .await
-    .expect("pg_constraint read failed");
-
-    fn strings(all: impl IntoIterator<Item = &'static str>) -> BTreeSet<String> {
-        all.into_iter().map(str::to_string).collect()
-    }
-    let expected: [(&str, BTreeSet<String>); 5] = [
-        ("commander_records_origin_canon", strings(CommanderOrigin::ALL.map(CommanderOrigin::as_str))),
-        ("commander_records_faction_bias_canon", strings(FactionBias::ALL.map(FactionBias::as_str))),
-        ("commander_records_commander_grade_canon", strings(CommanderGrade::ALL.map(CommanderGrade::as_str))),
-        ("commander_records_fatal_flaw_canon", strings(CommanderFlaw::ALL.map(CommanderFlaw::as_str))),
-        ("commander_records_specialization_canon", strings(CommanderSpecialization::ALL.map(CommanderSpecialization::as_str))),
-    ];
+    .unwrap_or_else(|e| panic!("{table}: pg_constraint read failed: {e}"));
 
     let names: BTreeSet<&str> = rows.iter().map(|r| r.conname.as_str()).collect();
     let want_names: BTreeSet<&str> = expected.iter().map(|(n, _)| *n).collect();
-    assert_eq!(names, want_names, "the *_canon CHECKs on commander_records must be exactly the five guarded here");
+    assert_eq!(names, want_names, "{table}: the *_canon CHECKs must be exactly the {} guarded here", expected.len());
 
-    for (name, roster) in &expected {
+    for (name, roster) in expected {
         let def = &rows.iter().find(|r| r.conname == *name).unwrap().def;
         let sql = constraint_literals(def);
         let sql_only: Vec<_> = sql.difference(roster).collect();
         let roster_only: Vec<_> = roster.difference(&sql).collect();
-        assert!(sql_only.is_empty(), "{name}: in SQL, not in roster: {sql_only:?}");
-        assert!(roster_only.is_empty(), "{name}: in roster, not in SQL: {roster_only:?}");
+        assert!(sql_only.is_empty(), "{table}.{name}: in SQL, not in roster: {sql_only:?}");
+        assert!(roster_only.is_empty(), "{table}.{name}: in roster, not in SQL: {roster_only:?}");
+    }
+}
+
+/// 4d-2 (Reviewer Brick B F2, CF3), generalised per table in 7a-1: every `*_canon` CHECK on
+/// every roster table lists exactly its roster enum's strings, in both directions, and each
+/// table has exactly the CHECKs listed in `roster_check_expectations`.
+#[tokio::test]
+async fn roster_checks_match_the_roster_both_ways() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    let mut conn = pool.acquire().await.expect("acquire failed");
+    for (table, expected) in roster_check_expectations() {
+        assert_roster_checks_match(&mut conn, table, &expected).await;
     }
 }
 
@@ -3186,6 +3224,121 @@ async fn test_commander_grade_round_trips() {
     let listed = repo.list_commanders_by_campaign(campaign_id).await.unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].commander_grade.as_deref(), Some("Heroic"), "list_commanders_by_campaign must return the stored Grade");
+
+    clean_wallet_4g1(&pool, &wallet).await;
+}
+
+/// Seeds `wallet`'s account and a fresh campaign; returns the campaign id.
+async fn seed_account_and_campaign(pool: &sqlx::PgPool, wallet: [u8; 32], map_seed: i64) -> uuid::Uuid {
+    sqlx::query(
+        "INSERT INTO player_accounts (wallet_address, trust_standing, gcn_balance)
+         VALUES ($1, 0, 0) ON CONFLICT (wallet_address) DO NOTHING"
+    )
+    .bind(wallet.to_vec())
+    .execute(pool)
+    .await
+    .expect("player_accounts FK seed failed");
+    PostgresCampaignRepository::new(pool.clone())
+        .create_campaign(&NewCampaignInstance { sector_id: uuid::Uuid::new_v4(), map_seed })
+        .await
+        .expect("create campaign failed")
+        .campaign_id
+}
+
+/// A hand-built Foreman: Standard Issue traits (TQS 10 + 8 + 12 = 30), stored as Heroic so
+/// a read that recomputed the Grade would fail; an apostrophe in the flaw string.
+fn hand_built_foreman(wallet: [u8; 32], campaign_id: uuid::Uuid) -> mercs_server::repository::ForemanRecord {
+    use sim_engine::grade::foreman_tqs;
+    let tqs = foreman_tqs(CommanderOrigin::Duck, ForemanSpecialization::BlackMarketAuger, ForemanFlaw::SeamFever);
+    assert_eq!(CommanderGrade::from_tqs(tqs), CommanderGrade::StandardIssue, "the fixture must stay sharp");
+    mercs_server::repository::ForemanRecord {
+        foreman_id:      uuid::Uuid::new_v4(),
+        campaign_id,
+        player_wallet:   wallet.to_vec(),
+        name:            "Mallardus Drek".into(),
+        rank:            1,
+        xp:              0,
+        stress:          17,
+        origin:          CommanderOrigin::Duck.as_str().into(),
+        faction_bias:    FactionBias::VoidCallerCollaborationist.as_str().into(),
+        specialization:  ForemanSpecialization::BlackMarketAuger.as_str().into(),
+        fatal_flaw:      ForemanFlaw::SeamFever.as_str().into(),
+        foreman_grade:   CommanderGrade::Heroic.as_str().into(),
+        is_shattered:    false,
+        is_kia:          false,
+        prng_seed_state: 0x7A01_i64,
+        created_at:      chrono::Utc::now(),
+        updated_at:      chrono::Utc::now(),
+    }
+}
+
+/// 7a-1 — every roster field and `foreman_grade` survive `create_foreman`, `get_foreman`
+/// and `list_foremen_by_campaign` unchanged.
+#[tokio::test]
+async fn test_foreman_record_round_trips() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    let wallet = [29u8; 32];
+    clean_wallet_4g1(&pool, &wallet).await;
+    let campaign_id = seed_account_and_campaign(&pool, wallet, 0x7A01_i64).await;
+
+    let repo = PostgresForemanRepository::new(pool.clone());
+    let mut record = hand_built_foreman(wallet, campaign_id);
+    record.fatal_flaw = ForemanFlaw::ProspectorsItch.as_str().into();
+    repo.create_foreman(record.clone()).await.expect("create_foreman failed");
+
+    let fetched = repo.get_foreman(record.foreman_id).await.unwrap().expect("foreman not found");
+    let listed = repo.list_foremen_by_campaign(campaign_id).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    for (path, got) in [("get_foreman", &fetched), ("list_foremen_by_campaign", &listed[0])] {
+        assert_eq!(got.foreman_id, record.foreman_id, "{path}");
+        assert_eq!(got.campaign_id, campaign_id, "{path}");
+        assert_eq!(got.player_wallet, wallet.to_vec(), "{path}");
+        assert_eq!(got.name, "Mallardus Drek", "{path}");
+        assert_eq!(got.stress, 17, "{path}");
+        assert_eq!(got.origin, "Duck", "{path}");
+        assert_eq!(got.faction_bias, "Void-Caller (Collaborationist)", "{path}");
+        assert_eq!(got.specialization, "Black Market Auger", "{path}");
+        assert_eq!(got.fatal_flaw, "Prospector's Itch", "{path}");
+        assert_eq!(got.foreman_grade, "Heroic", "{path}: the stored Grade, never recomputed");
+        assert_eq!(got.prng_seed_state, 0x7A01_i64, "{path}");
+    }
+    assert!(repo.get_foreman(uuid::Uuid::new_v4()).await.unwrap().is_none());
+
+    clean_wallet_4g1(&pool, &wallet).await;
+}
+
+/// 7a-1 — `0022`'s CHECKs refuse a Commander-only flaw and a Commander-only specialization.
+#[tokio::test]
+async fn test_foreman_records_reject_non_canon_roster_values() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    let wallet = [30u8; 32];
+    clean_wallet_4g1(&pool, &wallet).await;
+    let campaign_id = seed_account_and_campaign(&pool, wallet, 0x7A02_i64).await;
+
+    let repo = PostgresForemanRepository::new(pool.clone());
+    let record = hand_built_foreman(wallet, campaign_id);
+    repo.create_foreman(record.clone()).await.expect("a canonical Foreman must insert");
+
+    let cases = [
+        ("fatal_flaw", "UPDATE foreman_records SET fatal_flaw = 'Bloodthirsty' WHERE foreman_id = $1", "foreman_records_fatal_flaw_canon"),
+        ("specialization", "UPDATE foreman_records SET specialization = 'Cannoneer' WHERE foreman_id = $1", "foreman_records_specialization_canon"),
+    ];
+    for (column, sql, constraint) in cases {
+        let err = sqlx::query(sql)
+            .bind(record.foreman_id)
+            .execute(&pool)
+            .await
+            .expect_err(&format!("a Commander-only {column} must violate {constraint}"));
+        let db = err.as_database_error().unwrap_or_else(|| panic!("{constraint}: not a database error: {err}"));
+        assert_eq!(db.code().as_deref(), Some("23514"), "{constraint}: expected a check violation, got {err}");
+        assert_eq!(db.constraint(), Some(constraint), "{column}: wrong constraint");
+    }
 
     clean_wallet_4g1(&pool, &wallet).await;
 }

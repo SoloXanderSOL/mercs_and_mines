@@ -42,6 +42,7 @@ pub use commander::{
     InMemoryCommanderRepository, NewDeployment, PostgresCommanderRepository,
     STALE_DEPLOYMENT_AFTER,
 };
+pub use foreman::{ForemanRecord, ForemanRepository, InMemoryForemanRepository, PostgresForemanRepository};
 pub use postgres_account::PostgresAccountRepository;
 pub use section::{
     InMemorySectionRepository, PostgresSectionRepository,
