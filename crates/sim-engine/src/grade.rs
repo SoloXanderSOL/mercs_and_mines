@@ -223,21 +223,39 @@ pub fn foreman_tqs(origin: CommanderOrigin, spec: ForemanSpecialization, flaw: F
         + coherence(FOREMAN_COHERENT, FOREMAN_CONTRADICTORY, flaw, spec)
 }
 
-/// Every Commander (origin, specialization, flaw) combination whose spawn Grade is `grade`,
-/// in fixed `ALL × ALL × ALL` order (origin outer, flaw inner). The five bands partition
-/// the 720 combinations. The generator draws a band, then a combination from this list.
-pub fn commander_combinations(grade: CommanderGrade) -> Vec<(CommanderOrigin, CommanderSpecialization, CommanderFlaw)> {
+/// Every (origin, specialization, flaw) combination whose spawn Grade is `grade`, in fixed
+/// `ALL × specs × flaws` order (origin outer, flaw inner). Shared by both classes so their
+/// lists cannot drift.
+fn combinations<S: Copy, F: Copy>(
+    specs: &[S],
+    flaws: &[F],
+    tqs: fn(CommanderOrigin, S, F) -> u8,
+    grade: CommanderGrade,
+) -> Vec<(CommanderOrigin, S, F)> {
     let mut out = Vec::new();
     for origin in CommanderOrigin::ALL {
-        for spec in CommanderSpecialization::ALL {
-            for flaw in CommanderFlaw::ALL {
-                if CommanderGrade::from_tqs(commander_tqs(origin, spec, flaw)) == grade {
+        for &spec in specs {
+            for &flaw in flaws {
+                if CommanderGrade::from_tqs(tqs(origin, spec, flaw)) == grade {
                     out.push((origin, spec, flaw));
                 }
             }
         }
     }
     out
+}
+
+/// Every Commander (origin, specialization, flaw) combination whose spawn Grade is `grade`,
+/// in fixed `ALL × ALL × ALL` order (origin outer, flaw inner). The five bands partition
+/// the 720 combinations. The generator draws a band, then a combination from this list.
+pub fn commander_combinations(grade: CommanderGrade) -> Vec<(CommanderOrigin, CommanderSpecialization, CommanderFlaw)> {
+    combinations(&CommanderSpecialization::ALL, &CommanderFlaw::ALL, commander_tqs, grade)
+}
+
+/// Every Foreman (origin, specialization, flaw) combination whose spawn Grade is `grade`, in
+/// the same fixed order. The five bands partition the 650 combinations.
+pub fn foreman_combinations(grade: CommanderGrade) -> Vec<(CommanderOrigin, ForemanSpecialization, ForemanFlaw)> {
+    combinations(&ForemanSpecialization::ALL, &ForemanFlaw::ALL, foreman_tqs, grade)
 }
 
 impl CommanderGrade {
@@ -257,30 +275,6 @@ impl CommanderGrade {
 mod tests {
     use super::*;
     use std::collections::HashSet;
-
-    /// Per-grade counts in `CommanderGrade::ALL` order, plus every Heroic combination.
-    fn enumerate<S: Copy, F: Copy>(
-        specs: &[S],
-        flaws: &[F],
-        tqs: fn(CommanderOrigin, S, F) -> u8,
-    ) -> ([usize; 5], Vec<(CommanderOrigin, S, F, u8)>) {
-        let mut counts = [0usize; 5];
-        let mut heroic = Vec::new();
-        for origin in CommanderOrigin::ALL {
-            for &spec in specs {
-                for &flaw in flaws {
-                    let t = tqs(origin, spec, flaw);
-                    assert!(t <= 100, "TQS {t} above 100");
-                    let grade = CommanderGrade::from_tqs(t);
-                    counts[CommanderGrade::ALL.iter().position(|&g| g == grade).unwrap()] += 1;
-                    if grade == CommanderGrade::Heroic {
-                        heroic.push((origin, spec, flaw, t));
-                    }
-                }
-            }
-        }
-        (counts, heroic)
-    }
 
     #[test]
     fn grade_bands_at_every_boundary() {
@@ -346,10 +340,15 @@ mod tests {
         assert_eq!(seen.len(), 720);
     }
 
-    /// §3e: exactly three Foreman combinations reach Heroic.
+    /// §3e: exactly three Foreman combinations reach Heroic. Read through the production
+    /// `foreman_combinations`, so the pin guards the generator's lists too.
     #[test]
     fn foreman_enumeration_yields_the_three_heroic_archetypes() {
-        let (counts, heroic) = enumerate(&ForemanSpecialization::ALL, &ForemanFlaw::ALL, foreman_tqs);
+        let counts: [usize; 5] = CommanderGrade::ALL.map(|g| foreman_combinations(g).len());
+        let heroic: Vec<_> = foreman_combinations(CommanderGrade::Heroic)
+            .into_iter()
+            .map(|(o, s, f)| (o, s, f, foreman_tqs(o, s, f)))
+            .collect();
         println!("Foreman per-grade counts (of 650): {counts:?}");
         assert_eq!(counts.iter().sum::<usize>(), 650);
         let got: HashSet<_> = heroic.into_iter().collect();
@@ -362,6 +361,24 @@ mod tests {
         .collect();
         assert_eq!(got, want, "Foreman Heroic archetypes");
         assert_eq!(counts, [35, 367, 205, 40, 3], "Foreman per-grade counts");
+    }
+
+    /// The five bands' lists hold all 650 Foreman combinations, each in exactly one band,
+    /// and every listed combination grades to its band.
+    #[test]
+    fn foreman_combinations_partition_every_combination() {
+        let mut seen = HashSet::new();
+        let mut total = 0;
+        for grade in CommanderGrade::ALL {
+            for (o, s, f) in foreman_combinations(grade) {
+                assert!(foreman_tqs(o, s, f) <= 100);
+                assert_eq!(CommanderGrade::from_tqs(foreman_tqs(o, s, f)), grade, "{o:?}/{s:?}/{f:?}");
+                assert!(seen.insert((o, s, f)), "{o:?}/{s:?}/{f:?} listed in two bands");
+                total += 1;
+            }
+        }
+        assert_eq!(total, 650);
+        assert_eq!(seen.len(), 650);
     }
 
     fn assert_rows_well_formed<S: Copy + PartialEq + Eq + std::hash::Hash + std::fmt::Debug>(

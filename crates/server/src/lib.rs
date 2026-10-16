@@ -2,6 +2,7 @@ pub mod campaign_init;
 pub mod commander_gen;
 pub mod config;
 pub mod field_leader_gen;
+pub mod foreman_gen;
 pub mod api_types;
 pub mod auth;
 pub mod integrity;
