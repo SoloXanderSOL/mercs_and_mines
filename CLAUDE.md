@@ -42,7 +42,16 @@ As of 2026-10-15:
 - **Section 3 (Hex Map and Timers):** Complete — 3a-1, 3b-1, 3b-2, 3c-1, 3d-1, 3e-1.
 - **Section 4 (Commander Records):** In progress. 4a-1, 4b-0, 4b-1, 4e-0 (state-based Wipeout, GAP-35 part 2) and 4c-1
   (stress persisted through `sim-engine`'s pure stress fns; `update_stress` sets Shattered at
-  100; five mutators return `NotFound` on a miss) complete; 4a-2 unblocked. **4g-1 built
+  100; five mutators return `NotFound` on a miss) complete. **4a-2 complete (`f95969b`,
+  `90b0cd2`, `322c53d`, 2026-10-16; Commander Grade):** the Commander_Grade_System §3 tables
+  for both classes are data in `sim_engine::grade` (`commander_tqs`, `foreman_tqs`,
+  `CommanderGrade::from_tqs`); the roster gains `CommanderGrade`, `ForemanSpecialization` and
+  `ForemanFlaw` (Foremen are graded, with no generator until 7a-1). `generate_commander`
+  stores the Grade in the nullable `commander_records.commander_grade` (migration 0019, with
+  a CHECK); TQS is never stored, and the draw count stays 7. The death card copies the
+  Grade (`card_mint_pending.commander_grade`). Per-seed generator output is not a contract
+  (CF4). The sim `Commander.species` field and `Species` enum are gone; `is_nft` is dropped
+  (0020). No R7 bump. **4g-1 built
   (`1917f4c` storage + `21a76ab` route, 2026-10-14):** `POST /api/mission/resolve` requires
   an `AuthSession`, names a `commander_id` read from `commander_records` (404 for unknown or
   another wallet's; 409 for KIA, Shattered or already deployed; 400 for a non-null
@@ -109,10 +118,9 @@ As of 2026-10-15:
   scenarios) and `shellcheck` run in the `deploy-script` job on every push, and the deploy
   job needs it (GAP-33).
 
-**196/196 tests green (99 `mercs_server` lib + 2 `aar_determinism` + 70 `db_infrastructure`
-+ 25 `sim_engine`; single-threaded, verified at `cb9312d`). Workspace version `0.3.0`.
-Production = `8d5dad3` (0.3.0), deployed 2026-10-15; `dev` is ahead with Brick B, unpushed.
-Next: 4a-2 / 4d-2.** Any brick that changes what `resolve_mission` produces for
+**203/203 tests green (101 `mercs_server` lib + 2 `aar_determinism` + 71 `db_infrastructure`
++ 29 `sim_engine`; single-threaded, verified at `322c53d`). Workspace version `0.3.0`.
+Production = `8e74c74` (0.3.0); `dev` is ahead with 4a-2, unpushed. Next: 4d-2.** Any brick that changes what `resolve_mission` produces for
 a given seed bumps the workspace version in the same brick. 4b-1 reused `sim-engine`'s `OutcomeType` rather than
 defining a new enum, and writes **no input-log entry** — the rank-up entry was removed
 from scope. **ODQ-22 and ODQ-23 were ruled 2026-09-03 — engagement and mission outcomes
@@ -232,10 +240,12 @@ begins.
   (GAP-57; a deploy can roll back to the previous binary after the new one migrated):
   1. **Migrations are additive (expand/contract).** The previous release's binary must
      run against the new schema: no drop or rename in the release that stops using a
-     column. **Expand only:** every new column is nullable or has a default, and there is
-     no drop, rename or type change. Since `boot_migrator()`, this is the only thing
+     column. **An expand migration:** every new column is nullable or has a default, and
+     there is no drop, rename or type change. Since `boot_migrator()`, this is the only thing
      keeping a rollback correct: the previous binary boots against any newer schema, and
      a `NOT NULL` column without a default boots fine, then fails every old-binary insert.
+     A column may be dropped only when the rollback target (`.prev`, one release back)
+     names it nowhere, including its `.sqlx/` texts. The drop is its own migration.
   2. **Never edit an applied migration.** Its checksum is verified at boot
      (`VersionMismatch`).
   3. **No `-- no-transaction` migrations.** A failed one leaves a dirty row that
@@ -246,7 +256,11 @@ begins.
      write has no production caller; the migration's header names that writer.** Never
      `NOT VALID`: a constraint validates existing rows and fails the migration loudly.
 
-  Commander roster strings live in `sim_engine::roster`, mirrored by `0018`'s CHECKs.
+  Commander roster strings live in `sim_engine::roster`, mirrored by `0018`'s CHECKs; it
+  also holds the Foreman pools and `CommanderGrade`, mirrored by `0019`'s
+  `commander_records_commander_grade_canon`. `commander_grade` is persisted, never
+  recomputed from traits (Story Event characters are hand-graded). Write `CommanderGrade`
+  variants fully qualified (`QualityGrade::Elite` shares the name).
 
 * **Key-Value Store (Redis):** Live Sector hex state, deployment timers (global sorted
   set + per-sector sorted set for cancel path), active session state. **Persisted Redis
@@ -261,10 +275,11 @@ begins.
 * **Input Log (Postgres, append-only):** Treat as a financial instrument. The
   `gcn_transaction_ledger` and `input_logs` tables have immutability triggers that
   reject UPDATE and DELETE at the DB level. Do not work around them. **Types deserialised
-  from a logged payload change additively only:** variants are added, never renamed or
-  removed, or the AAR can no longer replay sessions that were valid when played. Current
-  examples: `CombatResolveRequest` and everything inside it, including the sim `Commander`
-  and `Species`.
+  from a logged payload change additively only.** Variants are added, never renamed or
+  removed. A new field is `Option` or `#[serde(default)]`. A field may be removed only if
+  nothing reads it and the type does not deny unknown fields: old payloads still
+  deserialise, and replay is unchanged. Current examples: `CombatResolveRequest` and
+  everything inside it, including the sim `Commander`.
 
 ---
 
@@ -311,10 +326,10 @@ constraints — parallel execution causes FK-23503 failures that are not caused 
 code under test. Any test report produced without `--test-threads=1` is unreliable and
 must be re-run before reporting results to the Director.
 
-**Test wallets:** `tests/` uses wallet seeds 0–9, 13–19, 21–25 and 88, with 10–12 taken by
+**Test wallets:** `tests/` uses wallet seeds 0–9, 13–19, 21–28 and 88, with 10–12 taken by
 a range literal (`(10u8..=12)`). **20 is the auth tests' signing-key seed**
 (`SigningKey::from_bytes(&[20u8; 32])`). It is used in memory only, and its derived
-public key is not `[20u8; 32]`. The next free seed is **26**.
+public key is not `[20u8; 32]`. The next free seed is **29**.
 
 **Deploy harness:** `bash deploy/test_remote_deploy.sh` runs the real deploy script
 against shims (about 12 s, no root or network needed). Run it after any change under
