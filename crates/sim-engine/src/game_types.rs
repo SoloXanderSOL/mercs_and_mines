@@ -273,9 +273,6 @@ pub struct Commander {
     pub attached_unit_id: Option<String>,
 }
 
-/// Retired Rank 5 Commanders on the Board of Directors.
-pub type AdvisorBoard = Vec<Commander>;
-
 // ----------------------------------------------------------------
 // MISSIONS
 // ----------------------------------------------------------------

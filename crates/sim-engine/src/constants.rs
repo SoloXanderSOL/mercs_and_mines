@@ -34,9 +34,6 @@ pub const STRESS_STRAINED_MAX: u8 = 70;
 /// Buff multiplier for a Strained commander (half effect).
 pub const STRESS_STRAINED_BUFF_MULT: f32 = 0.5;
 
-/// Commander rank required to be eligible for retirement to the Advisor Board.
-pub const COMMANDER_RETIRE_RANK: u8 = 5;
-
 // ── Mulberry32 PRNG algorithm constants ───────────────────────────────────────
 // FINANCIAL REQUIREMENT: altering these constants breaks input-log replay and
 // Prize Pool dispute resolution. They are immutable by design.

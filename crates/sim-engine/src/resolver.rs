@@ -20,14 +20,14 @@
 
 use crate::config::SimConfig;
 use crate::constants::{
-    COMMANDER_RETIRE_RANK, FNV1A_OFFSET_BASIS, FNV1A_PRIME, HIT_ROLL_THRESHOLD,
+    FNV1A_OFFSET_BASIS, FNV1A_PRIME, HIT_ROLL_THRESHOLD,
     MAX_SQUAD_BONUS_UNITS, MAX_STRESS, SKILL_LEVEL_MAX,
     STRESS_BREAKING_POINT_MAX, STRESS_BREAKING_POINT_MIN,
     STRESS_STRAINED_BUFF_MULT, STRESS_STRAINED_MAX, STRESS_STRAINED_MIN,
 };
 use crate::loot_roller::roll_loot;
 use crate::game_types::{
-    AdvisorBoard, BattleReport, Commander, Coordinates, ConvoyRecord,
+    BattleReport, Commander, Coordinates, ConvoyRecord,
     DepartureRejected, MissionCategory, MissionDefinition, MissionEnvironment, OutcomeType,
     Rewards, ScoreBreakdown, Squad, StressTier, Unit, UnitBattleResult,
     UnitArchetype, UnitStatus,
@@ -908,19 +908,6 @@ pub fn apply_deployment_penalty(commander: &mut Commander, cfg: &SimConfig) {
 pub fn resolve_commander_stress(commander: &mut Commander, casualties: u32, cfg: &SimConfig) {
     commander.stress_level = stress_after_casualties(commander.stress_level, casualties, cfg);
     clamp_and_check_shattered(commander);
-}
-
-/// Retires a Rank 5 Commander to the AdvisorBoard.
-/// Returns Err if the Commander has not reached Rank 5.
-pub fn retire_commander(
-    commander: Commander,
-    advisor_board: &mut AdvisorBoard,
-) -> Result<(), String> {
-    if commander.rank < COMMANDER_RETIRE_RANK {
-        return Err("Commander has not reached the rank required for retirement.".into());
-    }
-    advisor_board.push(commander);
-    Ok(())
 }
 
 // ── Travel & fuel logistics ────────────────────────────────────────────────
