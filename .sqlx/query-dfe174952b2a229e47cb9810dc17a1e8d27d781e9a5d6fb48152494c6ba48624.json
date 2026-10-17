@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT\n                section_id, campaign_id, commander_id, name, headcount,\n                loadout AS \"loadout: JsonValue\", xp, created_at, updated_at\n               FROM section_records WHERE section_id = $1",
+  "query": "SELECT\n                section_id, campaign_id, commander_id, player_wallet, name, headcount,\n                loadout AS \"loadout: JsonValue\", xp, created_at, updated_at\n               FROM section_records WHERE commander_id = $1",
   "describe": {
     "columns": [
       {
@@ -20,31 +20,36 @@
       },
       {
         "ordinal": 3,
+        "name": "player_wallet",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 4,
         "name": "name",
         "type_info": "Text"
       },
       {
-        "ordinal": 4,
+        "ordinal": 5,
         "name": "headcount",
         "type_info": "Int2"
       },
       {
-        "ordinal": 5,
+        "ordinal": 6,
         "name": "loadout: JsonValue",
         "type_info": "Jsonb"
       },
       {
-        "ordinal": 6,
+        "ordinal": 7,
         "name": "xp",
         "type_info": "Int4"
       },
       {
-        "ordinal": 7,
+        "ordinal": 8,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 8,
+        "ordinal": 9,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
@@ -58,6 +63,7 @@
       false,
       false,
       true,
+      true,
       false,
       false,
       false,
@@ -66,5 +72,5 @@
       false
     ]
   },
-  "hash": "c52ab6107b17ef9c393fb61cd742bf7a51542fd761acfc9e3f4265845b38fbd9"
+  "hash": "dfe174952b2a229e47cb9810dc17a1e8d27d781e9a5d6fb48152494c6ba48624"
 }

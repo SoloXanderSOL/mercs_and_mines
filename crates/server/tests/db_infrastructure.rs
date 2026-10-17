@@ -193,12 +193,11 @@ async fn commander_section_crud_is_correct() {
     // Wallet [2u8;32] is shared with initialize_campaign_orchestrates_correctly.
     // Pre-clean by wallet in FK order (F5): a campaign_id pre-clean is a no-op, since
     // the campaign above is brand new.
-    // Sections left by a panicked run, reached through wallet [2u8;32]'s stale commanders.
-    // Must run before the commander delete: section_records.commander_id is ON DELETE
-    // SET NULL, so afterwards the join matches nothing. Sections whose commander was
-    // already deleted by an earlier run have commander_id NULL and are unreachable here;
-    // they are clutter, not a collision, because this test reads only sections it creates.
-    sqlx::query("DELETE FROM section_records WHERE commander_id IN (SELECT commander_id FROM commander_records WHERE player_wallet = $1)")
+    // Sections left by a panicked run, reached through their owner column (GAP-63, 0025).
+    // Before 0025 they were reachable only through a live Commander, and
+    // section_records.commander_id is ON DELETE SET NULL, so a Section outlived the join.
+    // Its owner is RESTRICT, so it must go before the player_accounts delete below.
+    sqlx::query("DELETE FROM section_records WHERE player_wallet = $1")
         .bind(&[2u8; 32].to_vec()).execute(&pool).await.ok();
     sqlx::query("DELETE FROM commander_records WHERE player_wallet = $1")
         .bind(&[2u8; 32].to_vec()).execute(&pool).await.ok();
@@ -279,6 +278,7 @@ async fn commander_section_crud_is_correct() {
         section_id,
         campaign_id,
         commander_id: Some(commander_id),
+        player_wallet: Some(wallet_bytes.clone()),
         name:         "Alpha Section".into(),
         headcount:    8,
         loadout:      serde_json::json!({}),
@@ -293,6 +293,7 @@ async fn commander_section_crud_is_correct() {
         .expect("section not found");
     assert_eq!(sec.section_id, section_id);
     assert_eq!(sec.commander_id, Some(commander_id));
+    assert_eq!(sec.player_wallet, Some(vec![2u8; 32]), "the owner must round-trip");
     assert_eq!(sec.headcount, 8);
 
     // 9. update_headcount.
@@ -2472,13 +2473,16 @@ async fn convoy_timer_fires_and_marks_arrived() {
 
 /// The per-wallet roster tables, in cleanup order. Each has `player_wallet` and
 /// `campaign_id` columns; a new roster table adds itself here (Reviewer 7a-1 CF1).
-const ROSTER_TABLES: [&str; 4] = ["commander_records", "foreman_records", "advisor_records", "crew_records"];
+/// `section_records` (owner column since 7b-1, `0025`) goes before `commander_records`,
+/// because a Section references a Commander.
+const ROSTER_TABLES: [&str; 5] = ["section_records", "commander_records", "foreman_records", "advisor_records", "crew_records"];
 
 /// Removes everything a 4g-1 test wallet owns, in FK order: card_mint_pending →
 /// deployment_records → section_records → commander_records → foreman_records →
 /// advisor_records → crew_records (`ROSTER_TABLES`) → their campaigns → membership →
 /// player_accounts.
-/// `deployment_records.commander_id` is ON DELETE RESTRICT, so it must go first.
+/// `deployment_records.commander_id` is ON DELETE RESTRICT, so it must go first; it is
+/// there because of Commanders (`deployment_records` does not reference Sections).
 /// Campaigns are collected through the roster rows **and** the wallet's membership rows,
 /// so a test whose every roster insert is refused still has its campaign found
 /// (Reviewer 7c-1 F1; `seed_account_and_campaign` writes the membership row).
@@ -2487,8 +2491,6 @@ async fn clean_wallet_4g1(pool: &sqlx::PgPool, wallet: &[u8]) {
         .bind(wallet).execute(pool).await.expect("card_mint_pending cleanup failed");
     sqlx::query("DELETE FROM deployment_records WHERE commander_id IN (SELECT commander_id FROM commander_records WHERE player_wallet = $1)")
         .bind(wallet).execute(pool).await.expect("deployment_records cleanup failed");
-    sqlx::query("DELETE FROM section_records WHERE commander_id IN (SELECT commander_id FROM commander_records WHERE player_wallet = $1)")
-        .bind(wallet).execute(pool).await.ok();
     let union = ROSTER_TABLES
         .map(|t| format!("SELECT campaign_id FROM {t} WHERE player_wallet = $1"))
         .join(" UNION ")
@@ -5140,4 +5142,151 @@ async fn clean_wallet_4g1_finds_a_campaign_through_membership() {
         left, 0,
         "clean_wallet_4g1 left campaign {campaign_id} behind: a campaign reachable only through membership must be collected"
     );
+}
+
+/// A wallet-33 Section with an owner and the given Commander.
+fn owned_section(campaign_id: uuid::Uuid, commander_id: Option<uuid::Uuid>, player_wallet: Option<Vec<u8>>) -> SectionRecord {
+    SectionRecord {
+        section_id:    uuid::Uuid::new_v4(),
+        campaign_id,
+        commander_id,
+        player_wallet,
+        name:          "Bravo Section".into(),
+        headcount:     8,
+        loadout:       serde_json::json!({}),
+        xp:            0,
+        created_at:    chrono::Utc::now(),
+        updated_at:    chrono::Utc::now(),
+    }
+}
+
+/// 7b-1 — `section_records_headcount_range` (`0025`) stores 0 and 8 and refuses 9 and −1.
+#[tokio::test]
+async fn section_records_headcount_check_stores_0_and_8_refuses_9_and_minus_1() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    clean_wallet_4g1(&pool, &SECTION_WALLET).await;
+    let campaign_id = seed_account_and_campaign(&pool, SECTION_WALLET, 0x7B12_i64).await;
+
+    let mut results = Vec::new();
+    for headcount in [0i16, 8, 9, -1] {
+        let res = sqlx::query(
+            "INSERT INTO section_records (section_id, campaign_id, player_wallet, name, headcount)
+             VALUES ($1, $2, $3, 'Charlie Section', $4)"
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(campaign_id)
+        .bind(SECTION_WALLET.to_vec())
+        .bind(headcount)
+        .execute(&pool)
+        .await;
+        results.push((headcount, res));
+    }
+    let stored: Vec<i16> = sqlx::query_scalar("SELECT headcount FROM section_records WHERE campaign_id = $1 ORDER BY headcount")
+        .bind(campaign_id)
+        .fetch_all(&pool)
+        .await
+        .expect("read stored headcounts");
+    clean_wallet_4g1(&pool, &SECTION_WALLET).await;
+
+    assert_eq!(stored, vec![0i16, 8], "0 and 8 must be stored, nothing else");
+    for (headcount, res) in results {
+        match headcount {
+            0 | 8 => { res.unwrap_or_else(|e| panic!("headcount {headcount} must be stored: {e}")); }
+            _ => {
+                let err = res.expect_err(&format!("headcount {headcount} must violate section_records_headcount_range"));
+                assert_check_violation(&err, "section_records_headcount_range");
+            }
+        }
+    }
+}
+
+/// 7b-1 — the owner round-trips through `create_section` and all three reads.
+#[tokio::test]
+async fn postgres_section_repository_round_trips_the_owner() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    clean_wallet_4g1(&pool, &SECTION_WALLET).await;
+    let campaign_id = seed_account_and_campaign(&pool, SECTION_WALLET, 0x7B13_i64).await;
+    let commander = mercs_server::commander_gen::generate_commander(SECTION_WALLET.to_vec(), campaign_id, 42u32);
+    let commander_id = commander.commander_id;
+    PostgresCommanderRepository::new(pool.clone()).create_commander(commander).await.expect("create_commander failed");
+
+    let repo = PostgresSectionRepository::new(pool.clone());
+    let r = owned_section(campaign_id, Some(commander_id), Some(SECTION_WALLET.to_vec()));
+    let created = repo.create_section(r.clone()).await;
+    let got = repo.get_section(r.section_id).await;
+    let by_campaign = repo.list_sections_by_campaign(campaign_id).await;
+    let by_commander = repo.list_sections_by_commander(commander_id).await;
+    clean_wallet_4g1(&pool, &SECTION_WALLET).await;
+
+    created.expect("create_section failed");
+    let got = got.expect("get_section failed").expect("stored section");
+    assert_eq!(got.player_wallet, Some(vec![33u8; 32]));
+    let by_campaign = by_campaign.expect("list_sections_by_campaign failed");
+    assert_eq!(by_campaign.len(), 1);
+    assert_eq!(by_campaign[0].player_wallet, Some(vec![33u8; 32]));
+    let by_commander = by_commander.expect("list_sections_by_commander failed");
+    assert_eq!(by_commander.len(), 1);
+    assert_eq!(by_commander[0].player_wallet, Some(vec![33u8; 32]));
+}
+
+/// 7b-1 — `create_section` refuses a `None` owner (R2) and writes nothing.
+#[tokio::test]
+async fn postgres_create_section_refuses_a_missing_owner() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    clean_wallet_4g1(&pool, &SECTION_WALLET).await;
+    let campaign_id = seed_account_and_campaign(&pool, SECTION_WALLET, 0x7B14_i64).await;
+
+    let r = owned_section(campaign_id, None, None);
+    let res = PostgresSectionRepository::new(pool.clone()).create_section(r.clone()).await;
+    let (stored,): (i64,) = sqlx::query_as("SELECT count(*) FROM section_records WHERE section_id = $1")
+        .bind(r.section_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count failed");
+    clean_wallet_4g1(&pool, &SECTION_WALLET).await;
+
+    let err = res.expect_err("a None owner must be refused");
+    assert!(matches!(err, mercs_server::repository::RepositoryError::Internal(_)), "expected Internal, got {err:?}");
+    assert_eq!(stored, 0, "a refused section must not be written");
+}
+
+/// 7b-1 — a Section's owner blocks deleting the account (`ON DELETE RESTRICT`). The
+/// wallet's membership row also restricts, so it is deleted first and the constraint is
+/// asserted by name (spec-check trap T1).
+#[tokio::test]
+async fn section_owner_restricts_deleting_the_account() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    clean_wallet_4g1(&pool, &SECTION_WALLET).await;
+    let campaign_id = seed_account_and_campaign(&pool, SECTION_WALLET, 0x7B15_i64).await;
+    PostgresSectionRepository::new(pool.clone())
+        .create_section(owned_section(campaign_id, None, Some(SECTION_WALLET.to_vec())))
+        .await
+        .expect("create_section failed");
+    sqlx::query("DELETE FROM player_campaign_membership WHERE wallet_address = $1")
+        .bind(SECTION_WALLET.to_vec()).execute(&pool).await.expect("membership delete failed");
+
+    let res = sqlx::query("DELETE FROM player_accounts WHERE wallet_address = $1")
+        .bind(SECTION_WALLET.to_vec())
+        .execute(&pool)
+        .await;
+    clean_wallet_4g1(&pool, &SECTION_WALLET).await;
+    sqlx::query("DELETE FROM campaign_instances WHERE campaign_id = $1")
+        .bind(campaign_id).execute(&pool).await.expect("campaign cleanup failed");
+
+    let err = res.expect_err("an owned Section must block deleting its account");
+    let db = err.as_database_error().unwrap_or_else(|| panic!("not a database error: {err}"));
+    assert_eq!(db.code().as_deref(), Some("23503"), "expected a foreign-key violation, got {err}");
+    assert_eq!(db.constraint(), Some("section_records_player_wallet_fkey"));
 }
