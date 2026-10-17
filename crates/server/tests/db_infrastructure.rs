@@ -2479,6 +2479,9 @@ const ROSTER_TABLES: [&str; 4] = ["commander_records", "foreman_records", "advis
 /// advisor_records → crew_records (`ROSTER_TABLES`) → their campaigns → membership →
 /// player_accounts.
 /// `deployment_records.commander_id` is ON DELETE RESTRICT, so it must go first.
+/// Campaigns are collected through the roster rows **and** the wallet's membership rows,
+/// so a test whose every roster insert is refused still has its campaign found
+/// (Reviewer 7c-1 F1; `seed_account_and_campaign` writes the membership row).
 async fn clean_wallet_4g1(pool: &sqlx::PgPool, wallet: &[u8]) {
     sqlx::query("DELETE FROM card_mint_pending WHERE player_wallet = $1")
         .bind(wallet).execute(pool).await.expect("card_mint_pending cleanup failed");
@@ -2488,7 +2491,8 @@ async fn clean_wallet_4g1(pool: &sqlx::PgPool, wallet: &[u8]) {
         .bind(wallet).execute(pool).await.ok();
     let union = ROSTER_TABLES
         .map(|t| format!("SELECT campaign_id FROM {t} WHERE player_wallet = $1"))
-        .join(" UNION ");
+        .join(" UNION ")
+        + " UNION SELECT campaign_id FROM player_campaign_membership WHERE wallet_address = $1";
     let campaigns: Vec<uuid::Uuid> = sqlx::query_scalar(&union)
         .bind(wallet).fetch_all(pool).await.unwrap_or_default();
     for table in ROSTER_TABLES {
@@ -3243,7 +3247,9 @@ async fn test_commander_grade_round_trips() {
     clean_wallet_4g1(&pool, &wallet).await;
 }
 
-/// Seeds `wallet`'s account and a fresh campaign; returns the campaign id.
+/// Seeds `wallet`'s account, a fresh campaign and the wallet's membership of it; returns
+/// the campaign id. The membership row is what lets `clean_wallet_4g1` find the campaign
+/// when every roster insert a test makes is refused (Reviewer 7c-1 F1).
 async fn seed_account_and_campaign(pool: &sqlx::PgPool, wallet: [u8; 32], map_seed: i64) -> uuid::Uuid {
     sqlx::query(
         "INSERT INTO player_accounts (wallet_address, trust_standing, gcn_balance)
@@ -3253,11 +3259,16 @@ async fn seed_account_and_campaign(pool: &sqlx::PgPool, wallet: [u8; 32], map_se
     .execute(pool)
     .await
     .expect("player_accounts FK seed failed");
-    PostgresCampaignRepository::new(pool.clone())
+    let campaign_id = PostgresCampaignRepository::new(pool.clone())
         .create_campaign(&NewCampaignInstance { sector_id: uuid::Uuid::new_v4(), map_seed })
         .await
         .expect("create campaign failed")
-        .campaign_id
+        .campaign_id;
+    PostgresMembershipRepository::new(pool.clone())
+        .add_member(&wallet, campaign_id, None, None)
+        .await
+        .expect("membership seed failed");
+    campaign_id
 }
 
 /// A hand-built Foreman: Standard Issue traits (TQS 10 + 8 + 12 = 30), stored as Heroic so
@@ -3429,7 +3440,7 @@ async fn advisor_records_refuses_an_off_roster_quirk() {
     let campaign_id = seed_account_and_campaign(&pool, wallet, 0x7A22_i64).await;
 
     let r = hand_built_advisor(wallet, campaign_id, "The Financial Patron");
-    let err = sqlx::query(
+    let res = sqlx::query(
         "INSERT INTO advisor_records (advisor_id, campaign_id, player_wallet, name, origin,
              faction_bias, specialization, quirk, prng_seed_state)
          VALUES ($1, $2, $3, $4, $5, $6, $7, 'Not A Quirk', $8)"
@@ -3443,13 +3454,15 @@ async fn advisor_records_refuses_an_off_roster_quirk() {
     .bind(&r.specialization)
     .bind(r.prng_seed_state)
     .execute(&pool)
-    .await
-    .expect_err("an off-roster Quirk must violate advisor_records_quirk_canon");
+    .await;
+    clean_wallet_4g1(&pool, &wallet).await;
+    sqlx::query("DELETE FROM campaign_instances WHERE campaign_id = $1")
+        .bind(campaign_id).execute(&pool).await.expect("campaign cleanup failed");
+
+    let err = res.expect_err("an off-roster Quirk must violate advisor_records_quirk_canon");
     let db = err.as_database_error().unwrap_or_else(|| panic!("not a database error: {err}"));
     assert_eq!(db.code().as_deref(), Some("23514"), "expected a check violation, got {err}");
     assert_eq!(db.constraint(), Some("advisor_records_quirk_canon"));
-
-    clean_wallet_4g1(&pool, &wallet).await;
 }
 
 /// 7a-2 — deleting the campaign deletes its Advisors (`ON DELETE CASCADE`, ODQ-39 (g)).
@@ -5056,6 +5069,8 @@ async fn crew_records_refuses_raw_morale_outside_zero_to_hundred() {
         results.push((morale, res));
     }
     clean_wallet_4g1(&pool, &CREW_WALLET).await;
+    sqlx::query("DELETE FROM campaign_instances WHERE campaign_id = $1")
+        .bind(campaign_id).execute(&pool).await.expect("campaign cleanup failed");
 
     for (morale, res) in results {
         let err = res.expect_err(&format!("morale {morale} must violate crew_records_morale_range"));
@@ -5092,4 +5107,37 @@ async fn crew_records_cascade_with_their_campaign() {
     clean_wallet_4g1(&pool, &CREW_WALLET).await;
 
     assert_eq!(left, 0, "the crew must cascade with its campaign");
+}
+
+// ── Brick 7b-1: campaign cleanup through membership; section_records owner (0025) ──
+
+/// The only wallet the 7b-1 tests use.
+const SECTION_WALLET: [u8; 32] = [33u8; 32];
+
+/// 7b-1 (Reviewer 7c-1 F1) — a campaign the wallet reaches only through its membership
+/// row (no roster row at all) is still collected and deleted by `clean_wallet_4g1`.
+#[tokio::test]
+async fn clean_wallet_4g1_finds_a_campaign_through_membership() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    clean_wallet_4g1(&pool, &SECTION_WALLET).await;
+    let campaign_id = seed_account_and_campaign(&pool, SECTION_WALLET, 0x7B11_i64).await;
+
+    clean_wallet_4g1(&pool, &SECTION_WALLET).await;
+    let (left,): (i64,) = sqlx::query_as("SELECT count(*) FROM campaign_instances WHERE campaign_id = $1")
+        .bind(campaign_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count failed");
+    sqlx::query("DELETE FROM campaign_instances WHERE campaign_id = $1")
+        .bind(campaign_id).execute(&pool).await.expect("campaign cleanup failed");
+    sqlx::query("DELETE FROM player_accounts WHERE wallet_address = $1")
+        .bind(SECTION_WALLET.to_vec()).execute(&pool).await.ok();
+
+    assert_eq!(
+        left, 0,
+        "clean_wallet_4g1 left campaign {campaign_id} behind: a campaign reachable only through membership must be collected"
+    );
 }
