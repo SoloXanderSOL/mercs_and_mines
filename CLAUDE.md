@@ -85,10 +85,13 @@ As of 2026-10-17:
   `check_commander_permadeath` is deleted. `is_glorious_death` lives in `commander_gen`;
   the route passes a ticker contribution of `0.0` until §2c. The mission response gains
   `commander: {kia, glorious}`. No input-log entry, no R7 bump. Test cleanup order:
-  `card_mint_pending` → `deployment_records` → `section_records` → `commander_records` →
-  `foreman_records` (since 7a-1) → `advisor_records` (since 7a-2) → `crew_records` (since
-  7c-1) → their campaigns →
-  membership → `player_accounts`. `clean_wallet_4g1` is list-driven over `ROSTER_TABLES`.
+  `card_mint_pending` → `deployment_records` → `section_records` (in `ROSTER_TABLES` since
+  7b-1) → `commander_records` → `foreman_records` (since 7a-1) → `advisor_records` (since
+  7a-2) → `crew_records` (since 7c-1) → their campaigns → membership → `player_accounts`.
+  `clean_wallet_4g1` is list-driven over `ROSTER_TABLES` and collects campaigns through the
+  roster rows **and** the wallet's membership rows (since 7b-1). A test that seeds through
+  `seed_account_and_campaign` is cleaned by `clean_wallet_4g1` even if every insert it
+  makes is refused.
 - **Sections 5 and 6:** Not started.
 - **Sections 7 (Personnel Entity Model) and 8 (Combat Engine to canon):** created
   2026-10-13 (ruling D2); both run before Section 6. Strike Mining and Base Building moved
@@ -119,8 +122,17 @@ As of 2026-10-17:
   `foreman_id`, name, enum, `updated_at` or guard row). `CrewRecord::new_hire` sets the
   canon hire (8/0/60, no RNG). `create_crew` is the only write and clamps morale in both
   impls; the in-memory impl stores an out-of-range headcount and overwrites a duplicate id
-  (documented). No `AppState` field, no production caller, no R7 bump. **Next: 7b-1** (7d-1
-  needs both 7b-1 and 7c-1). Section 8 not started.
+  (documented). No `AppState` field, no production caller, no R7 bump. **7b-1 complete
+  (`877adb9`, `64be6db`, 2026-10-17; Section owner, GAP-63):** `seed_account_and_campaign`
+  writes a membership row and `clean_wallet_4g1` collects campaigns through it, so a
+  refusal-only test can't leak its campaign (Reviewer 7c-1 F1; the test DB's 59 orphans were
+  deleted once). Migration `0025` adds a **nullable** `section_records.player_wallet` (BYTEA,
+  RESTRICT, backfilled from the Commander, `idx_section_records_player`; `NOT NULL` waits for
+  a contract migration) and `section_records_headcount_range` (0..8). `SectionRecord` gains
+  `player_wallet: Option<Vec<u8>>`; `create_section` refuses `None` first in both impls
+  (`Internal`); the in-memory impl stores an out-of-range headcount. `update_headcount`
+  unchanged. No production caller, no R7 bump. **Next: 7b-2 and 7d-1** (7d-1 may run first).
+  Section 8 not started.
 - **INF-1 (infrastructure, GAP-37):** Complete — `tracing` subscriber installed, reward-mult
   config hardened, workspace version `0.2.0`.
 - **INF-2 (infrastructure, GAP-38):** Complete — idempotent `mercs_server::init_tracing()`
@@ -157,10 +169,10 @@ As of 2026-10-17:
   scenarios) and `shellcheck` run in the `deploy-script` job on every push, and the deploy
   job needs it (GAP-33).
 
-**258/258 tests green (120 `mercs_server` lib + 2 `aar_determinism` + 83 `db_infrastructure`
-+ 53 `sim_engine`; single-threaded, verified at `f7a6558`). Workspace version `0.3.0`.
-`.sqlx/` holds 66 files; the latest migration is `0024_crew_records`.
-Production = `f054caa` (0.3.0, 7a-2); `.prev` = `719c8ee`; `dev` is ahead with 7c-1,
+**264/264 tests green (121 `mercs_server` lib + 2 `aar_determinism` + 88 `db_infrastructure`
++ 53 `sim_engine`; single-threaded, verified at `64be6db`). Workspace version `0.3.0`.
+`.sqlx/` holds 66 files; the latest migration is `0025_section_records_owner_and_headcount`.
+Production = `2a4fcb3` (0.3.0, 7c-1); `.prev` = `f054caa`; `dev` is ahead with 7b-1,
 unpushed. Next: see the Phase 1 document.** Any brick that changes what `resolve_mission` produces for
 a given seed bumps the workspace version in the same brick. 4b-1 reused `sim-engine`'s `OutcomeType` rather than
 defining a new enum, and writes **no input-log entry** — the rank-up entry was removed
@@ -373,10 +385,10 @@ constraints — parallel execution causes FK-23503 failures that are not caused 
 code under test. Any test report produced without `--test-threads=1` is unreliable and
 must be re-run before reporting results to the Director.
 
-**Test wallets:** `tests/` uses wallet seeds 0–9, 13–19, 21–32 and 88, with 10–12 taken by
+**Test wallets:** `tests/` uses wallet seeds 0–9, 13–19, 21–33 and 88, with 10–12 taken by
 a range literal (`(10u8..=12)`). **20 is the auth tests' signing-key seed**
 (`SigningKey::from_bytes(&[20u8; 32])`). It is used in memory only, and its derived
-public key is not `[20u8; 32]`. The next free seed is **33**.
+public key is not `[20u8; 32]`. The next free seed is **34**.
 
 **Independent oracle:** A gate's expected value is never read from the code it checks. Pin
 it to a literal taken from canon or from a measurement made before the change (4d-2 N3: a
