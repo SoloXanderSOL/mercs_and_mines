@@ -4,6 +4,7 @@
 #![allow(unused)]
 pub mod account;
 pub mod advisor;
+pub mod crew;
 pub mod campaign;
 pub mod convoy;
 pub mod commander;
@@ -45,6 +46,7 @@ pub use commander::{
 };
 pub use foreman::{ForemanRecord, ForemanRepository, InMemoryForemanRepository, PostgresForemanRepository};
 pub use advisor::{AdvisorRecord, AdvisorRepository, InMemoryAdvisorRepository, PostgresAdvisorRepository};
+pub use crew::{CrewRecord, CrewRepository, InMemoryCrewRepository, PostgresCrewRepository};
 pub use postgres_account::PostgresAccountRepository;
 pub use section::{
     InMemorySectionRepository, PostgresSectionRepository,

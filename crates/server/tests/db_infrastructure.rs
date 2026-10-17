@@ -23,6 +23,7 @@ use mercs_server::repository::{
     NewDeployment, outcome_db_str,
     ForemanRepository, PostgresForemanRepository,
     AdvisorRecord, AdvisorRepository, PostgresAdvisorRepository,
+    CrewRecord, CrewRepository, PostgresCrewRepository,
 };
 use sim_engine::roster::{
     AdvisorQuirk, AdvisorSpecialization, CommanderFlaw, CommanderGrade, CommanderOrigin,
@@ -2471,11 +2472,12 @@ async fn convoy_timer_fires_and_marks_arrived() {
 
 /// The per-wallet roster tables, in cleanup order. Each has `player_wallet` and
 /// `campaign_id` columns; a new roster table adds itself here (Reviewer 7a-1 CF1).
-const ROSTER_TABLES: [&str; 3] = ["commander_records", "foreman_records", "advisor_records"];
+const ROSTER_TABLES: [&str; 4] = ["commander_records", "foreman_records", "advisor_records", "crew_records"];
 
 /// Removes everything a 4g-1 test wallet owns, in FK order: card_mint_pending →
 /// deployment_records → section_records → commander_records → foreman_records →
-/// advisor_records (`ROSTER_TABLES`) → their campaigns → membership → player_accounts.
+/// advisor_records → crew_records (`ROSTER_TABLES`) → their campaigns → membership →
+/// player_accounts.
 /// `deployment_records.commander_id` is ON DELETE RESTRICT, so it must go first.
 async fn clean_wallet_4g1(pool: &sqlx::PgPool, wallet: &[u8]) {
     sqlx::query("DELETE FROM card_mint_pending WHERE player_wallet = $1")
@@ -4887,4 +4889,207 @@ async fn convoy_arrival_is_logged_once() {
 
     assert_eq!(arrived, 1, "a retried arrival must not log convoy_arrived twice");
     assert!(!convoy.expect("convoy exists").in_transit, "the convoy stays landed");
+}
+
+// ── Brick 7c-1: crew_records (0024) and CrewRepository ──────────────────────
+
+/// The only wallet the 7c-1 tests use.
+const CREW_WALLET: [u8; 32] = [32u8; 32];
+
+/// Pre-cleans wallet 32 and seeds its account and a campaign.
+async fn seed_crew_fixture(pool: &sqlx::PgPool, map_seed: i64) -> uuid::Uuid {
+    clean_wallet_4g1(pool, &CREW_WALLET).await;
+    seed_account_and_campaign(pool, CREW_WALLET, map_seed).await
+}
+
+/// Asserts `err` is a CHECK violation (23514) of `constraint`.
+fn assert_check_violation(err: &sqlx::Error, constraint: &str) {
+    let db = err.as_database_error().unwrap_or_else(|| panic!("not a database error: {err}"));
+    assert_eq!(db.code().as_deref(), Some("23514"), "expected a check violation, got {err}");
+    assert_eq!(db.constraint(), Some(constraint));
+}
+
+/// 7c-1 — a `new_hire` crew round-trips through `create_crew`, `get_crew` and
+/// `list_crews_by_campaign`.
+#[tokio::test]
+async fn postgres_crew_repository_round_trips() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    let campaign_id = seed_crew_fixture(&pool, 0x7C11_i64).await;
+    let repo = PostgresCrewRepository::new(pool.clone());
+
+    let r = CrewRecord::new_hire(campaign_id, CREW_WALLET.to_vec());
+    repo.create_crew(r.clone()).await.expect("create_crew failed");
+
+    let got = repo.get_crew(r.crew_id).await.expect("get_crew failed").expect("stored crew");
+    let listed = repo.list_crews_by_campaign(campaign_id).await.expect("list failed");
+    let missing = repo.get_crew(uuid::Uuid::new_v4()).await.expect("get_crew failed");
+    clean_wallet_4g1(&pool, &CREW_WALLET).await;
+
+    for (path, c) in [("get", &got), ("list", listed.first().expect("one listed crew"))] {
+        assert_eq!(c.crew_id, r.crew_id, "{path}");
+        assert_eq!(c.campaign_id, campaign_id, "{path}");
+        assert_eq!(c.player_wallet, CREW_WALLET.to_vec(), "{path}");
+        assert_eq!(c.headcount, 8, "{path}");
+        assert_eq!(c.xp, 0, "{path}");
+        assert_eq!(c.morale, 60, "{path}");
+    }
+    assert_eq!(listed.len(), 1, "one crew in this campaign");
+    assert!(missing.is_none());
+}
+
+/// 7c-1 DoD — morale clamps to 0–100 on create. `-5` and `150` would hit
+/// `crew_records_morale_range` without the clamp.
+#[tokio::test]
+async fn postgres_create_crew_clamps_morale_at_both_bounds() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    let campaign_id = seed_crew_fixture(&pool, 0x7C12_i64).await;
+    let repo = PostgresCrewRepository::new(pool.clone());
+
+    let mut stored = Vec::new();
+    for (given, want) in [(-5i16, 0i16), (150, 100), (0, 0), (100, 100)] {
+        let mut r = CrewRecord::new_hire(campaign_id, CREW_WALLET.to_vec());
+        r.morale = given;
+        let created = repo.create_crew(r.clone()).await;
+        let got = repo.get_crew(r.crew_id).await.ok().flatten().map(|c| c.morale);
+        stored.push((given, want, created, got));
+    }
+    clean_wallet_4g1(&pool, &CREW_WALLET).await;
+
+    for (given, want, created, got) in stored {
+        assert!(created.is_ok(), "morale {given}: create_crew must clamp, not fail: {created:?}");
+        assert_eq!(got, Some(want), "morale {given} must be stored as {want}");
+    }
+}
+
+/// 7c-1 — the SQL defaults are the canon hire: 8 heads, 0 XP, morale 60 (ODQ-40).
+#[tokio::test]
+async fn crew_records_defaults_are_the_canon_hire() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    let campaign_id = seed_crew_fixture(&pool, 0x7C13_i64).await;
+    let crew_id = uuid::Uuid::new_v4();
+    sqlx::query("INSERT INTO crew_records (crew_id, campaign_id, player_wallet) VALUES ($1, $2, $3)")
+        .bind(crew_id)
+        .bind(campaign_id)
+        .bind(CREW_WALLET.to_vec())
+        .execute(&pool)
+        .await
+        .expect("owner-only insert failed");
+    let row: (i16, i32, i16) = sqlx::query_as("SELECT headcount, xp, morale FROM crew_records WHERE crew_id = $1")
+        .bind(crew_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read back failed");
+    clean_wallet_4g1(&pool, &CREW_WALLET).await;
+
+    assert_eq!(row, (8, 0, 60), "defaults (headcount, xp, morale)");
+}
+
+/// 7c-1 — `crew_records_headcount_range`: 9 and -1 are refused; 0 (a wipe) and 8 store.
+#[tokio::test]
+async fn crew_records_refuses_headcount_outside_zero_to_eight() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    let campaign_id = seed_crew_fixture(&pool, 0x7C14_i64).await;
+
+    let mut refusals = Vec::new();
+    for headcount in [9i16, -1] {
+        let res = sqlx::query("INSERT INTO crew_records (crew_id, campaign_id, player_wallet, headcount) VALUES ($1, $2, $3, $4)")
+            .bind(uuid::Uuid::new_v4())
+            .bind(campaign_id)
+            .bind(CREW_WALLET.to_vec())
+            .bind(headcount)
+            .execute(&pool)
+            .await;
+        refusals.push((headcount, res));
+    }
+    let repo = PostgresCrewRepository::new(pool.clone());
+    let mut accepted = Vec::new();
+    for headcount in [0i16, 8] {
+        let mut r = CrewRecord::new_hire(campaign_id, CREW_WALLET.to_vec());
+        r.headcount = headcount;
+        let created = repo.create_crew(r.clone()).await;
+        let got = repo.get_crew(r.crew_id).await.ok().flatten().map(|c| c.headcount);
+        accepted.push((headcount, created, got));
+    }
+    clean_wallet_4g1(&pool, &CREW_WALLET).await;
+
+    for (headcount, res) in refusals {
+        let err = res.expect_err(&format!("headcount {headcount} must violate crew_records_headcount_range"));
+        assert_check_violation(&err, "crew_records_headcount_range");
+    }
+    for (headcount, created, got) in accepted {
+        assert!(created.is_ok(), "headcount {headcount} must store: {created:?}");
+        assert_eq!(got, Some(headcount));
+    }
+}
+
+/// 7c-1 — `crew_records_morale_range` backs the clamp: a raw insert (no clamp) of 101 or -1
+/// is refused.
+#[tokio::test]
+async fn crew_records_refuses_raw_morale_outside_zero_to_hundred() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    let campaign_id = seed_crew_fixture(&pool, 0x7C15_i64).await;
+
+    let mut results = Vec::new();
+    for morale in [101i16, -1] {
+        let res = sqlx::query("INSERT INTO crew_records (crew_id, campaign_id, player_wallet, morale) VALUES ($1, $2, $3, $4)")
+            .bind(uuid::Uuid::new_v4())
+            .bind(campaign_id)
+            .bind(CREW_WALLET.to_vec())
+            .bind(morale)
+            .execute(&pool)
+            .await;
+        results.push((morale, res));
+    }
+    clean_wallet_4g1(&pool, &CREW_WALLET).await;
+
+    for (morale, res) in results {
+        let err = res.expect_err(&format!("morale {morale} must violate crew_records_morale_range"));
+        assert_check_violation(&err, "crew_records_morale_range");
+    }
+}
+
+/// 7c-1 — deleting the campaign deletes its crews (`ON DELETE CASCADE`).
+#[tokio::test]
+async fn crew_records_cascade_with_their_campaign() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    let campaign_id = seed_crew_fixture(&pool, 0x7C16_i64).await;
+    let crew_id = uuid::Uuid::new_v4();
+    sqlx::query("INSERT INTO crew_records (crew_id, campaign_id, player_wallet) VALUES ($1, $2, $3)")
+        .bind(crew_id)
+        .bind(campaign_id)
+        .bind(CREW_WALLET.to_vec())
+        .execute(&pool)
+        .await
+        .expect("insert failed");
+    sqlx::query("DELETE FROM campaign_instances WHERE campaign_id = $1")
+        .bind(campaign_id)
+        .execute(&pool)
+        .await
+        .expect("campaign delete failed");
+    let (left,): (i64,) = sqlx::query_as("SELECT count(*) FROM crew_records WHERE crew_id = $1")
+        .bind(crew_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count failed");
+    clean_wallet_4g1(&pool, &CREW_WALLET).await;
+
+    assert_eq!(left, 0, "the crew must cascade with its campaign");
 }

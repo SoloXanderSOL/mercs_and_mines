@@ -1,0 +1,58 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT crew_id, campaign_id, player_wallet, headcount, xp, morale, created_at\n               FROM crew_records WHERE campaign_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "crew_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "campaign_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "player_wallet",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 3,
+        "name": "headcount",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 4,
+        "name": "xp",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 5,
+        "name": "morale",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 6,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "84de0b6ca4170c5c9730c45e6a9c27cc2714762e74fc2495e650a1c64690461d"
+}
