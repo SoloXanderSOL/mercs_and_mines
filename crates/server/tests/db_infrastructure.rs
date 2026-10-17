@@ -22,10 +22,11 @@ use mercs_server::repository::{
     ConvoyDbRecord, ConvoyRepository, PostgresConvoyRepository,
     NewDeployment, outcome_db_str,
     ForemanRepository, PostgresForemanRepository,
+    AdvisorRecord, AdvisorRepository, PostgresAdvisorRepository,
 };
 use sim_engine::roster::{
-    CommanderFlaw, CommanderGrade, CommanderOrigin, CommanderSpecialization, FactionBias, ForemanFlaw,
-    ForemanSpecialization,
+    AdvisorQuirk, AdvisorSpecialization, CommanderFlaw, CommanderGrade, CommanderOrigin,
+    CommanderSpecialization, FactionBias, ForemanFlaw, ForemanSpecialization,
 };
 
 async fn test_pool() -> Option<sqlx::PgPool> {
@@ -2468,8 +2469,13 @@ async fn convoy_timer_fires_and_marks_arrived() {
 
 // ── Brick 4g-1: deployment records, start_session, stress CHECK ─────────────
 
-/// Removes everything a 4g-1 test wallet owns, in FK order: deployment_records →
-/// section_records → commander_records (and their campaigns) → membership → player_accounts.
+/// The per-wallet roster tables, in cleanup order. Each has `player_wallet` and
+/// `campaign_id` columns; a new roster table adds itself here (Reviewer 7a-1 CF1).
+const ROSTER_TABLES: [&str; 3] = ["commander_records", "foreman_records", "advisor_records"];
+
+/// Removes everything a 4g-1 test wallet owns, in FK order: card_mint_pending →
+/// deployment_records → section_records → commander_records → foreman_records →
+/// advisor_records (`ROSTER_TABLES`) → their campaigns → membership → player_accounts.
 /// `deployment_records.commander_id` is ON DELETE RESTRICT, so it must go first.
 async fn clean_wallet_4g1(pool: &sqlx::PgPool, wallet: &[u8]) {
     sqlx::query("DELETE FROM card_mint_pending WHERE player_wallet = $1")
@@ -2478,15 +2484,16 @@ async fn clean_wallet_4g1(pool: &sqlx::PgPool, wallet: &[u8]) {
         .bind(wallet).execute(pool).await.expect("deployment_records cleanup failed");
     sqlx::query("DELETE FROM section_records WHERE commander_id IN (SELECT commander_id FROM commander_records WHERE player_wallet = $1)")
         .bind(wallet).execute(pool).await.ok();
-    let campaigns: Vec<uuid::Uuid> = sqlx::query_scalar(
-        "SELECT campaign_id FROM commander_records WHERE player_wallet = $1
-         UNION SELECT campaign_id FROM foreman_records WHERE player_wallet = $1"
-    )
+    let union = ROSTER_TABLES
+        .map(|t| format!("SELECT campaign_id FROM {t} WHERE player_wallet = $1"))
+        .join(" UNION ");
+    let campaigns: Vec<uuid::Uuid> = sqlx::query_scalar(&union)
         .bind(wallet).fetch_all(pool).await.unwrap_or_default();
-    sqlx::query("DELETE FROM commander_records WHERE player_wallet = $1")
-        .bind(wallet).execute(pool).await.expect("commander_records cleanup failed");
-    sqlx::query("DELETE FROM foreman_records WHERE player_wallet = $1")
-        .bind(wallet).execute(pool).await.expect("foreman_records cleanup failed");
+    for table in ROSTER_TABLES {
+        sqlx::query(&format!("DELETE FROM {table} WHERE player_wallet = $1"))
+            .bind(wallet).execute(pool).await
+            .unwrap_or_else(|e| panic!("{table} cleanup failed: {e}"));
+    }
     for c in campaigns {
         sqlx::query("DELETE FROM campaign_instances WHERE campaign_id = $1")
             .bind(c).execute(pool).await.ok();
@@ -3112,6 +3119,12 @@ fn roster_check_expectations() -> Vec<(&'static str, Vec<(&'static str, std::col
             ("foreman_records_fatal_flaw_canon", strings(ForemanFlaw::ALL.map(ForemanFlaw::as_str))),
             ("foreman_records_foreman_grade_canon", strings(CommanderGrade::ALL.map(CommanderGrade::as_str))),
         ]),
+        ("advisor_records", vec![
+            ("advisor_records_origin_canon", strings(CommanderOrigin::ALL.map(CommanderOrigin::as_str))),
+            ("advisor_records_faction_bias_canon", strings(FactionBias::ALL.map(FactionBias::as_str))),
+            ("advisor_records_specialization_canon", strings(AdvisorSpecialization::ALL.map(AdvisorSpecialization::as_str))),
+            ("advisor_records_quirk_canon", strings(AdvisorQuirk::ALL.map(AdvisorQuirk::as_str))),
+        ]),
     ]
 }
 
@@ -3339,6 +3352,129 @@ async fn test_foreman_records_reject_non_canon_roster_values() {
         assert_eq!(db.code().as_deref(), Some("23514"), "{constraint}: expected a check violation, got {err}");
         assert_eq!(db.constraint(), Some(constraint), "{column}: wrong constraint");
     }
+
+    clean_wallet_4g1(&pool, &wallet).await;
+}
+
+/// A hand-built Advisor (7a-2) with the given specialization string.
+fn hand_built_advisor(wallet: [u8; 32], campaign_id: uuid::Uuid, specialization: &str) -> AdvisorRecord {
+    AdvisorRecord {
+        advisor_id:      uuid::Uuid::new_v4(),
+        campaign_id,
+        player_wallet:   wallet.to_vec(),
+        name:            "Vance Darwin-Macaque".into(),
+        rank:            1,
+        origin:          CommanderOrigin::ScienceApe.as_str().into(),
+        faction_bias:    FactionBias::JumpLaneRestorer.as_str().into(),
+        specialization:  specialization.into(),
+        quirk:           AdvisorQuirk::VanityMetrics.as_str().into(),
+        prng_seed_state: 0x7A2_i64,
+        created_at:      chrono::Utc::now(),
+    }
+}
+
+/// 7a-2 — every roster field survives `create_advisor`, `get_advisor` and
+/// `list_advisors_by_campaign` unchanged. A Research spec proves the CHECK holds all 14;
+/// a second record carries the `&` string.
+#[tokio::test]
+async fn postgres_advisor_repository_round_trips() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    let wallet = [31u8; 32];
+    clean_wallet_4g1(&pool, &wallet).await;
+    let campaign_id = seed_account_and_campaign(&pool, wallet, 0x7A21_i64).await;
+
+    let repo = PostgresAdvisorRepository::new(pool.clone());
+    let research = hand_built_advisor(wallet, campaign_id, "Head of Reverse Engineering");
+    let ampersand = hand_built_advisor(wallet, campaign_id, "VP of Tectonic Risk & Planetology");
+    repo.create_advisor(research.clone()).await.expect("a Research Advisor must insert");
+    repo.create_advisor(ampersand.clone()).await.expect("the & string must insert");
+
+    let fetched = repo.get_advisor(research.advisor_id).await.unwrap().expect("advisor not found");
+    let mut listed = repo.list_advisors_by_campaign(campaign_id).await.unwrap();
+    assert_eq!(listed.len(), 2);
+    listed.sort_by_key(|r| r.specialization.clone());
+    assert_eq!(listed[1].specialization, "VP of Tectonic Risk & Planetology");
+    assert_eq!(listed[1].advisor_id, ampersand.advisor_id);
+    for (path, got) in [("get_advisor", &fetched), ("list_advisors_by_campaign", &listed[0])] {
+        assert_eq!(got.advisor_id, research.advisor_id, "{path}");
+        assert_eq!(got.campaign_id, campaign_id, "{path}");
+        assert_eq!(got.player_wallet, wallet.to_vec(), "{path}");
+        assert_eq!(got.name, "Vance Darwin-Macaque", "{path}");
+        assert_eq!(got.rank, 1, "{path}");
+        assert_eq!(got.origin, "Science Ape", "{path}");
+        assert_eq!(got.faction_bias, "Jump Lane Restorer", "{path}");
+        assert_eq!(got.specialization, "Head of Reverse Engineering", "{path}");
+        assert_eq!(got.quirk, "Vanity Metrics", "{path}");
+        assert_eq!(got.prng_seed_state, 0x7A2_i64, "{path}");
+    }
+    assert!(repo.get_advisor(uuid::Uuid::new_v4()).await.unwrap().is_none());
+
+    clean_wallet_4g1(&pool, &wallet).await;
+}
+
+/// 7a-2 — `0023`'s CHECK refuses an off-roster Quirk.
+#[tokio::test]
+async fn advisor_records_refuses_an_off_roster_quirk() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    let wallet = [31u8; 32];
+    clean_wallet_4g1(&pool, &wallet).await;
+    let campaign_id = seed_account_and_campaign(&pool, wallet, 0x7A22_i64).await;
+
+    let r = hand_built_advisor(wallet, campaign_id, "The Financial Patron");
+    let err = sqlx::query(
+        "INSERT INTO advisor_records (advisor_id, campaign_id, player_wallet, name, origin,
+             faction_bias, specialization, quirk, prng_seed_state)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'Not A Quirk', $8)"
+    )
+    .bind(r.advisor_id)
+    .bind(r.campaign_id)
+    .bind(&r.player_wallet)
+    .bind(&r.name)
+    .bind(&r.origin)
+    .bind(&r.faction_bias)
+    .bind(&r.specialization)
+    .bind(r.prng_seed_state)
+    .execute(&pool)
+    .await
+    .expect_err("an off-roster Quirk must violate advisor_records_quirk_canon");
+    let db = err.as_database_error().unwrap_or_else(|| panic!("not a database error: {err}"));
+    assert_eq!(db.code().as_deref(), Some("23514"), "expected a check violation, got {err}");
+    assert_eq!(db.constraint(), Some("advisor_records_quirk_canon"));
+
+    clean_wallet_4g1(&pool, &wallet).await;
+}
+
+/// 7a-2 — deleting the campaign deletes its Advisors (`ON DELETE CASCADE`, ODQ-39 (g)).
+#[tokio::test]
+async fn advisor_records_cascade_with_their_campaign() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    let wallet = [31u8; 32];
+    clean_wallet_4g1(&pool, &wallet).await;
+    let campaign_id = seed_account_and_campaign(&pool, wallet, 0x7A23_i64).await;
+
+    let r = hand_built_advisor(wallet, campaign_id, "Director of Overland Logistics");
+    PostgresAdvisorRepository::new(pool.clone()).create_advisor(r.clone()).await.expect("create_advisor failed");
+    let count = |id: uuid::Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM advisor_records WHERE advisor_id = $1")
+                .bind(id).fetch_one(&pool).await.expect("count failed")
+        }
+    };
+    assert_eq!(count(r.advisor_id).await, 1);
+
+    sqlx::query("DELETE FROM campaign_instances WHERE campaign_id = $1")
+        .bind(campaign_id).execute(&pool).await.expect("campaign delete failed");
+    assert_eq!(count(r.advisor_id).await, 0, "the Advisor must go with its campaign");
 
     clean_wallet_4g1(&pool, &wallet).await;
 }

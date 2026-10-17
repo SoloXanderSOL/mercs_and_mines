@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO advisor_records (\n                advisor_id, campaign_id, player_wallet, name, rank,\n                origin, faction_bias, specialization, quirk, prng_seed_state\n            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Bytea",
+        "Text",
+        "Int2",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "bbdef786bd0d462cc78b10fc887f70779bb6ad19f4fc1e3e1eb207e97d44d290"
+}

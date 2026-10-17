@@ -3,6 +3,7 @@
 // This suppress is scoped to the repository module — remove once the types are fully wired up.
 #![allow(unused)]
 pub mod account;
+pub mod advisor;
 pub mod campaign;
 pub mod convoy;
 pub mod commander;
@@ -43,6 +44,7 @@ pub use commander::{
     STALE_DEPLOYMENT_AFTER,
 };
 pub use foreman::{ForemanRecord, ForemanRepository, InMemoryForemanRepository, PostgresForemanRepository};
+pub use advisor::{AdvisorRecord, AdvisorRepository, InMemoryAdvisorRepository, PostgresAdvisorRepository};
 pub use postgres_account::PostgresAccountRepository;
 pub use section::{
     InMemorySectionRepository, PostgresSectionRepository,
