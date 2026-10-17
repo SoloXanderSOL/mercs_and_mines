@@ -86,7 +86,8 @@ As of 2026-10-15:
   the route passes a ticker contribution of `0.0` until §2c. The mission response gains
   `commander: {kia, glorious}`. No input-log entry, no R7 bump. Test cleanup order:
   `card_mint_pending` → `deployment_records` → `section_records` → `commander_records` →
-  `foreman_records` (since 7a-1) → membership → `player_accounts`.
+  `foreman_records` (since 7a-1) → `advisor_records` (since 7a-2) → their campaigns →
+  membership → `player_accounts`. `clean_wallet_4g1` is list-driven over `ROSTER_TABLES`.
 - **Sections 5 and 6:** Not started.
 - **Sections 7 (Personnel Entity Model) and 8 (Combat Engine to canon):** created
   2026-10-13 (ruling D2); both run before Section 6. Strike Mining and Base Building moved
@@ -99,7 +100,19 @@ As of 2026-10-15:
   ODQ-38 numbers; the three shared flaws route through the Commander fns, F3), with no
   production caller. Migration `0022` adds `foreman_records`, with five roster CHECKs under the
   per-table guard `roster_checks_match_the_roster_both_ways`. `ForemanRepository` has Postgres
-  and in-memory impls and no `AppState` field (§5a adds it). Section 8 not started.
+  and in-memory impls and no `AppState` field (§5a adds it). **7a-2 complete (`0ceb184`,
+  `fdfe413`, `e88518f`, 2026-10-17; Advisors):** the dead Phase 0 `AdvisorBoard =
+  Vec<Commander>`, `retire_commander` and `COMMANDER_RETIRE_RANK` are deleted (retirement
+  freezes a Field Leader's own record; its brick adds its own constant). `sim_engine::roster`
+  gains `AdvisorSpecialization` (14) and `AdvisorQuirk` (12; identity only, GAP-64), plus
+  `AdvisorBoard` (3, derived by an exhaustive `board()`, never stored) and `GenericBoard`
+  (Mercenary/Mining, what a caller passes; `generic_pool` gives 4 and 7). The Research Board
+  is never rolled generically. `advisor_gen::generate_advisor(wallet, campaign, board, seed)`
+  makes seven draws (origin, spec, quirk, bias ×2, name ×2) with no band; rank 1, not rolled.
+  Migration `0023` adds `advisor_records` (one `name`, `prng_seed_state`, no `updated_at`,
+  four `_canon` CHECKs, campaign CASCADE). `AdvisorRepository` has Postgres and in-memory
+  impls, no `AppState` field and no production caller. No R7 bump. **Next: 7c-1 (crews);
+  7b-1 is also eligible.** Section 8 not started.
 - **INF-1 (infrastructure, GAP-37):** Complete — `tracing` subscriber installed, reward-mult
   config hardened, workspace version `0.2.0`.
 - **INF-2 (infrastructure, GAP-38):** Complete — idempotent `mercs_server::init_tracing()`
@@ -136,9 +149,10 @@ As of 2026-10-15:
   scenarios) and `shellcheck` run in the `deploy-script` job on every push, and the deploy
   job needs it (GAP-33).
 
-**239/239 tests green (112 `mercs_server` lib + 2 `aar_determinism` + 74 `db_infrastructure`
-+ 51 `sim_engine`; single-threaded, verified at `24e910c`). Workspace version `0.3.0`.
-Production = `cc272b1` (0.3.0, 4d-2); `.prev` = `0d93283`; `dev` is ahead with 7a-1,
+**249/249 tests green (117 `mercs_server` lib + 2 `aar_determinism` + 77 `db_infrastructure`
++ 53 `sim_engine`; single-threaded, verified at `e88518f`). Workspace version `0.3.0`.
+`.sqlx/` holds 63 files; the latest migration is `0023_advisor_records`.
+Production = `719c8ee` (0.3.0, 7a-1); `.prev` = `cc272b1`; `dev` is ahead with 7a-2,
 unpushed. Next: see the Phase 1 document.** Any brick that changes what `resolve_mission` produces for
 a given seed bumps the workspace version in the same brick. 4b-1 reused `sim-engine`'s `OutcomeType` rather than
 defining a new enum, and writes **no input-log entry** — the rank-up entry was removed
@@ -351,10 +365,10 @@ constraints — parallel execution causes FK-23503 failures that are not caused 
 code under test. Any test report produced without `--test-threads=1` is unreliable and
 must be re-run before reporting results to the Director.
 
-**Test wallets:** `tests/` uses wallet seeds 0–9, 13–19, 21–30 and 88, with 10–12 taken by
+**Test wallets:** `tests/` uses wallet seeds 0–9, 13–19, 21–31 and 88, with 10–12 taken by
 a range literal (`(10u8..=12)`). **20 is the auth tests' signing-key seed**
 (`SigningKey::from_bytes(&[20u8; 32])`). It is used in memory only, and its derived
-public key is not `[20u8; 32]`. The next free seed is **31**.
+public key is not `[20u8; 32]`. The next free seed is **32**.
 
 **Independent oracle:** A gate's expected value is never read from the code it checks. Pin
 it to a literal taken from canon or from a measurement made before the change (4d-2 N3: a
