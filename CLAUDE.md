@@ -169,10 +169,10 @@ As of 2026-10-17:
   scenarios) and `shellcheck` run in the `deploy-script` job on every push, and the deploy
   job needs it (GAP-33).
 
-**264/264 tests green (121 `mercs_server` lib + 2 `aar_determinism` + 88 `db_infrastructure`
-+ 53 `sim_engine`; single-threaded, verified at `64be6db`). Workspace version `0.3.0`.
-`.sqlx/` holds 66 files; the latest migration is `0025_section_records_owner_and_headcount`.
-Production = `2a4fcb3` (0.3.0, 7c-1); `.prev` = `f054caa`; `dev` is ahead with 7b-1,
+**283/283 tests green (1 `shared` + 123 `mercs_server` lib + 2 `aar_determinism` + 104
+`db_infrastructure` + 53 `sim_engine`; single-threaded, verified at `4abf451`). Workspace
+version `0.3.0`. `.sqlx/` holds 66 files; the latest migration is `0027_deployment_sections`.
+Production = `f7a1ff3` (0.3.0, 7b-1); `.prev` = `2a4fcb3`; `dev` is ahead with 7b-2,
 unpushed. Next: see the Phase 1 document.** Any brick that changes what `resolve_mission` produces for
 a given seed bumps the workspace version in the same brick. 4b-1 reused `sim-engine`'s `OutcomeType` rather than
 defining a new enum, and writes **no input-log entry** — the rank-up entry was removed
