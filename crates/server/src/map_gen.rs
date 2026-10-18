@@ -137,7 +137,8 @@ fn next_quadrant_clockwise(q: Quadrant) -> Quadrant {
     }
 }
 
-/// Assigns a gateway rim hex to each player. Solo players get a uniform random draw.
+/// Assigns a gateway rim hex to each player. Solo players get a uniform random draw (the
+/// shuffled rim order); past the rim's size, they round-robin over that same order.
 /// Charter groups are placed together in one quadrant with minimum 3-hex axial separation;
 /// overflow spills clockwise to the next quadrant.
 pub fn assign_gateway_hexes(
@@ -167,15 +168,7 @@ pub fn assign_gateway_hexes(
         rim_indices.swap(i, j);
     }
     for (slot, player) in solo_players.iter().enumerate() {
-        let idx = if slot < rim_indices.len() {
-            rim_indices[slot]
-        } else {
-            tracing::warn!(
-                "solo player count ({}) exceeds rim hex count ({}) — reusing slot 0",
-                solo_players.len(), rim.len()
-            );
-            rim_indices[0]
-        };
+        let idx = rim_indices[slot % rim_indices.len()];
         results.push(GatewayAssignment {
             wallet_address: player.wallet_address.clone(),
             q: rim[idx].0,
@@ -745,6 +738,35 @@ mod tests {
                 "assignment ({},{}) not in rim_hexes",
                 a.q, a.r
             );
+        }
+    }
+
+    #[test]
+    fn gateway_overflow_round_robins_over_the_rim() {
+        let safe_zone = test_safe_zone();
+        // Canon (GAP-70): 30 rim hexes at axial distance 5. Nothing below derives from len().
+        assert_eq!(safe_zone.rim_hexes.len(), 30);
+        let solo = |n: u8| -> Vec<PlayerSpawnRequest> {
+            (0..n).map(|i| PlayerSpawnRequest { wallet_address: vec![i], spawn_type: SpawnType::SoloQueue }).collect()
+        };
+
+        let big = assign_gateway_hexes(&safe_zone, &solo(65), &mut sim_engine::rng::Rng::new(42));
+        assert_eq!(big.len(), 65);
+        let mut counts: HashMap<(i32, i32), usize> = HashMap::new();
+        for a in &big {
+            *counts.entry((a.q, a.r)).or_default() += 1;
+        }
+        assert_eq!(counts.len(), 30, "every rim hex is used");
+        for (hex, n) in &counts {
+            assert!(*n == 2 || *n == 3, "hex {hex:?} holds {n}, expected 2 or 3");
+        }
+        assert_eq!(counts.values().filter(|n| **n == 3).count(), 5, "65 = 2*30 + 5");
+
+        let small = assign_gateway_hexes(&safe_zone, &solo(30), &mut sim_engine::rng::Rng::new(42));
+        assert_eq!(small.len(), 30);
+        for (s, b) in small.iter().zip(big.iter()) {
+            assert_eq!(s.wallet_address, b.wallet_address);
+            assert_eq!((s.q, s.r), (b.q, b.r), "unchanged at <=30 players");
         }
     }
 
