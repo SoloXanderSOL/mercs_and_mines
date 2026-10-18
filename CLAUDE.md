@@ -102,7 +102,20 @@ As of 2026-10-18:
   `CampaignRepository` return `RepositoryError`; `InitError::SqlxError` is gone (its sites
   use `InitError::RepositoryError`). `apply_ticker_delta` on an unknown campaign is
   `NotFound`. `InMemoryCampaignRepository` is still all `unimplemented!()` (5a-2 builds a
-  real one). **Next: 5a-1** (join schema, `0030`).
+  real one). **5a-1 complete (`96fb4ba`, `99f643e`, 2026-10-18; join schema):** migration
+  `0030` adds `acquired_via TEXT NOT NULL DEFAULT 'hired'` to commander/foreman/section/crew
+  records (`<t>_acquired_via_canon`: Commanders `starter|replacement|hired`, the rest
+  `starter|hired`; guard rows), `<t>_one_starter` partial uniques on `(campaign_id,
+  player_wallet) WHERE acquired_via = 'starter'`, and `<t>_membership_fkey` (`(campaign_id,
+  player_wallet) → player_campaign_membership`, `ON DELETE NO ACTION`) on those four and
+  `advisor_records`. `repository::AcquiredVia { Starter, Replacement, Hired }` is a `via`
+  parameter on the four `insert_*` helpers, never a struct field; every `create_*` passes
+  `Hired`, and nothing passes `Starter`/`Replacement` yet (5a-2/5a-4). GAP-61 step 1:
+  `require_grade` refuses `commander_grade: None` first in `insert_commander` and the in-memory
+  `create_commander`. A membership delete with roster rows left is now refused; a campaign
+  delete still cascades everything. `section_records_player_wallet_fkey` is shadowed by
+  membership's own account `RESTRICT` and can't be observed by name. Every Postgres roster
+  fixture writes a membership. **Next: 5a-2** (the join transaction).
 - **Section 6:** Not started.
 - **Sections 7 (Personnel Entity Model) and 8 (Combat Engine to canon):** created
   2026-10-13 (ruling D2); both run before Section 6. Strike Mining and Base Building moved
@@ -193,11 +206,11 @@ As of 2026-10-18:
   scenarios) and `shellcheck` run in the `deploy-script` job on every push, and the deploy
   job needs it (GAP-33).
 
-**318/318 tests green (1 `shared` + 129 `mercs_server` lib + 2 `aar_determinism` + 115
-`db_infrastructure` + 71 `sim_engine`; single-threaded, verified at `cef3ab2`). Workspace
-version `0.3.0`. `.sqlx/` holds 71 files; the latest migration is `0029_augmentee_records`.
-Production = `9194c0f` (0.3.0, 7d-1); `.prev` = `27f2598`; `dev` is ahead with INF-7 and
-5a-0, unpushed. Next: 5a-1; see the Phase 1 document.** Any brick that changes what `resolve_mission` produces for
+**330/330 tests green (1 `shared` + 129 `mercs_server` lib + 2 `aar_determinism` + 127
+`db_infrastructure` + 71 `sim_engine`; single-threaded, verified at `99f643e`). Workspace
+version `0.3.0`. `.sqlx/` holds 71 files; the latest migration is `0030_join_schema`.
+`main` = `698efb9` (INF-7 + 5a-0; CI Release run green 2026-10-18); `dev` is ahead with
+5a-1, unpushed. Next: 5a-2; see the Phase 1 document.** Any brick that changes what `resolve_mission` produces for
 a given seed bumps the workspace version in the same brick. 4b-1 reused `sim-engine`'s `OutcomeType` rather than
 defining a new enum, and writes **no input-log entry** — the rank-up entry was removed
 from scope. **ODQ-22 and ODQ-23 were ruled 2026-09-03 — engagement and mission outcomes
@@ -412,10 +425,16 @@ constraints — parallel execution causes FK-23503 failures that are not caused 
 code under test. Any test report produced without `--test-threads=1` is unreliable and
 must be re-run before reporting results to the Director.
 
-**Test wallets:** `tests/` uses wallet seeds 0–9, 13–19, 21–37 and 88, with 10–12 taken by
+**Test wallets:** `tests/` uses wallet seeds 0–9, 13–19, 21–41 and 88, with 10–12 taken by
 a range literal (`(10u8..=12)`). **20 is the auth tests' signing-key seed**
 (`SigningKey::from_bytes(&[20u8; 32])`). It is used in memory only, and its derived
-public key is not `[20u8; 32]`. The next free seed is **38**.
+public key is not `[20u8; 32]`. The next free seed is **42**.
+
+**Race tests:** Race tests force interleaving with a pause seam after the read, never a held
+lock alone: a held lock cannot make a remove-the-lock negative fail. Wait until B is parked
+at its own seam or shows `granted = false` in `pg_locks`; use a dedicated pool (≥ 3
+connections); and require every racer's result to be `Ok` where a unique constraint would
+otherwise hide the race.
 
 **Independent oracle:** A gate's expected value is never read from the code it checks. Pin
 it to a literal taken from canon or from a measurement made before the change (4d-2 N3: a
