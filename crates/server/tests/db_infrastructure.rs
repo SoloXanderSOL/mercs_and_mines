@@ -194,8 +194,8 @@ async fn commander_section_crud_is_correct() {
     // Pre-clean by wallet in FK order (F5): a campaign_id pre-clean is a no-op, since
     // the campaign above is brand new.
     // Sections left by a panicked run, reached through their owner column (GAP-63, 0025).
-    // Before 0025 they were reachable only through a live Commander, and
-    // section_records.commander_id is ON DELETE SET NULL, so a Section outlived the join.
+    // Before 0025 they were reachable only through a live Commander, whose link was
+    // ON DELETE SET NULL, so a Section outlived the join (0028 dropped that link).
     // Its owner is RESTRICT, so it must go before the player_accounts delete below.
     sqlx::query("DELETE FROM section_records WHERE player_wallet = $1")
         .bind(&[2u8; 32].to_vec()).execute(&pool).await.ok();
@@ -2461,8 +2461,7 @@ async fn convoy_timer_fires_and_marks_arrived() {
 
 /// The per-wallet roster tables, in cleanup order. Each has `player_wallet` and
 /// `campaign_id` columns; a new roster table adds itself here (Reviewer 7a-1 CF1).
-/// `section_records` (owner column since 7b-1, `0025`) goes before `commander_records`,
-/// because a Section references a Commander.
+/// `section_records` (owner column since 7b-1, `0025`) is listed first.
 const ROSTER_TABLES: [&str; 5] = ["section_records", "commander_records", "foreman_records", "advisor_records", "crew_records"];
 
 /// Removes everything a 4g-1 test wallet owns, in FK order: card_mint_pending →
