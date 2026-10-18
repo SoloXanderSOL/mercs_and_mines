@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO foreman_records (\n                foreman_id, campaign_id, player_wallet, name, rank, xp, stress,\n                origin, faction_bias, specialization, fatal_flaw, foreman_grade,\n                is_shattered, is_kia, prng_seed_state, acquired_via\n            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Bytea",
+        "Text",
+        "Int2",
+        "Int4",
+        "Int2",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Bool",
+        "Bool",
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c97e6fe210b0e1edce21f728d6c1c7cced5c73457d23a913f29625e6066951c5"
+}

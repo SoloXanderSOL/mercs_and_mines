@@ -6,7 +6,7 @@ use serde_json::Value as JsonValue;
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
-use super::RepositoryError;
+use super::{AcquiredVia, RepositoryError};
 
 // ── SectionRecord ────────────────────────────────────────────────────────────
 
@@ -55,15 +55,17 @@ impl PostgresSectionRepository {
 }
 
 /// The Section INSERT on a caller's connection (the join, 5a-2). No clamp: the CHECKs guard
-/// the row. The SQL literal is `create_section`'s, byte for byte (its `.sqlx/` name hashes it).
+/// the row. `via` is the row's provenance (`acquired_via`, 0030): `create_section` passes
+/// `Hired`.
 pub(crate) async fn insert_section(
     conn: &mut PgConnection,
     r: SectionRecord,
+    via: AcquiredVia,
 ) -> Result<(), RepositoryError> {
     sqlx::query!(
             r#"INSERT INTO section_records (
-                section_id, campaign_id, player_wallet, name, headcount, loadout, xp
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7)"#,
+                section_id, campaign_id, player_wallet, name, headcount, loadout, xp, acquired_via
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)"#,
         r.section_id,
         r.campaign_id,
         r.player_wallet,
@@ -71,6 +73,7 @@ pub(crate) async fn insert_section(
         r.headcount,
         r.loadout,
         r.xp,
+        via.as_str(),
     )
     .execute(&mut *conn)
     .await
@@ -83,7 +86,7 @@ impl SectionRepository for PostgresSectionRepository {
     async fn create_section(&self, r: SectionRecord) -> Result<(), RepositoryError> {
         let mut conn = self.pool.acquire().await
             .map_err(|e| RepositoryError::Internal(e.to_string()))?;
-        insert_section(&mut conn, r).await
+        insert_section(&mut conn, r, AcquiredVia::Hired).await
     }
 
     async fn get_section(&self, section_id: Uuid) -> Result<Option<SectionRecord>, RepositoryError> {

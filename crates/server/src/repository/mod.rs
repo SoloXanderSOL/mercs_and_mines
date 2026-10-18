@@ -75,6 +75,31 @@ pub use session::{
     SessionStateRepository,
 };
 
+/// The provenance of a roster row (`acquired_via`, migration `0030`; ruling S2): issued free
+/// at join, the alpha KIA replacement (Commanders only, ODQ-33), or hired. Written by the
+/// `insert_*` helpers and never stored on the record structs, so a generator roll stays
+/// provenance-free; the first brick that branches on it from a loaded record adds a field.
+/// No sim meaning and no serde. Mirrored by the `<t>_acquired_via_canon` CHECKs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcquiredVia {
+    Starter,
+    Replacement,
+    Hired,
+}
+
+impl AcquiredVia {
+    pub const ALL: [Self; 3] = [Self::Starter, Self::Replacement, Self::Hired];
+
+    /// The database string.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Starter => "starter",
+            Self::Replacement => "replacement",
+            Self::Hired => "hired",
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum RepositoryError {
     #[error("record not found")]

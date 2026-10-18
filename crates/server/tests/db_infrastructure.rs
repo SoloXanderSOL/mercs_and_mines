@@ -25,7 +25,7 @@ use mercs_server::repository::{
     AdvisorRecord, AdvisorRepository, PostgresAdvisorRepository,
     CrewRecord, CrewRepository, PostgresCrewRepository,
     AugmenteeOwner, AugmenteeRecord, AugmenteeRepository, PostgresAugmenteeRepository,
-    RepositoryError,
+    RepositoryError, AcquiredVia, InMemoryCommanderRepository,
 };
 use sim_engine::roster::{
     AdvisorQuirk, AdvisorSpecialization, Augment, AugmentCatalogue, CasualtyClass, CommanderFlaw,
@@ -3130,6 +3130,7 @@ fn roster_check_expectations() -> Vec<(&'static str, Vec<(&'static str, std::col
             ("commander_records_commander_grade_canon", strings(CommanderGrade::ALL.map(CommanderGrade::as_str))),
             ("commander_records_fatal_flaw_canon", strings(CommanderFlaw::ALL.map(CommanderFlaw::as_str))),
             ("commander_records_specialization_canon", strings(CommanderSpecialization::ALL.map(CommanderSpecialization::as_str))),
+            ("commander_records_acquired_via_canon", strings(AcquiredVia::ALL.map(AcquiredVia::as_str))),
         ]),
         ("foreman_records", vec![
             ("foreman_records_origin_canon", strings(CommanderOrigin::ALL.map(CommanderOrigin::as_str))),
@@ -3137,6 +3138,15 @@ fn roster_check_expectations() -> Vec<(&'static str, Vec<(&'static str, std::col
             ("foreman_records_specialization_canon", strings(ForemanSpecialization::ALL.map(ForemanSpecialization::as_str))),
             ("foreman_records_fatal_flaw_canon", strings(ForemanFlaw::ALL.map(ForemanFlaw::as_str))),
             ("foreman_records_foreman_grade_canon", strings(CommanderGrade::ALL.map(CommanderGrade::as_str))),
+            ("foreman_records_acquired_via_canon", strings(AcquiredVia::ALL.into_iter().filter(|v| *v != AcquiredVia::Replacement).map(AcquiredVia::as_str))),
+        ]),
+        // 5a-1 (0030): only Commanders can be a replacement (ODQ-33); the filter is this
+        // test's own oracle, not read from code.
+        ("section_records", vec![
+            ("section_records_acquired_via_canon", strings(AcquiredVia::ALL.into_iter().filter(|v| *v != AcquiredVia::Replacement).map(AcquiredVia::as_str))),
+        ]),
+        ("crew_records", vec![
+            ("crew_records_acquired_via_canon", strings(AcquiredVia::ALL.into_iter().filter(|v| *v != AcquiredVia::Replacement).map(AcquiredVia::as_str))),
         ]),
         ("advisor_records", vec![
             ("advisor_records_origin_canon", strings(CommanderOrigin::ALL.map(CommanderOrigin::as_str))),
@@ -5315,11 +5325,14 @@ async fn section_records_refuses_a_null_owner() {
     assert_eq!(stored, 0, "a refused section must not be written");
 }
 
-/// 7b-1 — a Section's owner blocks deleting the account (`ON DELETE RESTRICT`). The
-/// wallet's membership row also restricts, so it is deleted first and the constraint is
-/// asserted by name (spec-check trap T1).
+/// 7b-1, restated in 5a-1 — a member's Section blocks deleting that membership
+/// (`section_records_membership_fkey`, `0030`, `NO ACTION`). This test used to assert that
+/// the Section's owner FK (`section_records_player_wallet_fkey`, `RESTRICT`) blocks deleting
+/// the account. Since `0030` a Section implies a membership, and the membership's own account
+/// `RESTRICT` (`0007`) fires first, so that FK is defence in depth and can no longer be
+/// observed by name (5a-1 spec check E3).
 #[tokio::test]
-async fn section_owner_restricts_deleting_the_account() {
+async fn a_members_section_restricts_deleting_the_membership() {
     let pool = match test_pool().await {
         Some(p) => p,
         None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
@@ -5330,21 +5343,15 @@ async fn section_owner_restricts_deleting_the_account() {
         .create_section(owned_section(campaign_id, SECTION_WALLET.to_vec()))
         .await
         .expect("create_section failed");
-    sqlx::query("DELETE FROM player_campaign_membership WHERE wallet_address = $1")
-        .bind(SECTION_WALLET.to_vec()).execute(&pool).await.expect("membership delete failed");
 
-    let res = sqlx::query("DELETE FROM player_accounts WHERE wallet_address = $1")
+    let res = sqlx::query("DELETE FROM player_campaign_membership WHERE wallet_address = $1")
         .bind(SECTION_WALLET.to_vec())
         .execute(&pool)
         .await;
+    // The campaign delete cascades the Section and the membership together.
     clean_wallet_4g1(&pool, &SECTION_WALLET).await;
-    sqlx::query("DELETE FROM campaign_instances WHERE campaign_id = $1")
-        .bind(campaign_id).execute(&pool).await.expect("campaign cleanup failed");
 
-    let err = res.expect_err("an owned Section must block deleting its account");
-    let db = err.as_database_error().unwrap_or_else(|| panic!("not a database error: {err}"));
-    assert_eq!(db.code().as_deref(), Some("23503"), "expected a foreign-key violation, got {err}");
-    assert_eq!(db.constraint(), Some("section_records_player_wallet_fkey"));
+    assert_fk_violation(res, "section_records_membership_fkey");
 }
 
 // ── Brick 7b-2: per-mission Sections on deployment_sections (GAP-50, GAP-66) ─
@@ -6077,8 +6084,9 @@ async fn a_section_with_an_augmentee_cannot_be_deleted() {
     assert_fk_violation(res, "augmentee_records_section_fkey");
 }
 
-/// 7d-1 D11 — a campaign delete cascades through its Sections, Crews and augmentees. The
-/// membership row must go first (its campaign FK is not CASCADE): that is §4f's order.
+/// 7d-1 D11 — a campaign delete cascades through its Sections, Crews and augmentees, and
+/// (since 5a-1) through the membership that `0030`'s `NO ACTION` FKs tie them to: the
+/// campaign is deleted directly, and the check runs at the end of the statement.
 #[tokio::test]
 async fn a_campaign_delete_cascades_through_augmentees() {
     let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
@@ -6089,8 +6097,6 @@ async fn a_campaign_delete_cascades_through_augmentees() {
     let repo = PostgresAugmenteeRepository::new(pool.clone());
     let a = repo.create_augmentee(aug_record(campaign_id, AugmenteeOwner::Section(section), 1, Augment::IntegralGunArm)).await;
     let b = repo.create_augmentee(aug_record(campaign_id, AugmenteeOwner::Crew(crew), 1, Augment::GeophoneCochlea)).await;
-    let membership = sqlx::query("DELETE FROM player_campaign_membership WHERE campaign_id = $1")
-        .bind(campaign_id).execute(&pool).await;
     let deleted = sqlx::query("DELETE FROM campaign_instances WHERE campaign_id = $1")
         .bind(campaign_id).execute(&pool).await;
     let (left,): (i64,) = sqlx::query_as("SELECT count(*) FROM augmentee_records WHERE campaign_id = $1")
@@ -6099,7 +6105,251 @@ async fn a_campaign_delete_cascades_through_augmentees() {
 
     a.expect("create Section augmentee");
     b.expect("create Crew augmentee");
-    membership.expect("membership delete failed");
     assert_eq!(deleted.expect("the campaign delete must cascade").rows_affected(), 1);
     assert_eq!(left, 0, "the campaign's augmentees must cascade with it");
+}
+
+// ── Brick 5a-1: the join schema (0030) ───────────────────────────────────────
+
+/// The starter-index tests' wallet (one campaign per test).
+const STARTER_WALLET: [u8; 32] = [38u8; 32];
+/// The membership-FK tests' wallet (one campaign A per test, plus a campaign B it isn't in).
+const NON_MEMBER_WALLET: [u8; 32] = [39u8; 32];
+/// The Postgres missing-Grade test's wallet.
+const GRADE_WALLET: [u8; 32] = [40u8; 32];
+/// The duplicate-membership probe's wallet.
+const DUP_MEMBER_WALLET: [u8; 32] = [41u8; 32];
+
+/// Marks `first` then `second` as starters in `table` (keyed by `id_col`), with raw
+/// unchecked SQL (no `.sqlx` file). Returns the second UPDATE's result; the first must
+/// succeed, since one starter per (campaign, wallet) is allowed.
+async fn mark_two_starters(
+    pool: &sqlx::PgPool,
+    table: &str,
+    id_col: &str,
+    first: uuid::Uuid,
+    second: uuid::Uuid,
+) -> Result<sqlx::postgres::PgQueryResult, sqlx::Error> {
+    let sql = format!("UPDATE {table} SET acquired_via = 'starter' WHERE {id_col} = $1");
+    let one = sqlx::query(&sql).bind(first).execute(pool).await
+        .unwrap_or_else(|e| panic!("{table}: the first starter must be accepted: {e}"));
+    assert_eq!(one.rows_affected(), 1, "{table}: the first starter row must exist");
+    sqlx::query(&sql).bind(second).execute(pool).await
+}
+
+/// 5a-1 #1 — a second starter Commander for one (campaign, wallet) is refused.
+#[tokio::test]
+async fn second_starter_refused_commander() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    clean_wallet_4g1(&pool, &STARTER_WALLET).await;
+    let c = seed_account_and_campaign(&pool, STARTER_WALLET, 0x5A11_i64).await;
+    let a = pg_commander(&pool, STARTER_WALLET, c, 42).await;
+    let b = pg_commander(&pool, STARTER_WALLET, c, 43).await;
+    let res = mark_two_starters(&pool, "commander_records", "commander_id", a, b).await;
+    clean_wallet_4g1(&pool, &STARTER_WALLET).await;
+
+    assert_unique_violation(res, "commander_records_one_starter");
+}
+
+/// 5a-1 #2 — a second starter Foreman for one (campaign, wallet) is refused.
+#[tokio::test]
+async fn second_starter_refused_foreman() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    clean_wallet_4g1(&pool, &STARTER_WALLET).await;
+    let c = seed_account_and_campaign(&pool, STARTER_WALLET, 0x5A12_i64).await;
+    let repo = PostgresForemanRepository::new(pool.clone());
+    let a = hand_built_foreman(STARTER_WALLET, c);
+    let b = hand_built_foreman(STARTER_WALLET, c);
+    repo.create_foreman(a.clone()).await.expect("create_foreman a failed");
+    repo.create_foreman(b.clone()).await.expect("create_foreman b failed");
+    let res = mark_two_starters(&pool, "foreman_records", "foreman_id", a.foreman_id, b.foreman_id).await;
+    clean_wallet_4g1(&pool, &STARTER_WALLET).await;
+
+    assert_unique_violation(res, "foreman_records_one_starter");
+}
+
+/// 5a-1 #3 — a second starter Section for one (campaign, wallet) is refused.
+#[tokio::test]
+async fn second_starter_refused_section() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    clean_wallet_4g1(&pool, &STARTER_WALLET).await;
+    let c = seed_account_and_campaign(&pool, STARTER_WALLET, 0x5A13_i64).await;
+    let a = pg_section(&pool, STARTER_WALLET, c).await;
+    let b = pg_section(&pool, STARTER_WALLET, c).await;
+    let res = mark_two_starters(&pool, "section_records", "section_id", a, b).await;
+    clean_wallet_4g1(&pool, &STARTER_WALLET).await;
+
+    assert_unique_violation(res, "section_records_one_starter");
+}
+
+/// 5a-1 #4 — a second starter Crew for one (campaign, wallet) is refused.
+#[tokio::test]
+async fn second_starter_refused_crew() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    clean_wallet_4g1(&pool, &STARTER_WALLET).await;
+    let c = seed_account_and_campaign(&pool, STARTER_WALLET, 0x5A14_i64).await;
+    let a = aug_crew(&pool, STARTER_WALLET, c).await;
+    let b = aug_crew(&pool, STARTER_WALLET, c).await;
+    let res = mark_two_starters(&pool, "crew_records", "crew_id", a, b).await;
+    clean_wallet_4g1(&pool, &STARTER_WALLET).await;
+
+    assert_unique_violation(res, "crew_records_one_starter");
+}
+
+/// Moves `id` (a fresh row with no referrers, spec check E5) in `table` into a brand-new
+/// campaign B that the owner is not a member of, with raw unchecked SQL. Returns the
+/// UPDATE's result and B, which `clean_wallet_4g1` can't find, so the caller deletes it.
+async fn move_to_non_member_campaign(
+    pool: &sqlx::PgPool,
+    table: &str,
+    id_col: &str,
+    id: uuid::Uuid,
+    map_seed: i64,
+) -> (Result<sqlx::postgres::PgQueryResult, sqlx::Error>, uuid::Uuid) {
+    let b = PostgresCampaignRepository::new(pool.clone())
+        .create_campaign(&NewCampaignInstance { sector_id: uuid::Uuid::new_v4(), map_seed })
+        .await
+        .expect("create campaign B failed")
+        .campaign_id;
+    let res = sqlx::query(&format!("UPDATE {table} SET campaign_id = $1 WHERE {id_col} = $2"))
+        .bind(b).bind(id).execute(pool).await;
+    (res, b)
+}
+
+async fn delete_campaign(pool: &sqlx::PgPool, campaign_id: uuid::Uuid) {
+    sqlx::query("DELETE FROM campaign_instances WHERE campaign_id = $1")
+        .bind(campaign_id).execute(pool).await.expect("campaign B cleanup failed");
+}
+
+/// 5a-1 #5 — a Commander for a non-member of its campaign is refused.
+#[tokio::test]
+async fn non_member_row_refused_commander() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    clean_wallet_4g1(&pool, &NON_MEMBER_WALLET).await;
+    let a = seed_account_and_campaign(&pool, NON_MEMBER_WALLET, 0x5A15_i64).await;
+    let id = pg_commander(&pool, NON_MEMBER_WALLET, a, 42).await;
+    let (res, b) = move_to_non_member_campaign(&pool, "commander_records", "commander_id", id, 0x5A25_i64).await;
+    clean_wallet_4g1(&pool, &NON_MEMBER_WALLET).await;
+    delete_campaign(&pool, b).await;
+
+    assert_fk_violation(res, "commander_records_membership_fkey");
+}
+
+/// 5a-1 #6 — a Foreman for a non-member of its campaign is refused.
+#[tokio::test]
+async fn non_member_row_refused_foreman() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    clean_wallet_4g1(&pool, &NON_MEMBER_WALLET).await;
+    let a = seed_account_and_campaign(&pool, NON_MEMBER_WALLET, 0x5A16_i64).await;
+    let r = hand_built_foreman(NON_MEMBER_WALLET, a);
+    PostgresForemanRepository::new(pool.clone()).create_foreman(r.clone()).await.expect("create_foreman failed");
+    let (res, b) = move_to_non_member_campaign(&pool, "foreman_records", "foreman_id", r.foreman_id, 0x5A26_i64).await;
+    clean_wallet_4g1(&pool, &NON_MEMBER_WALLET).await;
+    delete_campaign(&pool, b).await;
+
+    assert_fk_violation(res, "foreman_records_membership_fkey");
+}
+
+/// 5a-1 #7 — a Section for a non-member of its campaign is refused.
+#[tokio::test]
+async fn non_member_row_refused_section() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    clean_wallet_4g1(&pool, &NON_MEMBER_WALLET).await;
+    let a = seed_account_and_campaign(&pool, NON_MEMBER_WALLET, 0x5A17_i64).await;
+    let id = pg_section(&pool, NON_MEMBER_WALLET, a).await;
+    let (res, b) = move_to_non_member_campaign(&pool, "section_records", "section_id", id, 0x5A27_i64).await;
+    clean_wallet_4g1(&pool, &NON_MEMBER_WALLET).await;
+    delete_campaign(&pool, b).await;
+
+    assert_fk_violation(res, "section_records_membership_fkey");
+}
+
+/// 5a-1 #8 — a Mining Crew for a non-member of its campaign is refused.
+#[tokio::test]
+async fn non_member_row_refused_crew() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    clean_wallet_4g1(&pool, &NON_MEMBER_WALLET).await;
+    let a = seed_account_and_campaign(&pool, NON_MEMBER_WALLET, 0x5A18_i64).await;
+    let id = aug_crew(&pool, NON_MEMBER_WALLET, a).await;
+    let (res, b) = move_to_non_member_campaign(&pool, "crew_records", "crew_id", id, 0x5A28_i64).await;
+    clean_wallet_4g1(&pool, &NON_MEMBER_WALLET).await;
+    delete_campaign(&pool, b).await;
+
+    assert_fk_violation(res, "crew_records_membership_fkey");
+}
+
+/// 5a-1 #9 — an Advisor for a non-member of its campaign is refused.
+#[tokio::test]
+async fn non_member_row_refused_advisor() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    clean_wallet_4g1(&pool, &NON_MEMBER_WALLET).await;
+    let a = seed_account_and_campaign(&pool, NON_MEMBER_WALLET, 0x5A19_i64).await;
+    let r = hand_built_advisor(NON_MEMBER_WALLET, a, "Director of Overland Logistics");
+    PostgresAdvisorRepository::new(pool.clone()).create_advisor(r.clone()).await.expect("create_advisor failed");
+    let (res, b) = move_to_non_member_campaign(&pool, "advisor_records", "advisor_id", r.advisor_id, 0x5A29_i64).await;
+    clean_wallet_4g1(&pool, &NON_MEMBER_WALLET).await;
+    delete_campaign(&pool, b).await;
+
+    assert_fk_violation(res, "advisor_records_membership_fkey");
+}
+
+/// A generated Commander for `wallet` in `campaign_id` with its Grade removed.
+fn gradeless_commander(wallet: [u8; 32], campaign_id: uuid::Uuid) -> CommanderRecord {
+    let mut r = mercs_server::commander_gen::generate_commander(wallet.to_vec(), campaign_id, 42);
+    assert!(r.commander_grade.is_some(), "the generator always grades; the test removes it");
+    r.commander_grade = None;
+    r
+}
+
+fn assert_grade_refused(res: Result<(), RepositoryError>) {
+    match res {
+        Err(RepositoryError::Internal(msg)) => assert!(
+            msg.contains("commander_grade is required"),
+            "unexpected refusal text: {msg}"
+        ),
+        other => panic!("a None Grade must be refused with Internal, got {other:?}"),
+    }
+}
+
+/// 5a-1 #10 (GAP-61 step 1) — Postgres refuses a Commander with no Grade, and writes nothing.
+/// The member pair satisfies the FK, so only the refusal can stop the insert.
+#[tokio::test]
+async fn create_commander_refuses_missing_grade_postgres() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    clean_wallet_4g1(&pool, &GRADE_WALLET).await;
+    let c = seed_account_and_campaign(&pool, GRADE_WALLET, 0x5A1A_i64).await;
+    let r = gradeless_commander(GRADE_WALLET, c);
+    let id = r.commander_id;
+    let res = PostgresCommanderRepository::new(pool.clone()).create_commander(r).await;
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM commander_records WHERE commander_id = $1")
+        .bind(id).fetch_one(&pool).await.expect("count failed");
+    clean_wallet_4g1(&pool, &GRADE_WALLET).await;
+
+    assert_grade_refused(res);
+    assert_eq!(rows, 0, "a refused Commander must not be written");
+}
+
+/// 5a-1 #11 (GAP-61 step 1) — the in-memory impl refuses a Commander with no Grade, and
+/// stores nothing.
+#[tokio::test]
+async fn create_commander_refuses_missing_grade_in_memory() {
+    let repo = InMemoryCommanderRepository::new();
+    let r = gradeless_commander(GRADE_WALLET, uuid::Uuid::new_v4());
+    let id = r.commander_id;
+    assert_grade_refused(repo.create_commander(r).await);
+    assert!(repo.get_commander(id).await.expect("get_commander failed").is_none(), "a refused Commander must not be stored");
+}
+
+/// 5a-1 #12 (Reviewer 5a-0 F2) — `RepositoryError` hides SQLSTATEs, so this raw probe pins
+/// that a duplicate membership is still the database's refusal, by name.
+#[tokio::test]
+async fn duplicate_membership_names_uq_player_campaign() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    clean_wallet_4g1(&pool, &DUP_MEMBER_WALLET).await;
+    let c = seed_account_and_campaign(&pool, DUP_MEMBER_WALLET, 0x5A1B_i64).await;
+    let res = sqlx::query("INSERT INTO player_campaign_membership (wallet_address, campaign_id) VALUES ($1, $2)")
+        .bind(DUP_MEMBER_WALLET.to_vec()).bind(c).execute(&pool).await;
+    clean_wallet_4g1(&pool, &DUP_MEMBER_WALLET).await;
+
+    assert_unique_violation(res, "uq_player_campaign");
 }

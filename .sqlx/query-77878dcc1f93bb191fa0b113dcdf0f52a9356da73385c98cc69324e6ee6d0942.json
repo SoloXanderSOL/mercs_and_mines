@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO section_records (\n                section_id, campaign_id, player_wallet, name, headcount, loadout, xp, acquired_via\n            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Bytea",
+        "Text",
+        "Int2",
+        "Jsonb",
+        "Int4",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "77878dcc1f93bb191fa0b113dcdf0f52a9356da73385c98cc69324e6ee6d0942"
+}

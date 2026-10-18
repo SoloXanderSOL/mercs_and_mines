@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO crew_records (\n                crew_id, campaign_id, player_wallet, headcount, xp, morale, acquired_via\n            ) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Bytea",
+        "Int2",
+        "Int4",
+        "Int2",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e28c34ff071109dab250d86338349458d1bfc082b09879ed147a2e23278989c5"
+}

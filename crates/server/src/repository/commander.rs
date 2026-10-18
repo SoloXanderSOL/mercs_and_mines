@@ -12,7 +12,7 @@ use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 use crate::commander_gen::{is_glorious_death, GloriousDeathCriteria};
 use uuid::Uuid;
 
-use super::RepositoryError;
+use super::{AcquiredVia, RepositoryError};
 
 /// Converts the SMALLINT `stress` column to the sim's u8 stress level. Migration 0016's
 /// `CHECK (stress BETWEEN 0 AND 100)` and `create_commander`'s clamp keep stored values in
@@ -117,6 +117,16 @@ pub(super) fn clamp_new_record(mut r: CommanderRecord) -> CommanderRecord {
     r.stress = r.stress.clamp(0, 100);
     r.is_shattered = r.is_shattered || r.stress >= 100;
     r
+}
+
+/// GAP-61 step 1: a new Commander must carry its Grade, so no binary that is the rollback
+/// target once §5b's `SET NOT NULL` lands can write a NULL. Both impls call it first,
+/// before the clamp and any write.
+pub(super) fn require_grade(r: &CommanderRecord) -> Result<(), RepositoryError> {
+    if r.commander_grade.is_none() {
+        return Err(RepositoryError::Internal("create_commander: commander_grade is required".into()));
+    }
+    Ok(())
 }
 
 // ── Deployment records (brick 4g-1) ──────────────────────────────────────────
@@ -370,19 +380,21 @@ async fn mark_commander_kia(
 }
 
 /// The Commander INSERT on a caller's connection, so the join (5a-2) can run it inside its
-/// own transaction. The clamp lives here, so no caller can skip it. The SQL literal is
-/// `create_commander`'s, byte for byte (its `.sqlx/` file name hashes the text).
+/// own transaction. The Grade refusal and the clamp live here, so no caller can skip them.
+/// `via` is the row's provenance (`acquired_via`, 0030): `create_commander` passes `Hired`.
 pub(crate) async fn insert_commander(
     conn: &mut PgConnection,
     r: CommanderRecord,
+    via: AcquiredVia,
 ) -> Result<(), RepositoryError> {
+    require_grade(&r)?;
     let r = clamp_new_record(r);
     sqlx::query!(
             r#"INSERT INTO commander_records (
                 commander_id, campaign_id, player_wallet, name, rank, xp, stress,
                 origin, faction_bias, specialization, fatal_flaw, veteran_trait,
-                is_shattered, is_kia, prng_seed_state, commander_grade
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)"#,
+                is_shattered, is_kia, prng_seed_state, commander_grade, acquired_via
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)"#,
         r.commander_id,
         r.campaign_id,
         r.player_wallet,
@@ -399,6 +411,7 @@ pub(crate) async fn insert_commander(
         r.is_kia,
         r.prng_seed_state,
         r.commander_grade,
+        via.as_str(),
     )
     .execute(&mut *conn)
     .await
@@ -411,7 +424,7 @@ impl CommanderRepository for PostgresCommanderRepository {
     async fn create_commander(&self, r: CommanderRecord) -> Result<(), RepositoryError> {
         let mut conn = self.pool.acquire().await
             .map_err(|e| RepositoryError::Internal(e.to_string()))?;
-        insert_commander(&mut conn, r).await
+        insert_commander(&mut conn, r, AcquiredVia::Hired).await
     }
 
     async fn get_commander(&self, commander_id: Uuid) -> Result<Option<CommanderRecord>, RepositoryError> {
@@ -808,6 +821,7 @@ impl Default for InMemoryCommanderRepository {
 #[async_trait]
 impl CommanderRepository for InMemoryCommanderRepository {
     async fn create_commander(&self, record: CommanderRecord) -> Result<(), RepositoryError> {
+        require_grade(&record)?;
         let record = clamp_new_record(record);
         self.store.insert(record.commander_id, record);
         Ok(())

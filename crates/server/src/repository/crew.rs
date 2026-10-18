@@ -4,7 +4,7 @@ use dashmap::DashMap;
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
-use super::RepositoryError;
+use super::{AcquiredVia, RepositoryError};
 
 // ── CrewRecord (brick 7c-1) ──────────────────────────────────────────────────
 
@@ -71,22 +71,24 @@ impl PostgresCrewRepository {
 }
 
 /// The Crew INSERT on a caller's connection (the join, 5a-2), with the morale clamp inside it.
-/// The SQL literal is `create_crew`'s, byte for byte (its `.sqlx/` name hashes the text).
+/// `via` is the row's provenance (`acquired_via`, 0030): `create_crew` passes `Hired`.
 pub(crate) async fn insert_crew(
     conn: &mut PgConnection,
     record: CrewRecord,
+    via: AcquiredVia,
 ) -> Result<(), RepositoryError> {
     let record = clamp_new_record(record);
     sqlx::query!(
             r#"INSERT INTO crew_records (
-                crew_id, campaign_id, player_wallet, headcount, xp, morale
-            ) VALUES ($1,$2,$3,$4,$5,$6)"#,
+                crew_id, campaign_id, player_wallet, headcount, xp, morale, acquired_via
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7)"#,
         record.crew_id,
         record.campaign_id,
         record.player_wallet,
         record.headcount,
         record.xp,
         record.morale,
+        via.as_str(),
     )
     .execute(&mut *conn)
     .await
@@ -99,7 +101,7 @@ impl CrewRepository for PostgresCrewRepository {
     async fn create_crew(&self, record: CrewRecord) -> Result<(), RepositoryError> {
         let mut conn = self.pool.acquire().await
             .map_err(|e| RepositoryError::Internal(e.to_string()))?;
-        insert_crew(&mut conn, record).await
+        insert_crew(&mut conn, record, AcquiredVia::Hired).await
     }
 
     async fn get_crew(&self, crew_id: Uuid) -> Result<Option<CrewRecord>, RepositoryError> {

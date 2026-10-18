@@ -4,7 +4,7 @@ use dashmap::DashMap;
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
-use super::RepositoryError;
+use super::{AcquiredVia, RepositoryError};
 
 // ── ForemanRecord (brick 7a-1) ───────────────────────────────────────────────
 
@@ -68,18 +68,19 @@ impl PostgresForemanRepository {
 }
 
 /// The Foreman INSERT on a caller's connection (the join, 5a-2), with the clamp inside it.
-/// The SQL literal is `create_foreman`'s, byte for byte (its `.sqlx/` name hashes the text).
+/// `via` is the row's provenance (`acquired_via`, 0030): `create_foreman` passes `Hired`.
 pub(crate) async fn insert_foreman(
     conn: &mut PgConnection,
     r: ForemanRecord,
+    via: AcquiredVia,
 ) -> Result<(), RepositoryError> {
     let r = clamp_new_record(r);
     sqlx::query!(
             r#"INSERT INTO foreman_records (
                 foreman_id, campaign_id, player_wallet, name, rank, xp, stress,
                 origin, faction_bias, specialization, fatal_flaw, foreman_grade,
-                is_shattered, is_kia, prng_seed_state
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)"#,
+                is_shattered, is_kia, prng_seed_state, acquired_via
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)"#,
         r.foreman_id,
         r.campaign_id,
         r.player_wallet,
@@ -95,6 +96,7 @@ pub(crate) async fn insert_foreman(
         r.is_shattered,
         r.is_kia,
         r.prng_seed_state,
+        via.as_str(),
     )
     .execute(&mut *conn)
     .await
@@ -107,7 +109,7 @@ impl ForemanRepository for PostgresForemanRepository {
     async fn create_foreman(&self, r: ForemanRecord) -> Result<(), RepositoryError> {
         let mut conn = self.pool.acquire().await
             .map_err(|e| RepositoryError::Internal(e.to_string()))?;
-        insert_foreman(&mut conn, r).await
+        insert_foreman(&mut conn, r, AcquiredVia::Hired).await
     }
 
     async fn get_foreman(&self, foreman_id: Uuid) -> Result<Option<ForemanRecord>, RepositoryError> {
