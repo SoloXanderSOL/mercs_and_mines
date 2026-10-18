@@ -222,6 +222,11 @@ async fn commander_section_crud_is_correct() {
     .execute(&pool)
     .await
     .expect("player_accounts FK seed failed");
+    // 5a-1 (0030): a roster row needs its owner's membership of the campaign.
+    PostgresMembershipRepository::new(pool.clone())
+        .add_member(&wallet_bytes, campaign_id, None, None)
+        .await
+        .expect("membership seed failed");
 
     // 2. Create a CommanderRecord.
     commander_repo.create_commander(CommanderRecord {
@@ -1005,6 +1010,11 @@ async fn commander_generate_and_persist() {
     .execute(&pool)
     .await
     .expect("player_accounts FK seed failed");
+    // 5a-1 (0030): a roster row needs its owner's membership of the campaign.
+    PostgresMembershipRepository::new(pool.clone())
+        .add_member(&wallet_bytes, campaign_id, None, None)
+        .await
+        .expect("membership seed failed");
 
     // 2. Generate a commander deterministically.
     let record = mercs_server::commander_gen::generate_commander(
@@ -1095,6 +1105,11 @@ async fn apply_mission_xp_persists_rank_and_xp() {
     .execute(&pool)
     .await
     .expect("player_accounts FK seed failed");
+    // 5a-1 (0030): a roster row needs its owner's membership of the campaign.
+    PostgresMembershipRepository::new(pool.clone())
+        .add_member(&wallet_bytes, campaign_id, None, None)
+        .await
+        .expect("membership seed failed");
 
     // 2. Generate a commander sitting just below the rank-2 threshold.
     let mut record = mercs_server::commander_gen::generate_commander(
@@ -1168,6 +1183,11 @@ async fn commander_stress_wrapper_shatters_in_one_write() {
     .execute(&pool)
     .await
     .expect("player_accounts FK seed failed");
+    // 5a-1 (0030): a roster row needs its owner's membership of the campaign.
+    PostgresMembershipRepository::new(pool.clone())
+        .add_member(&wallet_bytes, campaign_id, None, None)
+        .await
+        .expect("membership seed failed");
 
     let record = mercs_server::commander_gen::generate_commander(
         wallet_bytes.clone(),
@@ -2509,30 +2529,20 @@ async fn clean_wallet_4g1(pool: &sqlx::PgPool, wallet: &[u8]) {
         .bind(wallet).execute(pool).await.ok();
 }
 
-/// Pre-cleans `wallet`, then seeds its account, a campaign and one generated Commander
-/// at the given stress. Returns (campaign_id, commander_id).
+/// Pre-cleans `wallet`, then seeds its account, a campaign, its membership (5a-1: `0030`'s
+/// FK needs it, and `clean_wallet_4g1` then finds the campaign even with no Commander left)
+/// and one generated Commander at the given stress. Returns (campaign_id, commander_id).
 async fn seed_commander_4g1(pool: &sqlx::PgPool, wallet: [u8; 32], stress: i16) -> (uuid::Uuid, uuid::Uuid) {
     clean_wallet_4g1(pool, &wallet).await;
-    sqlx::query(
-        "INSERT INTO player_accounts (wallet_address, trust_standing, gcn_balance)
-         VALUES ($1, 0, 0) ON CONFLICT (wallet_address) DO NOTHING"
-    )
-    .bind(wallet.to_vec())
-    .execute(pool)
-    .await
-    .expect("player_accounts FK seed failed");
-    let campaign = PostgresCampaignRepository::new(pool.clone())
-        .create_campaign(&NewCampaignInstance { sector_id: uuid::Uuid::new_v4(), map_seed: 0x4601_i64 })
-        .await
-        .expect("create campaign failed");
-    let mut record = mercs_server::commander_gen::generate_commander(wallet.to_vec(), campaign.campaign_id, 42u32);
+    let campaign_id = seed_account_and_campaign(pool, wallet, 0x4601_i64).await;
+    let mut record = mercs_server::commander_gen::generate_commander(wallet.to_vec(), campaign_id, 42u32);
     record.stress = stress;
     let commander_id = record.commander_id;
     PostgresCommanderRepository::new(pool.clone())
         .create_commander(record)
         .await
         .expect("create_commander failed");
-    (campaign.campaign_id, commander_id)
+    (campaign_id, commander_id)
 }
 
 fn new_deployment_4g1(commander_id: uuid::Uuid, started_at: chrono::DateTime<chrono::Utc>) -> NewDeployment {
@@ -3210,19 +3220,7 @@ async fn test_commander_grade_round_trips() {
     assert_eq!(tqs, 30);
     assert_eq!(CommanderGrade::from_tqs(tqs), CommanderGrade::StandardIssue, "the fixture must stay sharp");
 
-    sqlx::query(
-        "INSERT INTO player_accounts (wallet_address, trust_standing, gcn_balance)
-         VALUES ($1, 0, 0) ON CONFLICT (wallet_address) DO NOTHING"
-    )
-    .bind(wallet.to_vec())
-    .execute(&pool)
-    .await
-    .expect("player_accounts FK seed failed");
-    let campaign_id = PostgresCampaignRepository::new(pool.clone())
-        .create_campaign(&NewCampaignInstance { sector_id: uuid::Uuid::new_v4(), map_seed: 0x4D02_i64 })
-        .await
-        .expect("create campaign failed")
-        .campaign_id;
+    let campaign_id = seed_account_and_campaign(&pool, wallet, 0x4D02_i64).await;
     let commander_id = uuid::Uuid::new_v4();
     let repo = PostgresCommanderRepository::new(pool.clone());
     repo.create_commander(CommanderRecord {
@@ -5561,6 +5559,11 @@ async fn fk_fixture(pool: &sqlx::PgPool) -> FkFixture {
     let dep = pg_deployment(a, c1, vec![], chrono::Utc::now());
     let started = PostgresCommanderRepository::new(pool.clone()).start_deployment(&dep).await.expect("start_deployment failed");
     assert_eq!(started, DeploymentStart::Started);
+    // 5a-1 (0030): wallet 35's Section in c1 needs wallet 35's membership of c1.
+    PostgresMembershipRepository::new(pool.clone())
+        .add_member(&OTHER_WALLET, c1, None, None)
+        .await
+        .expect("membership seed failed");
     FkFixture {
         c1, a, a2, d: dep.deployment_id,
         s34: pg_section(pool, DEPLOY_WALLET, c1).await,
