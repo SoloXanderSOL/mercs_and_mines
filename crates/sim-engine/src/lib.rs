@@ -20,5 +20,6 @@ pub mod fatal_flaw;
 pub mod foreman_flaw;
 pub mod roster;
 pub mod grade;
+pub mod casualty;
 
 pub use game_types::UnitArchetype;

@@ -276,6 +276,74 @@ pub const fn generic_pool(board: GenericBoard) -> &'static [AdvisorSpecializatio
     }
 }
 
+roster_enum! {
+    /// A Bespoke Augment SKU (Bespoke_Augmentation_System §6–7, brick 7d-1): the 8 combat
+    /// SKUs, then the 3 industrial ones. Mirrored by `0029`'s two `*_augment_canon` CHECKs,
+    /// split by `Augment::catalogue`.
+    Augment, 11 {
+        IntegralGunArm              => "Integral Gun-Arm",
+        ThermalLanceArm             => "Thermal Lance-Arm",
+        CoherentLightOculars        => "Coherent-Light Oculars",
+        CortexIntrusionJack         => "Cortex Intrusion Jack",
+        MyomerBundleArms            => "Myomer-Bundle Arms",
+        ArrestorCoilLegs            => "Arrestor-Coil Legs",
+        DopplerCochlea              => "Doppler Cochlea",
+        GloomSightOcularsTactical   => "Gloom-Sight Oculars (Tactical)",
+        GeophoneCochlea             => "Geophone Cochlea",
+        GloomSightOcularsIndustrial => "Gloom-Sight Oculars (Industrial)",
+        LoadBearerFrame             => "Load-Bearer Frame",
+    }
+}
+
+roster_enum! {
+    /// Who fitted an augment (Bespoke §2): Church ×1.0, secular ×0.5 on the VC#6 ticker.
+    /// Permanent; mirrored by `0029`'s `augmentee_records_fitting_source_canon`.
+    FittingSource, 2 {
+        Church  => "Church",
+        Secular => "Secular",
+    }
+}
+
+roster_enum! {
+    /// A named individual's persisted fate (Casualties_Reinforcements_and_Veterancy §6;
+    /// 7d-1 D1). A persistence level, not the sim's `UnitStatus`: `Deserted` is
+    /// campaign-layer and never comes out of a battle. Mirrored by `0029`'s
+    /// `augmentee_records_casualty_class_canon`.
+    CasualtyClass, 4 {
+        Kia      => "KIA",
+        Wounded  => "Wounded",
+        Mia      => "MIA",
+        Deserted => "Deserted",
+    }
+}
+
+/// Which catalogue an `Augment` belongs to (Bespoke §2, division of labour): combat SKUs
+/// fit Section members, industrial ones fit Mining Crew members. Derived, never stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AugmentCatalogue {
+    Combat,
+    Industrial,
+}
+
+impl Augment {
+    /// The catalogue this SKU is sold from (Bespoke §6 combat, §7 industrial).
+    pub fn catalogue(self) -> AugmentCatalogue {
+        match self {
+            Self::IntegralGunArm
+            | Self::ThermalLanceArm
+            | Self::CoherentLightOculars
+            | Self::CortexIntrusionJack
+            | Self::MyomerBundleArms
+            | Self::ArrestorCoilLegs
+            | Self::DopplerCochlea
+            | Self::GloomSightOcularsTactical => AugmentCatalogue::Combat,
+            Self::GeophoneCochlea
+            | Self::GloomSightOcularsIndustrial
+            | Self::LoadBearerFrame => AugmentCatalogue::Industrial,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
