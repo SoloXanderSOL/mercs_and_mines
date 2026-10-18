@@ -25,7 +25,6 @@ pub enum InitError {
     WasAlreadyActive,
     GatewayAssignmentFailed,
     RepositoryError(RepositoryError),
-    SqlxError(sqlx::Error),
 }
 
 pub async fn initialize_campaign(
@@ -37,7 +36,7 @@ pub async fn initialize_campaign(
 ) -> Result<(), InitError> {
     // 3.1 — load and validate campaign state
     let campaign = campaign_repo.get_campaign(campaign_id).await
-        .map_err(InitError::SqlxError)?
+        .map_err(InitError::RepositoryError)?
         .ok_or(InitError::CampaignNotFound)?;
 
     if campaign.state != CampaignLifecycle::Pending {
@@ -52,7 +51,7 @@ pub async fn initialize_campaign(
 
     // 3.4 — load members; guard against empty campaign
     let members = membership_repo.list_members_by_campaign(campaign_id).await
-        .map_err(InitError::SqlxError)?;
+        .map_err(InitError::RepositoryError)?;
 
     if members.is_empty() {
         return Err(InitError::NoMembersFound);
@@ -85,7 +84,7 @@ pub async fn initialize_campaign(
     let ends_at = Utc::now() + Duration::days(90);
 
     let activated = campaign_repo.activate_campaign(campaign_id, ends_at, initial_tickers).await
-        .map_err(InitError::SqlxError)?;
+        .map_err(InitError::RepositoryError)?;
 
     if !activated {
         return Err(InitError::WasAlreadyActive);
@@ -113,7 +112,7 @@ pub async fn initialize_campaign(
             campaign_id,
             assignment.q,
             assignment.r,
-        ).await.map_err(InitError::SqlxError)?;
+        ).await.map_err(InitError::RepositoryError)?;
     }
 
     // 3.10 — append campaign_started input log entry

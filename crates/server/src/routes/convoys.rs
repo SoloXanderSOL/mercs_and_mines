@@ -200,22 +200,22 @@ mod tests {
 
     #[async_trait::async_trait]
     impl CampaignRepository for OneCampaign {
-        async fn create_campaign(&self, _: &NewCampaignInstance) -> Result<CampaignInstance, sqlx::Error> {
+        async fn create_campaign(&self, _: &NewCampaignInstance) -> Result<CampaignInstance, RepositoryError> {
             unimplemented!()
         }
-        async fn get_campaign(&self, id: Uuid) -> Result<Option<CampaignInstance>, sqlx::Error> {
+        async fn get_campaign(&self, id: Uuid) -> Result<Option<CampaignInstance>, RepositoryError> {
             Ok((id == self.0.campaign_id).then(|| self.0.clone()))
         }
-        async fn update_sector_state(&self, _: Uuid, _: CampaignLifecycle) -> Result<(), sqlx::Error> {
+        async fn update_sector_state(&self, _: Uuid, _: CampaignLifecycle) -> Result<(), RepositoryError> {
             unimplemented!()
         }
-        async fn apply_ticker_delta(&self, _: Uuid, _: VictoryTickerType, _: f64) -> Result<f64, sqlx::Error> {
+        async fn apply_ticker_delta(&self, _: Uuid, _: VictoryTickerType, _: f64) -> Result<f64, RepositoryError> {
             unimplemented!()
         }
-        async fn list_campaigns_by_state(&self, _: CampaignLifecycle) -> Result<Vec<CampaignInstance>, sqlx::Error> {
+        async fn list_campaigns_by_state(&self, _: CampaignLifecycle) -> Result<Vec<CampaignInstance>, RepositoryError> {
             unimplemented!()
         }
-        async fn activate_campaign(&self, _: Uuid, _: DateTime<Utc>, _: serde_json::Value) -> Result<bool, sqlx::Error> {
+        async fn activate_campaign(&self, _: Uuid, _: DateTime<Utc>, _: serde_json::Value) -> Result<bool, RepositoryError> {
             unimplemented!()
         }
     }

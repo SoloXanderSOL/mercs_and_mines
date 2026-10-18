@@ -6,8 +6,10 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use serde_json::Value as JsonValue;
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
+
+use super::RepositoryError;
 
 // ── Campaign lifecycle state ─────────────────────────────────────────────────
 
@@ -105,20 +107,20 @@ pub trait CampaignRepository: Send + Sync {
     async fn create_campaign(
         &self,
         params: &NewCampaignInstance,
-    ) -> Result<CampaignInstance, sqlx::Error>;
+    ) -> Result<CampaignInstance, RepositoryError>;
 
     /// Look up a campaign by primary key.
     async fn get_campaign(
         &self,
         campaign_id: Uuid,
-    ) -> Result<Option<CampaignInstance>, sqlx::Error>;
+    ) -> Result<Option<CampaignInstance>, RepositoryError>;
 
     /// Transition the campaign's lifecycle state. Updates `updated_at`. Idempotent.
     async fn update_sector_state(
         &self,
         campaign_id: Uuid,
         new_state: CampaignLifecycle,
-    ) -> Result<(), sqlx::Error>;
+    ) -> Result<(), RepositoryError>;
 
     /// Add `delta` to one victory ticker, clamping the result to [0.0, 100.0].
     /// Treats a missing key as 0.0 on first write.
@@ -128,13 +130,13 @@ pub trait CampaignRepository: Send + Sync {
         campaign_id: Uuid,
         ticker: VictoryTickerType,
         delta: f64,
-    ) -> Result<f64, sqlx::Error>;
+    ) -> Result<f64, RepositoryError>;
 
     /// All campaigns currently in the given lifecycle state.
     async fn list_campaigns_by_state(
         &self,
         state: CampaignLifecycle,
-    ) -> Result<Vec<CampaignInstance>, sqlx::Error>;
+    ) -> Result<Vec<CampaignInstance>, RepositoryError>;
 
     /// Transition a Pending campaign to Active, setting ends_at and initializing victory_tickers.
     /// Returns true if the campaign was just activated (1 row updated), false if it was already
@@ -144,7 +146,7 @@ pub trait CampaignRepository: Send + Sync {
         campaign_id: Uuid,
         ends_at: DateTime<Utc>,
         victory_tickers: serde_json::Value,
-    ) -> Result<bool, sqlx::Error>;
+    ) -> Result<bool, RepositoryError>;
 }
 
 // ── Postgres implementation ──────────────────────────────────────────────────
@@ -159,13 +161,13 @@ impl PostgresCampaignRepository {
     }
 }
 
-#[async_trait]
-impl CampaignRepository for PostgresCampaignRepository {
-    async fn create_campaign(
-        &self,
-        params: &NewCampaignInstance,
-    ) -> Result<CampaignInstance, sqlx::Error> {
-        sqlx::query_as!(
+/// The campaign INSERT on a caller's connection (the join, 5a-2). The SQL literal is
+/// `create_campaign`'s, byte for byte (its `.sqlx/` name hashes the text).
+pub(crate) async fn insert_campaign(
+    conn: &mut PgConnection,
+    params: &NewCampaignInstance,
+) -> Result<CampaignInstance, RepositoryError> {
+    sqlx::query_as!(
             CampaignInstance,
             r#"INSERT INTO campaign_instances (sector_id, map_seed)
                VALUES ($1, $2)
@@ -179,17 +181,29 @@ impl CampaignRepository for PostgresCampaignRepository {
                    ends_at,
                    created_at,
                    updated_at"#,
-            params.sector_id,
-            params.map_seed
-        )
-        .fetch_one(&self.pool)
-        .await
+        params.sector_id,
+        params.map_seed
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|e| RepositoryError::Internal(e.to_string()))
+}
+
+#[async_trait]
+impl CampaignRepository for PostgresCampaignRepository {
+    async fn create_campaign(
+        &self,
+        params: &NewCampaignInstance,
+    ) -> Result<CampaignInstance, RepositoryError> {
+        let mut conn = self.pool.acquire().await
+            .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        insert_campaign(&mut conn, params).await
     }
 
     async fn get_campaign(
         &self,
         campaign_id: Uuid,
-    ) -> Result<Option<CampaignInstance>, sqlx::Error> {
+    ) -> Result<Option<CampaignInstance>, RepositoryError> {
         sqlx::query_as!(
             CampaignInstance,
             r#"SELECT
@@ -208,20 +222,22 @@ impl CampaignRepository for PostgresCampaignRepository {
         )
         .fetch_optional(&self.pool)
         .await
+        .map_err(|e| RepositoryError::Internal(e.to_string()))
     }
 
     async fn update_sector_state(
         &self,
         campaign_id: Uuid,
         new_state: CampaignLifecycle,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<(), RepositoryError> {
         sqlx::query!(
             "UPDATE campaign_instances SET state = $1, updated_at = now() WHERE campaign_id = $2",
             new_state as CampaignLifecycle,
             campaign_id
         )
         .execute(&self.pool)
-        .await?;
+        .await
+        .map_err(|e| RepositoryError::Internal(e.to_string()))?;
         Ok(())
     }
 
@@ -230,7 +246,7 @@ impl CampaignRepository for PostgresCampaignRepository {
         campaign_id: Uuid,
         ticker: VictoryTickerType,
         delta: f64,
-    ) -> Result<f64, sqlx::Error> {
+    ) -> Result<f64, RepositoryError> {
         let key = ticker.as_json_key();
 
         // Read the current tickers value.
@@ -238,8 +254,10 @@ impl CampaignRepository for PostgresCampaignRepository {
             "SELECT victory_tickers FROM campaign_instances WHERE campaign_id = $1",
             campaign_id
         )
-        .fetch_one(&self.pool)
-        .await?;
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Internal(e.to_string()))?
+        .ok_or(RepositoryError::NotFound)?;
 
         let current = row
             .victory_tickers
@@ -262,7 +280,8 @@ impl CampaignRepository for PostgresCampaignRepository {
             campaign_id
         )
         .execute(&self.pool)
-        .await?;
+        .await
+        .map_err(|e| RepositoryError::Internal(e.to_string()))?;
 
         Ok(new_value)
     }
@@ -270,7 +289,7 @@ impl CampaignRepository for PostgresCampaignRepository {
     async fn list_campaigns_by_state(
         &self,
         state: CampaignLifecycle,
-    ) -> Result<Vec<CampaignInstance>, sqlx::Error> {
+    ) -> Result<Vec<CampaignInstance>, RepositoryError> {
         sqlx::query_as!(
             CampaignInstance,
             r#"SELECT
@@ -289,6 +308,7 @@ impl CampaignRepository for PostgresCampaignRepository {
         )
         .fetch_all(&self.pool)
         .await
+        .map_err(|e| RepositoryError::Internal(e.to_string()))
     }
 
     async fn activate_campaign(
@@ -296,7 +316,7 @@ impl CampaignRepository for PostgresCampaignRepository {
         campaign_id: Uuid,
         ends_at: DateTime<Utc>,
         victory_tickers: serde_json::Value,
-    ) -> Result<bool, sqlx::Error> {
+    ) -> Result<bool, RepositoryError> {
         let result = sqlx::query!(
             r#"UPDATE campaign_instances
                SET state            = $1,
@@ -313,7 +333,8 @@ impl CampaignRepository for PostgresCampaignRepository {
             CampaignLifecycle::Pending as CampaignLifecycle,
         )
         .execute(&self.pool)
-        .await?;
+        .await
+        .map_err(|e| RepositoryError::Internal(e.to_string()))?;
         Ok(result.rows_affected() == 1)
     }
 }
@@ -339,14 +360,14 @@ impl CampaignRepository for InMemoryCampaignRepository {
     async fn create_campaign(
         &self,
         _params: &NewCampaignInstance,
-    ) -> Result<CampaignInstance, sqlx::Error> {
+    ) -> Result<CampaignInstance, RepositoryError> {
         unimplemented!("InMemoryCampaignRepository is a unit-test stub only")
     }
 
     async fn get_campaign(
         &self,
         _campaign_id: Uuid,
-    ) -> Result<Option<CampaignInstance>, sqlx::Error> {
+    ) -> Result<Option<CampaignInstance>, RepositoryError> {
         unimplemented!("InMemoryCampaignRepository is a unit-test stub only")
     }
 
@@ -354,7 +375,7 @@ impl CampaignRepository for InMemoryCampaignRepository {
         &self,
         _campaign_id: Uuid,
         _new_state: CampaignLifecycle,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<(), RepositoryError> {
         unimplemented!("InMemoryCampaignRepository is a unit-test stub only")
     }
 
@@ -363,14 +384,14 @@ impl CampaignRepository for InMemoryCampaignRepository {
         _campaign_id: Uuid,
         _ticker: VictoryTickerType,
         _delta: f64,
-    ) -> Result<f64, sqlx::Error> {
+    ) -> Result<f64, RepositoryError> {
         unimplemented!("InMemoryCampaignRepository is a unit-test stub only")
     }
 
     async fn list_campaigns_by_state(
         &self,
         _state: CampaignLifecycle,
-    ) -> Result<Vec<CampaignInstance>, sqlx::Error> {
+    ) -> Result<Vec<CampaignInstance>, RepositoryError> {
         unimplemented!("InMemoryCampaignRepository is a unit-test stub only")
     }
 
@@ -379,7 +400,7 @@ impl CampaignRepository for InMemoryCampaignRepository {
         _campaign_id: Uuid,
         _ends_at: DateTime<Utc>,
         _victory_tickers: serde_json::Value,
-    ) -> Result<bool, sqlx::Error> {
+    ) -> Result<bool, RepositoryError> {
         unimplemented!("InMemoryCampaignRepository is a unit-test stub only")
     }
 }

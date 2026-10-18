@@ -185,27 +185,27 @@ mod tests {
         async fn create_campaign(
             &self,
             _: &crate::repository::campaign::NewCampaignInstance,
-        ) -> Result<CampaignInstance, sqlx::Error> {
+        ) -> Result<CampaignInstance, crate::repository::RepositoryError> {
             unimplemented!()
         }
-        async fn get_campaign(&self, _: Uuid) -> Result<Option<CampaignInstance>, sqlx::Error> {
+        async fn get_campaign(&self, _: Uuid) -> Result<Option<CampaignInstance>, crate::repository::RepositoryError> {
             unimplemented!()
         }
-        async fn update_sector_state(&self, _: Uuid, _: CampaignLifecycle) -> Result<(), sqlx::Error> {
-            Err(sqlx::Error::PoolClosed)
+        async fn update_sector_state(&self, _: Uuid, _: CampaignLifecycle) -> Result<(), crate::repository::RepositoryError> {
+            Err(crate::repository::RepositoryError::Internal("attempted to acquire a connection on a closed pool".into()))
         }
         async fn apply_ticker_delta(
             &self,
             _: Uuid,
             _: crate::repository::campaign::VictoryTickerType,
             _: f64,
-        ) -> Result<f64, sqlx::Error> {
+        ) -> Result<f64, crate::repository::RepositoryError> {
             unimplemented!()
         }
-        async fn list_campaigns_by_state(&self, _: CampaignLifecycle) -> Result<Vec<CampaignInstance>, sqlx::Error> {
+        async fn list_campaigns_by_state(&self, _: CampaignLifecycle) -> Result<Vec<CampaignInstance>, crate::repository::RepositoryError> {
             Ok(self.0.lock().unwrap().clone())
         }
-        async fn activate_campaign(&self, _: Uuid, _: DateTime<Utc>, _: Value) -> Result<bool, sqlx::Error> {
+        async fn activate_campaign(&self, _: Uuid, _: DateTime<Utc>, _: Value) -> Result<bool, crate::repository::RepositoryError> {
             unimplemented!()
         }
     }

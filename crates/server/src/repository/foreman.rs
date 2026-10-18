@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 use super::RepositoryError;
@@ -37,7 +37,7 @@ pub struct ForemanRecord {
 
 /// `create_foreman` stores stress in 0..=100 and keeps the Commander invariant: a record
 /// that arrives at 100 is Shattered.
-fn clamp_new_record(mut r: ForemanRecord) -> ForemanRecord {
+pub(super) fn clamp_new_record(mut r: ForemanRecord) -> ForemanRecord {
     r.stress = r.stress.clamp(0, 100);
     r.is_shattered = r.is_shattered || r.stress >= 100;
     r
@@ -67,36 +67,47 @@ impl PostgresForemanRepository {
     }
 }
 
-#[async_trait]
-impl ForemanRepository for PostgresForemanRepository {
-    async fn create_foreman(&self, r: ForemanRecord) -> Result<(), RepositoryError> {
-        let r = clamp_new_record(r);
-        sqlx::query!(
+/// The Foreman INSERT on a caller's connection (the join, 5a-2), with the clamp inside it.
+/// The SQL literal is `create_foreman`'s, byte for byte (its `.sqlx/` name hashes the text).
+pub(crate) async fn insert_foreman(
+    conn: &mut PgConnection,
+    r: ForemanRecord,
+) -> Result<(), RepositoryError> {
+    let r = clamp_new_record(r);
+    sqlx::query!(
             r#"INSERT INTO foreman_records (
                 foreman_id, campaign_id, player_wallet, name, rank, xp, stress,
                 origin, faction_bias, specialization, fatal_flaw, foreman_grade,
                 is_shattered, is_kia, prng_seed_state
             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)"#,
-            r.foreman_id,
-            r.campaign_id,
-            r.player_wallet,
-            r.name,
-            r.rank,
-            r.xp,
-            r.stress,
-            r.origin,
-            r.faction_bias,
-            r.specialization,
-            r.fatal_flaw,
-            r.foreman_grade,
-            r.is_shattered,
-            r.is_kia,
-            r.prng_seed_state,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| RepositoryError::Internal(e.to_string()))?;
-        Ok(())
+        r.foreman_id,
+        r.campaign_id,
+        r.player_wallet,
+        r.name,
+        r.rank,
+        r.xp,
+        r.stress,
+        r.origin,
+        r.faction_bias,
+        r.specialization,
+        r.fatal_flaw,
+        r.foreman_grade,
+        r.is_shattered,
+        r.is_kia,
+        r.prng_seed_state,
+    )
+    .execute(&mut *conn)
+    .await
+    .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+    Ok(())
+}
+
+#[async_trait]
+impl ForemanRepository for PostgresForemanRepository {
+    async fn create_foreman(&self, r: ForemanRecord) -> Result<(), RepositoryError> {
+        let mut conn = self.pool.acquire().await
+            .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        insert_foreman(&mut conn, r).await
     }
 
     async fn get_foreman(&self, foreman_id: Uuid) -> Result<Option<ForemanRecord>, RepositoryError> {

@@ -2,8 +2,10 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
+
+use super::RepositoryError;
 
 // ── PlayerCampaignMembership ─────────────────────────────────────────────────
 
@@ -20,6 +22,8 @@ pub struct PlayerCampaignMembership {
 
 // ── MembershipRepository trait ───────────────────────────────────────────────
 
+/// Every method returns `RepositoryError` (5a-0). A duplicate membership surfaces as
+/// `Internal`; the unique-violation code is not distinguishable through this trait.
 #[async_trait]
 pub trait MembershipRepository: Send + Sync {
     async fn add_member(
@@ -28,13 +32,13 @@ pub trait MembershipRepository: Send + Sync {
         campaign_id: Uuid,
         gateway_hex_q: Option<i32>,
         gateway_hex_r: Option<i32>,
-    ) -> Result<PlayerCampaignMembership, sqlx::Error>;
+    ) -> Result<PlayerCampaignMembership, RepositoryError>;
 
     async fn get_membership(
         &self,
         wallet_address: &[u8],
         campaign_id: Uuid,
-    ) -> Result<Option<PlayerCampaignMembership>, sqlx::Error>;
+    ) -> Result<Option<PlayerCampaignMembership>, RepositoryError>;
 
     async fn assign_gateway_hex(
         &self,
@@ -42,28 +46,28 @@ pub trait MembershipRepository: Send + Sync {
         campaign_id: Uuid,
         q: i32,
         r: i32,
-    ) -> Result<(), sqlx::Error>;
+    ) -> Result<(), RepositoryError>;
 
     async fn set_inactive(
         &self,
         wallet_address: &[u8],
         campaign_id: Uuid,
-    ) -> Result<(), sqlx::Error>;
+    ) -> Result<(), RepositoryError>;
 
     async fn list_members_by_campaign(
         &self,
         campaign_id: Uuid,
-    ) -> Result<Vec<PlayerCampaignMembership>, sqlx::Error>;
+    ) -> Result<Vec<PlayerCampaignMembership>, RepositoryError>;
 
     async fn list_campaigns_by_player(
         &self,
         wallet_address: &[u8],
-    ) -> Result<Vec<PlayerCampaignMembership>, sqlx::Error>;
+    ) -> Result<Vec<PlayerCampaignMembership>, RepositoryError>;
 
     async fn delete_memberships_by_campaign(
         &self,
         campaign_id: Uuid,
-    ) -> Result<(), sqlx::Error>;
+    ) -> Result<(), RepositoryError>;
 }
 
 // ── PostgresMembershipRepository ─────────────────────────────────────────────
@@ -78,6 +82,33 @@ impl PostgresMembershipRepository {
     }
 }
 
+/// The membership INSERT on a caller's connection (the join, 5a-2). The SQL literal is
+/// `add_member`'s, byte for byte (its `.sqlx/` name hashes the text).
+pub(crate) async fn insert_membership(
+    conn: &mut PgConnection,
+    wallet_address: &[u8],
+    campaign_id: Uuid,
+    gateway_hex_q: Option<i32>,
+    gateway_hex_r: Option<i32>,
+) -> Result<PlayerCampaignMembership, RepositoryError> {
+    sqlx::query_as!(
+            PlayerCampaignMembership,
+            r#"INSERT INTO player_campaign_membership
+                (wallet_address, campaign_id, gateway_hex_q, gateway_hex_r)
+               VALUES ($1, $2, $3, $4)
+               RETURNING
+                membership_id, wallet_address, campaign_id,
+                gateway_hex_q, gateway_hex_r, joined_at, is_active"#,
+        wallet_address,
+        campaign_id,
+        gateway_hex_q,
+        gateway_hex_r,
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|e| RepositoryError::Internal(e.to_string()))
+}
+
 #[async_trait]
 impl MembershipRepository for PostgresMembershipRepository {
     async fn add_member(
@@ -86,30 +117,17 @@ impl MembershipRepository for PostgresMembershipRepository {
         campaign_id: Uuid,
         gateway_hex_q: Option<i32>,
         gateway_hex_r: Option<i32>,
-    ) -> Result<PlayerCampaignMembership, sqlx::Error> {
-        let row = sqlx::query_as!(
-            PlayerCampaignMembership,
-            r#"INSERT INTO player_campaign_membership
-                (wallet_address, campaign_id, gateway_hex_q, gateway_hex_r)
-               VALUES ($1, $2, $3, $4)
-               RETURNING
-                membership_id, wallet_address, campaign_id,
-                gateway_hex_q, gateway_hex_r, joined_at, is_active"#,
-            wallet_address,
-            campaign_id,
-            gateway_hex_q,
-            gateway_hex_r,
-        )
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(row)
+    ) -> Result<PlayerCampaignMembership, RepositoryError> {
+        let mut conn = self.pool.acquire().await
+            .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        insert_membership(&mut conn, wallet_address, campaign_id, gateway_hex_q, gateway_hex_r).await
     }
 
     async fn get_membership(
         &self,
         wallet_address: &[u8],
         campaign_id: Uuid,
-    ) -> Result<Option<PlayerCampaignMembership>, sqlx::Error> {
+    ) -> Result<Option<PlayerCampaignMembership>, RepositoryError> {
         let row = sqlx::query_as!(
             PlayerCampaignMembership,
             r#"SELECT
@@ -121,7 +139,8 @@ impl MembershipRepository for PostgresMembershipRepository {
             campaign_id,
         )
         .fetch_optional(&self.pool)
-        .await?;
+        .await
+        .map_err(|e| RepositoryError::Internal(e.to_string()))?;
         Ok(row)
     }
 
@@ -131,7 +150,7 @@ impl MembershipRepository for PostgresMembershipRepository {
         campaign_id: Uuid,
         q: i32,
         r: i32,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<(), RepositoryError> {
         sqlx::query!(
             r#"UPDATE player_campaign_membership
                SET gateway_hex_q = $3, gateway_hex_r = $4
@@ -142,7 +161,8 @@ impl MembershipRepository for PostgresMembershipRepository {
             r,
         )
         .execute(&self.pool)
-        .await?;
+        .await
+        .map_err(|e| RepositoryError::Internal(e.to_string()))?;
         Ok(())
     }
 
@@ -150,7 +170,7 @@ impl MembershipRepository for PostgresMembershipRepository {
         &self,
         wallet_address: &[u8],
         campaign_id: Uuid,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<(), RepositoryError> {
         sqlx::query!(
             r#"UPDATE player_campaign_membership
                SET is_active = FALSE
@@ -159,14 +179,15 @@ impl MembershipRepository for PostgresMembershipRepository {
             campaign_id,
         )
         .execute(&self.pool)
-        .await?;
+        .await
+        .map_err(|e| RepositoryError::Internal(e.to_string()))?;
         Ok(())
     }
 
     async fn list_members_by_campaign(
         &self,
         campaign_id: Uuid,
-    ) -> Result<Vec<PlayerCampaignMembership>, sqlx::Error> {
+    ) -> Result<Vec<PlayerCampaignMembership>, RepositoryError> {
         let rows = sqlx::query_as!(
             PlayerCampaignMembership,
             r#"SELECT
@@ -178,14 +199,15 @@ impl MembershipRepository for PostgresMembershipRepository {
             campaign_id,
         )
         .fetch_all(&self.pool)
-        .await?;
+        .await
+        .map_err(|e| RepositoryError::Internal(e.to_string()))?;
         Ok(rows)
     }
 
     async fn list_campaigns_by_player(
         &self,
         wallet_address: &[u8],
-    ) -> Result<Vec<PlayerCampaignMembership>, sqlx::Error> {
+    ) -> Result<Vec<PlayerCampaignMembership>, RepositoryError> {
         let rows = sqlx::query_as!(
             PlayerCampaignMembership,
             r#"SELECT
@@ -197,20 +219,22 @@ impl MembershipRepository for PostgresMembershipRepository {
             wallet_address,
         )
         .fetch_all(&self.pool)
-        .await?;
+        .await
+        .map_err(|e| RepositoryError::Internal(e.to_string()))?;
         Ok(rows)
     }
 
     async fn delete_memberships_by_campaign(
         &self,
         campaign_id: Uuid,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<(), RepositoryError> {
         sqlx::query!(
             "DELETE FROM player_campaign_membership WHERE campaign_id = $1",
             campaign_id,
         )
         .execute(&self.pool)
-        .await?;
+        .await
+        .map_err(|e| RepositoryError::Internal(e.to_string()))?;
         Ok(())
     }
 }
@@ -242,10 +266,10 @@ impl MembershipRepository for InMemoryMembershipRepository {
         campaign_id: Uuid,
         gateway_hex_q: Option<i32>,
         gateway_hex_r: Option<i32>,
-    ) -> Result<PlayerCampaignMembership, sqlx::Error> {
+    ) -> Result<PlayerCampaignMembership, RepositoryError> {
         let key = (wallet_address.to_vec(), campaign_id);
         if self.store.contains_key(&key) {
-            return Err(sqlx::Error::Protocol(
+            return Err(RepositoryError::Internal(
                 "unique constraint violation: (wallet_address, campaign_id) already exists".into(),
             ));
         }
@@ -266,7 +290,7 @@ impl MembershipRepository for InMemoryMembershipRepository {
         &self,
         wallet_address: &[u8],
         campaign_id: Uuid,
-    ) -> Result<Option<PlayerCampaignMembership>, sqlx::Error> {
+    ) -> Result<Option<PlayerCampaignMembership>, RepositoryError> {
         let key = (wallet_address.to_vec(), campaign_id);
         Ok(self.store.get(&key).map(|r| r.clone()))
     }
@@ -277,7 +301,7 @@ impl MembershipRepository for InMemoryMembershipRepository {
         campaign_id: Uuid,
         q: i32,
         r: i32,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<(), RepositoryError> {
         let key = (wallet_address.to_vec(), campaign_id);
         if let Some(mut m) = self.store.get_mut(&key) {
             m.gateway_hex_q = Some(q);
@@ -290,7 +314,7 @@ impl MembershipRepository for InMemoryMembershipRepository {
         &self,
         wallet_address: &[u8],
         campaign_id: Uuid,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<(), RepositoryError> {
         let key = (wallet_address.to_vec(), campaign_id);
         if let Some(mut m) = self.store.get_mut(&key) {
             m.is_active = false;
@@ -301,7 +325,7 @@ impl MembershipRepository for InMemoryMembershipRepository {
     async fn list_members_by_campaign(
         &self,
         campaign_id: Uuid,
-    ) -> Result<Vec<PlayerCampaignMembership>, sqlx::Error> {
+    ) -> Result<Vec<PlayerCampaignMembership>, RepositoryError> {
         let mut rows: Vec<PlayerCampaignMembership> = self.store.iter()
             .filter(|r| r.campaign_id == campaign_id)
             .map(|r| r.clone())
@@ -313,7 +337,7 @@ impl MembershipRepository for InMemoryMembershipRepository {
     async fn list_campaigns_by_player(
         &self,
         wallet_address: &[u8],
-    ) -> Result<Vec<PlayerCampaignMembership>, sqlx::Error> {
+    ) -> Result<Vec<PlayerCampaignMembership>, RepositoryError> {
         let mut rows: Vec<PlayerCampaignMembership> = self.store.iter()
             .filter(|r| r.wallet_address == wallet_address)
             .map(|r| r.clone())
@@ -325,7 +349,7 @@ impl MembershipRepository for InMemoryMembershipRepository {
     async fn delete_memberships_by_campaign(
         &self,
         campaign_id: Uuid,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<(), RepositoryError> {
         let keys: Vec<(Vec<u8>, Uuid)> = self.store.iter()
             .filter(|r| r.campaign_id == campaign_id)
             .map(|r| r.key().clone())

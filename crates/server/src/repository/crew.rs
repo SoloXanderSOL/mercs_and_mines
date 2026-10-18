@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 use super::RepositoryError;
@@ -40,7 +40,7 @@ impl CrewRecord {
 }
 
 /// `create_crew` stores morale in 0..=100. Headcount is not clamped: the CHECK guards it.
-fn clamp_new_record(mut r: CrewRecord) -> CrewRecord {
+pub(super) fn clamp_new_record(mut r: CrewRecord) -> CrewRecord {
     r.morale = r.morale.clamp(0, 100);
     r
 }
@@ -70,25 +70,36 @@ impl PostgresCrewRepository {
     }
 }
 
-#[async_trait]
-impl CrewRepository for PostgresCrewRepository {
-    async fn create_crew(&self, record: CrewRecord) -> Result<(), RepositoryError> {
-        let record = clamp_new_record(record);
-        sqlx::query!(
+/// The Crew INSERT on a caller's connection (the join, 5a-2), with the morale clamp inside it.
+/// The SQL literal is `create_crew`'s, byte for byte (its `.sqlx/` name hashes the text).
+pub(crate) async fn insert_crew(
+    conn: &mut PgConnection,
+    record: CrewRecord,
+) -> Result<(), RepositoryError> {
+    let record = clamp_new_record(record);
+    sqlx::query!(
             r#"INSERT INTO crew_records (
                 crew_id, campaign_id, player_wallet, headcount, xp, morale
             ) VALUES ($1,$2,$3,$4,$5,$6)"#,
-            record.crew_id,
-            record.campaign_id,
-            record.player_wallet,
-            record.headcount,
-            record.xp,
-            record.morale,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| RepositoryError::Internal(e.to_string()))?;
-        Ok(())
+        record.crew_id,
+        record.campaign_id,
+        record.player_wallet,
+        record.headcount,
+        record.xp,
+        record.morale,
+    )
+    .execute(&mut *conn)
+    .await
+    .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+    Ok(())
+}
+
+#[async_trait]
+impl CrewRepository for PostgresCrewRepository {
+    async fn create_crew(&self, record: CrewRecord) -> Result<(), RepositoryError> {
+        let mut conn = self.pool.acquire().await
+            .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        insert_crew(&mut conn, record).await
     }
 
     async fn get_crew(&self, crew_id: Uuid) -> Result<Option<CrewRecord>, RepositoryError> {

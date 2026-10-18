@@ -7,7 +7,7 @@ use dashmap::DashMap;
 use sim_engine::config::SimConfig;
 use sim_engine::game_types::OutcomeType;
 use sim_engine::resolver::{stress_after_casualties, stress_after_deployment};
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 
 use crate::commander_gen::{is_glorious_death, GloriousDeathCriteria};
 use uuid::Uuid;
@@ -113,7 +113,7 @@ pub struct CardMintPending {
 
 /// `create_commander` stores stress in 0..=100 and keeps `update_stress`'s invariant:
 /// a record that arrives at 100 is Shattered.
-fn clamp_new_record(mut r: CommanderRecord) -> CommanderRecord {
+pub(super) fn clamp_new_record(mut r: CommanderRecord) -> CommanderRecord {
     r.stress = r.stress.clamp(0, 100);
     r.is_shattered = r.is_shattered || r.stress >= 100;
     r
@@ -369,37 +369,49 @@ async fn mark_commander_kia(
     Ok(())
 }
 
-#[async_trait]
-impl CommanderRepository for PostgresCommanderRepository {
-    async fn create_commander(&self, r: CommanderRecord) -> Result<(), RepositoryError> {
-        let r = clamp_new_record(r);
-        sqlx::query!(
+/// The Commander INSERT on a caller's connection, so the join (5a-2) can run it inside its
+/// own transaction. The clamp lives here, so no caller can skip it. The SQL literal is
+/// `create_commander`'s, byte for byte (its `.sqlx/` file name hashes the text).
+pub(crate) async fn insert_commander(
+    conn: &mut PgConnection,
+    r: CommanderRecord,
+) -> Result<(), RepositoryError> {
+    let r = clamp_new_record(r);
+    sqlx::query!(
             r#"INSERT INTO commander_records (
                 commander_id, campaign_id, player_wallet, name, rank, xp, stress,
                 origin, faction_bias, specialization, fatal_flaw, veteran_trait,
                 is_shattered, is_kia, prng_seed_state, commander_grade
             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)"#,
-            r.commander_id,
-            r.campaign_id,
-            r.player_wallet,
-            r.name,
-            r.rank,
-            r.xp,
-            r.stress,
-            r.origin,
-            r.faction_bias,
-            r.specialization,
-            r.fatal_flaw,
-            r.veteran_trait,
-            r.is_shattered,
-            r.is_kia,
-            r.prng_seed_state,
-            r.commander_grade,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| RepositoryError::Internal(e.to_string()))?;
-        Ok(())
+        r.commander_id,
+        r.campaign_id,
+        r.player_wallet,
+        r.name,
+        r.rank,
+        r.xp,
+        r.stress,
+        r.origin,
+        r.faction_bias,
+        r.specialization,
+        r.fatal_flaw,
+        r.veteran_trait,
+        r.is_shattered,
+        r.is_kia,
+        r.prng_seed_state,
+        r.commander_grade,
+    )
+    .execute(&mut *conn)
+    .await
+    .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+    Ok(())
+}
+
+#[async_trait]
+impl CommanderRepository for PostgresCommanderRepository {
+    async fn create_commander(&self, r: CommanderRecord) -> Result<(), RepositoryError> {
+        let mut conn = self.pool.acquire().await
+            .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        insert_commander(&mut conn, r).await
     }
 
     async fn get_commander(&self, commander_id: Uuid) -> Result<Option<CommanderRecord>, RepositoryError> {
