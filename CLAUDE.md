@@ -92,7 +92,18 @@ As of 2026-10-18:
   roster rows **and** the wallet's membership rows (since 7b-1). A test that seeds through
   `seed_account_and_campaign` is cleaned by `clean_wallet_4g1` even if every insert it
   makes is refused.
-- **Sections 5 and 6:** Not started.
+- **Section 5 (Multiplayer Sync):** split agreed 2026-10-18 (5a-0 → 5a-4, then INF-6, then
+  5b–5d; the Section 5 doc's `## 5x`). **5a-0 complete (`cef3ab2`, 2026-10-18; no behaviour
+  change):** `pub(crate) insert_{commander,foreman,section,crew,membership,campaign}(conn:
+  &mut PgConnection, …)` hold each INSERT with its SQL literal moved byte for byte (a
+  `.sqlx/` file name is the sha256 of the literal, indentation included), plus every clamp;
+  the `create_*`/`add_member` methods acquire a connection and wrap them. `clamp_new_record`
+  is `pub(super)` in `commander`, `foreman` and `crew`. `MembershipRepository` and
+  `CampaignRepository` return `RepositoryError`; `InitError::SqlxError` is gone (its sites
+  use `InitError::RepositoryError`). `apply_ticker_delta` on an unknown campaign is
+  `NotFound`. `InMemoryCampaignRepository` is still all `unimplemented!()` (5a-2 builds a
+  real one). **Next: 5a-1** (join schema, `0030`).
+- **Section 6:** Not started.
 - **Sections 7 (Personnel Entity Model) and 8 (Combat Engine to canon):** created
   2026-10-13 (ruling D2); both run before Section 6. Strike Mining and Base Building moved
   into Phase 2 as §13/§14 (ruling D1). **Section 7 complete (2026-10-18): 7a-1 built (2026-10-16;
@@ -183,10 +194,10 @@ As of 2026-10-18:
   job needs it (GAP-33).
 
 **318/318 tests green (1 `shared` + 129 `mercs_server` lib + 2 `aar_determinism` + 115
-`db_infrastructure` + 71 `sim_engine`; single-threaded, verified at `2b61dc1`). Workspace
+`db_infrastructure` + 71 `sim_engine`; single-threaded, verified at `cef3ab2`). Workspace
 version `0.3.0`. `.sqlx/` holds 71 files; the latest migration is `0029_augmentee_records`.
-Production = `27f2598` (0.3.0, 7b-2); `.prev` = `f7a1ff3`; `dev` is ahead with 7d-1,
-unpushed. Next: see the Phase 1 document.** Any brick that changes what `resolve_mission` produces for
+Production = `9194c0f` (0.3.0, 7d-1); `.prev` = `27f2598`; `dev` is ahead with INF-7 and
+5a-0, unpushed. Next: 5a-1; see the Phase 1 document.** Any brick that changes what `resolve_mission` produces for
 a given seed bumps the workspace version in the same brick. 4b-1 reused `sim-engine`'s `OutcomeType` rather than
 defining a new enum, and writes **no input-log entry** — the rank-up entry was removed
 from scope. **ODQ-22 and ODQ-23 were ruled 2026-09-03 — engagement and mission outcomes
@@ -321,6 +332,9 @@ begins.
   5. **A new constraint must accept every value the previous binary can write, unless that
      write has no production caller; the migration's header names that writer.** Never
      `NOT VALID`: a constraint validates existing rows and fails the migration loudly.
+
+  Every repository trait returns `RepositoryError` (`NotFound`/`Internal`), never
+  `sqlx::Error`; map with an explicit `map_err`, never a `From` impl.
 
   Commander roster strings live in `sim_engine::roster`, mirrored by `0018`'s CHECKs; it
   also holds the Foreman pools and `CommanderGrade`, mirrored by `0019`'s
