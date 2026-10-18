@@ -41,7 +41,7 @@ pub use campaign::{
 pub use convoy::{ConvoyDbRecord, ConvoyRepository, InMemoryConvoyRepository, PostgresConvoyRepository};
 pub use commander::{
     outcome_db_str, AppliedEffects, CardMintPending, CommanderRecord, CommanderRepository, DeploymentRecord,
-    InMemoryCommanderRepository, NewDeployment, PostgresCommanderRepository,
+    DeploymentStart, InMemoryCommanderRepository, NewDeployment, PostgresCommanderRepository,
     STALE_DEPLOYMENT_AFTER,
 };
 pub use foreman::{ForemanRecord, ForemanRepository, InMemoryForemanRepository, PostgresForemanRepository};

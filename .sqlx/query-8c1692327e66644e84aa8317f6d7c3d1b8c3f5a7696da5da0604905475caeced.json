@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT\n                section_id, campaign_id, commander_id, player_wallet, name, headcount,\n                loadout AS \"loadout: JsonValue\", xp, created_at, updated_at\n               FROM section_records WHERE campaign_id = $1",
+  "query": "SELECT\n                section_id, campaign_id, player_wallet, name, headcount,\n                loadout AS \"loadout: JsonValue\", xp, created_at, updated_at\n               FROM section_records WHERE campaign_id = $1",
   "describe": {
     "columns": [
       {
@@ -15,41 +15,36 @@
       },
       {
         "ordinal": 2,
-        "name": "commander_id",
-        "type_info": "Uuid"
-      },
-      {
-        "ordinal": 3,
         "name": "player_wallet",
         "type_info": "Bytea"
       },
       {
-        "ordinal": 4,
+        "ordinal": 3,
         "name": "name",
         "type_info": "Text"
       },
       {
-        "ordinal": 5,
+        "ordinal": 4,
         "name": "headcount",
         "type_info": "Int2"
       },
       {
-        "ordinal": 6,
+        "ordinal": 5,
         "name": "loadout: JsonValue",
         "type_info": "Jsonb"
       },
       {
-        "ordinal": 7,
+        "ordinal": 6,
         "name": "xp",
         "type_info": "Int4"
       },
       {
-        "ordinal": 8,
+        "ordinal": 7,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 9,
+        "ordinal": 8,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
@@ -62,8 +57,7 @@
     "nullable": [
       false,
       false,
-      true,
-      true,
+      false,
       false,
       false,
       false,
@@ -72,5 +66,5 @@
       false
     ]
   },
-  "hash": "44ea6951c8c8f810112650a1ce489a0c287393d5464edceb0f45b9d0911cfabc"
+  "hash": "8c1692327e66644e84aa8317f6d7c3d1b8c3f5a7696da5da0604905475caeced"
 }

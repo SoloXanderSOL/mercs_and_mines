@@ -40,12 +40,13 @@ use sim_engine::{
 
 use crate::auth::AuthSession;
 use crate::api_types::{
-    convoy_vehicle_from_class, CombatResolveRequest, MissionResolveRequest, PackAssaultRequest,
+    convoy_vehicle_from_class, CombatResolveRequest, MissionResolveBody, PackAssaultRequest,
 };
 use crate::commander_gen::mission_tier;
 use crate::state::AppState;
 use crate::repository::commander::log_rank_up;
-use crate::repository::{CombatSession, InputLogRepository, NewDeployment, RepositoryError};
+use crate::repository::{CombatSession, DeploymentStart, InputLogRepository, NewDeployment, RepositoryError};
+use shared::command::{command_cap, CommandCap};
 
 type AppError = (StatusCode, Json<Value>);
 
@@ -64,6 +65,12 @@ fn internal_error(msg: impl Into<String>) -> AppError {
     let msg = msg.into();
     tracing::error!(at = %std::panic::Location::caller(), "{msg}");
     (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": msg})))
+}
+
+/// A `422` with the route's JSON error body, which tells it apart from axum's plain-text
+/// `422` for an undeserialisable body.
+fn unprocessable(msg: impl Into<String>) -> AppError {
+    (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"error": msg.into()})))
 }
 
 fn conflict(msg: impl Into<String>) -> AppError {
@@ -262,17 +269,21 @@ fn deploy_refusal(rec: &crate::repository::CommanderRecord) -> Option<AppError> 
     None
 }
 
-/// Mission ↔ Commander wiring (brick 4g-1, Phase_1_Section_4 §4g). Check order:
-/// 401 (extractor) → 400 (body) → 404 (unknown or not yours) → 409 (KIA, Shattered,
-/// already deployed) → active deployment → re-read, 409 (KIA, Shattered; deployment
-/// aborted; 4g-2) → input log before the roll (500 on failure, deployment aborted) →
-/// resolve → one atomic write of stress, XP, rank, (on a Wipeout) KIA and the death card,
-/// and the close, computed from the locked Commander row.
+/// Mission ↔ Commander wiring (brick 4g-1, Phase_1_Section_4 §4g; Sections since 7b-2).
+/// Check order: 401 (extractor) → 400 (body; then `section_ids` empty or duplicate) →
+/// 404 (Commander unknown or not yours) → 422 (more Sections than the rank's command cap,
+/// GAP-50) → 404 (a Section unknown, not yours or not in the Commander's campaign; one
+/// body) → 409 (KIA, Shattered) → active deployment, 409 (Commander or a Section already
+/// deployed) → re-read, 409 (KIA, Shattered; deployment aborted; 4g-2) → input log before
+/// the roll (500 on failure, deployment aborted) → resolve → one atomic write of stress,
+/// XP, rank, (on a Wipeout) KIA and the death card, and the close, computed from the
+/// locked Commander row. The close releases the Sections (trigger, `0027`).
 async fn post_mission_resolve(
     AuthSession(session): AuthSession,
     State(state): State<Arc<AppState>>,
-    Json(req): Json<MissionResolveRequest>,
+    Json(body): Json<MissionResolveBody>,
 ) -> Result<impl IntoResponse, AppError> {
+    let MissionResolveBody { request: req, section_ids } = body;
     // 400 — body shape. Refused fields are never silently ignored.
     if req.squad.commander.is_some() {
         return Err(bad_request("A mission cannot carry a client Commander; send commander_id"));
@@ -286,6 +297,13 @@ async fn post_mission_resolve(
     let mission = missions()
         .get(req.mission_id.as_str())
         .ok_or_else(|| bad_request(format!("Unknown mission_id: {}", req.mission_id)))?;
+    if section_ids.is_empty() {
+        return Err(bad_request("A mission needs at least one Section; send section_ids"));
+    }
+    let distinct: std::collections::HashSet<Uuid> = section_ids.iter().copied().collect();
+    if distinct.len() != section_ids.len() {
+        return Err(bad_request("section_ids must not repeat a Section"));
+    }
 
     // 404 — an unknown Commander and someone else's get the same body, so the route
     // never confirms which UUIDs exist.
@@ -299,6 +317,31 @@ async fn post_mission_resolve(
         .map_err(|e| internal_error(format!("commander read failed: {e}")))?
         .filter(|r| r.player_wallet == wallet)
         .ok_or_else(|| not_found("Commander not found"))?;
+
+    // 422 — the rank's command cap (GAP-50). A pure check before any Section I/O, so it
+    // also bounds the read below. Rank only rises, so this first read is never too lenient.
+    let cap = command_cap(rec.rank).ok_or_else(|| {
+        internal_error(format!("commander {} has rank {} outside 1..=5", rec.commander_id, rec.rank))
+    })?;
+    if let CommandCap::Sections(max) = cap {
+        if section_ids.len() > max as usize {
+            return Err(unprocessable(format!(
+                "A Rank {} Commander can take at most {max} Sections on a mission", rec.rank
+            )));
+        }
+    }
+
+    // 404 — every Section must be the caller's and in the Commander's campaign. One body
+    // for every cause, so the route never confirms which Section UUIDs exist. The database
+    // holds the same rule through deployment_sections' composite FKs (GAP-66).
+    let owned = state
+        .section_repo
+        .owned_section_ids(&section_ids, &wallet, rec.campaign_id)
+        .await
+        .map_err(|e| internal_error(format!("section read failed: {e}")))?;
+    if owned.len() != section_ids.len() {
+        return Err(not_found("Section not found"));
+    }
 
     // 409 — the flag gates deployment (§4g item 7). A fast path: the re-read under the
     // deployment lock below is the check that holds.
@@ -324,11 +367,16 @@ async fn post_mission_resolve(
             session_id,
             mission_id: mission.id.clone(),
             started_at: now,
+            player_wallet: wallet.clone(),
+            campaign_id: rec.campaign_id,
+            section_ids: section_ids.clone(),
         })
         .await
         .map_err(|e| internal_error(format!("deployment write failed: {e}")))?;
-    if !started {
-        return Err(conflict("Commander is already deployed"));
+    match started {
+        DeploymentStart::Started => {}
+        DeploymentStart::CommanderBusy => return Err(conflict("Commander is already deployed")),
+        DeploymentStart::SectionBusy => return Err(conflict("A Section is already deployed")),
     }
 
     // Re-read under the deployment lock (4g-2): another mission may have closed and
@@ -361,7 +409,10 @@ async fn post_mission_resolve(
         sector_tier: "Contested".into(),
         ruleset: "standard_v1".into(),
     };
-    let entry = session_start_entry(req_payload, &timestamp);
+    let mut entry = session_start_entry(req_payload, &timestamp);
+    // The Sections are a player input, so the log holds them; additive beside `request`,
+    // in request order (7b-2 R1, R5).
+    entry.payload["selection"] = json!({ "section_ids": section_ids });
     if let Err(e) = state.input_log_repo.start_session(&config, &entry).await {
         abort_deployment_or_log(&state, deployment_id).await;
         return Err(internal_error(format!("input log write failed: {e}")));

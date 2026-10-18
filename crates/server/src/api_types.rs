@@ -37,6 +37,19 @@ pub struct MissionResolveRequest {
     pub seed_override: Option<serde_json::Value>,
 }
 
+/// The HTTP body of `POST /api/mission/resolve` (7b-2 R1): the logged request plus the
+/// Sections the mission sends. Not logged itself: `payload.request` stays the
+/// `MissionResolveRequest`, and the selection goes in `payload.selection`. A missing
+/// `section_ids` reads as empty, which the route refuses with its own `400` (axum's
+/// rejection of a missing field would be a plain-text `422`, the rank cap's status).
+#[derive(Debug, Deserialize, Serialize)]
+pub struct MissionResolveBody {
+    #[serde(flatten)]
+    pub request: MissionResolveRequest,
+    #[serde(default)]
+    pub section_ids: Vec<Uuid>,
+}
+
 /// The mission request's squad. The sim `Squad` is built from it with `commander: None`.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct MissionSquadRequest {

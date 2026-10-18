@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO deployment_sections (deployment_id, section_id, commander_id, player_wallet, campaign_id) SELECT $1, unnest($2::uuid[]), $3, $4, $5 ON CONFLICT (section_id) WHERE released_at IS NULL DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "UuidArray",
+        "Uuid",
+        "Bytea",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "12373fae27990bcaf142f4fdba2e76b20a0649a9ce777ffae939492dc47ce23c"
+}

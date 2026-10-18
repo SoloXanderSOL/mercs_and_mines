@@ -20,7 +20,7 @@ use mercs_server::repository::{
     DeploymentTimer, RedisTimerRepository, TimerRepository, TimerType,
     CombatSession, RedisSessionStateRepository, SessionStateRepository,
     ConvoyDbRecord, ConvoyRepository, PostgresConvoyRepository,
-    NewDeployment, outcome_db_str,
+    NewDeployment, DeploymentStart, outcome_db_str,
     ForemanRepository, PostgresForemanRepository,
     AdvisorRecord, AdvisorRepository, PostgresAdvisorRepository,
     CrewRecord, CrewRepository, PostgresCrewRepository,
@@ -272,13 +272,13 @@ async fn commander_section_crud_is_correct() {
     assert!(after_shattered.is_shattered, "is_shattered must be true");
     assert!(!after_shattered.is_kia, "is_kia must remain false after set_shattered — Shattered is NOT Permadeath");
 
-    // 7. Create a SectionRecord linked to the same campaign and commander.
+    // 7. Create a SectionRecord in the same campaign, owned by the same wallet. Sections
+    // carry no Commander (7b-2): the link is per mission, on deployment_sections.
     let section_id = uuid::Uuid::new_v4();
     section_repo.create_section(SectionRecord {
         section_id,
         campaign_id,
-        commander_id: Some(commander_id),
-        player_wallet: Some(wallet_bytes.clone()),
+        player_wallet: wallet_bytes.clone(),
         name:         "Alpha Section".into(),
         headcount:    8,
         loadout:      serde_json::json!({}),
@@ -292,8 +292,7 @@ async fn commander_section_crud_is_correct() {
         .expect("get_section error")
         .expect("section not found");
     assert_eq!(sec.section_id, section_id);
-    assert_eq!(sec.commander_id, Some(commander_id));
-    assert_eq!(sec.player_wallet, Some(vec![2u8; 32]), "the owner must round-trip");
+    assert_eq!(sec.player_wallet, vec![2u8; 32], "the owner must round-trip");
     assert_eq!(sec.headcount, 8);
 
     // 9. update_headcount.
@@ -301,22 +300,11 @@ async fn commander_section_crud_is_correct() {
     let after_hc = section_repo.get_section(section_id).await.unwrap().unwrap();
     assert_eq!(after_hc.headcount, 5);
 
-    // 10. list_sections_by_commander.
-    let by_cmd = section_repo.list_sections_by_commander(commander_id).await
-        .expect("list_sections_by_commander failed");
-    assert_eq!(by_cmd.len(), 1);
-
-    // 11. set_kia — section must survive (ON DELETE SET NULL), commander_id becomes None.
+    // 10. set_kia — the Commander's death leaves the Section untouched.
     commander_repo.set_kia(commander_id).await.expect("set_kia failed");
     let after_kia = commander_repo.get_commander(commander_id).await.unwrap().unwrap();
     assert!(after_kia.is_kia, "is_kia must be true");
-
-    // Postgres ON DELETE SET NULL fires only when the commander_records row is deleted,
-    // not when is_kia is set. The row still exists; commander_id on the section is unchanged.
-    // We explicitly null it to simulate what campaign cleanup would do.
-    section_repo.assign_commander(section_id, None).await.expect("assign_commander(None) failed");
     let sec_after_kia = section_repo.get_section(section_id).await.unwrap().unwrap();
-    assert!(sec_after_kia.commander_id.is_none(), "commander_id must be None after KIA cleanup");
     assert_eq!(sec_after_kia.headcount, 5, "headcount must be preserved after KIA");
 
     // 12. delete_sections_by_campaign.
@@ -2478,17 +2466,21 @@ async fn convoy_timer_fires_and_marks_arrived() {
 const ROSTER_TABLES: [&str; 5] = ["section_records", "commander_records", "foreman_records", "advisor_records", "crew_records"];
 
 /// Removes everything a 4g-1 test wallet owns, in FK order: card_mint_pending →
-/// deployment_records → section_records → commander_records → foreman_records →
-/// advisor_records → crew_records (`ROSTER_TABLES`) → their campaigns → membership →
-/// player_accounts.
-/// `deployment_records.commander_id` is ON DELETE RESTRICT, so it must go first; it is
-/// there because of Commanders (`deployment_records` does not reference Sections).
+/// deployment_sections → deployment_records → section_records → commander_records →
+/// foreman_records → advisor_records → crew_records (`ROSTER_TABLES`) → every campaign
+/// the wallet owns roster rows in or is a member of → membership → player_accounts.
+/// `deployment_sections` (7b-2) RESTRICTs deployments, Commanders and Sections, and
+/// carries the owner itself, so it goes first. `deployment_records.commander_id` is
+/// ON DELETE RESTRICT, so it goes next; it is there because of Commanders.
 /// Campaigns are collected through the roster rows **and** the wallet's membership rows,
 /// so a test whose every roster insert is refused still has its campaign found
-/// (Reviewer 7c-1 F1; `seed_account_and_campaign` writes the membership row).
+/// (Reviewer 7c-1 F1; `seed_account_and_campaign` writes the membership row). A
+/// multi-wallet test cleans every wallet after collecting its results (Reviewer 7b-1 F1).
 async fn clean_wallet_4g1(pool: &sqlx::PgPool, wallet: &[u8]) {
     sqlx::query("DELETE FROM card_mint_pending WHERE player_wallet = $1")
         .bind(wallet).execute(pool).await.expect("card_mint_pending cleanup failed");
+    sqlx::query("DELETE FROM deployment_sections WHERE player_wallet = $1")
+        .bind(wallet).execute(pool).await.expect("deployment_sections cleanup failed");
     sqlx::query("DELETE FROM deployment_records WHERE commander_id IN (SELECT commander_id FROM commander_records WHERE player_wallet = $1)")
         .bind(wallet).execute(pool).await.expect("deployment_records cleanup failed");
     let union = ROSTER_TABLES
@@ -2545,6 +2537,10 @@ fn new_deployment_4g1(commander_id: uuid::Uuid, started_at: chrono::DateTime<chr
         session_id: uuid::Uuid::new_v4(),
         mission_id: "GUARD_DUTY".into(),
         started_at,
+        // No Sections, so no deployment_sections row: the owner and campaign are unused.
+        player_wallet: vec![],
+        campaign_id: uuid::Uuid::nil(),
+        section_ids: vec![],
     }
 }
 
@@ -2564,7 +2560,7 @@ async fn deployment_second_active_row_is_refused_by_the_database() {
     let now = chrono::Utc::now();
     let (a, b) = (new_deployment_4g1(commander_id, now), new_deployment_4g1(commander_id, now));
     let (ra, rb) = tokio::join!(repo.start_deployment(&a), repo.start_deployment(&b));
-    let (ra, rb) = (ra.expect("start a failed"), rb.expect("start b failed"));
+    let (ra, rb) = (ra.expect("start a failed") == DeploymentStart::Started, rb.expect("start b failed") == DeploymentStart::Started);
     assert!(ra ^ rb, "exactly one concurrent start must win (got {ra}, {rb})");
 
     let raw = sqlx::query(
@@ -2600,11 +2596,11 @@ async fn deployment_stale_active_row_is_aborted_on_next_start() {
 
     let now = chrono::Utc::now();
     let stale = new_deployment_4g1(commander_id, now - chrono::Duration::minutes(6));
-    assert!(repo.start_deployment(&stale).await.unwrap());
+    assert_eq!(repo.start_deployment(&stale).await.unwrap(), DeploymentStart::Started);
     // Four minutes later is not yet stale: refused.
-    assert!(!repo.start_deployment(&new_deployment_4g1(commander_id, now - chrono::Duration::minutes(2))).await.unwrap());
+    assert_eq!(repo.start_deployment(&new_deployment_4g1(commander_id, now - chrono::Duration::minutes(2))).await.unwrap(), DeploymentStart::CommanderBusy);
     let fresh = new_deployment_4g1(commander_id, now);
-    assert!(repo.start_deployment(&fresh).await.unwrap(), "a stale active row must not block the next start");
+    assert_eq!(repo.start_deployment(&fresh).await.unwrap(), DeploymentStart::Started, "a stale active row must not block the next start");
 
     let deps = repo.list_deployments_by_commander(commander_id).await.unwrap();
     assert_eq!(deps.len(), 2);
@@ -2635,7 +2631,7 @@ async fn resolve_deployment_rolls_back_when_the_close_fails() {
     let seeded = repo.get_commander(commander_id).await.unwrap().unwrap();
 
     let d = new_deployment_4g1(commander_id, chrono::Utc::now());
-    assert!(repo.start_deployment(&d).await.unwrap());
+    assert_eq!(repo.start_deployment(&d).await.unwrap(), DeploymentStart::Started);
     // First resolve: tier 5 Success, no casualties — stress 30 → 40, and a rank-up.
     let eff = repo.resolve_deployment(d.deployment_id, commander_id, 0, 5, 0.0, &OutcomeType::Success, &cfg)
         .await
@@ -2682,7 +2678,7 @@ async fn resolve_deployment_refuses_a_kia_commander() {
     let cfg = sim_engine::config::SimConfig::default();
 
     let d = new_deployment_4g1(commander_id, chrono::Utc::now());
-    assert!(repo.start_deployment(&d).await.unwrap());
+    assert_eq!(repo.start_deployment(&d).await.unwrap(), DeploymentStart::Started);
     repo.set_kia(commander_id).await.unwrap();
     let before = repo.get_commander(commander_id).await.unwrap().unwrap();
 
@@ -2724,7 +2720,7 @@ async fn resolve_deployment_builds_on_a_concurrent_stress_write() {
     assert_ne!(expected, stale, "precondition: the two orders must be distinguishable");
 
     let d = new_deployment_4g1(commander_id, chrono::Utc::now());
-    assert!(PostgresCommanderRepository::new(wide.clone()).start_deployment(&d).await.unwrap());
+    assert_eq!(PostgresCommanderRepository::new(wide.clone()).start_deployment(&d).await.unwrap(), DeploymentStart::Started);
 
     let mut tx_a = wide.begin().await.unwrap();
     let tx_a_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
@@ -2800,7 +2796,7 @@ async fn test_mark_commander_kia_writes_kia_and_a_snapshot_card() {
     assert_eq!(seeded.rank, 1, "precondition");
 
     let d = new_deployment_4g1(commander_id, chrono::Utc::now());
-    assert!(repo.start_deployment(&d).await.unwrap());
+    assert_eq!(repo.start_deployment(&d).await.unwrap(), DeploymentStart::Started);
     let eff = repo
         .resolve_deployment(d.deployment_id, commander_id, 2, 1, 0.0, &OutcomeType::Wipeout, &cfg)
         .await
@@ -2843,7 +2839,7 @@ async fn test_mark_commander_kia_rank_five_card_is_foil() {
     repo.update_rank_and_xp(commander_id, 5, 2600).await.unwrap();
 
     let d = new_deployment_4g1(commander_id, chrono::Utc::now());
-    assert!(repo.start_deployment(&d).await.unwrap());
+    assert_eq!(repo.start_deployment(&d).await.unwrap(), DeploymentStart::Started);
     let eff = repo
         .resolve_deployment(d.deployment_id, commander_id, 2, 1, 0.0, &OutcomeType::Wipeout, &cfg)
         .await
@@ -2874,7 +2870,7 @@ async fn postgres_card_stamps_the_locked_rank() {
     repo.update_rank_and_xp(commander_id, 5, 0).await.unwrap();
 
     let d = new_deployment_4g1(commander_id, chrono::Utc::now());
-    assert!(repo.start_deployment(&d).await.unwrap());
+    assert_eq!(repo.start_deployment(&d).await.unwrap(), DeploymentStart::Started);
     let eff = repo
         .resolve_deployment(d.deployment_id, commander_id, 2, 1, 0.0, &OutcomeType::Wipeout, &cfg)
         .await
@@ -2905,7 +2901,7 @@ async fn test_mark_commander_kia_rolls_back_with_the_close() {
     let cfg = sim_engine::config::SimConfig::default();
 
     let d = new_deployment_4g1(commander_id, chrono::Utc::now());
-    assert!(repo.start_deployment(&d).await.unwrap());
+    assert_eq!(repo.start_deployment(&d).await.unwrap(), DeploymentStart::Started);
     repo.resolve_deployment(d.deployment_id, commander_id, 0, 1, 0.0, &OutcomeType::Success, &cfg)
         .await
         .expect("first resolve failed");
@@ -3884,12 +3880,45 @@ fn mission_unit_json() -> serde_json::Value {
     .unwrap()
 }
 
-fn mission_body(commander_id: uuid::Uuid) -> serde_json::Value {
+fn mission_body(commander_id: uuid::Uuid, section_ids: &[uuid::Uuid]) -> serde_json::Value {
     serde_json::json!({
         "squad": { "units": [mission_unit_json()] },
         "mission_id": "GUARD_DUTY",
         "commander_id": commander_id,
+        "section_ids": section_ids,
     })
+}
+
+/// A Section owned by `wallet` in `campaign_id`, written through `state.section_repo`
+/// (in-memory by default; a Postgres-backed route test swaps the repository first).
+async fn seed_section(state: &mercs_server::state::AppState, wallet: [u8; 32], campaign_id: uuid::Uuid) -> uuid::Uuid {
+    let section_id = uuid::Uuid::new_v4();
+    state.section_repo.create_section(SectionRecord {
+        section_id,
+        campaign_id,
+        player_wallet: wallet.to_vec(),
+        name:          "Delta Section".into(),
+        headcount:     8,
+        loadout:       serde_json::json!({}),
+        xp:            0,
+        created_at:    chrono::Utc::now(),
+        updated_at:    chrono::Utc::now(),
+    }).await.expect("create_section failed");
+    section_id
+}
+
+/// A Section with the same owner and campaign as the stored Commander `commander_id`.
+async fn seed_section_for(state: &mercs_server::state::AppState, commander_id: uuid::Uuid) -> uuid::Uuid {
+    let rec = state.commander_repo.get_commander(commander_id).await.unwrap().expect("seeded Commander");
+    let wallet: [u8; 32] = rec.player_wallet.as_slice().try_into().expect("32-byte wallet");
+    seed_section(state, wallet, rec.campaign_id).await
+}
+
+/// The `error` string of a route's JSON error body.
+fn error_message(bytes: &[u8]) -> String {
+    let v: serde_json::Value = serde_json::from_slice(bytes)
+        .unwrap_or_else(|e| panic!("not a JSON error body ({e}): {}", String::from_utf8_lossy(bytes)));
+    v["error"].as_str().expect("no error string").to_string()
 }
 
 /// A generated in-memory Commander owned by `wallet`. Returns its id.
@@ -4100,8 +4129,9 @@ async fn auth_verify_answers_500_and_issues_no_session_when_the_upsert_fails() {
 async fn mission_resolve_requires_a_session() {
     let state = default_state();
     let commander_id = seed_in_memory_commander(&state, [4u8; 32], |_| {}).await;
+    let section = seed_section_for(&state, commander_id).await;
     let app = mercs_server::routes::router(std::sync::Arc::new(state));
-    let (status, _) = post_mission(app, None, &mission_body(commander_id)).await;
+    let (status, _) = post_mission(app, None, &mission_body(commander_id, &[section])).await;
     assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
 }
 
@@ -4110,11 +4140,12 @@ async fn mission_resolve_requires_a_session() {
 async fn mission_resolve_hides_another_wallets_commander() {
     let state = default_state();
     let theirs = seed_in_memory_commander(&state, [4u8; 32], |_| {}).await;
+    let their_section = seed_section_for(&state, theirs).await;
     let my_token = insert_session(&state, [14u8; 32]);
     let app = mercs_server::routes::router(std::sync::Arc::new(state));
 
-    let (s1, b1) = post_mission(app.clone(), Some(&my_token), &mission_body(theirs)).await;
-    let (s2, b2) = post_mission(app, Some(&my_token), &mission_body(uuid::Uuid::new_v4())).await;
+    let (s1, b1) = post_mission(app.clone(), Some(&my_token), &mission_body(theirs, &[their_section])).await;
+    let (s2, b2) = post_mission(app, Some(&my_token), &mission_body(uuid::Uuid::new_v4(), &[their_section])).await;
     assert_eq!(s1, axum::http::StatusCode::NOT_FOUND, "another wallet's Commander");
     assert_eq!(s2, axum::http::StatusCode::NOT_FOUND, "unknown Commander");
     assert_eq!(b1, b2, "the two 404 bodies must be byte-identical");
@@ -4126,6 +4157,7 @@ async fn mission_resolve_rejects_a_client_commander() {
     let state = default_state();
     let wallet = [4u8; 32];
     let commander_id = seed_in_memory_commander(&state, wallet, |_| {}).await;
+    let section = seed_section_for(&state, commander_id).await;
     let token = insert_session(&state, wallet);
     let app = mercs_server::routes::router(std::sync::Arc::new(state));
 
@@ -4139,13 +4171,13 @@ async fn mission_resolve_rejects_a_client_commander() {
     }).unwrap();
 
     for (label, commander) in [("full object", full), ("empty object", serde_json::json!({}))] {
-        let mut body = mission_body(commander_id);
+        let mut body = mission_body(commander_id, &[section]);
         body["squad"]["commander"] = commander;
         let (status, _) = post_mission(app.clone(), Some(&token), &body).await;
         assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{label} must be refused");
     }
 
-    let mut body = mission_body(commander_id);
+    let mut body = mission_body(commander_id, &[section]);
     body["squad"]["commander"] = serde_json::Value::Null;
     let (status, bytes) = post_mission(app, Some(&token), &body).await;
     assert_eq!(status, axum::http::StatusCode::OK, "null means no client Commander: {}", String::from_utf8_lossy(&bytes));
@@ -4156,9 +4188,10 @@ async fn mission_resolve_rejects_seed_override() {
     let state = default_state();
     let wallet = [4u8; 32];
     let commander_id = seed_in_memory_commander(&state, wallet, |_| {}).await;
+    let section = seed_section_for(&state, commander_id).await;
     let token = insert_session(&state, wallet);
     let app = mercs_server::routes::router(std::sync::Arc::new(state));
-    let mut body = mission_body(commander_id);
+    let mut body = mission_body(commander_id, &[section]);
     body["seed_override"] = serde_json::json!(42);
     let (status, _) = post_mission(app, Some(&token), &body).await;
     assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
@@ -4170,10 +4203,11 @@ async fn mission_resolve_refuses_kia_and_shattered() {
     let wallet = [4u8; 32];
     let kia = seed_in_memory_commander(&state, wallet, |r| r.is_kia = true).await;
     let shattered = seed_in_memory_commander(&state, wallet, |r| r.is_shattered = true).await;
+    let (kia_section, shattered_section) = (seed_section_for(&state, kia).await, seed_section_for(&state, shattered).await);
     let token = insert_session(&state, wallet);
     let app = mercs_server::routes::router(std::sync::Arc::new(state));
-    for (label, id) in [("KIA", kia), ("Shattered", shattered)] {
-        let (status, bytes) = post_mission(app.clone(), Some(&token), &mission_body(id)).await;
+    for (label, id, section) in [("KIA", kia, kia_section), ("Shattered", shattered, shattered_section)] {
+        let (status, bytes) = post_mission(app.clone(), Some(&token), &mission_body(id, &[section])).await;
         assert_eq!(status, axum::http::StatusCode::CONFLICT, "{label}: {}", String::from_utf8_lossy(&bytes));
     }
 }
@@ -4183,17 +4217,22 @@ async fn mission_resolve_refuses_an_already_deployed_commander() {
     let state = default_state();
     let wallet = [4u8; 32];
     let commander_id = seed_in_memory_commander(&state, wallet, |_| {}).await;
-    assert!(state.commander_repo.start_deployment(&NewDeployment {
+    let section = seed_section_for(&state, commander_id).await;
+    assert_eq!(state.commander_repo.start_deployment(&NewDeployment {
         deployment_id: uuid::Uuid::new_v4(),
         commander_id,
         session_id: uuid::Uuid::new_v4(),
         mission_id: "GUARD_DUTY".into(),
         started_at: chrono::Utc::now(),
-    }).await.unwrap());
+        player_wallet: wallet.to_vec(),
+        campaign_id: uuid::Uuid::nil(),
+        section_ids: vec![],
+    }).await.unwrap(), DeploymentStart::Started);
     let token = insert_session(&state, wallet);
     let app = mercs_server::routes::router(std::sync::Arc::new(state));
-    let (status, _) = post_mission(app, Some(&token), &mission_body(commander_id)).await;
+    let (status, bytes) = post_mission(app, Some(&token), &mission_body(commander_id, &[section])).await;
     assert_eq!(status, axum::http::StatusCode::CONFLICT);
+    assert_eq!(error_message(&bytes), "Commander is already deployed");
 }
 
 /// Test-only seam: forwards everything to `inner`, except that `start_deployment` first
@@ -4232,7 +4271,7 @@ impl CommanderRepository for ShatterOnStart {
     async fn delete_commanders_by_campaign(&self, campaign_id: uuid::Uuid) -> Result<u64, mercs_server::repository::RepositoryError> {
         self.inner.delete_commanders_by_campaign(campaign_id).await
     }
-    async fn start_deployment(&self, d: &NewDeployment) -> Result<bool, mercs_server::repository::RepositoryError> {
+    async fn start_deployment(&self, d: &NewDeployment) -> Result<DeploymentStart, mercs_server::repository::RepositoryError> {
         self.inner.update_stress(d.commander_id, 100).await?;
         self.inner.start_deployment(d).await
     }
@@ -4266,13 +4305,14 @@ async fn assert_shattered_after_first_read_is_refused(
 ) {
     let seeded = state.commander_repo.get_commander(commander_id).await.unwrap().unwrap();
     assert!(!seeded.is_shattered, "precondition: the first read sees a deployable Commander");
+    let section = seed_section_for(&state, commander_id).await;
     state.commander_repo = std::sync::Arc::new(ShatterOnStart { inner: state.commander_repo.clone() });
     let token = insert_session(&state, wallet);
     let commanders = state.commander_repo.clone();
     let logs = state.input_log_repo.clone();
     let app = mercs_server::routes::router(std::sync::Arc::new(state));
 
-    let (status, bytes) = post_mission(app, Some(&token), &mission_body(commander_id)).await;
+    let (status, bytes) = post_mission(app, Some(&token), &mission_body(commander_id, &[section])).await;
     assert_eq!(status, axum::http::StatusCode::CONFLICT, "{}", String::from_utf8_lossy(&bytes));
     assert!(String::from_utf8_lossy(&bytes).contains("Shattered"), "{}", String::from_utf8_lossy(&bytes));
 
@@ -4306,6 +4346,7 @@ async fn mission_resolve_refuses_a_commander_shattered_after_the_first_read_post
     let mut state = default_state();
     state.commander_repo = std::sync::Arc::new(PostgresCommanderRepository::new(pool.clone()));
     state.input_log_repo = std::sync::Arc::new(PostgresInputLogRepository::new(pool.clone()));
+    state.section_repo = std::sync::Arc::new(PostgresSectionRepository::new(pool.clone()));
     assert_shattered_after_first_read_is_refused(state, wallet, commander_id).await;
     clean_wallet_4g1(&pool, &wallet).await;
 }
@@ -4318,11 +4359,12 @@ async fn mission_resolve_aborts_with_500_when_the_log_write_fails() {
     state.input_log_repo = std::sync::Arc::new(FailingInputLog { inner: state.input_log_repo.clone(), fail_writes: true });
     let wallet = [4u8; 32];
     let commander_id = seed_in_memory_commander(&state, wallet, |r| { r.stress = 30; r.xp = 88; }).await;
+    let section = seed_section_for(&state, commander_id).await;
     let token = insert_session(&state, wallet);
     let commanders = state.commander_repo.clone();
     let app = mercs_server::routes::router(std::sync::Arc::new(state));
 
-    let (status, bytes) = post_mission(app, Some(&token), &mission_body(commander_id)).await;
+    let (status, bytes) = post_mission(app, Some(&token), &mission_body(commander_id, &[section])).await;
     assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR, "{}", String::from_utf8_lossy(&bytes));
 
     let deps = commanders.list_deployments_by_commander(commander_id).await.unwrap();
@@ -4372,11 +4414,13 @@ async fn mission_resolve_end_to_end_writes_effects() {
     let mut state = default_state();
     state.commander_repo = std::sync::Arc::new(PostgresCommanderRepository::new(pool.clone()));
     state.input_log_repo = std::sync::Arc::new(PostgresInputLogRepository::new(pool.clone()));
+    state.section_repo = std::sync::Arc::new(PostgresSectionRepository::new(pool.clone()));
+    let section = seed_section_for(&state, commander_id).await;
     let token = insert_session(&state, wallet);
     let sim_cfg = state.config.sim.clone();
     let app = mercs_server::routes::router(std::sync::Arc::new(state));
 
-    let (status, bytes) = post_mission(app.clone(), Some(&token), &mission_body(commander_id)).await;
+    let (status, bytes) = post_mission(app.clone(), Some(&token), &mission_body(commander_id, &[section])).await;
     assert_eq!(status, axum::http::StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
     let resp: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     let sid_str = resp["session_id"].as_str().expect("session_id missing").to_string();
@@ -5145,11 +5189,10 @@ async fn clean_wallet_4g1_finds_a_campaign_through_membership() {
 }
 
 /// A wallet-33 Section with an owner and the given Commander.
-fn owned_section(campaign_id: uuid::Uuid, commander_id: Option<uuid::Uuid>, player_wallet: Option<Vec<u8>>) -> SectionRecord {
+fn owned_section(campaign_id: uuid::Uuid, player_wallet: Vec<u8>) -> SectionRecord {
     SectionRecord {
         section_id:    uuid::Uuid::new_v4(),
         campaign_id,
-        commander_id,
         player_wallet,
         name:          "Bravo Section".into(),
         headcount:     8,
@@ -5203,7 +5246,7 @@ async fn section_records_headcount_check_stores_0_and_8_refuses_9_and_minus_1() 
     }
 }
 
-/// 7b-1 — the owner round-trips through `create_section` and all three reads.
+/// 7b-1 — the owner round-trips through `create_section` and both reads.
 #[tokio::test]
 async fn postgres_section_repository_round_trips_the_owner() {
     let pool = match test_pool().await {
@@ -5212,32 +5255,27 @@ async fn postgres_section_repository_round_trips_the_owner() {
     };
     clean_wallet_4g1(&pool, &SECTION_WALLET).await;
     let campaign_id = seed_account_and_campaign(&pool, SECTION_WALLET, 0x7B13_i64).await;
-    let commander = mercs_server::commander_gen::generate_commander(SECTION_WALLET.to_vec(), campaign_id, 42u32);
-    let commander_id = commander.commander_id;
-    PostgresCommanderRepository::new(pool.clone()).create_commander(commander).await.expect("create_commander failed");
 
     let repo = PostgresSectionRepository::new(pool.clone());
-    let r = owned_section(campaign_id, Some(commander_id), Some(SECTION_WALLET.to_vec()));
+    let r = owned_section(campaign_id, SECTION_WALLET.to_vec());
     let created = repo.create_section(r.clone()).await;
     let got = repo.get_section(r.section_id).await;
     let by_campaign = repo.list_sections_by_campaign(campaign_id).await;
-    let by_commander = repo.list_sections_by_commander(commander_id).await;
     clean_wallet_4g1(&pool, &SECTION_WALLET).await;
 
     created.expect("create_section failed");
     let got = got.expect("get_section failed").expect("stored section");
-    assert_eq!(got.player_wallet, Some(vec![33u8; 32]));
+    assert_eq!(got.player_wallet, vec![33u8; 32]);
     let by_campaign = by_campaign.expect("list_sections_by_campaign failed");
     assert_eq!(by_campaign.len(), 1);
-    assert_eq!(by_campaign[0].player_wallet, Some(vec![33u8; 32]));
-    let by_commander = by_commander.expect("list_sections_by_commander failed");
-    assert_eq!(by_commander.len(), 1);
-    assert_eq!(by_commander[0].player_wallet, Some(vec![33u8; 32]));
+    assert_eq!(by_campaign[0].player_wallet, vec![33u8; 32]);
 }
 
-/// 7b-1 — `create_section` refuses a `None` owner (R2) and writes nothing.
+/// 7b-2 — `0026` makes the owner `NOT NULL`: a raw insert with a null owner is refused
+/// (`23502`, naming the column) and nothing is written. Replaces 7b-1's `None` refusal,
+/// which the `Vec<u8>` field makes unrepresentable.
 #[tokio::test]
-async fn postgres_create_section_refuses_a_missing_owner() {
+async fn section_records_refuses_a_null_owner() {
     let pool = match test_pool().await {
         Some(p) => p,
         None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
@@ -5245,17 +5283,26 @@ async fn postgres_create_section_refuses_a_missing_owner() {
     clean_wallet_4g1(&pool, &SECTION_WALLET).await;
     let campaign_id = seed_account_and_campaign(&pool, SECTION_WALLET, 0x7B14_i64).await;
 
-    let r = owned_section(campaign_id, None, None);
-    let res = PostgresSectionRepository::new(pool.clone()).create_section(r.clone()).await;
+    let section_id = uuid::Uuid::new_v4();
+    let res = sqlx::query(
+        "INSERT INTO section_records (section_id, campaign_id, player_wallet, name) VALUES ($1, $2, NULL, 'Echo Section')"
+    )
+    .bind(section_id)
+    .bind(campaign_id)
+    .execute(&pool)
+    .await;
     let (stored,): (i64,) = sqlx::query_as("SELECT count(*) FROM section_records WHERE section_id = $1")
-        .bind(r.section_id)
+        .bind(section_id)
         .fetch_one(&pool)
         .await
         .expect("count failed");
     clean_wallet_4g1(&pool, &SECTION_WALLET).await;
 
-    let err = res.expect_err("a None owner must be refused");
-    assert!(matches!(err, mercs_server::repository::RepositoryError::Internal(_)), "expected Internal, got {err:?}");
+    let err = res.expect_err("a null owner must be refused");
+    let db = err.as_database_error().unwrap_or_else(|| panic!("not a database error: {err}"));
+    assert_eq!(db.code().as_deref(), Some("23502"), "expected a not-null violation, got {err}");
+    let pg = db.try_downcast_ref::<sqlx::postgres::PgDatabaseError>().expect("a Postgres error");
+    assert_eq!(pg.column(), Some("player_wallet"));
     assert_eq!(stored, 0, "a refused section must not be written");
 }
 
@@ -5271,7 +5318,7 @@ async fn section_owner_restricts_deleting_the_account() {
     clean_wallet_4g1(&pool, &SECTION_WALLET).await;
     let campaign_id = seed_account_and_campaign(&pool, SECTION_WALLET, 0x7B15_i64).await;
     PostgresSectionRepository::new(pool.clone())
-        .create_section(owned_section(campaign_id, None, Some(SECTION_WALLET.to_vec())))
+        .create_section(owned_section(campaign_id, SECTION_WALLET.to_vec()))
         .await
         .expect("create_section failed");
     sqlx::query("DELETE FROM player_campaign_membership WHERE wallet_address = $1")
@@ -5289,4 +5336,456 @@ async fn section_owner_restricts_deleting_the_account() {
     let db = err.as_database_error().unwrap_or_else(|| panic!("not a database error: {err}"));
     assert_eq!(db.code().as_deref(), Some("23503"), "expected a foreign-key violation, got {err}");
     assert_eq!(db.constraint(), Some("section_records_player_wallet_fkey"));
+}
+
+// ── Brick 7b-2: per-mission Sections on deployment_sections (GAP-50, GAP-66) ─
+
+/// The 7b-2 tests' owner and, for the other-owner cases, the second wallet.
+const DEPLOY_WALLET: [u8; 32] = [34u8; 32];
+const OTHER_WALLET: [u8; 32] = [35u8; 32];
+
+/// 7b-2 #4 — a missing `section_ids` key, an empty list and a repeated id are each the
+/// route's own `400` (JSON error body), not axum's plain-text `422`.
+#[tokio::test]
+async fn mission_route_refuses_section_ids_missing_empty_or_duplicate() {
+    let state = default_state();
+    let commander_id = seed_in_memory_commander(&state, DEPLOY_WALLET, |_| {}).await;
+    let section = seed_section_for(&state, commander_id).await;
+    let token = insert_session(&state, DEPLOY_WALLET);
+    let app = mercs_server::routes::router(std::sync::Arc::new(state));
+
+    let mut missing = mission_body(commander_id, &[]);
+    missing.as_object_mut().unwrap().remove("section_ids");
+    let cases = [
+        ("missing", missing),
+        ("empty", mission_body(commander_id, &[])),
+        ("duplicate", mission_body(commander_id, &[section, section])),
+    ];
+    for (label, body) in cases {
+        let (status, bytes) = post_mission(app.clone(), Some(&token), &body).await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{label}: {}", String::from_utf8_lossy(&bytes));
+        assert!(!error_message(&bytes).is_empty(), "{label}: the route's JSON error body");
+    }
+}
+
+/// 7b-2 #5 (GAP-50) — a Rank 1 Commander may take 2 Sections, not 3. The `422` carries
+/// the route's JSON error body.
+#[tokio::test]
+async fn mission_route_refuses_rank_1_with_three_sections() {
+    let state = default_state();
+    let commander_id = seed_in_memory_commander(&state, DEPLOY_WALLET, |r| r.rank = 1).await;
+    let mut s = Vec::new();
+    for _ in 0..3 {
+        s.push(seed_section_for(&state, commander_id).await);
+    }
+    let token = insert_session(&state, DEPLOY_WALLET);
+    let app = mercs_server::routes::router(std::sync::Arc::new(state));
+
+    let (status, bytes) = post_mission(app.clone(), Some(&token), &mission_body(commander_id, &s)).await;
+    assert_eq!(status, axum::http::StatusCode::UNPROCESSABLE_ENTITY, "{}", String::from_utf8_lossy(&bytes));
+    assert!(error_message(&bytes).contains("at most 2 Sections"), "{}", String::from_utf8_lossy(&bytes));
+
+    let (status, bytes) = post_mission(app, Some(&token), &mission_body(commander_id, &s[..2])).await;
+    assert_ne!(status, axum::http::StatusCode::UNPROCESSABLE_ENTITY, "2 Sections is within Rank 1's cap: {}", String::from_utf8_lossy(&bytes));
+    assert_eq!(status, axum::http::StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+}
+
+/// 7b-2 #6 — an unknown Section, another wallet's and one from another campaign are all
+/// `404` with byte-identical bodies.
+#[tokio::test]
+async fn mission_route_hides_foreign_and_unknown_sections() {
+    let state = default_state();
+    let commander_id = seed_in_memory_commander(&state, DEPLOY_WALLET, |_| {}).await;
+    let campaign_id = state.commander_repo.get_commander(commander_id).await.unwrap().unwrap().campaign_id;
+    let theirs = seed_section(&state, OTHER_WALLET, campaign_id).await;
+    let elsewhere = seed_section(&state, DEPLOY_WALLET, uuid::Uuid::new_v4()).await;
+    let token = insert_session(&state, DEPLOY_WALLET);
+    let app = mercs_server::routes::router(std::sync::Arc::new(state));
+
+    let mut bodies = Vec::new();
+    for (label, section) in [("unknown", uuid::Uuid::new_v4()), ("another wallet's", theirs), ("another campaign's", elsewhere)] {
+        let (status, bytes) = post_mission(app.clone(), Some(&token), &mission_body(commander_id, &[section])).await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND, "{label}: {}", String::from_utf8_lossy(&bytes));
+        bodies.push(bytes);
+    }
+    assert_eq!(bodies[0], bodies[1], "unknown vs another wallet's");
+    assert_eq!(bodies[0], bodies[2], "unknown vs another campaign's");
+}
+
+/// 7b-2 #7 — a Section held by another Commander's active deployment is a `409` with the
+/// Section body, not the Commander-busy one.
+#[tokio::test]
+async fn mission_route_refuses_a_section_already_deployed() {
+    let state = default_state();
+    let campaign_id = uuid::Uuid::new_v4();
+    let holder = seed_in_memory_commander(&state, DEPLOY_WALLET, |r| r.campaign_id = campaign_id).await;
+    let commander_id = seed_in_memory_commander(&state, DEPLOY_WALLET, |r| r.campaign_id = campaign_id).await;
+    let section = seed_section(&state, DEPLOY_WALLET, campaign_id).await;
+    let held = state.commander_repo.start_deployment(&NewDeployment {
+        deployment_id: uuid::Uuid::new_v4(),
+        commander_id: holder,
+        session_id: uuid::Uuid::new_v4(),
+        mission_id: "GUARD_DUTY".into(),
+        started_at: chrono::Utc::now(),
+        player_wallet: DEPLOY_WALLET.to_vec(),
+        campaign_id,
+        section_ids: vec![section],
+    }).await.unwrap();
+    assert_eq!(held, DeploymentStart::Started);
+    let token = insert_session(&state, DEPLOY_WALLET);
+    let commanders = state.commander_repo.clone();
+    let app = mercs_server::routes::router(std::sync::Arc::new(state));
+
+    let (status, bytes) = post_mission(app, Some(&token), &mission_body(commander_id, &[section])).await;
+    assert_eq!(status, axum::http::StatusCode::CONFLICT, "{}", String::from_utf8_lossy(&bytes));
+    assert_eq!(error_message(&bytes), "A Section is already deployed");
+    assert!(commanders.list_deployments_by_commander(commander_id).await.unwrap().is_empty(),
+        "the refused start must write no deployment");
+}
+
+/// 7b-2 #8 — the selection is logged beside `request`, in request order (not sorted), and
+/// `request` keeps its pre-7b-2 shape.
+#[tokio::test]
+async fn mission_route_logs_the_selection_in_request_order() {
+    let state = default_state();
+    let commander_id = seed_in_memory_commander(&state, DEPLOY_WALLET, |r| r.rank = 1).await;
+    let mut sent = vec![seed_section_for(&state, commander_id).await, seed_section_for(&state, commander_id).await];
+    sent.sort();
+    sent.reverse(); // descending, so request order differs from the sorted insert order
+    let token = insert_session(&state, DEPLOY_WALLET);
+    let logs = state.input_log_repo.clone();
+    let app = mercs_server::routes::router(std::sync::Arc::new(state));
+
+    let (status, bytes) = post_mission(app, Some(&token), &mission_body(commander_id, &sent)).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+    let resp: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let sid = uuid::Uuid::parse_str(resp["session_id"].as_str().unwrap()).unwrap();
+    let entries = logs.get_entries_by_session(&sid).await.unwrap();
+    assert_eq!(entries.len(), 1);
+    let payload = &entries[0].payload;
+    let logged: Vec<uuid::Uuid> = serde_json::from_value(payload["selection"]["section_ids"].clone()).expect("selection.section_ids");
+    assert_eq!(logged, sent, "the log keeps request order");
+    assert!(payload["request"].get("section_ids").is_none(), "payload.request keeps its pre-7b-2 shape");
+    assert_eq!(payload["request"]["commander_id"].as_str(), Some(commander_id.to_string().as_str()));
+}
+
+/// 7b-2 #9 — an `f7a1ff3`-shape mission payload (no `selection`) and a 7b-2 one both
+/// deserialise their `request` into `MissionResolveRequest`.
+#[tokio::test]
+async fn pre_7b2_mission_log_still_deserialises() {
+    use mercs_server::api_types::MissionResolveRequest;
+    let commander_id = "0b6f3c1e-5d2a-4c8e-9f10-2a3b4c5d6e7f";
+    let request = serde_json::json!({
+        "squad": { "units": [mission_unit_json()] },
+        "mission_id": "GUARD_DUTY",
+        "commander_id": commander_id,
+    });
+    let old = serde_json::json!({ "request": request.clone(), "timestamp": "2026-10-17T12:00:00+00:00" });
+    let new = serde_json::json!({
+        "request": request,
+        "timestamp": "2026-10-18T12:00:00+00:00",
+        "selection": { "section_ids": ["5c1d0e2f-3a4b-4c5d-8e6f-7a8b9c0d1e2f"] },
+    });
+    for (label, payload) in [("f7a1ff3", old), ("7b-2", new)] {
+        let req: MissionResolveRequest = serde_json::from_value(payload["request"].clone())
+            .unwrap_or_else(|e| panic!("{label} payload.request must deserialise: {e}"));
+        assert_eq!(req.commander_id.to_string(), commander_id, "{label}");
+        assert_eq!(req.mission_id, "GUARD_DUTY", "{label}");
+        assert_eq!(req.squad.units.len(), 1, "{label}");
+    }
+}
+
+/// The Postgres fixture for 7b-2's FK tests: wallet 34 owns campaigns `c1` and `c2`,
+/// Commanders `a` (with active deployment `d`, no Sections) and `a2` in `c1`, Section
+/// `s34` in `c1` and `s34b` in `c2`. Wallet 35 owns Section `s35` in `c1`.
+struct FkFixture {
+    c1: uuid::Uuid,
+    a: uuid::Uuid,
+    a2: uuid::Uuid,
+    d: uuid::Uuid,
+    s34: uuid::Uuid,
+    s34b: uuid::Uuid,
+    s35: uuid::Uuid,
+}
+
+async fn pg_commander(pool: &sqlx::PgPool, wallet: [u8; 32], campaign_id: uuid::Uuid, seed: u32) -> uuid::Uuid {
+    let rec = mercs_server::commander_gen::generate_commander(wallet.to_vec(), campaign_id, seed);
+    let id = rec.commander_id;
+    PostgresCommanderRepository::new(pool.clone()).create_commander(rec).await.expect("create_commander failed");
+    id
+}
+
+async fn pg_section(pool: &sqlx::PgPool, wallet: [u8; 32], campaign_id: uuid::Uuid) -> uuid::Uuid {
+    let r = owned_section(campaign_id, wallet.to_vec());
+    let id = r.section_id;
+    PostgresSectionRepository::new(pool.clone()).create_section(r).await.expect("create_section failed");
+    id
+}
+
+fn pg_deployment(commander_id: uuid::Uuid, campaign_id: uuid::Uuid, section_ids: Vec<uuid::Uuid>, started_at: chrono::DateTime<chrono::Utc>) -> NewDeployment {
+    NewDeployment {
+        deployment_id: uuid::Uuid::new_v4(),
+        commander_id,
+        session_id: uuid::Uuid::new_v4(),
+        mission_id: "GUARD_DUTY".into(),
+        started_at,
+        player_wallet: DEPLOY_WALLET.to_vec(),
+        campaign_id,
+        section_ids,
+    }
+}
+
+async fn clean_7b2(pool: &sqlx::PgPool) {
+    clean_wallet_4g1(pool, &DEPLOY_WALLET).await;
+    clean_wallet_4g1(pool, &OTHER_WALLET).await;
+}
+
+async fn fk_fixture(pool: &sqlx::PgPool) -> FkFixture {
+    clean_7b2(pool).await;
+    let c1 = seed_account_and_campaign(pool, DEPLOY_WALLET, 0x7B21_i64).await;
+    let c2 = seed_account_and_campaign(pool, DEPLOY_WALLET, 0x7B22_i64).await;
+    seed_account_and_campaign(pool, OTHER_WALLET, 0x7B23_i64).await;
+    let a = pg_commander(pool, DEPLOY_WALLET, c1, 42).await;
+    let a2 = pg_commander(pool, DEPLOY_WALLET, c1, 43).await;
+    let dep = pg_deployment(a, c1, vec![], chrono::Utc::now());
+    let started = PostgresCommanderRepository::new(pool.clone()).start_deployment(&dep).await.expect("start_deployment failed");
+    assert_eq!(started, DeploymentStart::Started);
+    FkFixture {
+        c1, a, a2, d: dep.deployment_id,
+        s34: pg_section(pool, DEPLOY_WALLET, c1).await,
+        s34b: pg_section(pool, DEPLOY_WALLET, c2).await,
+        s35: pg_section(pool, OTHER_WALLET, c1).await,
+    }
+}
+
+/// A raw `deployment_sections` insert, as a forged or buggy writer would make it.
+async fn raw_join_insert(pool: &sqlx::PgPool, d: uuid::Uuid, section: uuid::Uuid, commander: uuid::Uuid, wallet: [u8; 32], campaign: uuid::Uuid) -> Result<sqlx::postgres::PgQueryResult, sqlx::Error> {
+    sqlx::query("INSERT INTO deployment_sections (deployment_id, section_id, commander_id, player_wallet, campaign_id) VALUES ($1, $2, $3, $4, $5)")
+        .bind(d).bind(section).bind(commander).bind(wallet.to_vec()).bind(campaign)
+        .execute(pool)
+        .await
+}
+
+fn assert_fk_violation(res: Result<sqlx::postgres::PgQueryResult, sqlx::Error>, constraint: &str) {
+    let err = res.expect_err(&format!("the insert must violate {constraint}"));
+    let db = err.as_database_error().unwrap_or_else(|| panic!("not a database error: {err}"));
+    assert_eq!(db.code().as_deref(), Some("23503"), "expected a foreign-key violation, got {err}");
+    assert_eq!(db.constraint(), Some(constraint));
+}
+
+/// 7b-2 #10 (GAP-66) — another wallet's Section, with the deployment pair and the
+/// Commander triple satisfied.
+#[tokio::test]
+async fn deployment_sections_refuses_another_wallets_section() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    let f = fk_fixture(&pool).await;
+    let res = raw_join_insert(&pool, f.d, f.s35, f.a, DEPLOY_WALLET, f.c1).await;
+    clean_7b2(&pool).await;
+    assert_fk_violation(res, "deployment_sections_section_fkey");
+}
+
+/// 7b-2 #11 (GAP-66) — the same wallet's Section from another campaign.
+#[tokio::test]
+async fn deployment_sections_refuses_another_campaigns_section() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    let f = fk_fixture(&pool).await;
+    let res = raw_join_insert(&pool, f.d, f.s34b, f.a, DEPLOY_WALLET, f.c1).await;
+    clean_7b2(&pool).await;
+    assert_fk_violation(res, "deployment_sections_section_fkey");
+}
+
+/// 7b-2 #12 (GAP-66) — the Section triple and the deployment pair hold (wallet 35's
+/// Section, named as wallet 35's), but the Commander is not wallet 35's.
+#[tokio::test]
+async fn deployment_sections_refuses_a_commander_of_another_owner() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    let f = fk_fixture(&pool).await;
+    let res = raw_join_insert(&pool, f.d, f.s35, f.a, OTHER_WALLET, f.c1).await;
+    clean_7b2(&pool).await;
+    assert_fk_violation(res, "deployment_sections_commander_fkey");
+}
+
+/// 7b-2 #13 (GAP-66) — the Commander and Section triples hold, but the deployment is not
+/// this Commander's.
+#[tokio::test]
+async fn deployment_sections_refuses_a_mismatched_deployment_pair() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    let f = fk_fixture(&pool).await;
+    let res = raw_join_insert(&pool, f.d, f.s34, f.a2, DEPLOY_WALLET, f.c1).await;
+    clean_7b2(&pool).await;
+    assert_fk_violation(res, "deployment_sections_deployment_fkey");
+}
+
+/// Pre-cleans, then seeds wallet 34 with a campaign, two Commanders and two Sections.
+/// Returns (campaign, commander a, commander b, section 1, section 2).
+async fn two_commanders_two_sections(pool: &sqlx::PgPool) -> (uuid::Uuid, uuid::Uuid, uuid::Uuid, uuid::Uuid, uuid::Uuid) {
+    clean_7b2(pool).await;
+    let c = seed_account_and_campaign(pool, DEPLOY_WALLET, 0x7B24_i64).await;
+    let a = pg_commander(pool, DEPLOY_WALLET, c, 42).await;
+    let b = pg_commander(pool, DEPLOY_WALLET, c, 43).await;
+    let s1 = pg_section(pool, DEPLOY_WALLET, c).await;
+    let s2 = pg_section(pool, DEPLOY_WALLET, c).await;
+    (c, a, b, s1, s2)
+}
+
+/// Whether the (deployment, Section) join row has been released.
+async fn released(pool: &sqlx::PgPool, deployment_id: uuid::Uuid, section_id: uuid::Uuid) -> bool {
+    sqlx::query_scalar("SELECT released_at IS NOT NULL FROM deployment_sections WHERE deployment_id = $1 AND section_id = $2")
+        .bind(deployment_id).bind(section_id)
+        .fetch_one(pool).await.expect("join row read failed")
+}
+
+/// 7b-2 #14 — a busy Section refuses the whole start: no deployment row and no join row
+/// for the second Commander, whose other Section stays free for its next start.
+#[tokio::test]
+async fn postgres_start_deployment_refuses_a_busy_section_and_rolls_back() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    let (c, a, b, s1, s2) = two_commanders_two_sections(&pool).await;
+    let repo = PostgresCommanderRepository::new(pool.clone());
+    let now = chrono::Utc::now();
+    let first = repo.start_deployment(&pg_deployment(a, c, vec![s1], now)).await;
+    let busy = repo.start_deployment(&pg_deployment(b, c, vec![s2, s1], now)).await;
+    let b_rows_after_refusal = repo.list_deployments_by_commander(b).await;
+    let (s2_rows,): (i64,) = sqlx::query_as("SELECT count(*) FROM deployment_sections WHERE section_id = $1")
+        .bind(s2).fetch_one(&pool).await.expect("count failed");
+    let retry = repo.start_deployment(&pg_deployment(b, c, vec![s2], now)).await;
+    clean_7b2(&pool).await;
+
+    assert_eq!(first.expect("first start failed"), DeploymentStart::Started);
+    assert_eq!(busy.expect("busy start failed"), DeploymentStart::SectionBusy);
+    assert!(b_rows_after_refusal.expect("list failed").is_empty(), "the refused start must roll back its deployment row");
+    assert_eq!(s2_rows, 0, "the refused start must roll back its join rows");
+    assert_eq!(retry.expect("retry failed"), DeploymentStart::Started, "the free Section starts once the busy one is dropped");
+}
+
+/// 7b-2 #15 — the stale abort (same Commander) releases the Section, which starts again.
+#[tokio::test]
+async fn postgres_section_redeploys_after_stale_abort() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    let (c, a, _b, s1, _s2) = two_commanders_two_sections(&pool).await;
+    let repo = PostgresCommanderRepository::new(pool.clone());
+    let now = chrono::Utc::now();
+    let stale = pg_deployment(a, c, vec![s1], now - chrono::Duration::minutes(6));
+    let first = repo.start_deployment(&stale).await;
+    let again = repo.start_deployment(&pg_deployment(a, c, vec![s1], now)).await;
+    let was_released = released(&pool, stale.deployment_id, s1).await;
+    clean_7b2(&pool).await;
+
+    assert_eq!(first.expect("stale start failed"), DeploymentStart::Started);
+    assert_eq!(again.expect("restart failed"), DeploymentStart::Started, "the stale abort must release the Section");
+    assert!(was_released, "the stale deployment's join row must be released");
+}
+
+/// 7b-2 #16 — `abort_deployment` releases the Section, which another Commander then takes.
+#[tokio::test]
+async fn postgres_section_redeploys_after_abort() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    let (c, a, b, s1, _s2) = two_commanders_two_sections(&pool).await;
+    let repo = PostgresCommanderRepository::new(pool.clone());
+    let now = chrono::Utc::now();
+    let d = pg_deployment(a, c, vec![s1], now);
+    let first = repo.start_deployment(&d).await;
+    let aborted = repo.abort_deployment(d.deployment_id).await;
+    let was_released = released(&pool, d.deployment_id, s1).await;
+    let again = repo.start_deployment(&pg_deployment(b, c, vec![s1], now)).await;
+    clean_7b2(&pool).await;
+
+    assert_eq!(first.expect("first start failed"), DeploymentStart::Started);
+    aborted.expect("abort failed");
+    assert!(was_released, "the abort must release the join row");
+    assert_eq!(again.expect("restart failed"), DeploymentStart::Started, "the aborted deployment's Section must start again");
+}
+
+/// 7b-2 #17 — `resolve_deployment`'s close releases the Section.
+#[tokio::test]
+async fn postgres_section_redeploys_after_resolve() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    let (c, a, b, s1, _s2) = two_commanders_two_sections(&pool).await;
+    let repo = PostgresCommanderRepository::new(pool.clone());
+    let now = chrono::Utc::now();
+    let d = pg_deployment(a, c, vec![s1], now);
+    let first = repo.start_deployment(&d).await;
+    let cfg = sim_engine::config::SimConfig::default();
+    let resolved = repo.resolve_deployment(d.deployment_id, a, 0, 1, 0.0, &sim_engine::game_types::OutcomeType::Success, &cfg).await;
+    let was_released = released(&pool, d.deployment_id, s1).await;
+    let again = repo.start_deployment(&pg_deployment(b, c, vec![s1], now)).await;
+    clean_7b2(&pool).await;
+
+    assert_eq!(first.expect("first start failed"), DeploymentStart::Started);
+    resolved.expect("resolve failed");
+    assert!(was_released, "the resolve close must release the join row");
+    assert_eq!(again.expect("restart failed"), DeploymentStart::Started, "the resolved deployment's Section must start again");
+}
+
+/// 7b-2 #18 (R4) — Commander A's stale deployment holds S; Commander B starts with S, and
+/// the stale rule aborts A's deployment although it is not B's.
+#[tokio::test]
+async fn postgres_stale_section_holder_is_aborted_for_another_commander() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    let (c, a, b, s1, _s2) = two_commanders_two_sections(&pool).await;
+    let repo = PostgresCommanderRepository::new(pool.clone());
+    let now = chrono::Utc::now();
+    let first = repo.start_deployment(&pg_deployment(a, c, vec![s1], now - chrono::Duration::minutes(6))).await;
+    let other = repo.start_deployment(&pg_deployment(b, c, vec![s1], now)).await;
+    let a_rows = repo.list_deployments_by_commander(a).await;
+    clean_7b2(&pool).await;
+
+    assert_eq!(first.expect("stale start failed"), DeploymentStart::Started);
+    assert_eq!(other.expect("other start failed"), DeploymentStart::Started, "a stale holder must not block another Commander");
+    let a_rows = a_rows.expect("list failed");
+    assert_eq!(a_rows.len(), 1);
+    assert_eq!(a_rows[0].status, "aborted", "the stale holder must be aborted");
+}
+
+/// 7b-2 #19 — the trigger releases on any close, including a raw status write as `.prev`
+/// (f7a1ff3) makes it, which knows nothing of deployment_sections.
+#[tokio::test]
+async fn trigger_releases_sections_on_a_raw_status_update() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    let (c, a, _b, s1, _s2) = two_commanders_two_sections(&pool).await;
+    let repo = PostgresCommanderRepository::new(pool.clone());
+    let d = pg_deployment(a, c, vec![s1], chrono::Utc::now());
+    let first = repo.start_deployment(&d).await;
+    let held_before = released(&pool, d.deployment_id, s1).await;
+    let raw = sqlx::query("UPDATE deployment_records SET status = 'aborted', closed_at = now() WHERE deployment_id = $1 AND status = 'active'")
+        .bind(d.deployment_id)
+        .execute(&pool)
+        .await;
+    let was_released = released(&pool, d.deployment_id, s1).await;
+    clean_7b2(&pool).await;
+
+    assert_eq!(first.expect("start failed"), DeploymentStart::Started);
+    assert!(!held_before, "precondition: the join row is active");
+    assert_eq!(raw.expect("raw close failed").rows_affected(), 1);
+    assert!(was_released, "the trigger must release the Section on a raw close");
 }

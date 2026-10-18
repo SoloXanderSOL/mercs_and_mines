@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT section_id FROM section_records WHERE section_id = ANY($1) AND player_wallet = $2 AND campaign_id = $3",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "section_id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray",
+        "Bytea",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "28b3e035abfb8d2f6ea636a53f2ec2faefbcc6967068e8e1d2f5209ad060014e"
+}

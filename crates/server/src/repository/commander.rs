@@ -129,6 +129,23 @@ pub struct NewDeployment {
     pub mission_id:    String,
     /// Supplied by the caller so the stale rule is testable without sleeping.
     pub started_at:    DateTime<Utc>,
+    /// The Commander's owner and campaign, carried onto every `deployment_sections` row
+    /// (7b-2). The composite FKs hold the Commander and each Section to these values.
+    pub player_wallet: Vec<u8>,
+    pub campaign_id:   Uuid,
+    /// The Sections this deployment sends (7b-2). Empty is accepted here; the route
+    /// refuses it.
+    pub section_ids:   Vec<Uuid>,
+}
+
+/// What `start_deployment` did. A return value, not an error (7b-2 R2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeploymentStart {
+    Started,
+    /// The Commander already has an `active` deployment; nothing was written.
+    CommanderBusy,
+    /// A requested Section is in another `active` deployment; nothing was written.
+    SectionBusy,
 }
 
 /// Mirrors `deployment_records`. `status` is `active` / `resolved` / `aborted`.
@@ -195,11 +212,15 @@ pub trait CommanderRepository: Send + Sync {
     async fn list_commanders_by_campaign(&self, campaign_id: Uuid) -> Result<Vec<CommanderRecord>, RepositoryError>;
     async fn delete_commanders_by_campaign(&self, campaign_id: Uuid) -> Result<u64, RepositoryError>;
 
-    /// Records an `active` deployment. In one transaction it first aborts this Commander's
-    /// `active` row if it is older than `STALE_DEPLOYMENT_AFTER`, then inserts. Returns
-    /// `Ok(false)` when the Commander already has an `active` deployment: the partial
-    /// unique index `deployment_records_one_active` serialises each Commander.
-    async fn start_deployment(&self, d: &NewDeployment) -> Result<bool, RepositoryError>;
+    /// Records an `active` deployment and its Sections. In one transaction it first aborts
+    /// every `active` deployment older than `STALE_DEPLOYMENT_AFTER` that is this
+    /// Commander's or holds a requested Section (7b-2 R4), then inserts the deployment,
+    /// then its `deployment_sections` rows. `CommanderBusy` when the Commander already has
+    /// an `active` deployment (`deployment_records_one_active`); `SectionBusy` when a
+    /// requested Section is in one (`deployment_sections_one_active`). Either refusal
+    /// writes nothing. Closing a deployment releases its Sections: in Postgres through the
+    /// trigger `deployment_records_release_sections` (`0027`), so every close path does.
+    async fn start_deployment(&self, d: &NewDeployment) -> Result<DeploymentStart, RepositoryError>;
     /// Marks an `active` deployment `aborted`. `NotFound` if it is not `active`.
     async fn abort_deployment(&self, deployment_id: Uuid) -> Result<(), RepositoryError>;
     /// The mission's atomic write (§4g item 6.5). Locks the Commander row, refuses a KIA
@@ -541,13 +562,18 @@ impl CommanderRepository for PostgresCommanderRepository {
         Ok(result.rows_affected())
     }
 
-    async fn start_deployment(&self, d: &NewDeployment) -> Result<bool, RepositoryError> {
+    async fn start_deployment(&self, d: &NewDeployment) -> Result<DeploymentStart, RepositoryError> {
+        // Dropping `tx` without commit rolls back the stale abort and the deployment insert,
+        // so a refusal writes nothing.
         let mut tx = self.pool.begin().await.map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        // R4: a crashed deployment that still holds a requested Section is stale too,
+        // whoever its Commander is. The trigger releases the Sections of what this aborts.
         sqlx::query!(
-            "UPDATE deployment_records SET status = 'aborted', closed_at = $2 WHERE commander_id = $1 AND status = 'active' AND started_at < $3",
+            "UPDATE deployment_records SET status = 'aborted', closed_at = $2 WHERE status = 'active' AND started_at < $3 AND (commander_id = $1 OR deployment_id IN (SELECT deployment_id FROM deployment_sections WHERE section_id = ANY($4) AND released_at IS NULL))",
             d.commander_id,
             d.started_at,
             stale_cutoff(d.started_at),
+            d.section_ids.as_slice(),
         )
         .execute(&mut *tx)
         .await
@@ -563,8 +589,29 @@ impl CommanderRepository for PostgresCommanderRepository {
         .execute(&mut *tx)
         .await
         .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        if inserted.rows_affected() != 1 {
+            return Ok(DeploymentStart::CommanderBusy);
+        }
+        // R5: sorted, so two starts that share Sections lock them in the same order and
+        // cannot deadlock. The input log keeps the request's order.
+        let mut sorted = d.section_ids.clone();
+        sorted.sort();
+        let joined = sqlx::query!(
+            "INSERT INTO deployment_sections (deployment_id, section_id, commander_id, player_wallet, campaign_id) SELECT $1, unnest($2::uuid[]), $3, $4, $5 ON CONFLICT (section_id) WHERE released_at IS NULL DO NOTHING",
+            d.deployment_id,
+            sorted.as_slice(),
+            d.commander_id,
+            d.player_wallet.as_slice(),
+            d.campaign_id,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        if joined.rows_affected() < sorted.len() as u64 {
+            return Ok(DeploymentStart::SectionBusy);
+        }
         tx.commit().await.map_err(|e| RepositoryError::Internal(e.to_string()))?;
-        Ok(inserted.rows_affected() == 1)
+        Ok(DeploymentStart::Started)
     }
 
     async fn abort_deployment(&self, deployment_id: Uuid) -> Result<(), RepositoryError> {
@@ -683,10 +730,40 @@ impl CommanderRepository for PostgresCommanderRepository {
 /// `resolve_deployment` writes KIA, the card and the close in one critical section.
 #[derive(Default)]
 struct DeploymentStore {
-    records: HashMap<Uuid, DeploymentRecord>,
-    cards:   Vec<CardMintPending>,
+    records:  HashMap<Uuid, DeploymentRecord>,
+    cards:    Vec<CardMintPending>,
+    /// Mirrors `deployment_sections`: one row per (deployment, Section).
+    sections: Vec<DeploymentSectionRow>,
 }
 
+/// One `deployment_sections` row. `released_at` is `None` while the deployment is active.
+#[derive(Debug, Clone)]
+struct DeploymentSectionRow {
+    deployment_id: Uuid,
+    section_id:    Uuid,
+    released_at:   Option<DateTime<Utc>>,
+}
+
+/// Stands in for the trigger `deployment_records_release_sections`: every in-memory close
+/// calls it.
+fn release_sections(sections: &mut [DeploymentSectionRow], deployment_id: Uuid, at: DateTime<Utc>) {
+    for row in sections.iter_mut().filter(|r| r.deployment_id == deployment_id && r.released_at.is_none()) {
+        row.released_at = Some(at);
+    }
+}
+
+impl DeploymentStore {
+
+    fn holds_active_section(&self, deployment_id: Uuid, section_ids: &[Uuid]) -> bool {
+        self.sections.iter().any(|r| r.deployment_id == deployment_id && r.released_at.is_none() && section_ids.contains(&r.section_id))
+    }
+}
+
+/// In-memory stub. It models the one-active-deployment rules for Commanders and Sections,
+/// the stale rule (R4 included) and the release of Sections at the stale abort, the abort
+/// and the resolve close. **Postgres-only:** the three composite FKs on
+/// `deployment_sections` (same owner, same campaign), the `RESTRICT`s and the release
+/// trigger; this impl cannot see Sections, so the route's `404` is the check here.
 pub struct InMemoryCommanderRepository {
     store: DashMap<Uuid, CommanderRecord>,
     /// Every deployment method holds this one lock for its whole body, which stands in
@@ -780,7 +857,7 @@ impl CommanderRepository for InMemoryCommanderRepository {
         Ok(count)
     }
 
-    async fn start_deployment(&self, d: &NewDeployment) -> Result<bool, RepositoryError> {
+    async fn start_deployment(&self, d: &NewDeployment) -> Result<DeploymentStart, RepositoryError> {
         let mut deps = self.lock_deployments()?;
         // Mirrors the Postgres foreign key to commander_records.
         if !self.store.contains_key(&d.commander_id) {
@@ -788,15 +865,36 @@ impl CommanderRepository for InMemoryCommanderRepository {
                 "deployment_records.commander_id {} is not in commander_records", d.commander_id
             )));
         }
+        // Validate before mutating: a refusal leaves the store exactly as it was, as the
+        // dropped Postgres transaction does (the stale abort included).
         let cutoff = stale_cutoff(d.started_at);
-        for dep in deps.records.values_mut() {
-            if dep.commander_id == d.commander_id && dep.status == "active" && dep.started_at < cutoff {
+        let stale: Vec<Uuid> = deps.records.values()
+            .filter(|dep| dep.status == "active" && dep.started_at < cutoff)
+            .filter(|dep| dep.commander_id == d.commander_id || deps.holds_active_section(dep.deployment_id, &d.section_ids))
+            .map(|dep| dep.deployment_id)
+            .collect();
+        let live = |dep: &DeploymentRecord| dep.status == "active" && !stale.contains(&dep.deployment_id);
+        if deps.records.values().any(|dep| dep.commander_id == d.commander_id && live(dep)) {
+            return Ok(DeploymentStart::CommanderBusy);
+        }
+        // As `deployment_sections_one_active` does, this reads only `released_at`: an
+        // unreleased row blocks whatever its deployment's status, so a close that forgets to
+        // release is caught (NG6). Rows of deployments aborted just above don't count.
+        let section_busy = deps.sections.iter().any(|r| {
+            r.released_at.is_none() && !stale.contains(&r.deployment_id) && d.section_ids.contains(&r.section_id)
+        });
+        if section_busy {
+            return Ok(DeploymentStart::SectionBusy);
+        }
+        for id in &stale {
+            if let Some(dep) = deps.records.get_mut(id) {
                 dep.status = "aborted".into();
                 dep.closed_at = Some(d.started_at);
             }
+            release_sections(&mut deps.sections, *id, d.started_at);
         }
-        if deps.records.values().any(|dep| dep.commander_id == d.commander_id && dep.status == "active") {
-            return Ok(false);
+        for section_id in &d.section_ids {
+            deps.sections.push(DeploymentSectionRow { deployment_id: d.deployment_id, section_id: *section_id, released_at: None });
         }
         deps.records.insert(d.deployment_id, DeploymentRecord {
             deployment_id: d.deployment_id,
@@ -808,18 +906,20 @@ impl CommanderRepository for InMemoryCommanderRepository {
             started_at:    d.started_at,
             closed_at:     None,
         });
-        Ok(true)
+        Ok(DeploymentStart::Started)
     }
 
     async fn abort_deployment(&self, deployment_id: Uuid) -> Result<(), RepositoryError> {
         let mut deps = self.lock_deployments()?;
+        let now = Utc::now();
         let dep = deps
             .records
             .get_mut(&deployment_id)
             .filter(|dep| dep.status == "active")
             .ok_or(RepositoryError::NotFound)?;
         dep.status = "aborted".into();
-        dep.closed_at = Some(Utc::now());
+        dep.closed_at = Some(now);
+        release_sections(&mut deps.sections, deployment_id, now);
         Ok(())
     }
 
@@ -834,7 +934,7 @@ impl CommanderRepository for InMemoryCommanderRepository {
         cfg: &SimConfig,
     ) -> Result<AppliedEffects, RepositoryError> {
         let mut deps = self.lock_deployments()?;
-        let DeploymentStore { records, cards } = &mut *deps;
+        let DeploymentStore { records, cards, sections } = &mut *deps;
         // Validate everything before mutating anything: no partial write on any refusal.
         let dep = records
             .get_mut(&deployment_id)
@@ -869,9 +969,11 @@ impl CommanderRepository for InMemoryCommanderRepository {
         }
         eff.is_kia = died;
         eff.glorious = glorious;
+        let now = Utc::now();
         dep.status = "resolved".into();
         dep.outcome = Some(outcome_db_str(outcome).into());
-        dep.closed_at = Some(Utc::now());
+        dep.closed_at = Some(now);
+        release_sections(sections, deployment_id, now);
         Ok(eff)
     }
 
@@ -1086,12 +1188,74 @@ mod tests {
     // ── deployments + create clamp (brick 4g-1) ──────────────────────────────
 
     fn new_deployment(commander_id: Uuid, started_at: DateTime<Utc>) -> NewDeployment {
+        with_sections(commander_id, started_at, vec![])
+    }
+
+    fn with_sections(commander_id: Uuid, started_at: DateTime<Utc>, section_ids: Vec<Uuid>) -> NewDeployment {
         NewDeployment {
             deployment_id: Uuid::new_v4(),
             commander_id,
             session_id: Uuid::new_v4(),
             mission_id: "GUARD_DUTY".into(),
             started_at,
+            player_wallet: vec![7u8; 32],
+            campaign_id: Uuid::nil(),
+            section_ids,
+        }
+    }
+
+    /// Two Commanders in one in-memory repository.
+    async fn two_commander_repo() -> (InMemoryCommanderRepository, Uuid, Uuid) {
+        let repo = InMemoryCommanderRepository::new();
+        let a = crate::commander_gen::generate_commander(vec![7u8; 32], Uuid::nil(), 42);
+        let b = crate::commander_gen::generate_commander(vec![7u8; 32], Uuid::nil(), 43);
+        let (ida, idb) = (a.commander_id, b.commander_id);
+        repo.create_commander(a).await.unwrap();
+        repo.create_commander(b).await.unwrap();
+        (repo, ida, idb)
+    }
+
+    /// 7b-2 #2 — a second Commander asking for a held Section gets `SectionBusy`, and the
+    /// store is unchanged: no deployment row for it, the holder still active.
+    #[tokio::test]
+    async fn in_memory_start_deployment_refuses_a_busy_section() {
+        let (repo, a, b) = two_commander_repo().await;
+        let (s1, s2) = (Uuid::new_v4(), Uuid::new_v4());
+        let now = Utc::now();
+        assert_eq!(repo.start_deployment(&with_sections(a, now, vec![s1])).await.unwrap(), DeploymentStart::Started);
+        let r = repo.start_deployment(&with_sections(b, now, vec![s2, s1])).await.unwrap();
+        assert_eq!(r, DeploymentStart::SectionBusy);
+        assert!(repo.list_deployments_by_commander(b).await.unwrap().is_empty(), "the refused start wrote a deployment");
+        let held = repo.list_deployments_by_commander(a).await.unwrap();
+        assert_eq!((held.len(), held[0].status.as_str()), (1, "active"));
+        let deps = repo.lock_deployments().unwrap();
+        assert_eq!(deps.sections.len(), 1, "the refused start wrote join rows");
+        assert_eq!(deps.sections[0].section_id, s1);
+    }
+
+    /// 7b-2 #3 — each close path (stale abort, abort, resolve close) releases the
+    /// deployment's Sections, so another Commander can start with them.
+    #[tokio::test]
+    async fn in_memory_close_paths_release_sections() {
+        let cfg = SimConfig::default();
+        let now = Utc::now();
+        for path in ["stale", "abort", "resolve"] {
+            let (repo, a, b) = two_commander_repo().await;
+            let s = Uuid::new_v4();
+            let started = if path == "stale" { now - chrono::Duration::minutes(6) } else { now };
+            let first = with_sections(a, started, vec![s]);
+            assert_eq!(repo.start_deployment(&first).await.unwrap(), DeploymentStart::Started);
+            match path {
+                "abort" => repo.abort_deployment(first.deployment_id).await.unwrap(),
+                "resolve" => {
+                    repo.resolve_deployment(first.deployment_id, a, 0, 1, 0.0, &OutcomeType::Success, &cfg).await.unwrap();
+                }
+                _ => {} // the next start's stale rule closes it
+            }
+            let r = repo.start_deployment(&with_sections(b, now, vec![s])).await.unwrap();
+            assert_eq!(r, DeploymentStart::Started, "the Section must start again after the {path} close");
+            let firsts = repo.list_deployments_by_commander(a).await.unwrap();
+            assert_ne!(firsts[0].status, "active", "the {path} close left the first deployment active");
         }
     }
 
@@ -1099,8 +1263,8 @@ mod tests {
     async fn in_memory_start_deployment_refuses_a_second_active_row() {
         let (repo, id) = seeded_repo(0, 1, |_| {}).await;
         let now = Utc::now();
-        assert!(repo.start_deployment(&new_deployment(id, now)).await.unwrap());
-        assert!(!repo.start_deployment(&new_deployment(id, now)).await.unwrap(), "second active row must be refused");
+        assert_eq!(repo.start_deployment(&new_deployment(id, now)).await.unwrap(), DeploymentStart::Started);
+        assert_eq!(repo.start_deployment(&new_deployment(id, now)).await.unwrap(), DeploymentStart::CommanderBusy, "second active row must be refused");
         let deps = repo.list_deployments_by_commander(id).await.unwrap();
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].status, "active");
@@ -1111,9 +1275,9 @@ mod tests {
         let (repo, id) = seeded_repo(0, 1, |_| {}).await;
         let now = Utc::now();
         let stale = new_deployment(id, now - chrono::Duration::minutes(6));
-        assert!(repo.start_deployment(&stale).await.unwrap());
+        assert_eq!(repo.start_deployment(&stale).await.unwrap(), DeploymentStart::Started);
         let fresh = new_deployment(id, now);
-        assert!(repo.start_deployment(&fresh).await.unwrap(), "a stale active row must not block the next start");
+        assert_eq!(repo.start_deployment(&fresh).await.unwrap(), DeploymentStart::Started, "a stale active row must not block the next start");
         let deps = repo.list_deployments_by_commander(id).await.unwrap();
         assert_eq!(deps.len(), 2);
         assert_eq!(deps[0].deployment_id, stale.deployment_id);
@@ -1127,7 +1291,7 @@ mod tests {
     async fn in_memory_resolve_deployment_on_a_closed_row_changes_nothing() {
         let (repo, id) = seeded_repo(88, 1, |r| r.stress = 30).await;
         let d = new_deployment(id, Utc::now());
-        assert!(repo.start_deployment(&d).await.unwrap());
+        assert_eq!(repo.start_deployment(&d).await.unwrap(), DeploymentStart::Started);
         repo.abort_deployment(d.deployment_id).await.unwrap();
         // Applied, these inputs would Shatter the Commander and rank them up.
         let cfg = SimConfig::default();
@@ -1148,7 +1312,7 @@ mod tests {
     async fn in_memory_resolve_deployment_refuses_a_kia_commander() {
         let (repo, id) = seeded_repo(88, 1, |r| r.stress = 30).await;
         let d = new_deployment(id, Utc::now());
-        assert!(repo.start_deployment(&d).await.unwrap());
+        assert_eq!(repo.start_deployment(&d).await.unwrap(), DeploymentStart::Started);
         repo.set_kia(id).await.unwrap();
         let cfg = SimConfig::default();
         let r = repo.resolve_deployment(d.deployment_id, id, 10, 5, 0.0, &OutcomeType::Success, &cfg).await;
@@ -1165,7 +1329,7 @@ mod tests {
     async fn test_mark_commander_kia_in_memory_wipeout_queues_one_card() {
         let (repo, id) = seeded_repo(400, 3, |r| r.stress = 30).await;
         let d = new_deployment(id, Utc::now());
-        assert!(repo.start_deployment(&d).await.unwrap());
+        assert_eq!(repo.start_deployment(&d).await.unwrap(), DeploymentStart::Started);
         let cfg = SimConfig::default();
         let eff = repo
             .resolve_deployment(d.deployment_id, id, 2, 4, 0.0, &OutcomeType::Wipeout, &cfg)
@@ -1195,7 +1359,7 @@ mod tests {
     async fn card_stamps_the_locked_rank() {
         let (repo, id) = seeded_repo(0, 5, |r| r.stress = 30).await;
         let d = new_deployment(id, Utc::now());
-        assert!(repo.start_deployment(&d).await.unwrap());
+        assert_eq!(repo.start_deployment(&d).await.unwrap(), DeploymentStart::Started);
         let cfg = SimConfig::default();
         let eff = repo
             .resolve_deployment(d.deployment_id, id, 2, 1, 0.0, &OutcomeType::Wipeout, &cfg)
@@ -1213,7 +1377,7 @@ mod tests {
     async fn test_mark_commander_kia_in_memory_non_wipeout_writes_nothing() {
         let (repo, id) = seeded_repo(400, 3, |r| r.stress = 30).await;
         let d = new_deployment(id, Utc::now());
-        assert!(repo.start_deployment(&d).await.unwrap());
+        assert_eq!(repo.start_deployment(&d).await.unwrap(), DeploymentStart::Started);
         let cfg = SimConfig::default();
         let eff = repo
             .resolve_deployment(d.deployment_id, id, 2, 4, 0.0, &OutcomeType::Defeat, &cfg)
