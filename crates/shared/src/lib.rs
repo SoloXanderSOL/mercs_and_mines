@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub mod command;
 pub mod hex;
 pub mod ws_events;
 
