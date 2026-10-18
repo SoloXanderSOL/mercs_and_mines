@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE augmentee_records SET casualty_class = $2, fate_at = now() WHERE augmentee_id = $1 AND (casualty_class IS NULL OR casualty_class = 'Wounded')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8c893e3fedc164c4299a5d97adb8f36aa06a183ced4b3f9f7133b74624cce32f"
+}

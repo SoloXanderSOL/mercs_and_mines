@@ -1,0 +1,100 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT augmentee_id, campaign_id, player_wallet, section_id, crew_id, slot,\n                          name, callsign, augment, fitting_source, casualty_class, fate_at,\n                          prng_seed_state, created_at\n                   FROM augmentee_records WHERE crew_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "augmentee_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "campaign_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "player_wallet",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 3,
+        "name": "section_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 4,
+        "name": "crew_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 5,
+        "name": "slot",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 6,
+        "name": "name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "callsign",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "augment",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "fitting_source",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "casualty_class",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "fate_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 12,
+        "name": "prng_seed_state",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 13,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "be008815e5768efb705441737cc9fd2b619c6da037fff69d0e406479d388a611"
+}

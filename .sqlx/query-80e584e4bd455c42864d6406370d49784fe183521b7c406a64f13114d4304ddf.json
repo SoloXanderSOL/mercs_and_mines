@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO augmentee_records (\n                augmentee_id, campaign_id, player_wallet, section_id, crew_id, slot,\n                name, callsign, augment, fitting_source, casualty_class, fate_at, prng_seed_state\n            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Bytea",
+        "Uuid",
+        "Uuid",
+        "Int2",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Timestamptz",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "80e584e4bd455c42864d6406370d49784fe183521b7c406a64f13114d4304ddf"
+}

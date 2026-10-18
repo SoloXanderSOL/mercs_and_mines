@@ -24,10 +24,13 @@ use mercs_server::repository::{
     ForemanRepository, PostgresForemanRepository,
     AdvisorRecord, AdvisorRepository, PostgresAdvisorRepository,
     CrewRecord, CrewRepository, PostgresCrewRepository,
+    AugmenteeOwner, AugmenteeRecord, AugmenteeRepository, PostgresAugmenteeRepository,
+    RepositoryError,
 };
 use sim_engine::roster::{
-    AdvisorQuirk, AdvisorSpecialization, CommanderFlaw, CommanderGrade, CommanderOrigin,
-    CommanderSpecialization, FactionBias, ForemanFlaw, ForemanSpecialization,
+    AdvisorQuirk, AdvisorSpecialization, Augment, AugmentCatalogue, CasualtyClass, CommanderFlaw,
+    CommanderGrade, CommanderOrigin, CommanderSpecialization, FactionBias, FittingSource,
+    ForemanFlaw, ForemanSpecialization,
 };
 
 async fn test_pool() -> Option<sqlx::PgPool> {
@@ -2461,13 +2464,16 @@ async fn convoy_timer_fires_and_marks_arrived() {
 
 /// The per-wallet roster tables, in cleanup order. Each has `player_wallet` and
 /// `campaign_id` columns; a new roster table adds itself here (Reviewer 7a-1 CF1).
-/// `section_records` (owner column since 7b-1, `0025`) is listed first.
-const ROSTER_TABLES: [&str; 5] = ["section_records", "commander_records", "foreman_records", "advisor_records", "crew_records"];
+/// `augmentee_records` (7d-1, `0029`) is first: its owner FKs RESTRICT both
+/// `section_records` and `crew_records` (a wipe is a state, never a `DELETE`; Reviewer
+/// 7b-2 CF2).
+const ROSTER_TABLES: [&str; 6] = ["augmentee_records", "section_records", "commander_records", "foreman_records", "advisor_records", "crew_records"];
 
 /// Removes everything a 4g-1 test wallet owns, in FK order: card_mint_pending →
-/// deployment_sections → deployment_records → section_records → commander_records →
-/// foreman_records → advisor_records → crew_records (`ROSTER_TABLES`) → every campaign
-/// the wallet owns roster rows in or is a member of → membership → player_accounts.
+/// deployment_sections → deployment_records → augmentee_records → section_records →
+/// commander_records → foreman_records → advisor_records → crew_records (`ROSTER_TABLES`)
+/// → every campaign collected through roster rows and membership → membership →
+/// player_accounts.
 /// `deployment_sections` (7b-2) RESTRICTs deployments, Commanders and Sections, and
 /// carries the owner itself, so it goes first. `deployment_records.commander_id` is
 /// ON DELETE RESTRICT, so it goes next; it is there because of Commanders.
@@ -3127,6 +3133,12 @@ fn roster_check_expectations() -> Vec<(&'static str, Vec<(&'static str, std::col
             ("advisor_records_faction_bias_canon", strings(FactionBias::ALL.map(FactionBias::as_str))),
             ("advisor_records_specialization_canon", strings(AdvisorSpecialization::ALL.map(AdvisorSpecialization::as_str))),
             ("advisor_records_quirk_canon", strings(AdvisorQuirk::ALL.map(AdvisorQuirk::as_str))),
+        ]),
+        ("augmentee_records", vec![
+            ("augmentee_records_combat_augment_canon", strings(Augment::ALL.into_iter().filter(|a| a.catalogue() == AugmentCatalogue::Combat).map(Augment::as_str))),
+            ("augmentee_records_industrial_augment_canon", strings(Augment::ALL.into_iter().filter(|a| a.catalogue() == AugmentCatalogue::Industrial).map(Augment::as_str))),
+            ("augmentee_records_fitting_source_canon", strings(FittingSource::ALL.map(FittingSource::as_str))),
+            ("augmentee_records_casualty_class_canon", strings(CasualtyClass::ALL.map(CasualtyClass::as_str))),
         ]),
     ]
 }
@@ -5787,4 +5799,304 @@ async fn trigger_releases_sections_on_a_raw_status_update() {
     assert!(!held_before, "precondition: the join row is active");
     assert_eq!(raw.expect("raw close failed").rows_affected(), 1);
     assert!(was_released, "the trigger must release the Section on a raw close");
+}
+
+// ── Brick 7d-1: augmentee_records (0029) ─────────────────────────────────────
+
+/// The 7d-1 tests' wallet, and "another wallet" for the owner-integrity tests.
+const AUG_WALLET: [u8; 32] = [36u8; 32];
+const AUG_OTHER: [u8; 32] = [37u8; 32];
+
+/// A stored Section owned by `wallet` in `campaign_id`.
+async fn aug_section(pool: &sqlx::PgPool, wallet: [u8; 32], campaign_id: uuid::Uuid) -> uuid::Uuid {
+    let r = owned_section(campaign_id, wallet.to_vec());
+    PostgresSectionRepository::new(pool.clone()).create_section(r.clone()).await.expect("create_section failed");
+    r.section_id
+}
+
+/// A stored Mining Crew owned by `wallet` in `campaign_id`.
+async fn aug_crew(pool: &sqlx::PgPool, wallet: [u8; 32], campaign_id: uuid::Uuid) -> uuid::Uuid {
+    let r = CrewRecord::new_hire(campaign_id, wallet.to_vec());
+    PostgresCrewRepository::new(pool.clone()).create_crew(r.clone()).await.expect("create_crew failed");
+    r.crew_id
+}
+
+/// A generated augmentee; the SKU must fit the owner.
+fn aug_record(campaign_id: uuid::Uuid, owner: AugmenteeOwner, slot: i16, augment: Augment) -> AugmenteeRecord {
+    mercs_server::augmentee_gen::generate_augmentee(
+        AUG_WALLET.to_vec(), campaign_id, owner, slot, CommanderOrigin::HumanCorporate, augment, FittingSource::Church, 36,
+    )
+}
+
+/// A raw insert, so a refusal surfaces as the database error rather than `Internal`.
+async fn raw_augmentee(
+    pool: &sqlx::PgPool,
+    wallet: [u8; 32],
+    campaign_id: uuid::Uuid,
+    section_id: Option<uuid::Uuid>,
+    crew_id: Option<uuid::Uuid>,
+    slot: i16,
+    augment: &str,
+) -> Result<sqlx::postgres::PgQueryResult, sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO augmentee_records (augmentee_id, campaign_id, player_wallet, section_id, crew_id, slot,
+                                        name, callsign, augment, fitting_source, prng_seed_state)
+         VALUES ($1, $2, $3, $4, $5, $6, 'Kira Drek', 'Rivet', $7, 'Secular', 0)"
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(campaign_id)
+    .bind(wallet.to_vec())
+    .bind(section_id)
+    .bind(crew_id)
+    .bind(slot)
+    .bind(augment)
+    .execute(pool)
+    .await
+}
+
+fn assert_unique_violation(res: Result<sqlx::postgres::PgQueryResult, sqlx::Error>, constraint: &str) {
+    let err = res.expect_err(&format!("the insert must violate {constraint}"));
+    let db = err.as_database_error().unwrap_or_else(|| panic!("not a database error: {err}"));
+    assert_eq!(db.code().as_deref(), Some("23505"), "expected a unique violation, got {err}");
+    assert_eq!(db.constraint(), Some(constraint));
+}
+
+/// 7d-1 D1 — a Section and a Crew augmentee round-trip through create, get and both lists.
+#[tokio::test]
+async fn augmentee_records_round_trip() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    clean_wallet_4g1(&pool, &AUG_WALLET).await;
+    let campaign_id = seed_account_and_campaign(&pool, AUG_WALLET, 0x7D11_i64).await;
+    let section = aug_section(&pool, AUG_WALLET, campaign_id).await;
+    let crew = aug_crew(&pool, AUG_WALLET, campaign_id).await;
+    let repo = PostgresAugmenteeRepository::new(pool.clone());
+
+    let s1 = aug_record(campaign_id, AugmenteeOwner::Section(section), 1, Augment::IntegralGunArm);
+    let s2 = aug_record(campaign_id, AugmenteeOwner::Section(section), 2, Augment::GloomSightOcularsTactical);
+    let c1 = aug_record(campaign_id, AugmenteeOwner::Crew(crew), 1, Augment::LoadBearerFrame);
+    let mut created = Vec::new();
+    for r in [&s1, &s2, &c1] {
+        created.push(repo.create_augmentee(r.clone()).await);
+    }
+    let got = repo.get_augmentee(s1.augmentee_id).await;
+    let missing = repo.get_augmentee(uuid::Uuid::new_v4()).await;
+    let by_section = repo.list_augmentees_by_owner(&AugmenteeOwner::Section(section)).await;
+    let by_crew = repo.list_augmentees_by_owner(&AugmenteeOwner::Crew(crew)).await;
+    clean_wallet_4g1(&pool, &AUG_WALLET).await;
+
+    for c in created {
+        c.expect("create_augmentee failed");
+    }
+    let got = got.expect("get_augmentee failed");
+    assert_eq!(got.owner, AugmenteeOwner::Section(section));
+    assert_eq!((got.slot, got.augment.as_str(), got.fitting_source.as_str()), (1, "Integral Gun-Arm", "Church"));
+    assert_eq!((got.name.as_str(), got.callsign.as_str()), (s1.name.as_str(), s1.callsign.as_str()));
+    assert_eq!((got.casualty_class, got.fate_at, got.prng_seed_state), (None, None, 36));
+    assert!(matches!(missing, Err(RepositoryError::NotFound)), "an unknown id is NotFound: {missing:?}");
+    let mut section_ids: Vec<_> = by_section.expect("list by Section failed").iter().map(|r| r.augmentee_id).collect();
+    section_ids.sort();
+    let mut want = vec![s1.augmentee_id, s2.augmentee_id];
+    want.sort();
+    assert_eq!(section_ids, want);
+    let crew_rows = by_crew.expect("list by Crew failed");
+    assert_eq!(crew_rows.len(), 1);
+    assert_eq!((crew_rows[0].augmentee_id, crew_rows[0].owner), (c1.augmentee_id, AugmenteeOwner::Crew(crew)));
+}
+
+/// 7d-1 D2 — a held slot refuses a second serving holder; a KIA frees it.
+#[tokio::test]
+async fn augmentee_slot_is_refused_while_held_and_freed_by_death() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    clean_wallet_4g1(&pool, &AUG_WALLET).await;
+    let campaign_id = seed_account_and_campaign(&pool, AUG_WALLET, 0x7D12_i64).await;
+    let section = aug_section(&pool, AUG_WALLET, campaign_id).await;
+    let repo = PostgresAugmenteeRepository::new(pool.clone());
+    let holder = aug_record(campaign_id, AugmenteeOwner::Section(section), 1, Augment::DopplerCochlea);
+    let created = repo.create_augmentee(holder.clone()).await;
+    let second = raw_augmentee(&pool, AUG_WALLET, campaign_id, Some(section), None, 1, "Doppler Cochlea").await;
+    let fate = repo.record_fate(holder.augmentee_id, CasualtyClass::Kia).await;
+    let after = raw_augmentee(&pool, AUG_WALLET, campaign_id, Some(section), None, 1, "Doppler Cochlea").await;
+    clean_wallet_4g1(&pool, &AUG_WALLET).await;
+
+    created.expect("create_augmentee failed");
+    assert_unique_violation(second, "augmentee_records_section_slot_held");
+    fate.expect("record_fate(KIA) failed");
+    after.expect("a KIA holder must free the slot");
+}
+
+/// 7d-1 D3 — a Wounded holder keeps the slot.
+#[tokio::test]
+async fn augmentee_wounded_holder_keeps_the_slot() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    clean_wallet_4g1(&pool, &AUG_WALLET).await;
+    let campaign_id = seed_account_and_campaign(&pool, AUG_WALLET, 0x7D13_i64).await;
+    let section = aug_section(&pool, AUG_WALLET, campaign_id).await;
+    let repo = PostgresAugmenteeRepository::new(pool.clone());
+    let holder = aug_record(campaign_id, AugmenteeOwner::Section(section), 1, Augment::DopplerCochlea);
+    let created = repo.create_augmentee(holder.clone()).await;
+    let fate = repo.record_fate(holder.augmentee_id, CasualtyClass::Wounded).await;
+    let second = raw_augmentee(&pool, AUG_WALLET, campaign_id, Some(section), None, 1, "Doppler Cochlea").await;
+    clean_wallet_4g1(&pool, &AUG_WALLET).await;
+
+    created.expect("create_augmentee failed");
+    fate.expect("record_fate(Wounded) failed");
+    assert_unique_violation(second, "augmentee_records_section_slot_held");
+}
+
+/// 7d-1 D4 — an industrial SKU on a Section.
+#[tokio::test]
+async fn augmentee_records_refuse_an_industrial_augment_on_a_section() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    clean_wallet_4g1(&pool, &AUG_WALLET).await;
+    let campaign_id = seed_account_and_campaign(&pool, AUG_WALLET, 0x7D14_i64).await;
+    let section = aug_section(&pool, AUG_WALLET, campaign_id).await;
+    let res = raw_augmentee(&pool, AUG_WALLET, campaign_id, Some(section), None, 1, "Geophone Cochlea").await;
+    clean_wallet_4g1(&pool, &AUG_WALLET).await;
+
+    assert_check_violation(&res.expect_err("an industrial SKU must not fit a Section"), "augmentee_records_combat_augment_canon");
+}
+
+/// 7d-1 D5 — a combat SKU on a Crew.
+#[tokio::test]
+async fn augmentee_records_refuse_a_combat_augment_on_a_crew() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    clean_wallet_4g1(&pool, &AUG_WALLET).await;
+    let campaign_id = seed_account_and_campaign(&pool, AUG_WALLET, 0x7D15_i64).await;
+    let crew = aug_crew(&pool, AUG_WALLET, campaign_id).await;
+    let res = raw_augmentee(&pool, AUG_WALLET, campaign_id, None, Some(crew), 1, "Integral Gun-Arm").await;
+    clean_wallet_4g1(&pool, &AUG_WALLET).await;
+
+    assert_check_violation(&res.expect_err("a combat SKU must not fit a Crew"), "augmentee_records_industrial_augment_canon");
+}
+
+/// 7d-1 D6 — zero owners, two owners and slot 3.
+#[tokio::test]
+async fn augmentee_records_refuse_bad_owner_count_and_slot() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    clean_wallet_4g1(&pool, &AUG_WALLET).await;
+    let campaign_id = seed_account_and_campaign(&pool, AUG_WALLET, 0x7D16_i64).await;
+    let section = aug_section(&pool, AUG_WALLET, campaign_id).await;
+    let crew = aug_crew(&pool, AUG_WALLET, campaign_id).await;
+    // Two owners can't keep the other CHECKs satisfied: no SKU is in both catalogues, so a
+    // two-owner row always fails one *_augment_canon too, and Postgres tests CHECKs in name
+    // order, so `industrial_augment_canon` (before `one_owner`) is the name it reports.
+    let none = raw_augmentee(&pool, AUG_WALLET, campaign_id, None, None, 1, "Integral Gun-Arm").await;
+    let both = raw_augmentee(&pool, AUG_WALLET, campaign_id, Some(section), Some(crew), 1, "Integral Gun-Arm").await;
+    let slot3 = raw_augmentee(&pool, AUG_WALLET, campaign_id, Some(section), None, 3, "Integral Gun-Arm").await;
+    clean_wallet_4g1(&pool, &AUG_WALLET).await;
+
+    assert_check_violation(&none.expect_err("zero owners must be refused"), "augmentee_records_one_owner");
+    assert_check_violation(&both.expect_err("two owners must be refused"), "augmentee_records_industrial_augment_canon");
+    assert_check_violation(&slot3.expect_err("slot 3 must be refused"), "augmentee_records_slot_range");
+}
+
+/// 7d-1 D7 — wallet 37's augmentee on wallet 36's Section.
+#[tokio::test]
+async fn augmentee_records_refuse_another_wallets_section() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    clean_wallet_4g1(&pool, &AUG_WALLET).await;
+    clean_wallet_4g1(&pool, &AUG_OTHER).await;
+    let campaign_id = seed_account_and_campaign(&pool, AUG_WALLET, 0x7D17_i64).await;
+    seed_account_and_campaign(&pool, AUG_OTHER, 0x7D18_i64).await;
+    let section = aug_section(&pool, AUG_WALLET, campaign_id).await;
+    let res = raw_augmentee(&pool, AUG_OTHER, campaign_id, Some(section), None, 1, "Integral Gun-Arm").await;
+    clean_wallet_4g1(&pool, &AUG_WALLET).await;
+    clean_wallet_4g1(&pool, &AUG_OTHER).await;
+
+    assert_fk_violation(res, "augmentee_records_section_fkey");
+}
+
+/// 7d-1 D8 — wallet 37's augmentee on wallet 36's Crew.
+#[tokio::test]
+async fn augmentee_records_refuse_another_wallets_crew() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    clean_wallet_4g1(&pool, &AUG_WALLET).await;
+    clean_wallet_4g1(&pool, &AUG_OTHER).await;
+    let campaign_id = seed_account_and_campaign(&pool, AUG_WALLET, 0x7D19_i64).await;
+    seed_account_and_campaign(&pool, AUG_OTHER, 0x7D1A_i64).await;
+    let crew = aug_crew(&pool, AUG_WALLET, campaign_id).await;
+    let res = raw_augmentee(&pool, AUG_OTHER, campaign_id, None, Some(crew), 1, "Load-Bearer Frame").await;
+    clean_wallet_4g1(&pool, &AUG_WALLET).await;
+    clean_wallet_4g1(&pool, &AUG_OTHER).await;
+
+    assert_fk_violation(res, "augmentee_records_crew_fkey");
+}
+
+/// 7d-1 D9 — `record_fate` on Postgres: a terminal or unknown augmentee is `NotFound`;
+/// Wounded can still die, and `fate_at` is set.
+#[tokio::test]
+async fn augmentee_record_fate_is_final_once_terminal() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    clean_wallet_4g1(&pool, &AUG_WALLET).await;
+    let campaign_id = seed_account_and_campaign(&pool, AUG_WALLET, 0x7D1B_i64).await;
+    let section = aug_section(&pool, AUG_WALLET, campaign_id).await;
+    let repo = PostgresAugmenteeRepository::new(pool.clone());
+    let dead = aug_record(campaign_id, AugmenteeOwner::Section(section), 1, Augment::IntegralGunArm);
+    let hurt = aug_record(campaign_id, AugmenteeOwner::Section(section), 2, Augment::ThermalLanceArm);
+    repo.create_augmentee(dead.clone()).await.expect("create dead");
+    repo.create_augmentee(hurt.clone()).await.expect("create hurt");
+    let kia = repo.record_fate(dead.augmentee_id, CasualtyClass::Kia).await;
+    let refate = repo.record_fate(dead.augmentee_id, CasualtyClass::Mia).await;
+    let unknown = repo.record_fate(uuid::Uuid::new_v4(), CasualtyClass::Kia).await;
+    let wounded = repo.record_fate(hurt.augmentee_id, CasualtyClass::Wounded).await;
+    let then_kia = repo.record_fate(hurt.augmentee_id, CasualtyClass::Kia).await;
+    let dead_row = repo.get_augmentee(dead.augmentee_id).await;
+    let hurt_row = repo.get_augmentee(hurt.augmentee_id).await;
+    clean_wallet_4g1(&pool, &AUG_WALLET).await;
+
+    kia.expect("record_fate(KIA) failed");
+    assert!(matches!(refate, Err(RepositoryError::NotFound)), "a KIA must not be re-fated: {refate:?}");
+    assert!(matches!(unknown, Err(RepositoryError::NotFound)), "an unknown id is NotFound: {unknown:?}");
+    wounded.expect("record_fate(Wounded) failed");
+    then_kia.expect("a Wounded augmentee can still die");
+    let dead_row = dead_row.expect("get dead");
+    assert_eq!(dead_row.casualty_class.as_deref(), Some("KIA"), "the refused MIA must not overwrite KIA");
+    assert!(dead_row.fate_at.is_some());
+    let hurt_row = hurt_row.expect("get hurt");
+    assert_eq!(hurt_row.casualty_class.as_deref(), Some("KIA"));
+    assert!(hurt_row.fate_at.is_some(), "fate_at must be set");
+}
+
+/// 7d-1 D10 — a wipe is a state, never a `DELETE`: the augmentee RESTRICTs its Section.
+#[tokio::test]
+async fn a_section_with_an_augmentee_cannot_be_deleted() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    clean_wallet_4g1(&pool, &AUG_WALLET).await;
+    let campaign_id = seed_account_and_campaign(&pool, AUG_WALLET, 0x7D1C_i64).await;
+    let section = aug_section(&pool, AUG_WALLET, campaign_id).await;
+    let created = PostgresAugmenteeRepository::new(pool.clone())
+        .create_augmentee(aug_record(campaign_id, AugmenteeOwner::Section(section), 1, Augment::IntegralGunArm))
+        .await;
+    let res = sqlx::query("DELETE FROM section_records WHERE section_id = $1").bind(section).execute(&pool).await;
+    clean_wallet_4g1(&pool, &AUG_WALLET).await;
+
+    created.expect("create_augmentee failed");
+    assert_fk_violation(res, "augmentee_records_section_fkey");
+}
+
+/// 7d-1 D11 — a campaign delete cascades through its Sections, Crews and augmentees. The
+/// membership row must go first (its campaign FK is not CASCADE): that is §4f's order.
+#[tokio::test]
+async fn a_campaign_delete_cascades_through_augmentees() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    clean_wallet_4g1(&pool, &AUG_WALLET).await;
+    let campaign_id = seed_account_and_campaign(&pool, AUG_WALLET, 0x7D1D_i64).await;
+    let section = aug_section(&pool, AUG_WALLET, campaign_id).await;
+    let crew = aug_crew(&pool, AUG_WALLET, campaign_id).await;
+    let repo = PostgresAugmenteeRepository::new(pool.clone());
+    let a = repo.create_augmentee(aug_record(campaign_id, AugmenteeOwner::Section(section), 1, Augment::IntegralGunArm)).await;
+    let b = repo.create_augmentee(aug_record(campaign_id, AugmenteeOwner::Crew(crew), 1, Augment::GeophoneCochlea)).await;
+    let membership = sqlx::query("DELETE FROM player_campaign_membership WHERE campaign_id = $1")
+        .bind(campaign_id).execute(&pool).await;
+    let deleted = sqlx::query("DELETE FROM campaign_instances WHERE campaign_id = $1")
+        .bind(campaign_id).execute(&pool).await;
+    let (left,): (i64,) = sqlx::query_as("SELECT count(*) FROM augmentee_records WHERE campaign_id = $1")
+        .bind(campaign_id).fetch_one(&pool).await.expect("count failed");
+    clean_wallet_4g1(&pool, &AUG_WALLET).await;
+
+    a.expect("create Section augmentee");
+    b.expect("create Crew augmentee");
+    membership.expect("membership delete failed");
+    assert_eq!(deleted.expect("the campaign delete must cascade").rows_affected(), 1);
+    assert_eq!(left, 0, "the campaign's augmentees must cascade with it");
 }
