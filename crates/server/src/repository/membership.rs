@@ -63,11 +63,6 @@ pub trait MembershipRepository: Send + Sync {
         &self,
         wallet_address: &[u8],
     ) -> Result<Vec<PlayerCampaignMembership>, RepositoryError>;
-
-    async fn delete_memberships_by_campaign(
-        &self,
-        campaign_id: Uuid,
-    ) -> Result<(), RepositoryError>;
 }
 
 // ── PostgresMembershipRepository ─────────────────────────────────────────────
@@ -223,20 +218,6 @@ impl MembershipRepository for PostgresMembershipRepository {
         .map_err(|e| RepositoryError::Internal(e.to_string()))?;
         Ok(rows)
     }
-
-    async fn delete_memberships_by_campaign(
-        &self,
-        campaign_id: Uuid,
-    ) -> Result<(), RepositoryError> {
-        sqlx::query!(
-            "DELETE FROM player_campaign_membership WHERE campaign_id = $1",
-            campaign_id,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| RepositoryError::Internal(e.to_string()))?;
-        Ok(())
-    }
 }
 
 // ── InMemoryMembershipRepository (unit-test stub) ────────────────────────────
@@ -344,19 +325,5 @@ impl MembershipRepository for InMemoryMembershipRepository {
             .collect();
         rows.sort_by_key(|r| r.joined_at);
         Ok(rows)
-    }
-
-    async fn delete_memberships_by_campaign(
-        &self,
-        campaign_id: Uuid,
-    ) -> Result<(), RepositoryError> {
-        let keys: Vec<(Vec<u8>, Uuid)> = self.store.iter()
-            .filter(|r| r.campaign_id == campaign_id)
-            .map(|r| r.key().clone())
-            .collect();
-        for k in keys {
-            self.store.remove(&k);
-        }
-        Ok(())
     }
 }
