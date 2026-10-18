@@ -217,7 +217,7 @@ As of 2026-10-18:
 **337/337 tests green (1 `shared` + 136 `mercs_server` lib + 2 `aar_determinism` + 127
 `db_infrastructure` + 71 `sim_engine`; single-threaded, verified at `0b84e70`). Workspace
 version `0.3.0`. `.sqlx/` holds 70 files; the latest migration is `0030_join_schema`.
-`main` = `c63a22a` (5a-1, deployed 2026-10-18); `dev` is ahead with 5a-2a, unpushed.
+`main` = `dev` = `3b186b9` (5a-2a, deployed 2026-10-18); `dev` is ahead with 5a-2b, unpushed.
 Next: 5a-2b; see the Phase 1 document.** Any brick that changes what `resolve_mission` produces for
 a given seed bumps the workspace version in the same brick. 4b-1 reused `sim-engine`'s `OutcomeType` rather than
 defining a new enum, and writes **no input-log entry** — the rank-up entry was removed
@@ -363,6 +363,10 @@ begins.
   recomputed from traits (Story Event characters are hand-graded). Write `CommanderGrade`
   variants fully qualified (`QualityGrade::Elite` shares the name).
 
+  `acquired_via` (`0030`) is written by the `insert_*` helpers' `via` parameter, never
+  stored on the record structs. At most one starter per `(campaign, wallet)` by the
+  `<t>_one_starter` index; exactly one by the join transaction.
+
 * **Key-Value Store (Redis):** Live Sector hex state, deployment timers (global sorted
   set + per-sector sorted set for cancel path), active session state. **Persisted Redis
   types (`DeploymentTimer`, `TimerType`, `SectorState`) change additively only:** new
@@ -442,7 +446,9 @@ public key is not `[20u8; 32]`. The next free seed is **42**.
 lock alone: a held lock cannot make a remove-the-lock negative fail. Wait until B is parked
 at its own seam or shows `granted = false` in `pg_locks`; use a dedicated pool (≥ 3
 connections); and require every racer's result to be `Ok` where a unique constraint would
-otherwise hide the race.
+otherwise hide the race. An in-transaction pause seam is an injected hook on the Postgres
+impl (`None` in production, `#[doc(hidden)] pub` constructor), because integration tests
+never see `cfg(test)`. Precedent: `PostgresCampaignJoinRepository::with_pause_seam` (5a-2b).
 
 **Independent oracle:** A gate's expected value is never read from the code it checks. Pin
 it to a literal taken from canon or from a measurement made before the change (4d-2 N3: a
