@@ -115,7 +115,15 @@ As of 2026-10-18:
   `create_commander`. A membership delete with roster rows left is now refused; a campaign
   delete still cascades everything. `section_records_player_wallet_fkey` is shadowed by
   membership's own account `RESTRICT` and can't be observed by name. Every Postgres roster
-  fixture writes a membership. **Next: 5a-2** (the join transaction).
+  fixture writes a membership. **5a-2a complete (`11aefb8`, `7f198f2`, `0b84e70`,
+  2026-10-18):** `InMemoryCampaignRepository` is a real `DashMap` store mirroring the Postgres
+  impl, miss paths included (`update_sector_state` miss → `Ok(())`; `activate_campaign` →
+  `false` for a missing id or any non-`Pending` state; list unordered). Share it as
+  `Arc<InMemoryCampaignRepository>`: no inner `Arc`, no `Clone`, no `Mutex`. `AppState::new`
+  is unchanged (5a-3 rewires it). GAP-70: `assign_gateway_hexes` round-robins Solo overflow
+  (`rim_indices[slot % len]`, no draw moves, no R7); the overflow `warn!` is gone.
+  `delete_memberships_by_campaign` is deleted (trait and both impls, one `.sqlx` file).
+  **Next: 5a-2b** (the join transaction).
 - **Section 6:** Not started.
 - **Sections 7 (Personnel Entity Model) and 8 (Combat Engine to canon):** created
   2026-10-13 (ruling D2); both run before Section 6. Strike Mining and Base Building moved
@@ -206,11 +214,11 @@ As of 2026-10-18:
   scenarios) and `shellcheck` run in the `deploy-script` job on every push, and the deploy
   job needs it (GAP-33).
 
-**330/330 tests green (1 `shared` + 129 `mercs_server` lib + 2 `aar_determinism` + 127
-`db_infrastructure` + 71 `sim_engine`; single-threaded, verified at `99f643e`). Workspace
-version `0.3.0`. `.sqlx/` holds 71 files; the latest migration is `0030_join_schema`.
-`main` = `698efb9` (INF-7 + 5a-0; CI Release run green 2026-10-18); `dev` is ahead with
-5a-1, unpushed. Next: 5a-2; see the Phase 1 document.** Any brick that changes what `resolve_mission` produces for
+**337/337 tests green (1 `shared` + 136 `mercs_server` lib + 2 `aar_determinism` + 127
+`db_infrastructure` + 71 `sim_engine`; single-threaded, verified at `0b84e70`). Workspace
+version `0.3.0`. `.sqlx/` holds 70 files; the latest migration is `0030_join_schema`.
+`main` = `c63a22a` (5a-1, deployed 2026-10-18); `dev` is ahead with 5a-2a, unpushed.
+Next: 5a-2b; see the Phase 1 document.** Any brick that changes what `resolve_mission` produces for
 a given seed bumps the workspace version in the same brick. 4b-1 reused `sim-engine`'s `OutcomeType` rather than
 defining a new enum, and writes **no input-log entry** — the rank-up entry was removed
 from scope. **ODQ-22 and ODQ-23 were ruled 2026-09-03 — engagement and mission outcomes
@@ -440,6 +448,20 @@ otherwise hide the race.
 it to a literal taken from canon or from a measurement made before the change (4d-2 N3: a
 frequency test that derived its target from `DEFAULT_GRADE_WEIGHTS` passed under the
 mutation).
+
+**Negative-run validity:** A negative proves something only if its run is valid.
+1. The `test result` line must exist. A rejected flag or a compile failure prints no such
+   line, and a missing line is a void run, never "zero failures".
+2. Passed + failed must equal the count taken from the prompt's own table, never a count
+   read from a fresh run of the code under test. Any other sum voids the run; report it,
+   don't reconcile it.
+3. A schema-mutation negative captures every object it will touch first, and aborts before
+   mutating if the capture fails or doesn't match. After restoring, it diffs against an
+   independently captured reference (the dev DB, which no negative touches), not only
+   against its own capture: two equally incomplete snapshots diff empty (5a-1 §6).
+
+Cargo flags such as `--no-fail-fast` go **before** `--`; after it they are passed to the
+test binary, which rejects them.
 
 **Deploy harness:** `bash deploy/test_remote_deploy.sh` runs the real deploy script
 against shims (about 12 s, no root or network needed). Run it after any change under
