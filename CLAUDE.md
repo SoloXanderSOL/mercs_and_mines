@@ -27,7 +27,7 @@ Before writing any code, read the Phase 1 Alpha Foundation document to understan
 is already built. Do not guess — read it. The status block at the top of that document
 is the ground truth.
 
-As of 2026-10-17:
+As of 2026-10-18:
 
 - **Section 1 (Database Layer):** 1a (Postgres) and 1b (Redis) complete. **1c-3 (the
   GAP-34 fix) built at `bb49b3c`:** `session_start` (header + full request + timestamp)
@@ -95,7 +95,7 @@ As of 2026-10-17:
 - **Sections 5 and 6:** Not started.
 - **Sections 7 (Personnel Entity Model) and 8 (Combat Engine to canon):** created
   2026-10-13 (ruling D2); both run before Section 6. Strike Mining and Base Building moved
-  into Phase 2 as §13/§14 (ruling D1). **Section 7 in progress: 7a-1 built (2026-10-16;
+  into Phase 2 as §13/§14 (ruling D1). **Section 7 complete (2026-10-18): 7a-1 built (2026-10-16;
   Mining Foreman).** The class-neutral generation helpers live in `field_leader_gen`, where
   `pick_band` refuses an overflowing `u32` sum, an all-zero vector and a non-zero weight on an
   empty band (Reviewer 4d-2 F1/F2). `generate_foreman` is band-first over
@@ -131,8 +131,21 @@ As of 2026-10-17:
   a contract migration) and `section_records_headcount_range` (0..8). `SectionRecord` gains
   `player_wallet: Option<Vec<u8>>`; `create_section` refuses `None` first in both impls
   (`Internal`); the in-memory impl stores an out-of-range headcount. `update_headcount`
-  unchanged. No production caller, no R7 bump. **Next: 7b-2 and 7d-1** (7d-1 may run first).
-  Section 8 not started.
+  unchanged. No production caller, no R7 bump. **7b-2 complete (`5ee4de7`, `4abf451`,
+  2026-10-18; deployed at `27f2598`):** per-mission Sections on `deployment_sections`
+  (`0027`), the rank cap, `player_wallet NOT NULL` (`0026`). **7d-1 complete (`63a9206`,
+  `0fbd41a`, `2b61dc1`, 2026-10-18; Section 7 is complete):** `0028` drops
+  `section_records.commander_id` (contract). `sim_engine::roster` gains `Augment` (11, with
+  `catalogue()`), `FittingSource` (2) and `CasualtyClass` (4, a persistence level, not
+  `UnitStatus`). `sim_engine::casualty`: `from_unit_status`, `chrome_fate` (per carrier,
+  ODQ-43), `run_casualty_lottery` (convert first, then exactly `k` draws) and Equipment
+  Recovery (`recovery_chance_percent` 75/40/15/0; `roll_equipment_recovery`, one draw per
+  KIA, survivor-gated). Migration `0029` adds `augmentee_records` (exactly one owner;
+  composite owner FKs `RESTRICT`; campaign `CASCADE`; the Chrome Ceiling as partial uniques;
+  two guarded catalogue CHECKs) and `crew_records_owner_key`. `server::augmentee_gen` and
+  `repository::augmentee` (Postgres + in-memory; `record_fate` is one conditional `UPDATE`).
+  No production caller (8b-1 wires it), no `AppState` field, no R7 bump.
+  `augmentee_records` is `ROSTER_TABLES[0]`. Section 8 not started.
 - **INF-1 (infrastructure, GAP-37):** Complete — `tracing` subscriber installed, reward-mult
   config hardened, workspace version `0.2.0`.
 - **INF-2 (infrastructure, GAP-38):** Complete — idempotent `mercs_server::init_tracing()`
@@ -169,10 +182,10 @@ As of 2026-10-17:
   scenarios) and `shellcheck` run in the `deploy-script` job on every push, and the deploy
   job needs it (GAP-33).
 
-**283/283 tests green (1 `shared` + 123 `mercs_server` lib + 2 `aar_determinism` + 104
-`db_infrastructure` + 53 `sim_engine`; single-threaded, verified at `4abf451`). Workspace
-version `0.3.0`. `.sqlx/` holds 66 files; the latest migration is `0027_deployment_sections`.
-Production = `f7a1ff3` (0.3.0, 7b-1); `.prev` = `2a4fcb3`; `dev` is ahead with 7b-2,
+**318/318 tests green (1 `shared` + 129 `mercs_server` lib + 2 `aar_determinism` + 115
+`db_infrastructure` + 71 `sim_engine`; single-threaded, verified at `2b61dc1`). Workspace
+version `0.3.0`. `.sqlx/` holds 71 files; the latest migration is `0029_augmentee_records`.
+Production = `27f2598` (0.3.0, 7b-2); `.prev` = `f7a1ff3`; `dev` is ahead with 7d-1,
 unpushed. Next: see the Phase 1 document.** Any brick that changes what `resolve_mission` produces for
 a given seed bumps the workspace version in the same brick. 4b-1 reused `sim-engine`'s `OutcomeType` rather than
 defining a new enum, and writes **no input-log entry** — the rank-up entry was removed
@@ -385,10 +398,10 @@ constraints — parallel execution causes FK-23503 failures that are not caused 
 code under test. Any test report produced without `--test-threads=1` is unreliable and
 must be re-run before reporting results to the Director.
 
-**Test wallets:** `tests/` uses wallet seeds 0–9, 13–19, 21–33 and 88, with 10–12 taken by
+**Test wallets:** `tests/` uses wallet seeds 0–9, 13–19, 21–37 and 88, with 10–12 taken by
 a range literal (`(10u8..=12)`). **20 is the auth tests' signing-key seed**
 (`SigningKey::from_bytes(&[20u8; 32])`). It is used in memory only, and its derived
-public key is not `[20u8; 32]`. The next free seed is **34**.
+public key is not `[20u8; 32]`. The next free seed is **38**.
 
 **Independent oracle:** A gate's expected value is never read from the code it checks. Pin
 it to a literal taken from canon or from a measurement made before the change (4d-2 N3: a
