@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT c.campaign_id\n           FROM campaign_instances c\n           LEFT JOIN player_campaign_membership m ON m.campaign_id = c.campaign_id\n           WHERE c.state = 'Pending'\n           GROUP BY c.campaign_id\n           HAVING count(m.membership_id) < $1\n           ORDER BY c.created_at, c.campaign_id\n           LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "campaign_id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "ff2f35c712255bde4840947f80170371779d944b089c273b5b1cc2cc4dff5f69"
+}

@@ -353,7 +353,10 @@ impl CampaignRepository for PostgresCampaignRepository {
 /// - JSONB number normalisation (`to_jsonb(0.0::float8)` stores `0`; serde_json keeps
 ///   `0.0`), so compare tickers with `.as_f64()`, never `Value ==` across backends;
 /// - `apply_ticker_delta`'s two autocommit statements: here it is atomic under the
-///   shard lock, so it is strictly stronger than Postgres and can't reveal GAP-72.
+///   shard lock, so it is strictly stronger than Postgres and can't reveal GAP-72;
+/// - timestamp precision: in-memory timestamps keep nanoseconds, while `timestamptz` keeps
+///   microseconds, so an exact timestamp equality across backends (or a JSON snapshot)
+///   can differ.
 pub struct InMemoryCampaignRepository {
     store: DashMap<Uuid, CampaignInstance>,
 }

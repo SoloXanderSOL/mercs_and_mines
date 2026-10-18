@@ -27,6 +27,24 @@ pub struct SectionRecord {
     pub updated_at:    DateTime<Utc>,
 }
 
+/// The free starter Section a join writes (ODQ-41): "8/8" means `headcount: 8` (no capacity
+/// column exists; the range is `section_records_headcount_range`, 0..8), an empty loadout,
+/// and the name `"1st Section"` (S5). Both join impls call it, so they cannot drift.
+pub(crate) fn starter_section(campaign_id: Uuid, player_wallet: Vec<u8>) -> SectionRecord {
+    let now = Utc::now();
+    SectionRecord {
+        section_id: Uuid::new_v4(),
+        campaign_id,
+        player_wallet,
+        name: "1st Section".to_string(),
+        headcount: 8,
+        loadout: serde_json::json!({}),
+        xp: 0,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
 // ── SectionRepository trait ──────────────────────────────────────────────────
 
 #[async_trait]

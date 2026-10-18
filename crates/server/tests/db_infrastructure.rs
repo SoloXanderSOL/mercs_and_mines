@@ -6353,3 +6353,390 @@ async fn duplicate_membership_names_uq_player_campaign() {
 
     assert_unique_violation(res, "uq_player_campaign");
 }
+
+// ── 5a-2b: the campaign join ─────────────────────────────────────────────────
+
+use mercs_server::repository::{
+    CampaignJoinRepository, JoinOutcome, JoinSeeds, PauseHook, PostgresCampaignJoinRepository,
+    StarterIds,
+};
+
+const JOIN_SEEDS: JoinSeeds = JoinSeeds { commander: 0x1111_1111, foreman: 0x2222_2222, map: 0x3333_3333 };
+
+/// The account row the join's precondition needs, and nothing else (no campaign, no membership).
+async fn seed_account(pool: &sqlx::PgPool, wallet: [u8; 32]) {
+    sqlx::query(
+        "INSERT INTO player_accounts (wallet_address, trust_standing, gcn_balance)
+         VALUES ($1, 0, 0) ON CONFLICT (wallet_address) DO NOTHING"
+    )
+    .bind(wallet.to_vec())
+    .execute(pool)
+    .await
+    .expect("player_accounts seed failed");
+}
+
+async fn pending_campaign_count(pool: &sqlx::PgPool) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM campaign_instances WHERE state = 'Pending'")
+        .fetch_one(pool).await.expect("pending count failed")
+}
+
+/// The join's pick is global, so a leftover Pending campaign would capture the test: a dirty
+/// test DB voids the run loudly.
+async fn assert_no_pending_campaign(pool: &sqlx::PgPool) {
+    assert_eq!(pending_campaign_count(pool).await, 0, "dirty test DB: a Pending campaign exists before this test (void run)");
+}
+
+async fn wallet_rows(pool: &sqlx::PgPool, table: &str, wallet: [u8; 32]) -> i64 {
+    let col = if table == "player_campaign_membership" { "wallet_address" } else { "player_wallet" };
+    sqlx::query_scalar(&format!("SELECT count(*) FROM {table} WHERE {col} = $1"))
+        .bind(wallet.to_vec()).fetch_one(pool).await
+        .unwrap_or_else(|e| panic!("{table} count failed: {e}"))
+}
+
+async fn campaign_members(pool: &sqlx::PgPool, campaign_id: uuid::Uuid) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM player_campaign_membership WHERE campaign_id = $1")
+        .bind(campaign_id).fetch_one(pool).await.expect("member count failed")
+}
+
+async fn acquired_via_of(pool: &sqlx::PgPool, table: &str, id_col: &str, id: uuid::Uuid) -> String {
+    sqlx::query_scalar(&format!("SELECT acquired_via FROM {table} WHERE {id_col} = $1"))
+        .bind(id).fetch_one(pool).await
+        .unwrap_or_else(|e| panic!("{table} acquired_via read failed: {e}"))
+}
+
+fn joined_ids(o: JoinOutcome) -> StarterIds {
+    match o {
+        JoinOutcome::Joined(ids) => ids,
+        other => panic!("expected Joined, got {other:?}"),
+    }
+}
+
+/// 5a-2b P1 — a join writes one of each starter, owned by the joiner, with the canon values.
+#[tokio::test]
+async fn campaign_join_writes_one_of_each_starter() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    let wallet = [42u8; 32];
+    clean_wallet_4g1(&pool, &wallet).await;
+    assert_no_pending_campaign(&pool).await;
+    seed_account(&pool, wallet).await;
+
+    let ids = joined_ids(PostgresCampaignJoinRepository::new(pool.clone()).join_campaign(&wallet, 2, JOIN_SEEDS).await.unwrap());
+
+    for t in ["commander_records", "foreman_records", "section_records", "crew_records"] {
+        let n: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {t} WHERE campaign_id = $1 AND player_wallet = $2"))
+            .bind(ids.campaign_id).bind(wallet.to_vec()).fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 1, "{t}: one starter row");
+    }
+
+    let c = PostgresCommanderRepository::new(pool.clone()).get_commander(ids.commander_id).await.unwrap().expect("commander");
+    assert_eq!((c.rank, c.xp, c.stress), (1, 0, 0));
+    assert!(c.commander_grade.is_some());
+    assert_eq!(c.prng_seed_state, 0x1111_1111);
+    assert_eq!(c.player_wallet, wallet.to_vec());
+    let f = PostgresForemanRepository::new(pool.clone()).get_foreman(ids.foreman_id).await.unwrap().expect("foreman");
+    assert_eq!(f.prng_seed_state, 0x2222_2222);
+    assert_ne!(c.prng_seed_state, f.prng_seed_state, "the two seeds differ");
+    assert_eq!(f.player_wallet, wallet.to_vec());
+    let s = PostgresSectionRepository::new(pool.clone()).get_section(ids.section_id).await.unwrap().expect("section");
+    assert_eq!(s.name, "1st Section");
+    assert_eq!(s.headcount, 8);
+    assert_eq!(s.loadout, serde_json::json!({}));
+    assert_eq!(s.player_wallet, wallet.to_vec());
+    let crew = PostgresCrewRepository::new(pool.clone()).get_crew(ids.crew_id).await.unwrap().expect("crew");
+    assert_eq!((crew.headcount, crew.xp, crew.morale), (8, 0, 60));
+    assert_eq!(crew.player_wallet, wallet.to_vec());
+
+    let m = PostgresMembershipRepository::new(pool.clone()).get_membership(&wallet, ids.campaign_id).await.unwrap().expect("membership");
+    assert_eq!((m.gateway_hex_q, m.gateway_hex_r), (None, None));
+    let camp = PostgresCampaignRepository::new(pool.clone()).get_campaign(ids.campaign_id).await.unwrap().expect("campaign");
+    assert_eq!(camp.state, CampaignLifecycle::Pending);
+    assert_eq!(camp.map_seed, 0x3333_3333);
+
+    clean_wallet_4g1(&pool, &wallet).await;
+}
+
+/// 5a-2b P2 (Reviewer 5a-1 CF1) — each starter's `acquired_via` reaches the column as
+/// `'starter'`, and a `create_*` row as `'hired'`.
+#[tokio::test]
+async fn campaign_join_writes_acquired_via_starter() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    let wallet = [43u8; 32];
+    clean_wallet_4g1(&pool, &wallet).await;
+    assert_no_pending_campaign(&pool).await;
+    seed_account(&pool, wallet).await;
+
+    let ids = joined_ids(PostgresCampaignJoinRepository::new(pool.clone()).join_campaign(&wallet, 2, JOIN_SEEDS).await.unwrap());
+    assert_eq!(acquired_via_of(&pool, "commander_records", "commander_id", ids.commander_id).await, "starter", "commander acquired_via");
+    assert_eq!(acquired_via_of(&pool, "foreman_records", "foreman_id", ids.foreman_id).await, "starter", "foreman acquired_via");
+    assert_eq!(acquired_via_of(&pool, "section_records", "section_id", ids.section_id).await, "starter", "section acquired_via");
+    assert_eq!(acquired_via_of(&pool, "crew_records", "crew_id", ids.crew_id).await, "starter", "crew acquired_via");
+
+    let hired = CrewRecord::new_hire(ids.campaign_id, wallet.to_vec());
+    let hired_id = hired.crew_id;
+    PostgresCrewRepository::new(pool.clone()).create_crew(hired).await.unwrap();
+    assert_eq!(acquired_via_of(&pool, "crew_records", "crew_id", hired_id).await, "hired", "hired crew acquired_via");
+
+    clean_wallet_4g1(&pool, &wallet).await;
+}
+
+/// 5a-2b P3 — a repeat join returns `AlreadyMember` with the same ids and writes nothing.
+#[tokio::test]
+async fn campaign_join_repeat_returns_already_member() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    let wallet = [44u8; 32];
+    clean_wallet_4g1(&pool, &wallet).await;
+    assert_no_pending_campaign(&pool).await;
+    seed_account(&pool, wallet).await;
+    let repo = PostgresCampaignJoinRepository::new(pool.clone());
+
+    let ids = joined_ids(repo.join_campaign(&wallet, 2, JOIN_SEEDS).await.unwrap());
+    let again = repo.join_campaign(&wallet, 2, JOIN_SEEDS).await.unwrap();
+    assert_eq!(again, JoinOutcome::AlreadyMember(ids));
+
+    assert_eq!(pending_campaign_count(&pool).await, 1, "one campaign");
+    for t in ["player_campaign_membership", "commander_records", "foreman_records", "section_records", "crew_records"] {
+        assert_eq!(wallet_rows(&pool, t, wallet).await, 1, "{t}: one row");
+    }
+
+    clean_wallet_4g1(&pool, &wallet).await;
+}
+
+/// 5a-2b P4 — three wallets at cap 2 fill two campaigns.
+#[tokio::test]
+async fn campaign_join_fills_campaigns_up_to_cap() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    let wallets = [[45u8; 32], [46u8; 32], [47u8; 32]];
+    for w in &wallets { clean_wallet_4g1(&pool, w).await; }
+    assert_no_pending_campaign(&pool).await;
+    for w in wallets { seed_account(&pool, w).await; }
+    let repo = PostgresCampaignJoinRepository::new(pool.clone());
+
+    let mut ids = Vec::new();
+    for w in &wallets {
+        ids.push(joined_ids(repo.join_campaign(w, 2, JOIN_SEEDS).await.unwrap()));
+    }
+    let campaigns = pending_campaign_count(&pool).await;
+
+    for w in &wallets { clean_wallet_4g1(&pool, w).await; }
+    assert_eq!(ids[0].campaign_id, ids[1].campaign_id, "the first two share a campaign");
+    assert_ne!(ids[2].campaign_id, ids[0].campaign_id, "the third gets a new campaign");
+    assert_eq!(campaigns, 2, "two campaigns in all");
+}
+
+/// 5a-2b P5 — at cap 1, a join lands in an existing empty Pending campaign (guards
+/// `count(m.membership_id)`: `count(*)` counts an empty campaign as 1).
+#[tokio::test]
+async fn campaign_join_picks_an_empty_pending_campaign() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    let wallet = [48u8; 32];
+    clean_wallet_4g1(&pool, &wallet).await;
+    assert_no_pending_campaign(&pool).await;
+    seed_account(&pool, wallet).await;
+    let e = PostgresCampaignRepository::new(pool.clone())
+        .create_campaign(&NewCampaignInstance { sector_id: uuid::Uuid::new_v4(), map_seed: 0x5A2B_i64 })
+        .await.unwrap().campaign_id;
+
+    let ids = joined_ids(PostgresCampaignJoinRepository::new(pool.clone()).join_campaign(&wallet, 1, JOIN_SEEDS).await.unwrap());
+    let pending = pending_campaign_count(&pool).await;
+
+    clean_wallet_4g1(&pool, &wallet).await;
+    delete_campaign(&pool, e).await;
+    assert_eq!(ids.campaign_id, e, "joined the existing empty campaign");
+    assert_eq!(pending, 1, "no second campaign");
+}
+
+/// 5a-2b P6 — the oldest Pending campaign is picked, and two campaigns created in one
+/// transaction (same `now()`) tie-break on `campaign_id`.
+#[tokio::test]
+async fn campaign_join_picks_the_oldest_pending_campaign() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    let wallets = [[49u8; 32], [50u8; 32], [51u8; 32]];
+    for w in &wallets { clean_wallet_4g1(&pool, w).await; }
+    assert_no_pending_campaign(&pool).await;
+    for w in wallets { seed_account(&pool, w).await; }
+
+    let o = PostgresCampaignRepository::new(pool.clone())
+        .create_campaign(&NewCampaignInstance { sector_id: uuid::Uuid::new_v4(), map_seed: 0x0_i64 })
+        .await.unwrap().campaign_id;
+    let mut tx = pool.begin().await.unwrap();
+    let mut tied = Vec::new();
+    for seed in [1_i64, 2] {
+        let id: uuid::Uuid = sqlx::query_scalar("INSERT INTO campaign_instances (sector_id, map_seed) VALUES ($1, $2) RETURNING campaign_id")
+            .bind(uuid::Uuid::new_v4()).bind(seed).fetch_one(&mut *tx).await.unwrap();
+        tied.push(id);
+    }
+    tx.commit().await.unwrap();
+    let first_tied = *tied.iter().min().unwrap();
+
+    let repo = PostgresCampaignJoinRepository::new(pool.clone());
+    let mut ids = Vec::new();
+    for w in &wallets {
+        ids.push(joined_ids(repo.join_campaign(w, 2, JOIN_SEEDS).await.unwrap()));
+    }
+
+    for w in &wallets { clean_wallet_4g1(&pool, w).await; }
+    for c in [o, tied[0], tied[1]] { delete_campaign(&pool, c).await; }
+    assert_eq!(ids[0].campaign_id, o, "the first joiner takes the oldest campaign");
+    assert_eq!(ids[1].campaign_id, o, "the second joiner fills it");
+    assert_eq!(ids[2].campaign_id, first_tied, "a created_at tie goes to the smaller campaign_id");
+}
+
+/// 5a-2b P7 — a member with no starter set is an integrity error, not `AlreadyMember`.
+#[tokio::test]
+async fn campaign_join_member_without_starter_set_is_internal() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    let wallet = [52u8; 32];
+    clean_wallet_4g1(&pool, &wallet).await;
+    assert_no_pending_campaign(&pool).await;
+    seed_account_and_campaign(&pool, wallet, 0x5A2B7_i64).await;
+
+    let res = PostgresCampaignJoinRepository::new(pool.clone()).join_campaign(&wallet, 2, JOIN_SEEDS).await;
+    clean_wallet_4g1(&pool, &wallet).await;
+    match res {
+        Err(RepositoryError::Internal(m)) => assert!(m.contains("no starter set"), "unexpected text: {m}"),
+        other => panic!("expected Internal, got {other:?}"),
+    }
+}
+
+/// A pause hook: each call reports "parked", then waits until the gate opens. Once open,
+/// every later call passes straight through.
+fn join_pause_hook() -> (PauseHook, tokio::sync::mpsc::UnboundedReceiver<()>, tokio::sync::watch::Sender<bool>) {
+    let (parked_tx, parked_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+    let hook: PauseHook = std::sync::Arc::new(move || {
+        let parked = parked_tx.clone();
+        let mut gate = gate_rx.clone();
+        Box::pin(async move {
+            let _ = parked.send(());
+            let _ = gate.wait_for(|open| *open).await;
+        })
+    });
+    (hook, parked_rx, gate_tx)
+}
+
+/// Runs A and B through the seam protocol (Section 5 doc): A parks; B either parks at its own
+/// seam or waits on the join lock; then the gate opens. Returns both results.
+async fn race_joins(
+    wide: &sqlx::PgPool,
+    a: [u8; 32],
+    b: [u8; 32],
+    cap: i64,
+) -> (Result<JoinOutcome, RepositoryError>, Result<JoinOutcome, RepositoryError>) {
+    use std::time::Duration;
+    let (hook, mut parked, gate) = join_pause_hook();
+    let repo = std::sync::Arc::new(PostgresCampaignJoinRepository::with_pause_seam(wide.clone(), hook));
+
+    let ra = repo.clone();
+    let task_a = tokio::spawn(async move { ra.join_campaign(&a, cap, JOIN_SEEDS).await });
+    tokio::time::timeout(Duration::from_secs(10), parked.recv())
+        .await.expect("A never parked").expect("A never parked");
+
+    let rb = repo.clone();
+    let task_b = tokio::spawn(async move { rb.join_campaign(&b, cap, JOIN_SEEDS).await });
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if parked.try_recv().is_ok() { break; }
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND objsubid = 1 AND NOT granted"
+        ).fetch_one(wide).await.expect("pg_locks poll failed");
+        if waiting == 1 { break; }
+        assert!(tokio::time::Instant::now() < deadline, "B neither parked nor waited on the lock");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    gate.send(true).expect("open the gate");
+    let ra = task_a.await.expect("A panicked");
+    let rb = task_b.await.expect("B panicked");
+    (ra, rb)
+}
+
+async fn wide_pool() -> sqlx::PgPool {
+    let url = std::env::var("TEST_DATABASE_URL").unwrap();
+    PgPoolOptions::new().max_connections(4).connect(&url).await.expect("wide pool")
+}
+
+/// 5a-2b P8 (seam (a)) — one wallet joining twice at once gets one starter set: one call
+/// joins, the other is `AlreadyMember`, and both are `Ok`.
+#[tokio::test]
+async fn concurrent_joins_by_one_wallet_yield_one_starter_set() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    let wallet = [53u8; 32];
+    clean_wallet_4g1(&pool, &wallet).await;
+    assert_no_pending_campaign(&pool).await;
+    seed_account(&pool, wallet).await;
+    // Both racers must pick the same row, so the campaign exists before either starts.
+    let e = PostgresCampaignRepository::new(pool.clone())
+        .create_campaign(&NewCampaignInstance { sector_id: uuid::Uuid::new_v4(), map_seed: 0x5A2B8_i64 })
+        .await.unwrap().campaign_id;
+    let wide = wide_pool().await;
+
+    let (ra, rb) = race_joins(&wide, wallet, wallet, 2).await;
+    let rows: Vec<i64> = {
+        let mut v = Vec::new();
+        for t in ["player_campaign_membership", "commander_records", "foreman_records", "section_records", "crew_records"] {
+            v.push(wallet_rows(&pool, t, wallet).await);
+        }
+        v
+    };
+    clean_wallet_4g1(&pool, &wallet).await;
+    delete_campaign(&pool, e).await;
+
+    let (ra, rb) = match (ra, rb) {
+        (Ok(a), Ok(b)) => (a, b),
+        other => panic!("both calls Ok: {other:?}"),
+    };
+    let (j, am) = match (ra, rb) {
+        (JoinOutcome::Joined(j), JoinOutcome::AlreadyMember(am)) | (JoinOutcome::AlreadyMember(am), JoinOutcome::Joined(j)) => (j, am),
+        other => panic!("one Joined and one AlreadyMember: {other:?}"),
+    };
+    assert_eq!(j, am, "the same starter set");
+    assert_eq!(rows, vec![1, 1, 1, 1, 1], "one membership and one row per roster table");
+}
+
+/// 5a-2b P9 (seam (b)) — two wallets racing for the last seat at cap 2: no campaign goes over
+/// cap.
+#[tokio::test]
+async fn concurrent_joins_for_the_last_seat_respect_the_cap() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    let (first, a, b) = ([54u8; 32], [55u8; 32], [56u8; 32]);
+    for w in [first, a, b] { clean_wallet_4g1(&pool, &w).await; }
+    assert_no_pending_campaign(&pool).await;
+    for w in [first, a, b] { seed_account(&pool, w).await; }
+    let wide = wide_pool().await;
+
+    let seated = joined_ids(PostgresCampaignJoinRepository::new(pool.clone()).join_campaign(&first, 2, JOIN_SEEDS).await.unwrap());
+    let (ra, rb) = race_joins(&wide, a, b, 2).await;
+
+    let mut campaigns = vec![seated.campaign_id];
+    for r in [&ra, &rb] {
+        if let Ok(JoinOutcome::Joined(ids) | JoinOutcome::AlreadyMember(ids)) = r { campaigns.push(ids.campaign_id); }
+    }
+    campaigns.sort();
+    campaigns.dedup();
+    let mut members = Vec::new();
+    for c in &campaigns { members.push(campaign_members(&pool, *c).await); }
+    for w in [first, a, b] { clean_wallet_4g1(&pool, &w).await; }
+
+    let (ra, rb) = match (ra, rb) {
+        (Ok(a), Ok(b)) => (a, b),
+        other => panic!("both calls Ok: {other:?}"),
+    };
+    assert!(matches!(ra, JoinOutcome::Joined(_)) && matches!(rb, JoinOutcome::Joined(_)), "both Joined: {ra:?} / {rb:?}");
+    assert!(members.iter().all(|&n| n <= 2), "campaign over cap: {members:?}");
+    assert_eq!(campaigns.len(), 2, "two campaigns in all");
+}
+
+/// 5a-2b P10 — a join with no account fails, and the campaign it created rolls back with it.
+#[tokio::test]
+async fn campaign_join_without_an_account_rolls_back() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    let wallet = [57u8; 32];
+    clean_wallet_4g1(&pool, &wallet).await;
+    assert_no_pending_campaign(&pool).await;
+
+    let res = PostgresCampaignJoinRepository::new(pool.clone()).join_campaign(&wallet, 2, JOIN_SEEDS).await;
+    let pending = pending_campaign_count(&pool).await;
+    clean_wallet_4g1(&pool, &wallet).await;
+    assert!(matches!(res, Err(RepositoryError::Internal(_))), "expected Internal, got {res:?}");
+    assert_eq!(pending, 0, "the created campaign rolled back");
+}

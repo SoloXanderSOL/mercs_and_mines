@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT m.campaign_id\n           FROM player_campaign_membership m\n           JOIN campaign_instances c ON c.campaign_id = m.campaign_id\n           WHERE m.wallet_address = $1 AND c.state IN ('Pending','Active','Ending')\n           ORDER BY m.joined_at, m.campaign_id\n           LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "campaign_id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bytea"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "ffde1034ea28dbaf134ceb9613e3e36a9431b0d13d97ff5c705efb2494e626c3"
+}

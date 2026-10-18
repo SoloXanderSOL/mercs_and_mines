@@ -124,7 +124,7 @@ pub(super) fn clamp_new_record(mut r: CommanderRecord) -> CommanderRecord {
 /// before the clamp and any write.
 pub(super) fn require_grade(r: &CommanderRecord) -> Result<(), RepositoryError> {
     if r.commander_grade.is_none() {
-        return Err(RepositoryError::Internal("create_commander: commander_grade is required".into()));
+        return Err(RepositoryError::Internal("commander_grade is required".into()));
     }
     Ok(())
 }

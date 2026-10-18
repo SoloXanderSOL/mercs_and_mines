@@ -1,0 +1,41 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n            (SELECT commander_id FROM commander_records\n              WHERE campaign_id = $1 AND player_wallet = $2 AND acquired_via = 'starter') AS \"commander_id?\",\n            (SELECT foreman_id FROM foreman_records\n              WHERE campaign_id = $1 AND player_wallet = $2 AND acquired_via = 'starter') AS \"foreman_id?\",\n            (SELECT section_id FROM section_records\n              WHERE campaign_id = $1 AND player_wallet = $2 AND acquired_via = 'starter') AS \"section_id?\",\n            (SELECT crew_id FROM crew_records\n              WHERE campaign_id = $1 AND player_wallet = $2 AND acquired_via = 'starter') AS \"crew_id?\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "commander_id?",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "foreman_id?",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "section_id?",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "crew_id?",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Bytea"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "997a4629ff7d7d9c086e7f1183641ff52190f46d43e141349cc8cf9cbebc742d"
+}

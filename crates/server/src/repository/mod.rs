@@ -7,6 +7,8 @@ pub mod advisor;
 pub mod augmentee;
 pub mod crew;
 pub mod campaign;
+pub mod campaign_join;
+pub mod campaign_join_in_memory;
 pub mod convoy;
 pub mod commander;
 pub mod foreman;
@@ -39,6 +41,11 @@ pub use campaign::{
     InMemoryCampaignRepository, NewCampaignInstance, PostgresCampaignRepository,
     VictoryTickerType,
 };
+pub use campaign_join::{
+    CampaignJoinRepository, JoinOutcome, JoinSeeds, PauseHook, PostgresCampaignJoinRepository,
+    StarterIds, SECTOR_PLAYER_CAP,
+};
+pub use campaign_join_in_memory::InMemoryCampaignJoinRepository;
 pub use convoy::{ConvoyDbRecord, ConvoyRepository, InMemoryConvoyRepository, PostgresConvoyRepository};
 pub use commander::{
     outcome_db_str, AppliedEffects, CardMintPending, CommanderRecord, CommanderRepository, DeploymentRecord,

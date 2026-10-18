@@ -139,6 +139,8 @@ fn next_quadrant_clockwise(q: Quadrant) -> Quadrant {
 
 /// Assigns a gateway rim hex to each player. Solo players get a uniform random draw (the
 /// shuffled rim order); past the rim's size, they round-robin over that same order.
+/// The ≤1 per-hex spread holds for Solo players among themselves; Charter placement does
+/// not consult Solo occupancy (GAP-73).
 /// Charter groups are placed together in one quadrant with minimum 3-hex axial separation;
 /// overflow spills clockwise to the next quadrant.
 pub fn assign_gateway_hexes(

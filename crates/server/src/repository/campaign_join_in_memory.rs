@@ -1,0 +1,291 @@
+//! The in-memory campaign join (5a-2b), over 5a-2a's shared in-memory stores. The trait,
+//! the shared types and the Postgres impl live in `campaign_join.rs`.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use uuid::Uuid;
+
+use super::campaign::{CampaignLifecycle, CampaignRepository, InMemoryCampaignRepository, NewCampaignInstance};
+use super::campaign_join::{CampaignJoinRepository, JoinOutcome, JoinSeeds, StarterIds, NO_STARTER_SET};
+use super::commander::{CommanderRepository, InMemoryCommanderRepository};
+use super::crew::{CrewRecord, CrewRepository, InMemoryCrewRepository};
+use super::foreman::{ForemanRepository, InMemoryForemanRepository};
+use super::membership::{InMemoryMembershipRepository, MembershipRepository};
+use super::section::{starter_section, InMemorySectionRepository, SectionRepository};
+use super::RepositoryError;
+use crate::commander_gen::generate_commander;
+use crate::foreman_gen::generate_foreman;
+
+/// The join over the six in-memory stores, writing through their trait methods only
+/// (Reviewer 5a-2a CF2): it holds no `DashMap` `Ref`/`RefMut`, no `std` guard across an
+/// `.await`, and never holds its lock while calling code that waits on it. The lock is a
+/// `tokio::sync::Mutex` because its guard is held across those `.await`s (a `std` guard is
+/// `!Send`). Lock order: join lock → one `DashMap` shard per call.
+///
+/// - **Not atomic.** A failure part-way leaves the earlier writes. It is sequentially correct
+///   and serialised against other joins through this instance only.
+/// - **The membership FK invariant holds in memory by construction, not by enforcement:** the
+///   membership is written first, and no membership check is added to any in-memory
+///   `create_*` (Reviewer 5a-1 CF3).
+/// - The in-memory stores overwrite a duplicate id rather than refuse it (Reviewer 7a-1 F2),
+///   so no in-memory test asserts duplicate refusal.
+/// - The roster stores hold no `acquired_via`, so the starter ids live in this impl's map. A
+///   membership written outside the join has no entry: the in-memory face of "no starter set".
+/// - It never names `clamp_new_record`: each in-memory `create_*` clamps itself (Reviewer
+///   5a-0 CF5 is satisfied vacuously).
+pub struct InMemoryCampaignJoinRepository {
+    campaigns:   Arc<InMemoryCampaignRepository>,
+    memberships: Arc<InMemoryMembershipRepository>,
+    commanders:  Arc<InMemoryCommanderRepository>,
+    foremen:     Arc<InMemoryForemanRepository>,
+    sections:    Arc<InMemorySectionRepository>,
+    crews:       Arc<InMemoryCrewRepository>,
+    /// The join lock, and the starter ids of every join made through this instance.
+    starters:    tokio::sync::Mutex<HashMap<(Vec<u8>, Uuid), StarterIds>>,
+}
+
+impl InMemoryCampaignJoinRepository {
+    pub fn new(
+        campaigns:   Arc<InMemoryCampaignRepository>,
+        memberships: Arc<InMemoryMembershipRepository>,
+        commanders:  Arc<InMemoryCommanderRepository>,
+        foremen:     Arc<InMemoryForemanRepository>,
+        sections:    Arc<InMemorySectionRepository>,
+        crews:       Arc<InMemoryCrewRepository>,
+    ) -> Self {
+        Self {
+            campaigns,
+            memberships,
+            commanders,
+            foremen,
+            sections,
+            crews,
+            starters: tokio::sync::Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl CampaignJoinRepository for InMemoryCampaignJoinRepository {
+    async fn join_campaign(
+        &self,
+        wallet: &[u8],
+        cap: i64,
+        seeds: JoinSeeds,
+    ) -> Result<JoinOutcome, RepositoryError> {
+        let mut starters = self.starters.lock().await;
+
+        // S1/S7: any membership row in a live campaign, oldest first.
+        let mut rows = self.memberships.list_campaigns_by_player(wallet).await?;
+        rows.sort_by_key(|m| (m.joined_at, m.campaign_id));
+        for m in rows {
+            let live = matches!(
+                self.campaigns.get_campaign(m.campaign_id).await?.map(|c| c.state),
+                Some(CampaignLifecycle::Pending | CampaignLifecycle::Active | CampaignLifecycle::Ending)
+            );
+            if live {
+                return match starters.get(&(wallet.to_vec(), m.campaign_id)) {
+                    Some(ids) => Ok(JoinOutcome::AlreadyMember(*ids)),
+                    None => Err(RepositoryError::Internal(NO_STARTER_SET.into())),
+                };
+            }
+        }
+
+        // The pick: the store is unordered (Reviewer 7a-1 F3), so sort here.
+        let mut pending = self.campaigns.list_campaigns_by_state(CampaignLifecycle::Pending).await?;
+        pending.sort_by_key(|c| (c.created_at, c.campaign_id));
+        let mut picked = None;
+        for c in pending {
+            let members = self.memberships.list_members_by_campaign(c.campaign_id).await?.len();
+            if (members as i64) < cap {
+                picked = Some(c.campaign_id);
+                break;
+            }
+        }
+        let campaign_id = match picked {
+            Some(id) => id,
+            None => {
+                self.campaigns
+                    .create_campaign(&NewCampaignInstance { sector_id: Uuid::new_v4(), map_seed: seeds.map })
+                    .await?
+                    .campaign_id
+            }
+        };
+
+        // Membership first, then the roster, in the Postgres order (Reviewer 5a-1 CF3).
+        self.memberships.add_member(wallet, campaign_id, None, None).await?;
+
+        let commander = generate_commander(wallet.to_vec(), campaign_id, seeds.commander);
+        let commander_id = commander.commander_id;
+        self.commanders.create_commander(commander).await?;
+
+        let foreman = generate_foreman(wallet.to_vec(), campaign_id, seeds.foreman);
+        let foreman_id = foreman.foreman_id;
+        self.foremen.create_foreman(foreman).await?;
+
+        let section = starter_section(campaign_id, wallet.to_vec());
+        let section_id = section.section_id;
+        self.sections.create_section(section).await?;
+
+        let crew = CrewRecord::new_hire(campaign_id, wallet.to_vec());
+        let crew_id = crew.crew_id;
+        self.crews.create_crew(crew).await?;
+
+        let ids = StarterIds { campaign_id, commander_id, foreman_id, section_id, crew_id };
+        starters.insert((wallet.to_vec(), campaign_id), ids);
+        Ok(JoinOutcome::Joined(ids))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    const SEEDS: JoinSeeds = JoinSeeds { commander: 0x1111_1111, foreman: 0x2222_2222, map: 0x3333_3333 };
+
+    struct Stores {
+        campaigns:   Arc<InMemoryCampaignRepository>,
+        memberships: Arc<InMemoryMembershipRepository>,
+        commanders:  Arc<InMemoryCommanderRepository>,
+        foremen:     Arc<InMemoryForemanRepository>,
+        sections:    Arc<InMemorySectionRepository>,
+        crews:       Arc<InMemoryCrewRepository>,
+        join:        InMemoryCampaignJoinRepository,
+    }
+
+    fn stores() -> Stores {
+        let campaigns = Arc::new(InMemoryCampaignRepository::new());
+        let memberships = Arc::new(InMemoryMembershipRepository::new());
+        let commanders = Arc::new(InMemoryCommanderRepository::new());
+        let foremen = Arc::new(InMemoryForemanRepository::new());
+        let sections = Arc::new(InMemorySectionRepository::new());
+        let crews = Arc::new(InMemoryCrewRepository::new());
+        let join = InMemoryCampaignJoinRepository::new(
+            campaigns.clone(), memberships.clone(), commanders.clone(),
+            foremen.clone(), sections.clone(), crews.clone(),
+        );
+        Stores { campaigns, memberships, commanders, foremen, sections, crews, join }
+    }
+
+    fn joined(o: JoinOutcome) -> StarterIds {
+        match o {
+            JoinOutcome::Joined(ids) => ids,
+            other => panic!("expected Joined, got {other:?}"),
+        }
+    }
+
+    /// Row counts for `wallet` in `campaign` across the four roster stores.
+    async fn roster_counts(s: &Stores, campaign: Uuid, wallet: &[u8]) -> [usize; 4] {
+        [
+            s.commanders.list_commanders_by_campaign(campaign).await.unwrap().iter().filter(|r| r.player_wallet == wallet).count(),
+            s.foremen.list_foremen_by_campaign(campaign).await.unwrap().iter().filter(|r| r.player_wallet == wallet).count(),
+            s.sections.list_sections_by_campaign(campaign).await.unwrap().iter().filter(|r| r.player_wallet == wallet).count(),
+            s.crews.list_crews_by_campaign(campaign).await.unwrap().iter().filter(|r| r.player_wallet == wallet).count(),
+        ]
+    }
+
+    async fn pending_count(s: &Stores) -> usize {
+        s.campaigns.list_campaigns_by_state(CampaignLifecycle::Pending).await.unwrap().len()
+    }
+
+    /// M1 — one of each starter, owned by the joiner, with the canon starting values.
+    #[tokio::test]
+    async fn in_memory_join_writes_one_of_each_starter() {
+        let s = stores();
+        let wallet = vec![42u8; 32];
+        let ids = joined(s.join.join_campaign(&wallet, 2, SEEDS).await.unwrap());
+
+        assert_eq!(roster_counts(&s, ids.campaign_id, &wallet).await, [1, 1, 1, 1]);
+
+        let c = s.commanders.get_commander(ids.commander_id).await.unwrap().expect("commander");
+        assert_eq!((c.rank, c.xp, c.stress), (1, 0, 0));
+        assert!(c.commander_grade.is_some());
+        assert_eq!(c.prng_seed_state, 0x1111_1111);
+        assert_eq!(c.player_wallet, wallet);
+
+        let f = s.foremen.get_foreman(ids.foreman_id).await.unwrap().expect("foreman");
+        assert_eq!(f.prng_seed_state, 0x2222_2222);
+        assert_ne!(c.prng_seed_state, f.prng_seed_state, "the two seeds differ");
+        assert_eq!(f.player_wallet, wallet);
+
+        let sec = s.sections.get_section(ids.section_id).await.unwrap().expect("section");
+        assert_eq!(sec.name, "1st Section");
+        assert_eq!(sec.headcount, 8);
+        assert_eq!(sec.loadout, serde_json::json!({}));
+        assert_eq!(sec.player_wallet, wallet);
+
+        let crew = s.crews.get_crew(ids.crew_id).await.unwrap().expect("crew");
+        assert_eq!((crew.headcount, crew.xp, crew.morale), (8, 0, 60));
+        assert_eq!(crew.player_wallet, wallet);
+
+        let m = s.memberships.get_membership(&wallet, ids.campaign_id).await.unwrap().expect("membership");
+        assert_eq!((m.gateway_hex_q, m.gateway_hex_r), (None, None));
+
+        let camp = s.campaigns.get_campaign(ids.campaign_id).await.unwrap().expect("campaign");
+        assert_eq!(camp.state, CampaignLifecycle::Pending);
+        assert_eq!(camp.map_seed, 0x3333_3333);
+    }
+
+    /// M2 — a repeat join returns the same ids and writes nothing.
+    #[tokio::test]
+    async fn in_memory_repeat_join_returns_already_member() {
+        let s = stores();
+        let wallet = vec![43u8; 32];
+        let ids = joined(s.join.join_campaign(&wallet, 2, SEEDS).await.unwrap());
+        let again = s.join.join_campaign(&wallet, 2, SEEDS).await.unwrap();
+        assert_eq!(again, JoinOutcome::AlreadyMember(ids));
+        assert_eq!(roster_counts(&s, ids.campaign_id, &wallet).await, [1, 1, 1, 1]);
+        assert_eq!(s.memberships.list_campaigns_by_player(&wallet).await.unwrap().len(), 1);
+        assert_eq!(pending_count(&s).await, 1);
+    }
+
+    /// M3 — three wallets at cap 2 fill two campaigns.
+    #[tokio::test]
+    async fn in_memory_join_fills_campaigns_up_to_cap() {
+        let s = stores();
+        let a = joined(s.join.join_campaign(&[42u8; 32], 2, SEEDS).await.unwrap());
+        let b = joined(s.join.join_campaign(&[43u8; 32], 2, SEEDS).await.unwrap());
+        let c = joined(s.join.join_campaign(&[44u8; 32], 2, SEEDS).await.unwrap());
+        assert_eq!(a.campaign_id, b.campaign_id, "the first two share a campaign");
+        assert_ne!(c.campaign_id, a.campaign_id, "the third gets a new campaign");
+        assert_eq!(pending_count(&s).await, 2);
+    }
+
+    /// M4 — at cap 1, a join lands in an existing empty Pending campaign.
+    #[tokio::test]
+    async fn in_memory_join_picks_an_empty_pending_campaign() {
+        let s = stores();
+        let e = s.campaigns.create_campaign(&NewCampaignInstance { sector_id: Uuid::new_v4(), map_seed: 7 }).await.unwrap();
+        let ids = joined(s.join.join_campaign(&[42u8; 32], 1, SEEDS).await.unwrap());
+        assert_eq!(ids.campaign_id, e.campaign_id, "joined the existing empty campaign");
+        assert_eq!(pending_count(&s).await, 1);
+    }
+
+    /// M5 — the older of two Pending campaigns is picked.
+    #[tokio::test]
+    async fn in_memory_join_picks_the_oldest_pending_campaign() {
+        let s = stores();
+        let older = s.campaigns.create_campaign(&NewCampaignInstance { sector_id: Uuid::new_v4(), map_seed: 1 }).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let newer = s.campaigns.create_campaign(&NewCampaignInstance { sector_id: Uuid::new_v4(), map_seed: 2 }).await.unwrap();
+        assert!(older.created_at < newer.created_at, "precondition: distinct creation times");
+        let ids = joined(s.join.join_campaign(&[42u8; 32], 1, SEEDS).await.unwrap());
+        assert_eq!(ids.campaign_id, older.campaign_id, "joined the older campaign");
+    }
+
+    /// M6 — a membership written outside the join has no starter set.
+    #[tokio::test]
+    async fn in_memory_member_without_starter_set_is_internal() {
+        let s = stores();
+        let wallet = [44u8; 32];
+        let c = s.campaigns.create_campaign(&NewCampaignInstance { sector_id: Uuid::new_v4(), map_seed: 3 }).await.unwrap();
+        s.memberships.add_member(&wallet, c.campaign_id, None, None).await.unwrap();
+        match s.join.join_campaign(&wallet, 2, SEEDS).await {
+            Err(RepositoryError::Internal(m)) => assert!(m.contains("no starter set"), "unexpected text: {m}"),
+            other => panic!("expected Internal, got {other:?}"),
+        }
+    }
+}
