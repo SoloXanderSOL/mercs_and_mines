@@ -6422,37 +6422,48 @@ async fn campaign_join_writes_one_of_each_starter() {
 
     let ids = joined_ids(PostgresCampaignJoinRepository::new(pool.clone()).join_campaign(&wallet, 2, JOIN_SEEDS).await.unwrap());
 
+    // Read everything, clean, then assert: a failed assertion must not leave a Pending
+    // campaign behind for the next join test's dirty-DB guard.
+    let mut counts = Vec::new();
     for t in ["commander_records", "foreman_records", "section_records", "crew_records"] {
         let n: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {t} WHERE campaign_id = $1 AND player_wallet = $2"))
             .bind(ids.campaign_id).bind(wallet.to_vec()).fetch_one(&pool).await.unwrap();
+        counts.push((t, n));
+    }
+    let c = PostgresCommanderRepository::new(pool.clone()).get_commander(ids.commander_id).await.unwrap();
+    let f = PostgresForemanRepository::new(pool.clone()).get_foreman(ids.foreman_id).await.unwrap();
+    let s = PostgresSectionRepository::new(pool.clone()).get_section(ids.section_id).await.unwrap();
+    let crew = PostgresCrewRepository::new(pool.clone()).get_crew(ids.crew_id).await.unwrap();
+    let m = PostgresMembershipRepository::new(pool.clone()).get_membership(&wallet, ids.campaign_id).await.unwrap();
+    let camp = PostgresCampaignRepository::new(pool.clone()).get_campaign(ids.campaign_id).await.unwrap();
+    clean_wallet_4g1(&pool, &wallet).await;
+
+    for (t, n) in counts {
         assert_eq!(n, 1, "{t}: one starter row");
     }
-
-    let c = PostgresCommanderRepository::new(pool.clone()).get_commander(ids.commander_id).await.unwrap().expect("commander");
+    let c = c.expect("commander");
     assert_eq!((c.rank, c.xp, c.stress), (1, 0, 0));
     assert!(c.commander_grade.is_some());
     assert_eq!(c.prng_seed_state, 0x1111_1111);
     assert_eq!(c.player_wallet, wallet.to_vec());
-    let f = PostgresForemanRepository::new(pool.clone()).get_foreman(ids.foreman_id).await.unwrap().expect("foreman");
+    let f = f.expect("foreman");
     assert_eq!(f.prng_seed_state, 0x2222_2222);
     assert_ne!(c.prng_seed_state, f.prng_seed_state, "the two seeds differ");
     assert_eq!(f.player_wallet, wallet.to_vec());
-    let s = PostgresSectionRepository::new(pool.clone()).get_section(ids.section_id).await.unwrap().expect("section");
+    let s = s.expect("section");
     assert_eq!(s.name, "1st Section");
     assert_eq!(s.headcount, 8);
     assert_eq!(s.loadout, serde_json::json!({}));
     assert_eq!(s.player_wallet, wallet.to_vec());
-    let crew = PostgresCrewRepository::new(pool.clone()).get_crew(ids.crew_id).await.unwrap().expect("crew");
+    let crew = crew.expect("crew");
     assert_eq!((crew.headcount, crew.xp, crew.morale), (8, 0, 60));
     assert_eq!(crew.player_wallet, wallet.to_vec());
 
-    let m = PostgresMembershipRepository::new(pool.clone()).get_membership(&wallet, ids.campaign_id).await.unwrap().expect("membership");
+    let m = m.expect("membership");
     assert_eq!((m.gateway_hex_q, m.gateway_hex_r), (None, None));
-    let camp = PostgresCampaignRepository::new(pool.clone()).get_campaign(ids.campaign_id).await.unwrap().expect("campaign");
+    let camp = camp.expect("campaign");
     assert_eq!(camp.state, CampaignLifecycle::Pending);
     assert_eq!(camp.map_seed, 0x3333_3333);
-
-    clean_wallet_4g1(&pool, &wallet).await;
 }
 
 /// 5a-2b P2 (Reviewer 5a-1 CF1) — each starter's `acquired_via` reaches the column as
@@ -6466,17 +6477,23 @@ async fn campaign_join_writes_acquired_via_starter() {
     seed_account(&pool, wallet).await;
 
     let ids = joined_ids(PostgresCampaignJoinRepository::new(pool.clone()).join_campaign(&wallet, 2, JOIN_SEEDS).await.unwrap());
-    assert_eq!(acquired_via_of(&pool, "commander_records", "commander_id", ids.commander_id).await, "starter", "commander acquired_via");
-    assert_eq!(acquired_via_of(&pool, "foreman_records", "foreman_id", ids.foreman_id).await, "starter", "foreman acquired_via");
-    assert_eq!(acquired_via_of(&pool, "section_records", "section_id", ids.section_id).await, "starter", "section acquired_via");
-    assert_eq!(acquired_via_of(&pool, "crew_records", "crew_id", ids.crew_id).await, "starter", "crew acquired_via");
+    let commander = acquired_via_of(&pool, "commander_records", "commander_id", ids.commander_id).await;
+    let foreman = acquired_via_of(&pool, "foreman_records", "foreman_id", ids.foreman_id).await;
+    let section = acquired_via_of(&pool, "section_records", "section_id", ids.section_id).await;
+    let crew = acquired_via_of(&pool, "crew_records", "crew_id", ids.crew_id).await;
 
     let hired = CrewRecord::new_hire(ids.campaign_id, wallet.to_vec());
     let hired_id = hired.crew_id;
     PostgresCrewRepository::new(pool.clone()).create_crew(hired).await.unwrap();
-    assert_eq!(acquired_via_of(&pool, "crew_records", "crew_id", hired_id).await, "hired", "hired crew acquired_via");
-
+    let hired = acquired_via_of(&pool, "crew_records", "crew_id", hired_id).await;
+    // Clean before asserting, so a failure leaves no Pending campaign behind.
     clean_wallet_4g1(&pool, &wallet).await;
+
+    assert_eq!(commander, "starter", "commander acquired_via");
+    assert_eq!(foreman, "starter", "foreman acquired_via");
+    assert_eq!(section, "starter", "section acquired_via");
+    assert_eq!(crew, "starter", "crew acquired_via");
+    assert_eq!(hired, "hired", "hired crew acquired_via");
 }
 
 /// 5a-2b P3 — a repeat join returns `AlreadyMember` with the same ids and writes nothing.
@@ -6490,15 +6507,20 @@ async fn campaign_join_repeat_returns_already_member() {
     let repo = PostgresCampaignJoinRepository::new(pool.clone());
 
     let ids = joined_ids(repo.join_campaign(&wallet, 2, JOIN_SEEDS).await.unwrap());
-    let again = repo.join_campaign(&wallet, 2, JOIN_SEEDS).await.unwrap();
-    assert_eq!(again, JoinOutcome::AlreadyMember(ids));
-
-    assert_eq!(pending_campaign_count(&pool).await, 1, "one campaign");
+    let again = repo.join_campaign(&wallet, 2, JOIN_SEEDS).await;
+    let campaigns = pending_campaign_count(&pool).await;
+    let mut rows = Vec::new();
     for t in ["player_campaign_membership", "commander_records", "foreman_records", "section_records", "crew_records"] {
-        assert_eq!(wallet_rows(&pool, t, wallet).await, 1, "{t}: one row");
+        rows.push((t, wallet_rows(&pool, t, wallet).await));
     }
-
+    // Clean before asserting, so a failure leaves no Pending campaign behind.
     clean_wallet_4g1(&pool, &wallet).await;
+
+    assert_eq!(again.expect("repeat join"), JoinOutcome::AlreadyMember(ids));
+    assert_eq!(campaigns, 1, "one campaign");
+    for (t, n) in rows {
+        assert_eq!(n, 1, "{t}: one row");
+    }
 }
 
 /// 5a-2b P4 — three wallets at cap 2 fill two campaigns.
@@ -6511,13 +6533,14 @@ async fn campaign_join_fills_campaigns_up_to_cap() {
     for w in wallets { seed_account(&pool, w).await; }
     let repo = PostgresCampaignJoinRepository::new(pool.clone());
 
-    let mut ids = Vec::new();
+    let mut outcomes = Vec::new();
     for w in &wallets {
-        ids.push(joined_ids(repo.join_campaign(w, 2, JOIN_SEEDS).await.unwrap()));
+        outcomes.push(repo.join_campaign(w, 2, JOIN_SEEDS).await);
     }
     let campaigns = pending_campaign_count(&pool).await;
 
     for w in &wallets { clean_wallet_4g1(&pool, w).await; }
+    let ids: Vec<StarterIds> = outcomes.into_iter().map(|o| joined_ids(o.expect("join"))).collect();
     assert_eq!(ids[0].campaign_id, ids[1].campaign_id, "the first two share a campaign");
     assert_ne!(ids[2].campaign_id, ids[0].campaign_id, "the third gets a new campaign");
     assert_eq!(campaigns, 2, "two campaigns in all");
@@ -6569,13 +6592,14 @@ async fn campaign_join_picks_the_oldest_pending_campaign() {
     let first_tied = *tied.iter().min().unwrap();
 
     let repo = PostgresCampaignJoinRepository::new(pool.clone());
-    let mut ids = Vec::new();
+    let mut outcomes = Vec::new();
     for w in &wallets {
-        ids.push(joined_ids(repo.join_campaign(w, 2, JOIN_SEEDS).await.unwrap()));
+        outcomes.push(repo.join_campaign(w, 2, JOIN_SEEDS).await);
     }
 
     for w in &wallets { clean_wallet_4g1(&pool, w).await; }
     for c in [o, tied[0], tied[1]] { delete_campaign(&pool, c).await; }
+    let ids: Vec<StarterIds> = outcomes.into_iter().map(|o| joined_ids(o.expect("join"))).collect();
     assert_eq!(ids[0].campaign_id, o, "the first joiner takes the oldest campaign");
     assert_eq!(ids[1].campaign_id, o, "the second joiner fills it");
     assert_eq!(ids[2].campaign_id, first_tied, "a created_at tie goes to the smaller campaign_id");
