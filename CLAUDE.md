@@ -132,7 +132,18 @@ As of 2026-10-18:
   (Reviewer 5a-2b F1); `initialize_campaign` does map gen, hexes, Redis and `campaign_started`
   after its commit. `LAUNCH_MAX_MEMBERS = 1` (GAP-58, until 5b-2) → `409` "campaign has more
   than one member"; `InitError::WasAlreadyActive` is gone. `AppState.campaign_join_repo`
-  (Postgres in `main.rs`). No route calls the join yet. **Next: 5a-3b** (the join route).
+  (Postgres in `main.rs`); deployed with its docs commit `145338e`. **5a-3b complete
+  (`4af1945`, 2026-10-19; the join's first production caller):** `POST /api/campaign/join`
+  (`routes/campaign.rs`; `AuthSession`, no body) → `201` `Joined` / `200` `AlreadyMember` with
+  `{campaign_id, commander_id, foreman_id, section_id, crew_id}` (built with `json!`;
+  `StarterIds` has no `Serialize`); every join error → `500`. S3: `post_mission_resolve` answers
+  `409` "campaign is not active" right after the `404` Commander, before `start_deployment`
+  (an unlocked read). GAP-74: dispatch `404` (JSON) → `403` non-member → `409` not `Active`;
+  the events socket `401` → `404` → `403` → `409` unless `Active` or `Ending`, before the
+  upgrade, which it takes as `Result<WebSocketUpgrade, WebSocketUpgradeRejection>` so the
+  checks run first (an admitted `oneshot` request answers `426`). `forbidden()` helper.
+  `OneCampaign` is gone. A failed launch is retired to `Archived` (`admin.rs`). No migration,
+  no `.sqlx` change, no R7. **Next: 5a-4** (the KIA replacement).
 - **Section 6:** Not started.
 - **Sections 7 (Personnel Entity Model) and 8 (Combat Engine to canon):** created
   2026-10-13 (ruling D2); both run before Section 6. Strike Mining and Base Building moved
@@ -223,11 +234,11 @@ As of 2026-10-18:
   scenarios) and `shellcheck` run in the `deploy-script` job on every push, and the deploy
   job needs it (GAP-33).
 
-**361/361 tests green (1 `shared` + 148 `mercs_server` lib + 2 `aar_determinism` + 139
-`db_infrastructure` + 71 `sim_engine`; single-threaded, verified at `8473f14`). Workspace
+**375/375 tests green (1 `shared` + 160 `mercs_server` lib + 2 `aar_determinism` + 141
+`db_infrastructure` + 71 `sim_engine`; single-threaded, verified at `4af1945`). Workspace
 version `0.3.0`. `.sqlx/` holds 74 files; the latest migration is `0030_join_schema`.
-`main` = `b3711f8` (5a-2b, deployed 2026-10-18); `dev` is ahead with 5a-3a, unpushed.
-Next: 5a-3b; see the Phase 1 document.** Any brick that changes what `resolve_mission` produces for
+`main` = `145338e` (5a-3a, deployed 2026-10-19); `dev` is ahead with 5a-3b, unpushed.
+Next: 5a-4; see the Phase 1 document.** Any brick that changes what `resolve_mission` produces for
 a given seed bumps the workspace version in the same brick. 4b-1 reused `sim-engine`'s `OutcomeType` rather than
 defining a new enum, and writes **no input-log entry** — the rank-up entry was removed
 from scope. **ODQ-22 and ODQ-23 were ruled 2026-09-03 — engagement and mission outcomes
@@ -378,7 +389,11 @@ begins.
 
   **`JOIN_ADVISORY_KEY` has two takers:** `join_campaign` and `begin_launch` (5a-3a). Any new
   writer that moves a campaign out of `Pending`, or writes a membership, takes it
-  (`lock_joins`) as the first statement of the same transaction.
+  (`lock_joins`) as the first statement of the same transaction. `update_sector_state` is
+  unconditional by id, so it never touches a `Pending` campaign without the key. Future
+  key-takers: a stale-`Pending` reaper and an admin "cancel campaign". A failed launch is
+  retired to `Archived` (the `admin.rs` statement), never reset to `Pending`: a reset reopens
+  the campaign to joins.
 
 * **Key-Value Store (Redis):** Live Sector hex state, deployment timers (global sorted
   set + per-sector sorted set for cancel path), active session state. **Persisted Redis
@@ -450,15 +465,17 @@ constraints — parallel execution causes FK-23503 failures that are not caused 
 code under test. Any test report produced without `--test-threads=1` is unreliable and
 must be re-run before reporting results to the Director.
 
-**Test wallets:** `tests/` uses wallet seeds 0–10, 13–19, 21–61 and 88; 11 and 12 (a range
+**Test wallets:** `tests/` uses wallet seeds 0–10, 13–19, 21–62 and 88; 11 and 12 (a range
 literal until 5a-3a) stay reserved. **20 is the auth tests' signing-key seed**
 (`SigningKey::from_bytes(&[20u8; 32])`). It is used in memory only, and its derived
-public key is not `[20u8; 32]`. The next free seed is **62**.
+public key is not `[20u8; 32]`. The next free seed is **63**.
 
 **One in-memory join per `AppState`:** `AppState::new` builds each join-shared store once and
 one `InMemoryCampaignJoinRepository` over the same `Arc`s. A test that replaces a join-read
 field (`campaign_repo`, `membership_repo`, `commander_repo`, `section_repo`) replaces
 `campaign_join_repo` alongside, or the join and the launch keep reading the old stores.
+A Postgres route test builds its state with `pg_route_state` (`db_infrastructure.rs`), which
+swaps the four join-read repositories and `campaign_join_repo` together.
 
 **Race tests:** Race tests force interleaving with a pause seam after the read, never a held
 lock alone: a held lock cannot make a remove-the-lock negative fail. Wait until B is parked
