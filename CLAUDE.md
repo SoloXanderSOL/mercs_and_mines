@@ -143,7 +143,16 @@ As of 2026-10-18:
   upgrade, which it takes as `Result<WebSocketUpgrade, WebSocketUpgradeRejection>` so the
   checks run first (an admitted `oneshot` request answers `426`). `forbidden()` helper.
   `OneCampaign` is gone. A failed launch is retired to `Archived` (`admin.rs`). No migration,
-  no `.sqlx` change, no R7. **Next: 5a-4** (the KIA replacement).
+  no `.sqlx` change, no R7. **5a-3c complete (`32199dc`, 2026-10-19; the join switch,
+  Reviewer 5a-3b F1):** `ServerConfig::join_enabled` (default `false`) is read from
+  `MERCS_JOIN_ENABLED` by `env_bool` (`parse_or_warn`: exactly `true` opens; anything else
+  warns and stays closed; documented in `.env.example`). Order: `401` (`AuthSession`) →
+  `503` `{"error":"campaign joins are closed"}` (`service_unavailable()`) → wallet decode →
+  join, so the `503` precedes every database read and `JOIN_ADVISORY_KEY`. **Off in
+  production until INF-6's rate limit is live; the Director turns it on.** A test that joins
+  turns it on itself (the lib `joined_state()`; E1 via `Arc::make_mut(&mut state.config)`);
+  `pg_route_state` leaves it off. Both bare dispatch `500`s go through `internal_error`
+  (CF5). **5a-3b and 5a-3c deploy together.** **Next: 5a-4** (the KIA replacement).
 - **Section 6:** Not started.
 - **Sections 7 (Personnel Entity Model) and 8 (Combat Engine to canon):** created
   2026-10-13 (ruling D2); both run before Section 6. Strike Mining and Base Building moved
@@ -234,10 +243,10 @@ As of 2026-10-18:
   scenarios) and `shellcheck` run in the `deploy-script` job on every push, and the deploy
   job needs it (GAP-33).
 
-**375/375 tests green (1 `shared` + 160 `mercs_server` lib + 2 `aar_determinism` + 141
-`db_infrastructure` + 71 `sim_engine`; single-threaded, verified at `4af1945`). Workspace
+**379/379 tests green (1 `shared` + 164 `mercs_server` lib + 2 `aar_determinism` + 141
+`db_infrastructure` + 71 `sim_engine`; single-threaded, verified at `32199dc`). Workspace
 version `0.3.0`. `.sqlx/` holds 74 files; the latest migration is `0030_join_schema`.
-`main` = `145338e` (5a-3a, deployed 2026-10-19); `dev` is ahead with 5a-3b, unpushed.
+`main` = `145338e` (5a-3a, deployed 2026-10-19); `dev` is ahead with 5a-3b and 5a-3c, unpushed.
 Next: 5a-4; see the Phase 1 document.** Any brick that changes what `resolve_mission` produces for
 a given seed bumps the workspace version in the same brick. 4b-1 reused `sim-engine`'s `OutcomeType` rather than
 defining a new enum, and writes **no input-log entry** — the rank-up entry was removed
