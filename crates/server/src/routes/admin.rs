@@ -60,10 +60,13 @@ async fn launch_campaign(
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))).into_response();
     }
 
-    // If initialization fails mid-flight after activation (e.g. Redis upsert fails),
-    // the campaign may be left in Active state. Recovery requires a manual DB reset:
-    // `UPDATE campaign_instances SET state = 'Pending' WHERE campaign_id = '...'`
-    // Activation now precedes map gen (5a-3a: it commits under the join lock first).
+    // If initialization fails after activation (e.g. the Redis upsert), the campaign is left
+    // Active and uninitialised. Recovery: retire it, never reset it to Pending (a Pending
+    // campaign is open to joins, so a relaunch can meet a second member; 5a-3b):
+    //   UPDATE campaign_instances SET state = 'Archived', updated_at = now()
+    //    WHERE campaign_id = '...' AND state = 'Active';
+    // Its members' next join places them in a new campaign (S1 counts only Pending, Active
+    // and Ending); their starters in the retired campaign stay behind.
     match initialize_campaign(
         campaign_id,
         &*state.campaign_join_repo,

@@ -14,7 +14,7 @@ use uuid::Uuid;
 use crate::auth::AuthSession;
 use crate::map_gen::hex_axial_distance;
 use crate::repository::{
-    ConvoyDbRecord, DeploymentTimer, HexOccupant, TimerType, WalletAddress,
+    CampaignLifecycle, ConvoyDbRecord, DeploymentTimer, HexOccupant, TimerType, WalletAddress,
 };
 use crate::state::AppState;
 
@@ -54,12 +54,26 @@ async fn dispatch_convoy(
     // Look up campaign → derive sector_id
     let campaign = match state.campaign_repo.get_campaign(campaign_id).await {
         Ok(Some(c)) => c,
-        Ok(None)    => return StatusCode::NOT_FOUND.into_response(),
+        Ok(None)    => return super::not_found("campaign not found").into_response(),
         Err(e)      => {
             tracing::error!("dispatch_convoy: get_campaign failed for campaign {campaign_id}: {e}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
+
+    // GAP-74 (5a-3b): 403 for a non-member, then 409 unless Active, in that order, so a
+    // non-member can't probe a campaign's state. Any membership row counts (S7: no
+    // production writer sets is_active = false).
+    match state.membership_repo.get_membership(&owner_wallet, campaign_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return super::forbidden("not a member of this campaign").into_response(),
+        Err(e) => {
+            return super::internal_error(format!("dispatch_convoy: membership read failed for campaign {campaign_id}: {e}")).into_response();
+        }
+    }
+    if campaign.state != CampaignLifecycle::Active {
+        return super::conflict("campaign is not active").into_response();
+    }
     let sector_id = campaign.sector_id;
 
     // Terrain modifier — destination hex only (Phase 1 simplification)
@@ -186,70 +200,50 @@ mod tests {
     use crate::config::Config;
     use crate::convoy_expiry::{poll_expiry_once, ExpiryWarns};
     use crate::repository::{
-        CampaignInstance, CampaignLifecycle, CampaignRepository, ConvoyRepository,
-        NewCampaignInstance, OccupationStatus, PostgresConvoyRepository, RepositoryError,
-        SectorState, VictoryTickerType,
+        ConvoyRepository, NewCampaignInstance, OccupationStatus, PostgresConvoyRepository,
+        RepositoryError, SectorState,
     };
     use axum::body::Body;
     use axum::http::Request;
-    use chrono::DateTime;
+    use http_body_util::BodyExt;
     use tower::ServiceExt;
 
-    /// Answers `get_campaign` with one fixed campaign; nothing else is reached by dispatch.
-    struct OneCampaign(CampaignInstance);
-
-    #[async_trait::async_trait]
-    impl CampaignRepository for OneCampaign {
-        async fn create_campaign(&self, _: &NewCampaignInstance) -> Result<CampaignInstance, RepositoryError> {
-            unimplemented!()
-        }
-        async fn get_campaign(&self, id: Uuid) -> Result<Option<CampaignInstance>, RepositoryError> {
-            Ok((id == self.0.campaign_id).then(|| self.0.clone()))
-        }
-        async fn update_sector_state(&self, _: Uuid, _: CampaignLifecycle) -> Result<(), RepositoryError> {
-            unimplemented!()
-        }
-        async fn apply_ticker_delta(&self, _: Uuid, _: VictoryTickerType, _: f64) -> Result<f64, RepositoryError> {
-            unimplemented!()
-        }
-        async fn list_campaigns_by_state(&self, _: CampaignLifecycle) -> Result<Vec<CampaignInstance>, RepositoryError> {
-            unimplemented!()
-        }
-        async fn activate_campaign(&self, _: Uuid, _: DateTime<Utc>, _: serde_json::Value) -> Result<bool, RepositoryError> {
-            unimplemented!()
-        }
-    }
-
-    /// State with one campaign, a signed-in session and in-memory timers; the default
-    /// convoy repository is the in-memory stub, which panics if any convoy write is tried.
-    fn dispatch_state() -> (AppState, Uuid, Uuid) {
-        let campaign_id = Uuid::new_v4();
-        let sector_id = Uuid::new_v4();
-        let mut state = AppState::new(Arc::new(Config::default()));
-        state.campaign_repo = Arc::new(OneCampaign(CampaignInstance {
-            campaign_id,
-            sector_id,
-            map_seed: 1,
-            state: CampaignLifecycle::Active,
-            victory_tickers: serde_json::json!({}),
-            started_at: None,
-            ends_at: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        }));
-        let wallet = bs58::encode([5u8; 32]).into_string();
+    /// Inserts a signed-in session `token` for `wallet`.
+    fn sign_in(state: &AppState, token: &str, wallet: [u8; 32]) {
+        let wallet = bs58::encode(wallet).into_string();
         let now = Utc::now().timestamp();
-        state.sessions.insert("t".into(), shared::SessionToken {
-            token_id: "t".into(),
+        state.sessions.insert(token.into(), shared::SessionToken {
+            token_id: token.into(),
             account_id: wallet.clone(),
             wallet_address: wallet,
             issued_at: now,
             expires_at: now + 600,
         });
+    }
+
+    /// State with one Active campaign that `[5u8; 32]` is a member of, a signed-in session
+    /// `"t"` for that wallet and in-memory timers. Every write goes through `AppState::new`'s
+    /// shared stores. The default convoy repository is the in-memory stub, which panics if
+    /// any convoy write is tried.
+    async fn dispatch_state() -> (AppState, Uuid, Uuid) {
+        let sector_id = Uuid::new_v4();
+        let state = AppState::new(Arc::new(Config::default()));
+        let campaign_id = state.campaign_repo
+            .create_campaign(&NewCampaignInstance { sector_id, map_seed: 1 })
+            .await
+            .expect("create_campaign")
+            .campaign_id;
+        let activated = state.campaign_repo
+            .activate_campaign(campaign_id, Utc::now() + Duration::days(90), serde_json::json!({}))
+            .await
+            .expect("activate_campaign");
+        assert!(activated, "the fixture campaign must activate");
+        state.membership_repo.add_member(&[5u8; 32], campaign_id, None, None).await.expect("add_member");
+        sign_in(&state, "t", [5u8; 32]);
         (state, campaign_id, sector_id)
     }
 
-    async fn dispatch(state: Arc<AppState>, campaign_id: Uuid, to: (i32, i32)) -> StatusCode {
+    async fn dispatch_as(state: Arc<AppState>, token: &str, campaign_id: Uuid, to: (i32, i32)) -> (StatusCode, Vec<u8>) {
         let body = serde_json::json!({
             "origin_q": 0, "origin_r": 0, "destination_q": to.0, "destination_r": to.1,
             "vehicle_class": "BehemothMegaTruck", "cargo": {}
@@ -258,10 +252,57 @@ mod tests {
             .method("POST")
             .uri(format!("/api/campaign/{campaign_id}/convoy/dispatch"))
             .header("content-type", "application/json")
-            .header("authorization", "Bearer t")
+            .header("authorization", format!("Bearer {token}"))
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap();
-        router().with_state(state).oneshot(req).await.unwrap().status()
+        let resp = router().with_state(state).oneshot(req).await.unwrap();
+        let status = resp.status();
+        (status, resp.into_body().collect().await.unwrap().to_bytes().to_vec())
+    }
+
+    async fn dispatch(state: Arc<AppState>, campaign_id: Uuid, to: (i32, i32)) -> StatusCode {
+        dispatch_as(state, "t", campaign_id, to).await.0
+    }
+
+    /// GAP-74: a signed-in wallet with no membership is refused `403`, and nothing is scheduled.
+    #[tokio::test]
+    async fn dispatch_refuses_a_non_member() {
+        let (mut state, campaign_id, _) = dispatch_state().await;
+        let timers = Arc::new(crate::repository::InMemoryTimerRepository::new());
+        state.timer_repo = timers.clone();
+        sign_in(&state, "outsider", [6u8; 32]);
+
+        let (status, body) = dispatch_as(Arc::new(state), "outsider", campaign_id, (1, 0)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{}", String::from_utf8_lossy(&body));
+        assert!(timers.0.is_empty(), "a refused dispatch schedules nothing");
+    }
+
+    /// GAP-74: a member of a campaign that is not Active is refused `409`.
+    #[tokio::test]
+    async fn dispatch_refuses_a_campaign_that_is_not_active() {
+        let (mut state, _, _) = dispatch_state().await;
+        let timers = Arc::new(crate::repository::InMemoryTimerRepository::new());
+        state.timer_repo = timers.clone();
+        let pending = state.campaign_repo
+            .create_campaign(&NewCampaignInstance { sector_id: Uuid::new_v4(), map_seed: 2 })
+            .await
+            .expect("create_campaign")
+            .campaign_id;
+        state.membership_repo.add_member(&[5u8; 32], pending, None, None).await.expect("add_member");
+
+        let (status, body) = dispatch_as(Arc::new(state), "t", pending, (1, 0)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{}", String::from_utf8_lossy(&body));
+        assert!(timers.0.is_empty(), "a refused dispatch schedules nothing");
+    }
+
+    /// An unknown campaign is `404` with the route's JSON body.
+    #[tokio::test]
+    async fn dispatch_unknown_campaign_is_404_with_a_body() {
+        let (state, _, _) = dispatch_state().await;
+        let (status, body) = dispatch_as(Arc::new(state), "t", Uuid::new_v4(), (1, 0)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("a JSON body");
+        assert_eq!(v, serde_json::json!({"error": "campaign not found"}));
     }
 
     #[tokio::test]
@@ -271,7 +312,7 @@ mod tests {
             .connect_lazy("postgres://unused@127.0.0.1:1/unused")
             .expect("lazy pool");
         pool.close().await;
-        let (mut state, campaign_id, sector_id) = dispatch_state();
+        let (mut state, campaign_id, sector_id) = dispatch_state().await;
         state.convoy_repo = Arc::new(PostgresConvoyRepository::new(pool));
         let timers = Arc::new(crate::repository::InMemoryTimerRepository::new());
         state.timer_repo = timers.clone();
@@ -307,7 +348,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_dispatch_timer_is_cancelled_by_the_phantom_path() {
-        let (mut state, campaign_id, _) = dispatch_state();
+        let (mut state, campaign_id, _) = dispatch_state().await;
         state.convoy_repo = Arc::new(NoConvoyRows);
         let timers = Arc::new(crate::repository::InMemoryTimerRepository::new());
         state.timer_repo = timers.clone();
@@ -342,7 +383,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_refuses_zero_distance() {
-        let (mut state, campaign_id, _) = dispatch_state();
+        let (mut state, campaign_id, _) = dispatch_state().await;
         let timers = Arc::new(crate::repository::InMemoryTimerRepository::new());
         state.timer_repo = timers.clone();
 

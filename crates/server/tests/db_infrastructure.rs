@@ -2204,15 +2204,10 @@ async fn convoy_dispatch_creates_db_record_and_timer() {
         .expect("Failed to connect to Redis");
 
     // Build AppState with real repos
-    let config = Arc::new(mercs_server::config::Config::default());
-    let mut state = mercs_server::state::AppState::new(
-        config,
-    );
-    state.campaign_repo  = Arc::new(PostgresCampaignRepository::new(pool.clone()));
+    let mut state = pg_route_state(&pool);
     state.convoy_repo    = Arc::new(PostgresConvoyRepository::new(pool.clone()));
     state.sector_repo    = Arc::new(RedisSectorStateRepository::new(redis_mgr.clone()));
     state.timer_repo     = Arc::new(RedisTimerRepository::new(redis_mgr.clone()));
-    state.input_log_repo = Arc::new(PostgresInputLogRepository::new(pool.clone()));
     let state = Arc::new(state);
 
     // Wallet [88u8; 32] — distinct from all other test wallets
@@ -2229,14 +2224,17 @@ async fn convoy_dispatch_creates_db_record_and_timer() {
     };
     state.sessions.insert(token_id.clone(), session_token);
 
-    // Create a campaign in Postgres (sector_id is just a UUID — no Postgres FK)
+    // An Active campaign in Postgres with the wallet as a member (GAP-74: dispatch refuses a
+    // non-member and a campaign that isn't Active). sector_id is just a UUID — no Postgres FK.
     let campaign_repo = PostgresCampaignRepository::new(pool.clone());
-    let campaign = campaign_repo.create_campaign(&NewCampaignInstance {
-        sector_id: uuid::Uuid::new_v4(),
-        map_seed:  77777_i64,
-    }).await.expect("create_campaign failed");
-    let campaign_id = campaign.campaign_id;
-    let sector_id   = campaign.sector_id;
+    let campaign_id = seed_account_and_campaign(&pool, wallet_bytes, 77777_i64).await;
+    assert!(
+        campaign_repo.activate_campaign(campaign_id, Utc::now() + chrono::Duration::days(90), serde_json::json!({}))
+            .await.expect("activate_campaign failed"),
+        "the dispatch campaign must activate"
+    );
+    let sector_id = campaign_repo.get_campaign(campaign_id).await
+        .expect("get_campaign failed").expect("seeded campaign").sector_id;
 
     // Seed SectorState in Redis with terrain at destination hex (5, 3)
     let mut terrain = std::collections::HashMap::new();
@@ -2305,6 +2303,8 @@ async fn convoy_dispatch_creates_db_record_and_timer() {
 
     sqlx::query!("DELETE FROM campaign_instances WHERE campaign_id = $1", campaign_id)
         .execute(&pool).await.expect("cleanup campaign_instances");
+    sqlx::query("DELETE FROM player_accounts WHERE wallet_address = $1")
+        .bind(wallet_bytes.to_vec()).execute(&pool).await.expect("cleanup player_accounts");
 
     let timer_id_str  = convoy_id.to_string();
     let sector_id_str = sector_id.to_string();
@@ -2515,6 +2515,12 @@ async fn clean_wallet_4g1(pool: &sqlx::PgPool, wallet: &[u8]) {
 async fn seed_commander_4g1(pool: &sqlx::PgPool, wallet: [u8; 32], stress: i16) -> (uuid::Uuid, uuid::Uuid) {
     clean_wallet_4g1(pool, &wallet).await;
     let campaign_id = seed_account_and_campaign(pool, wallet, 0x4601_i64).await;
+    // Active, so the mission route's S3 admits it (5a-3b) and the join's pick never sees it.
+    let activated = PostgresCampaignRepository::new(pool.clone())
+        .activate_campaign(campaign_id, chrono::Utc::now() + chrono::Duration::days(90), serde_json::json!({}))
+        .await
+        .expect("activate_campaign failed");
+    assert!(activated, "the seeded campaign must activate");
     let mut record = mercs_server::commander_gen::generate_commander(wallet.to_vec(), campaign_id, 42u32);
     record.stress = stress;
     let commander_id = record.commander_id;
@@ -3920,9 +3926,25 @@ fn error_message(bytes: &[u8]) -> String {
     v["error"].as_str().expect("no error string").to_string()
 }
 
-/// A generated in-memory Commander owned by `wallet`. Returns its id.
+/// An `Active` campaign in `state.campaign_repo` (5a-3b: missions need one, S3). Returns its id.
+async fn seed_active_campaign(state: &mercs_server::state::AppState) -> uuid::Uuid {
+    let id = state.campaign_repo
+        .create_campaign(&NewCampaignInstance { sector_id: uuid::Uuid::new_v4(), map_seed: 1 })
+        .await
+        .expect("create_campaign failed")
+        .campaign_id;
+    let activated = state.campaign_repo
+        .activate_campaign(id, chrono::Utc::now() + chrono::Duration::days(90), serde_json::json!({}))
+        .await
+        .expect("activate_campaign failed");
+    assert!(activated, "the seeded campaign must activate");
+    id
+}
+
+/// A generated in-memory Commander owned by `wallet`, in a fresh `Active` campaign. Returns its id.
 async fn seed_in_memory_commander(state: &mercs_server::state::AppState, wallet: [u8; 32], mutate: impl FnOnce(&mut CommanderRecord)) -> uuid::Uuid {
-    let mut rec = mercs_server::commander_gen::generate_commander(wallet.to_vec(), uuid::Uuid::new_v4(), 42);
+    let campaign_id = seed_active_campaign(state).await;
+    let mut rec = mercs_server::commander_gen::generate_commander(wallet.to_vec(), campaign_id, 42);
     mutate(&mut rec);
     let id = rec.commander_id;
     state.commander_repo.create_commander(rec).await.expect("create_commander failed");
@@ -3949,6 +3971,21 @@ async fn post_mission(app: axum::Router, token: Option<&str>, body: &serde_json:
 
 fn default_state() -> mercs_server::state::AppState {
     mercs_server::state::AppState::new(std::sync::Arc::new(mercs_server::config::Config::default()))
+}
+
+/// A Postgres route test starts here, so the join and the routes read one set of stores
+/// (code `CLAUDE.md` §5's trap): the four join-read repositories and `campaign_join_repo`
+/// swap together, plus the input log. Everything else stays in memory.
+fn pg_route_state(pool: &sqlx::PgPool) -> mercs_server::state::AppState {
+    use std::sync::Arc;
+    let mut state = default_state();
+    state.campaign_repo = Arc::new(PostgresCampaignRepository::new(pool.clone()));
+    state.membership_repo = Arc::new(PostgresMembershipRepository::new(pool.clone()));
+    state.commander_repo = Arc::new(PostgresCommanderRepository::new(pool.clone()));
+    state.section_repo = Arc::new(PostgresSectionRepository::new(pool.clone()));
+    state.campaign_join_repo = Arc::new(PostgresCampaignJoinRepository::new(pool.clone()));
+    state.input_log_repo = Arc::new(PostgresInputLogRepository::new(pool.clone()));
+    state
 }
 
 /// GET of the integrity route; returns the status only.
@@ -4342,10 +4379,7 @@ async fn mission_resolve_refuses_a_commander_shattered_after_the_first_read_post
     };
     let wallet = [19u8; 32];
     let (_campaign_id, commander_id) = seed_commander_4g1(&pool, wallet, 20).await;
-    let mut state = default_state();
-    state.commander_repo = std::sync::Arc::new(PostgresCommanderRepository::new(pool.clone()));
-    state.input_log_repo = std::sync::Arc::new(PostgresInputLogRepository::new(pool.clone()));
-    state.section_repo = std::sync::Arc::new(PostgresSectionRepository::new(pool.clone()));
+    let state = pg_route_state(&pool);
     assert_shattered_after_first_read_is_refused(state, wallet, commander_id).await;
     clean_wallet_4g1(&pool, &wallet).await;
 }
@@ -4410,10 +4444,7 @@ async fn mission_resolve_end_to_end_writes_effects() {
     let logs = PostgresInputLogRepository::new(pool.clone());
     let record = commanders.get_commander(commander_id).await.unwrap().unwrap();
 
-    let mut state = default_state();
-    state.commander_repo = std::sync::Arc::new(PostgresCommanderRepository::new(pool.clone()));
-    state.input_log_repo = std::sync::Arc::new(PostgresInputLogRepository::new(pool.clone()));
-    state.section_repo = std::sync::Arc::new(PostgresSectionRepository::new(pool.clone()));
+    let state = pg_route_state(&pool);
     let section = seed_section_for(&state, commander_id).await;
     let token = insert_session(&state, wallet);
     let sim_cfg = state.config.sim.clone();
@@ -4787,12 +4818,10 @@ async fn convoy_fixture() -> Option<ConvoyFixture> {
     let client = redis::Client::open(redis_url).expect("Invalid TEST_REDIS_URL");
     let conn = redis::aio::ConnectionManager::new(client).await.expect("Failed to connect to Redis");
 
-    let mut state = mercs_server::state::AppState::new(Arc::new(mercs_server::config::Config::default()));
-    state.campaign_repo  = Arc::new(PostgresCampaignRepository::new(pool.clone()));
+    let mut state = pg_route_state(&pool);
     state.convoy_repo    = Arc::new(PostgresConvoyRepository::new(pool.clone()));
     state.sector_repo    = Arc::new(RedisSectorStateRepository::new(conn.clone()));
     state.timer_repo     = Arc::new(RedisTimerRepository::new(conn.clone()));
-    state.input_log_repo = Arc::new(PostgresInputLogRepository::new(pool.clone()));
 
     let wallet_b58 = bs58::encode([25u8; 32]).into_string();
     let token_id = format!("inf5-convoy-{}", uuid::Uuid::new_v4());
@@ -4805,10 +4834,16 @@ async fn convoy_fixture() -> Option<ConvoyFixture> {
         expires_at:     now + 7200,
     });
 
-    let campaign = PostgresCampaignRepository::new(pool.clone())
-        .create_campaign(&NewCampaignInstance { sector_id: uuid::Uuid::new_v4(), map_seed: 25_i64 })
-        .await
-        .expect("create_campaign");
+    // An Active campaign that wallet 25 is a member of (GAP-74: dispatch refuses a
+    // non-member and a campaign that isn't Active).
+    let campaigns = PostgresCampaignRepository::new(pool.clone());
+    let campaign_id = seed_account_and_campaign(&pool, [25u8; 32], 25_i64).await;
+    assert!(
+        campaigns.activate_campaign(campaign_id, chrono::Utc::now() + chrono::Duration::days(90), serde_json::json!({}))
+            .await.expect("activate_campaign"),
+        "the fixture campaign must activate"
+    );
+    let campaign = campaigns.get_campaign(campaign_id).await.expect("get_campaign").expect("seeded campaign");
     state.sector_repo.upsert_sector(SectorState {
         sector_id:           campaign.sector_id,
         campaign_id:         campaign.campaign_id,
@@ -4868,6 +4903,7 @@ async fn clean_convoy_fixture(f: &ConvoyFixture, convoy_id: uuid::Uuid) {
     sqlx::query("DELETE FROM input_logs WHERE campaign_id = $1").bind(f.campaign_id).execute(&f.pool).await.ok();
     sqlx::query("ALTER TABLE input_logs ENABLE TRIGGER ALL").execute(&f.pool).await.ok();
     sqlx::query("DELETE FROM campaign_instances WHERE campaign_id = $1").bind(f.campaign_id).execute(&f.pool).await.ok();
+    sqlx::query("DELETE FROM player_accounts WHERE wallet_address = $1").bind([25u8; 32].to_vec()).execute(&f.pool).await.ok();
 }
 
 #[tokio::test]
@@ -5413,7 +5449,7 @@ async fn mission_route_hides_foreign_and_unknown_sections() {
 #[tokio::test]
 async fn mission_route_refuses_a_section_already_deployed() {
     let state = default_state();
-    let campaign_id = uuid::Uuid::new_v4();
+    let campaign_id = seed_active_campaign(&state).await;
     let holder = seed_in_memory_commander(&state, DEPLOY_WALLET, |r| r.campaign_id = campaign_id).await;
     let commander_id = seed_in_memory_commander(&state, DEPLOY_WALLET, |r| r.campaign_id = campaign_id).await;
     let section = seed_section(&state, DEPLOY_WALLET, campaign_id).await;
@@ -5463,6 +5499,154 @@ async fn mission_route_logs_the_selection_in_request_order() {
     assert_eq!(logged, sent, "the log keeps request order");
     assert!(payload["request"].get("section_ids").is_none(), "payload.request keeps its pre-7b-2 shape");
     assert_eq!(payload["request"]["commander_id"].as_str(), Some(commander_id.to_string().as_str()));
+}
+
+// ── Brick 5a-3b: S3, and the first real-player mission end to end ────────────
+
+/// 5a-3b S3 — a Commander whose campaign is `Pending` is refused `409`, and the refusal
+/// comes before `start_deployment`, so no deployment row is opened.
+#[tokio::test]
+async fn mission_resolve_refuses_a_pending_campaign() {
+    let state = default_state();
+    let pending = state.campaign_repo
+        .create_campaign(&NewCampaignInstance { sector_id: uuid::Uuid::new_v4(), map_seed: 1 })
+        .await
+        .expect("create_campaign failed")
+        .campaign_id;
+    let commander_id = seed_in_memory_commander(&state, DEPLOY_WALLET, |r| r.campaign_id = pending).await;
+    let section = seed_section(&state, DEPLOY_WALLET, pending).await;
+    let token = insert_session(&state, DEPLOY_WALLET);
+    let commanders = state.commander_repo.clone();
+    let app = mercs_server::routes::router(std::sync::Arc::new(state));
+
+    let (status, bytes) = post_mission(app, Some(&token), &mission_body(commander_id, &[section])).await;
+    assert_eq!(status, axum::http::StatusCode::CONFLICT, "{}", String::from_utf8_lossy(&bytes));
+    assert_eq!(error_message(&bytes), "campaign is not active");
+    assert!(commanders.list_deployments_by_commander(commander_id).await.unwrap().is_empty(),
+        "a refused mission must open no deployment row");
+}
+
+/// 5a-3b E1 — join → admin launch → a mission with the starter Commander and starter
+/// Section → `200`, all on Postgres (`sector_repo` stays in memory, so no Redis). The
+/// battle's outcome comes from the route's seed, so only its invariants are asserted.
+#[tokio::test]
+async fn join_launch_and_first_mission_end_to_end() {
+    use sim_engine::game_types::OutcomeType;
+    use axum::{body::Body, http::{Request, StatusCode}};
+
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    let wallet = [62u8; 32];
+    clean_wallet_4g1(&pool, &wallet).await;
+    assert_no_pending_campaign(&pool).await; // the join's pick is global
+    seed_account(&pool, wallet).await;
+
+    let state = std::sync::Arc::new(pg_route_state(&pool));
+    let token = insert_session(&state, wallet);
+
+    // 1. Join.
+    let join_req = Request::builder()
+        .method("POST")
+        .uri("/api/campaign/join")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let (join_status, join_body) = send(&state, join_req).await;
+    let joined: serde_json::Value = serde_json::from_str(&join_body).unwrap_or(serde_json::Value::Null);
+    let uuid_of = |key: &str| joined[key].as_str().and_then(|s| uuid::Uuid::parse_str(s).ok());
+    let (campaign_id, commander_id, section_id) = (uuid_of("campaign_id"), uuid_of("commander_id"), uuid_of("section_id"));
+
+    // 2. Admin launch (the key is set and removed as in admin_launch_campaign_returns_200_then_409).
+    const TEST_ADMIN_KEY: &str = "test-only-not-a-real-admin-key";
+    let launch_status = match campaign_id {
+        Some(c) => {
+            std::env::set_var("ADMIN_API_KEY", TEST_ADMIN_KEY);
+            let req = Request::builder()
+                .method("POST")
+                .uri(format!("/api/admin/campaign/{c}/launch"))
+                .header("x-admin-key", TEST_ADMIN_KEY)
+                .body(Body::empty())
+                .unwrap();
+            let (s, _) = send(&state, req).await;
+            std::env::remove_var("ADMIN_API_KEY");
+            Some(s)
+        }
+        None => None,
+    };
+
+    // 3. The first mission, with the starter Commander and the starter Section.
+    let (mission_status, mission_bytes) = match (commander_id, section_id) {
+        (Some(cmd), Some(sec)) => {
+            let app = mercs_server::routes::router(std::sync::Arc::clone(&state));
+            let (s, b) = post_mission(app, Some(&token), &mission_body(cmd, &[sec])).await;
+            (Some(s), b)
+        }
+        _ => (None, Vec::new()),
+    };
+    let resp: serde_json::Value = serde_json::from_slice(&mission_bytes).unwrap_or(serde_json::Value::Null);
+    let sid = resp["session_id"].as_str().and_then(|s| uuid::Uuid::parse_str(s).ok());
+
+    // Collect.
+    let commanders = PostgresCommanderRepository::new(pool.clone());
+    let deps = match commander_id {
+        Some(c) => commanders.list_deployments_by_commander(c).await.expect("list deployments"),
+        None => Vec::new(),
+    };
+    let after = match commander_id {
+        Some(c) => commanders.get_commander(c).await.expect("get_commander"),
+        None => None,
+    };
+    let logged_campaign = match sid {
+        Some(s) => PostgresInputLogRepository::new(pool.clone())
+            .get_session_config(&s).await.expect("get_session_config").map(|c| c.campaign_id),
+        None => None,
+    };
+    let mut starters = Vec::new();
+    for table in ["commander_records", "foreman_records", "section_records", "crew_records"] {
+        let n: i64 = sqlx::query_scalar(&format!(
+            "SELECT count(*) FROM {table} WHERE player_wallet = $1 AND acquired_via = 'starter'"
+        ))
+        .bind(wallet.to_vec())
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|e| panic!("{table} starter count failed: {e}"));
+        starters.push((table, n));
+    }
+
+    // Clean: the immutable log rows (campaign_started and the mission session), then the wallet.
+    sqlx::query("ALTER TABLE input_logs DISABLE TRIGGER ALL").execute(&pool).await.ok();
+    if let Some(c) = campaign_id {
+        sqlx::query("DELETE FROM input_logs WHERE campaign_id = $1").bind(c).execute(&pool).await.ok();
+    }
+    if let Some(s) = sid {
+        sqlx::query("DELETE FROM input_logs WHERE session_id = $1").bind(s).execute(&pool).await.ok();
+    }
+    sqlx::query("ALTER TABLE input_logs ENABLE TRIGGER ALL").execute(&pool).await.ok();
+    if let Some(s) = sid {
+        sqlx::query("ALTER TABLE session_configs DISABLE TRIGGER ALL").execute(&pool).await.ok();
+        sqlx::query("DELETE FROM session_configs WHERE session_id = $1").bind(s).execute(&pool).await.ok();
+        sqlx::query("ALTER TABLE session_configs ENABLE TRIGGER ALL").execute(&pool).await.ok();
+    }
+    clean_wallet_4g1(&pool, &wallet).await;
+
+    // Assert.
+    assert_eq!(join_status, StatusCode::CREATED, "join: {join_body}");
+    let campaign_id = campaign_id.expect("campaign_id in the join body");
+    assert_eq!(launch_status, Some(StatusCode::OK), "admin launch");
+    assert_eq!(mission_status, Some(StatusCode::OK), "mission: {}", String::from_utf8_lossy(&mission_bytes));
+    assert_eq!(deps.len(), 1, "one deployment");
+    assert_eq!(deps[0].status, "resolved");
+    assert_eq!(Some(deps[0].session_id), sid);
+    assert_eq!(logged_campaign, Some(campaign_id), "session_configs.campaign_id is the joined campaign");
+    let outcome: OutcomeType = serde_json::from_value(resp["report"]["outcome"].clone()).expect("report.outcome");
+    let died = matches!(outcome, OutcomeType::Wipeout);
+    assert_eq!(resp["commander"]["kia"].as_bool(), Some(died), "commander.kia must equal outcome == Wipeout");
+    assert_eq!(after.expect("the starter Commander").is_kia, died);
+    for (table, n) in starters {
+        assert_eq!(n, 1, "{table}: exactly one starter row for the joiner");
+    }
 }
 
 /// 7b-2 #9 — an `f7a1ff3`-shape mission payload (no `selection`) and a 7b-2 one both

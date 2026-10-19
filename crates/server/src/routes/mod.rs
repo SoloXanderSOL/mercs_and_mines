@@ -5,6 +5,7 @@
 // Timestamp is always generated server-side via chrono::Utc::now(); never accepted from client.
 
 pub mod admin;
+mod campaign;
 pub mod convoy_events;
 pub mod convoys;
 pub mod ws_combat;
@@ -45,7 +46,7 @@ use crate::api_types::{
 use crate::commander_gen::mission_tier;
 use crate::state::AppState;
 use crate::repository::commander::log_rank_up;
-use crate::repository::{CombatSession, DeploymentStart, InputLogRepository, NewDeployment, RepositoryError};
+use crate::repository::{CampaignLifecycle, CombatSession, DeploymentStart, InputLogRepository, NewDeployment, RepositoryError};
 use shared::command::{command_cap, CommandCap};
 
 type AppError = (StatusCode, Json<Value>);
@@ -75,6 +76,10 @@ fn unprocessable(msg: impl Into<String>) -> AppError {
 
 fn conflict(msg: impl Into<String>) -> AppError {
     (StatusCode::CONFLICT, Json(json!({"error": msg.into()})))
+}
+
+fn forbidden(msg: impl Into<String>) -> AppError {
+    (StatusCode::FORBIDDEN, Json(json!({"error": msg.into()})))
 }
 
 fn unauthorized(msg: impl Into<String>) -> AppError {
@@ -271,7 +276,8 @@ fn deploy_refusal(rec: &crate::repository::CommanderRecord) -> Option<AppError> 
 
 /// Mission ↔ Commander wiring (brick 4g-1, Phase_1_Section_4 §4g; Sections since 7b-2).
 /// Check order: 401 (extractor) → 400 (body; then `section_ids` empty or duplicate) →
-/// 404 (Commander unknown or not yours) → 422 (more Sections than the rank's command cap,
+/// 404 (Commander unknown or not yours) → 409 (the Commander's campaign is not Active,
+/// S3, 5a-3b) → 422 (more Sections than the rank's command cap,
 /// GAP-50) → 404 (a Section unknown, not yours or not in the Commander's campaign; one
 /// body) → 409 (KIA, Shattered) → active deployment, 409 (Commander or a Section already
 /// deployed) → re-read, 409 (KIA, Shattered; deployment aborted; 4g-2) → input log before
@@ -317,6 +323,20 @@ async fn post_mission_resolve(
         .map_err(|e| internal_error(format!("commander read failed: {e}")))?
         .filter(|r| r.player_wallet == wallet)
         .ok_or_else(|| not_found("Commander not found"))?;
+
+    // 409 — S3: missions need an Active campaign. An unlocked read, so a campaign that
+    // leaves Active mid-request resolves one last mission (accepted for Phase 1, the
+    // lifecycle task's stale-read class). It sits before start_deployment, so a refused
+    // mission opens no deployment row.
+    let campaign = state
+        .campaign_repo
+        .get_campaign(rec.campaign_id)
+        .await
+        .map_err(|e| internal_error(format!("campaign read failed: {e}")))?
+        .ok_or_else(|| internal_error(format!("commander {} has no campaign {}", rec.commander_id, rec.campaign_id)))?;
+    if campaign.state != CampaignLifecycle::Active {
+        return Err(conflict("campaign is not active"));
+    }
 
     // 422 — the rank's command cap (GAP-50). A pure check before any Section I/O, so it
     // also bounds the read below. Rank only rises, so this first read is never too lenient.
@@ -734,6 +754,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/ore-run/start",             post(post_ore_run_start))
         .route("/api/session/:id/integrity",     get(get_session_integrity))
         .merge(admin::router())
+        .merge(campaign::router())
         .merge(convoys::router())
         .merge(convoy_events::router())
         .with_state(state)
