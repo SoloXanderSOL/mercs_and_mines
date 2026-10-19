@@ -56,8 +56,7 @@ async fn dispatch_convoy(
         Ok(Some(c)) => c,
         Ok(None)    => return super::not_found("campaign not found").into_response(),
         Err(e)      => {
-            tracing::error!("dispatch_convoy: get_campaign failed for campaign {campaign_id}: {e}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            return super::internal_error(format!("dispatch_convoy: get_campaign failed for campaign {campaign_id}: {e}")).into_response();
         }
     };
 
@@ -171,8 +170,7 @@ async fn dispatch_convoy(
         fires_at:      arrival_time,
     };
     if let Err(e) = state.timer_repo.schedule_timer(timer).await {
-        tracing::error!("dispatch_convoy: schedule_timer failed for campaign {campaign_id}, convoy {convoy_id}: {e:?}");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        return super::internal_error(format!("dispatch_convoy: schedule_timer failed for campaign {campaign_id}, convoy {convoy_id}: {e:?}")).into_response();
     }
 
     // 2. The convoy and its `convoy_dispatched` row, together or not at all.
@@ -303,6 +301,24 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         let v: serde_json::Value = serde_json::from_slice(&body).expect("a JSON body");
         assert_eq!(v, serde_json::json!({"error": "campaign not found"}));
+    }
+
+    /// Reviewer 5a-3b CF5: a failed campaign read is a `500` built by `internal_error`, so
+    /// it carries the route's JSON body.
+    #[tokio::test]
+    async fn dispatch_campaign_read_failure_is_500_with_a_body() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused@127.0.0.1:1/unused")
+            .expect("lazy pool");
+        pool.close().await;
+        let (mut state, campaign_id, _) = dispatch_state().await;
+        state.campaign_repo = Arc::new(crate::repository::PostgresCampaignRepository::new(pool));
+
+        let (status, body) = dispatch_as(Arc::new(state), "t", campaign_id, (1, 0)).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("a JSON body");
+        let error = v["error"].as_str().unwrap_or_else(|| panic!("no error string: {v}"));
+        assert!(error.starts_with("dispatch_convoy: get_campaign failed for campaign "), "{error}");
     }
 
     #[tokio::test]

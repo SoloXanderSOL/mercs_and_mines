@@ -37,6 +37,7 @@ fn env_u64(key: &str, default: u64) -> u64 { parse_or_warn(env_lookup, key, defa
 fn env_usize(key: &str, default: usize) -> usize { parse_or_warn(env_lookup, key, default) }
 fn env_f64(key: &str, default: f64) -> f64 { parse_or_warn(env_lookup, key, default) }
 fn env_i32(key: &str, default: i32) -> i32 { parse_or_warn(env_lookup, key, default) }
+fn env_bool(key: &str, default: bool) -> bool { parse_or_warn(env_lookup, key, default) }
 
 pub(crate) const DECISIVE_SUCCESS_REWARD_MULT_KEY: &str = "DECISIVE_SUCCESS_REWARD_MULT";
 
@@ -105,6 +106,8 @@ pub struct ServerConfig {
     pub combat_session_stale_secs: u64,
     /// Default max-ticks cap when the client does not supply one.
     pub default_max_ticks: usize,
+    /// The join switch, from `MERCS_JOIN_ENABLED` (exactly `true` opens joins). Off by default until INF-6's rate limit is live.
+    pub join_enabled: bool,
 }
 
 impl Default for ServerConfig {
@@ -115,6 +118,7 @@ impl Default for ServerConfig {
             challenge_expiry_secs:      60,
             combat_session_stale_secs:  300,
             default_max_ticks:          50,
+            join_enabled:               false,
         }
     }
 }
@@ -127,6 +131,7 @@ impl ServerConfig {
             challenge_expiry_secs:      env_i64  ("CHALLENGE_EXPIRY_SECS",       60),
             combat_session_stale_secs:  env_u64  ("COMBAT_SESSION_STALE_SECS",   300),
             default_max_ticks:          env_usize("DEFAULT_MAX_TICKS",           50),
+            join_enabled:               env_bool ("MERCS_JOIN_ENABLED",          false),
         }
     }
 }
@@ -200,7 +205,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::{
-        finite_f64_or_warn, parse_or_warn, u32_with_warn, ServerConfig,
+        finite_f64_or_warn, parse_or_warn, u32_with_warn, Config, ServerConfig,
         DECISIVE_SUCCESS_REWARD_MULT_KEY, DEFAULT_BIND_ADDR,
     };
     use std::collections::HashMap;
@@ -262,6 +267,29 @@ mod tests {
         check::<i32>(10, ("-7", -7), &common);
         check::<i64>(10, ("-7", -7), &common);
         check::<f64>(1.5, ("2.25", 2.25), &common);
+    }
+
+    /// 5a-3c — the join switch is closed unless something opens it.
+    #[test]
+    fn join_switch_defaults_off() {
+        assert_eq!(Config::default().server.join_enabled, false);
+    }
+
+    /// 5a-3c — only the exact text `true` opens the join switch; everything else, unset
+    /// included, keeps it closed.
+    #[test]
+    fn join_switch_parses_exact_true_only() {
+        // `None` is the unset case.
+        let read = |value: Option<&str>| {
+            let key = "MERCS_JOIN_ENABLED";
+            let pairs: Vec<(&str, &str)> = value.into_iter().map(|v| (key, v)).collect();
+            parse_or_warn(lookup(&pairs), key, false)
+        };
+        assert_eq!(read(Some("true")), true, "\"true\" opens the switch");
+        for bad in ["false", "1", "TRUE", ""] {
+            assert_eq!(read(Some(bad)), false, "{bad:?} must keep the switch closed");
+        }
+        assert_eq!(read(None), false, "unset keeps the switch closed");
     }
 
     /// INF-2 — a stress penalty that is set but unusable warns and falls back; one above

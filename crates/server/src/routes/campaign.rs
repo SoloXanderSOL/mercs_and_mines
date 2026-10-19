@@ -15,7 +15,7 @@ use crate::auth::AuthSession;
 use crate::repository::{JoinOutcome, JoinSeeds, StarterIds, SECTOR_PLAYER_CAP};
 use crate::state::AppState;
 
-use super::{internal_error, unauthorized, AppError};
+use super::{internal_error, service_unavailable, unauthorized, AppError};
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new().route("/api/campaign/join", post(post_campaign_join))
@@ -41,10 +41,16 @@ fn starter_ids_body(ids: &StarterIds) -> serde_json::Value {
 /// - Every repository error is a `500`. The text is never matched.
 /// - The join is not a logged input: the starters' generator rolls are server decisions
 ///   stored in their records.
+/// - While the join switch is off (5a-3c), every signed-in caller gets `503` before any
+///   database read or the join lock.
 async fn post_campaign_join(
     AuthSession(session): AuthSession,
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, AppError> {
+    if !state.config.server.join_enabled {
+        return Err(service_unavailable("campaign joins are closed"));
+    }
+
     let wallet: Vec<u8> = bs58::decode(&session.wallet_address)
         .into_vec()
         .map_err(|_| unauthorized("session wallet is not valid base58"))?;
@@ -70,7 +76,7 @@ async fn post_campaign_join(
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::repository::NewCampaignInstance;
+    use crate::repository::{CampaignLifecycle, NewCampaignInstance};
     use axum::body::Body;
     use axum::http::Request;
     use http_body_util::BodyExt;
@@ -79,9 +85,9 @@ mod tests {
 
     const WALLET: [u8; 32] = [7u8; 32];
 
-    /// A signed-in session `"t"` for `WALLET`.
-    fn joined_state() -> AppState {
-        let state = AppState::new(Arc::new(Config::default()));
+    /// A signed-in session `"t"` for `WALLET`, on `config`.
+    fn signed_in(config: Config) -> AppState {
+        let state = AppState::new(Arc::new(config));
         let wallet = bs58::encode(WALLET).into_string();
         let now = chrono::Utc::now().timestamp();
         state.sessions.insert("t".into(), shared::SessionToken {
@@ -92,6 +98,13 @@ mod tests {
             expires_at: now + 600,
         });
         state
+    }
+
+    /// `signed_in` with the join switch on.
+    fn joined_state() -> AppState {
+        let mut config = Config::default();
+        config.server.join_enabled = true;
+        signed_in(config)
     }
 
     async fn join(state: Arc<AppState>, token: Option<&str>) -> (StatusCode, serde_json::Value) {
@@ -114,6 +127,25 @@ mod tests {
     async fn join_requires_a_session() {
         let (status, _) = join(Arc::new(joined_state()), None).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// 5a-3c J5: on the default config the switch is off. No session is still `401`; a
+    /// session gets `503`, and nothing is written.
+    #[tokio::test]
+    async fn join_is_503_when_switched_off() {
+        let state = Arc::new(signed_in(Config::default()));
+
+        let (status, _) = join(state.clone(), None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "the session check comes before the switch");
+
+        let (status, body) = join(state.clone(), Some("t")).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body, json!({"error": "campaign joins are closed"}));
+
+        assert!(state.membership_repo.list_campaigns_by_player(&WALLET).await.unwrap().is_empty(),
+            "a refused join writes no membership");
+        assert!(state.campaign_repo.list_campaigns_by_state(CampaignLifecycle::Pending).await.unwrap().is_empty(),
+            "a refused join creates no campaign");
     }
 
     #[tokio::test]

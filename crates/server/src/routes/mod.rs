@@ -82,6 +82,12 @@ fn forbidden(msg: impl Into<String>) -> AppError {
     (StatusCode::FORBIDDEN, Json(json!({"error": msg.into()})))
 }
 
+/// A `503` with the house JSON body. No journal line: a closed switch is configuration,
+/// not a fault.
+fn service_unavailable(msg: impl Into<String>) -> AppError {
+    (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": msg.into()})))
+}
+
 fn unauthorized(msg: impl Into<String>) -> AppError {
     (StatusCode::UNAUTHORIZED, Json(json!({"error": msg.into()})))
 }

@@ -5543,7 +5543,9 @@ async fn join_launch_and_first_mission_end_to_end() {
     assert_no_pending_campaign(&pool).await; // the join's pick is global
     seed_account(&pool, wallet).await;
 
-    let state = std::sync::Arc::new(pg_route_state(&pool));
+    let mut state = pg_route_state(&pool);
+    std::sync::Arc::make_mut(&mut state.config).server.join_enabled = true; // 5a-3c: joins are off by default
+    let state = std::sync::Arc::new(state);
     let token = insert_session(&state, wallet);
 
     // 1. Join.
