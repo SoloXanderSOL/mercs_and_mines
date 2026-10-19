@@ -10,52 +10,61 @@ use crate::map_gen::{
     PlayerSpawnRequest, SpawnType,
 };
 use crate::repository::{
-    CampaignLifecycle, CampaignRepository,
-    InputLogRepository, MembershipRepository,
-    OccupationStatus, RepositoryError,
+    CampaignJoinRepository, InputLogRepository, LaunchStart,
+    MembershipRepository, OccupationStatus, RepositoryError,
     SectorState, SectorStateRepository,
     VictoryTickerType,
 };
+
+/// The most members a launch accepts. A multi-member launch would write one whole-blob
+/// Sector state per member (GAP-58); 5b-2 fixes that and removes this guard.
+pub const LAUNCH_MAX_MEMBERS: usize = 1;
 
 #[derive(Debug)]
 pub enum InitError {
     NotPending,
     CampaignNotFound,
     NoMembersFound,
-    WasAlreadyActive,
+    TooManyMembers(usize),
     GatewayAssignmentFailed,
     RepositoryError(RepositoryError),
 }
 
 pub async fn initialize_campaign(
     campaign_id: Uuid,
-    campaign_repo:   &(dyn CampaignRepository + Send + Sync),
+    join_repo:       &dyn CampaignJoinRepository,
     membership_repo: &dyn MembershipRepository,
     sector_repo:     &dyn SectorStateRepository,
     input_log_repo:  &(dyn InputLogRepository + Send + Sync),
 ) -> Result<(), InitError> {
-    // 3.1 — load and validate campaign state
-    let campaign = campaign_repo.get_campaign(campaign_id).await
-        .map_err(InitError::RepositoryError)?
-        .ok_or(InitError::CampaignNotFound)?;
+    // 3.7 (values) — build initial tickers and ends_at; `begin_launch` writes them
+    let initial_tickers: serde_json::Value = VictoryTickerType::variants()
+        .iter()
+        .map(|v| (v.as_json_key().to_string(), serde_json::Value::from(0.0_f64)))
+        .collect::<serde_json::Map<_, _>>()
+        .into();
 
-    if campaign.state != CampaignLifecycle::Pending {
-        return Err(InitError::NotPending);
-    }
+    let ends_at = Utc::now() + Duration::days(90);
+
+    // 3.1, 3.4, 3.7 — under the join lock: load and validate, list members, guard, activate.
+    // Once Active, no join can enter, so everything below runs after the commit.
+    let (campaign, members) = match join_repo
+        .begin_launch(campaign_id, LAUNCH_MAX_MEMBERS, ends_at, initial_tickers)
+        .await
+        .map_err(InitError::RepositoryError)?
+    {
+        LaunchStart::Started { campaign, members } => (campaign, members),
+        LaunchStart::NotFound => return Err(InitError::CampaignNotFound),
+        LaunchStart::NotPending => return Err(InitError::NotPending),
+        LaunchStart::NoMembers => return Err(InitError::NoMembersFound),
+        LaunchStart::TooManyMembers(n) => return Err(InitError::TooManyMembers(n)),
+    };
 
     // 3.2 — derive u32 PRNG root from i64 map_seed
     let seed_u32 = (campaign.map_seed as u32) ^ ((campaign.map_seed >> 32) as u32);
 
     // 3.3 — generate sector map
     let sector_map = generate_sector_map(seed_u32, MAP_RADIUS_HEXES);
-
-    // 3.4 — load members; guard against empty campaign
-    let members = membership_repo.list_members_by_campaign(campaign_id).await
-        .map_err(InitError::RepositoryError)?;
-
-    if members.is_empty() {
-        return Err(InitError::NoMembersFound);
-    }
 
     // 3.5 — build spawn requests (Phase 1: all SoloQueue)
     let requests: Vec<PlayerSpawnRequest> = members.iter()
@@ -73,22 +82,6 @@ pub async fn initialize_campaign(
         &requests,
         &mut Rng::new(seed_u32.wrapping_add(SPAWN_SEED_NONCE)),
     );
-
-    // 3.7 — build initial tickers and activate campaign
-    let initial_tickers: serde_json::Value = VictoryTickerType::variants()
-        .iter()
-        .map(|v| (v.as_json_key().to_string(), serde_json::Value::from(0.0_f64)))
-        .collect::<serde_json::Map<_, _>>()
-        .into();
-
-    let ends_at = Utc::now() + Duration::days(90);
-
-    let activated = campaign_repo.activate_campaign(campaign_id, ends_at, initial_tickers).await
-        .map_err(InitError::RepositoryError)?;
-
-    if !activated {
-        return Err(InitError::WasAlreadyActive);
-    }
 
     // 3.8 — write sector state to Redis
     sector_repo.upsert_sector(SectorState {
@@ -115,7 +108,7 @@ pub async fn initialize_campaign(
         ).await.map_err(InitError::RepositoryError)?;
     }
 
-    // 3.10 — append campaign_started input log entry
+    // 3.10 — append campaign_started input log entry (the ends_at just written)
     let campaign_started = InputLogEntry {
         tick: 0,
         seq: 0,

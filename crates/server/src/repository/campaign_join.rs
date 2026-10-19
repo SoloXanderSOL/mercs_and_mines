@@ -11,11 +11,13 @@ use async_trait::async_trait;
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
-use super::campaign::{insert_campaign, NewCampaignInstance};
+use chrono::{DateTime, Utc};
+
+use super::campaign::{activate_row, campaign_row, insert_campaign, CampaignInstance, CampaignLifecycle, NewCampaignInstance};
 use super::commander::insert_commander;
 use super::crew::{insert_crew, CrewRecord};
 use super::foreman::insert_foreman;
-use super::membership::insert_membership;
+use super::membership::{insert_membership, member_rows, PlayerCampaignMembership};
 use super::section::{insert_section, starter_section};
 use super::{AcquiredVia, RepositoryError};
 use crate::commander_gen::generate_commander;
@@ -28,8 +30,9 @@ pub const SECTOR_PLAYER_CAP: i64 = 200;
 // sqlx 0.8.6's migrator key is `0x3d32ad9e * crc32_iso_hdlc(db_name)`
 // (`sqlx-postgres-0.8.6/src/migrate.rs:326–330`): both factors are ≥ 0 and the product is
 // < `i64::MAX`, so the migrator's key is never negative and cannot equal this one.
-/// The advisory key that serialises every join, server-wide.
-pub(crate) const JOIN_ADVISORY_KEY: i64 = -0x4D4D_4A4F_494E;
+/// The advisory key that serialises every join and every launch, server-wide. Public so the
+/// integration tests can filter `pg_locks` by it rather than repeat the literal.
+pub const JOIN_ADVISORY_KEY: i64 = -0x4D4D_4A4F_494E;
 const _: () = assert!(JOIN_ADVISORY_KEY < 0);
 
 /// The seeds a join rolls from. The route fills them with `generate_seed()` twice and
@@ -61,6 +64,20 @@ pub enum JoinOutcome {
     AlreadyMember(StarterIds),
 }
 
+/// The launch's view of a campaign under the join lock (5a-3a). Outcomes, not errors (the
+/// `DeploymentStart` precedent).
+#[derive(Debug)]
+pub enum LaunchStart {
+    /// The campaign was `Pending` with 1..=`max_members` members and is now `Active`.
+    /// `campaign` is the snapshot read before the activation; `members` are in
+    /// `joined_at ASC` order.
+    Started { campaign: CampaignInstance, members: Vec<PlayerCampaignMembership> },
+    NotFound,
+    NotPending,
+    NoMembers,
+    TooManyMembers(usize),
+}
+
 /// The refusal for a member whose starter set is missing or partial.
 pub(crate) const NO_STARTER_SET: &str = "campaign join: member has no starter set";
 
@@ -85,6 +102,19 @@ pub trait CampaignJoinRepository: Send + Sync {
         cap: i64,
         seeds: JoinSeeds,
     ) -> Result<JoinOutcome, RepositoryError>;
+
+    /// The admin launch's state change, serialised against every join (Reviewer 5a-2b F1):
+    /// under the join lock it reads the campaign and its members, refuses an empty or
+    /// over-`max_members` campaign, and activates it with `ends_at` and `victory_tickers`.
+    /// Once `Active`, no join can enter the campaign, so map gen, gateway hexes, Redis and
+    /// `campaign_started` run after this returns, from `Started`'s members.
+    async fn begin_launch(
+        &self,
+        campaign_id: Uuid,
+        max_members: usize,
+        ends_at: DateTime<Utc>,
+        victory_tickers: serde_json::Value,
+    ) -> Result<LaunchStart, RepositoryError>;
 }
 
 // ── Postgres reads, on the transaction's connection only ─────────────────────
@@ -205,7 +235,9 @@ impl PostgresCampaignJoinRepository {
     /// The join with a pause hook, awaited once after the live-membership check and the
     /// pick or create, before any insert. It exists for the race tests in the integration
     /// binary, which never compiles the lib with `cfg(test)`. Production pays one `Option`
-    /// check.
+    /// check. **The hook fires in both methods:** `begin_launch` awaits it after the guard,
+    /// before the activation. A test that parks only one racer gives the other its own
+    /// instance from `new` on the same pool (both take the same database key).
     #[doc(hidden)]
     pub fn with_pause_seam(pool: PgPool, hook: PauseHook) -> Self {
         Self { pool, pause: Some(hook) }
@@ -272,5 +304,47 @@ impl CampaignJoinRepository for PostgresCampaignJoinRepository {
 
         tx.commit().await.map_err(|e| RepositoryError::Internal(e.to_string()))?;
         Ok(JoinOutcome::Joined(StarterIds { campaign_id, commander_id, foreman_id, section_id, crew_id }))
+    }
+
+    async fn begin_launch(
+        &self,
+        campaign_id: Uuid,
+        max_members: usize,
+        ends_at: DateTime<Utc>,
+        victory_tickers: serde_json::Value,
+    ) -> Result<LaunchStart, RepositoryError> {
+        // Every early return drops `tx`; the rollback releases the xact lock, as in the join.
+        let mut tx = self.pool.begin().await
+            .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        lock_joins(&mut tx).await?;
+
+        let Some(campaign) = campaign_row(&mut tx, campaign_id).await? else {
+            return Ok(LaunchStart::NotFound);
+        };
+        if campaign.state != CampaignLifecycle::Pending {
+            return Ok(LaunchStart::NotPending);
+        }
+
+        let members = member_rows(&mut tx, campaign_id).await?;
+        if members.is_empty() {
+            return Ok(LaunchStart::NoMembers);
+        }
+        // The guard, read under the lock: no join can add a member until this tx ends.
+        if members.len() > max_members {
+            return Ok(LaunchStart::TooManyMembers(members.len()));
+        }
+
+        if let Some(hook) = &self.pause {
+            hook().await;
+        }
+
+        if !activate_row(&mut tx, campaign_id, ends_at, victory_tickers).await? {
+            // Unreachable from the join under the lock; only an out-of-band state write
+            // reaches it (backstop, the `uq_player_campaign` class).
+            return Ok(LaunchStart::NotPending);
+        }
+
+        tx.commit().await.map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        Ok(LaunchStart::Started { campaign, members })
     }
 }

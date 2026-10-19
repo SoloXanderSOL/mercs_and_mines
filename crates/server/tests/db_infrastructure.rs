@@ -1694,80 +1694,29 @@ async fn initialize_campaign_orchestrates_correctly() {
     let membership_repo = PostgresMembershipRepository::new(pool.clone());
     let sector_repo     = RedisSectorStateRepository::new(redis_mgr.clone());
     let input_log_repo  = PostgresInputLogRepository::new(pool.clone());
+    let join_repo       = PostgresCampaignJoinRepository::new(pool.clone());
 
-    // Pre-test: clear membership rows left by any prior panicked run.
-    // wallet_address has ON DELETE RESTRICT, so memberships must be removed before
-    // player_accounts can be deleted. The cascade on campaign_id only covers the
-    // campaign created in THIS run — orphaned rows from prior crashes must be wiped by wallet.
-    let test_wallets: Vec<Vec<u8>> = (1u8..=3).map(|i| vec![i; 32]).collect();
-    for w in &test_wallets {
-        sqlx::query("DELETE FROM player_campaign_membership WHERE wallet_address = $1")
-            .bind(w).execute(&pool).await.expect("pre-test membership cleanup");
-    }
-    for w in &test_wallets {
-        sqlx::query("DELETE FROM player_accounts WHERE wallet_address = $1")
-            .bind(w).execute(&pool).await.ok();
-    }
+    // One member (5a-3a: the launch guard refuses more until 5b-2).
+    let wallet = [1u8; 32];
+    clean_wallet_4g1(&pool, &wallet).await;
+    assert_no_pending_campaign(&pool).await;
+    let campaign_id = seed_account_and_campaign(&pool, wallet, 12345_i64).await;
+    let sector_id = campaign_repo.get_campaign(campaign_id).await
+        .expect("get_campaign error").expect("seeded campaign").sector_id;
 
-    let sector_id = uuid::Uuid::new_v4();
-    let campaign = campaign_repo.create_campaign(&NewCampaignInstance {
-        sector_id,
-        map_seed: 12345_i64,
-    }).await.expect("create_campaign failed");
-    let campaign_id = campaign.campaign_id;
-
-    let wallets: Vec<Vec<u8>> = (1u8..=3).map(|i| vec![i; 32]).collect();
-    for w in &wallets {
-        sqlx::query(
-            "INSERT INTO player_accounts (wallet_address, trust_standing, gcn_balance)
-             VALUES ($1, 0, 0)
-             ON CONFLICT (wallet_address) DO NOTHING"
-        )
-        .bind(w)
-        .execute(&pool)
-        .await
-        .expect("player_accounts FK seed failed");
-    }
-    for w in &wallets {
-        membership_repo.add_member(w, campaign_id, None, None)
-            .await
-            .expect("add_member failed");
-    }
-
-    initialize_campaign(
+    let init = initialize_campaign(
         campaign_id,
-        &campaign_repo,
+        &join_repo,
         &membership_repo,
         &sector_repo,
         &input_log_repo,
-    ).await.expect("initialize_campaign returned Err");
+    ).await;
 
-    let updated = campaign_repo.get_campaign(campaign_id).await
-        .expect("get_campaign error")
-        .expect("campaign not found after initialize");
-    assert_eq!(updated.state, CampaignLifecycle::Active, "state must be Active after initialize");
-    let ends_at = updated.ends_at.expect("ends_at must be Some after initialize");
-    assert!(
-        ends_at > chrono::Utc::now() + chrono::Duration::days(80),
-        "ends_at must be at least 80 days in the future"
-    );
-
-    let sector_state = sector_repo.get_sector(sector_id).await
-        .expect("get_sector failed")
-        .expect("get_sector returned None — upsert_sector must have written to Redis");
-    assert!(
-        !sector_state.terrain.is_empty(),
-        "terrain must be populated in Redis after initialize"
-    );
-
+    // Collect, clean, then assert.
+    let updated = campaign_repo.get_campaign(campaign_id).await.expect("get_campaign error");
+    let sector_state = sector_repo.get_sector(sector_id).await.expect("get_sector failed");
     let members = membership_repo.list_members_by_campaign(campaign_id).await
         .expect("list_members_by_campaign failed");
-    assert_eq!(members.len(), 3, "expected 3 members");
-    for m in &members {
-        assert!(m.gateway_hex_q.is_some(), "gateway_hex_q must be Some after initialize");
-        assert!(m.gateway_hex_r.is_some(), "gateway_hex_r must be Some after initialize");
-    }
-
     let log_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM input_logs WHERE campaign_id = $1 AND event_type = 'campaign_started'"
     )
@@ -1775,7 +1724,6 @@ async fn initialize_campaign_orchestrates_correctly() {
     .fetch_one(&pool)
     .await
     .expect("log count query failed");
-    assert_eq!(log_count, 1, "input_logs must have exactly one campaign_started entry — retry must not produce duplicates");
 
     sqlx::query("ALTER TABLE input_logs DISABLE TRIGGER ALL")
         .execute(&pool).await.expect("disable triggers for cleanup failed");
@@ -1783,21 +1731,7 @@ async fn initialize_campaign_orchestrates_correctly() {
         .bind(campaign_id).execute(&pool).await.expect("post-test input_logs cleanup failed");
     sqlx::query("ALTER TABLE input_logs ENABLE TRIGGER ALL")
         .execute(&pool).await.expect("re-enable triggers after cleanup failed");
-
-    sqlx::query("DELETE FROM campaign_instances WHERE campaign_id = $1")
-        .bind(campaign_id)
-        .execute(&pool)
-        .await
-        .expect("post-test campaign cleanup failed");
-
-    for w in &wallets {
-        sqlx::query("DELETE FROM player_accounts WHERE wallet_address = $1")
-            .bind(w)
-            .execute(&pool)
-            .await
-            .expect("post-test player_accounts cleanup failed");
-    }
-
+    clean_wallet_4g1(&pool, &wallet).await;
     use redis::AsyncCommands;
     let mut conn = redis_mgr.clone();
     conn.del::<_, ()>(format!("sector:{}:hex_state", sector_id))
@@ -1806,6 +1740,27 @@ async fn initialize_campaign_orchestrates_correctly() {
     conn.srem::<_, _, ()>("sectors:all", sector_id.to_string())
         .await
         .expect("SREM sectors:all cleanup failed");
+
+    init.expect("initialize_campaign returned Err");
+    let updated = updated.expect("campaign not found after initialize");
+    assert_eq!(updated.state, CampaignLifecycle::Active, "state must be Active after initialize");
+    let ends_at = updated.ends_at.expect("ends_at must be Some after initialize");
+    assert!(
+        ends_at > chrono::Utc::now() + chrono::Duration::days(80),
+        "ends_at must be at least 80 days in the future"
+    );
+    let sector_state = sector_state
+        .expect("get_sector returned None — upsert_sector must have written to Redis");
+    assert!(
+        !sector_state.terrain.is_empty(),
+        "terrain must be populated in Redis after initialize"
+    );
+    assert_eq!(members.len(), 1, "expected 1 member");
+    for m in &members {
+        assert!(m.gateway_hex_q.is_some(), "gateway_hex_q must be Some after initialize");
+        assert!(m.gateway_hex_r.is_some(), "gateway_hex_r must be Some after initialize");
+    }
+    assert_eq!(log_count, 1, "input_logs must have exactly one campaign_started entry — retry must not produce duplicates");
 }
 
 #[tokio::test]
@@ -2009,44 +1964,18 @@ async fn admin_launch_campaign_returns_200_then_409() {
     state.membership_repo = Arc::new(PostgresMembershipRepository::new(pool.clone()));
     state.sector_repo     = Arc::new(RedisSectorStateRepository::new(redis_mgr.clone()));
     state.input_log_repo  = Arc::new(PostgresInputLogRepository::new(pool.clone()));
+    // The trap (5a-3a): the launch reads through the join repository, so it is replaced too.
+    state.campaign_join_repo = Arc::new(PostgresCampaignJoinRepository::new(pool.clone()));
     let state = Arc::new(state);
 
-    // Wallets 10–12 (unique to this test — no conflict with other integration tests)
-    let wallets: Vec<Vec<u8>> = (10u8..=12).map(|i| vec![i; 32]).collect();
-
-    // Pre-test cleanup in case a prior panicked run left rows
-    for w in &wallets {
-        sqlx::query("DELETE FROM player_campaign_membership WHERE wallet_address = $1")
-            .bind(w).execute(&pool).await.ok();
-    }
-    for w in &wallets {
-        sqlx::query("DELETE FROM player_accounts WHERE wallet_address = $1")
-            .bind(w).execute(&pool).await.ok();
-    }
-
-    // Setup: Pending campaign + 3 members (mirrors initialize_campaign_orchestrates_correctly)
-    let sector_id = uuid::Uuid::new_v4();
-    let campaign_repo   = PostgresCampaignRepository::new(pool.clone());
-    let membership_repo = PostgresMembershipRepository::new(pool.clone());
-
-    let campaign = campaign_repo.create_campaign(&NewCampaignInstance {
-        sector_id,
-        map_seed: 55555_i64,
-    }).await.expect("create_campaign failed");
-    let campaign_id = campaign.campaign_id;
-
-    for w in &wallets {
-        sqlx::query(
-            "INSERT INTO player_accounts (wallet_address, trust_standing, gcn_balance)
-             VALUES ($1, 0, 0)
-             ON CONFLICT (wallet_address) DO NOTHING"
-        )
-        .bind(w).execute(&pool).await.expect("player_accounts seed failed");
-    }
-    for w in &wallets {
-        membership_repo.add_member(w, campaign_id, None, None)
-            .await.expect("add_member failed");
-    }
+    // Setup: a Pending campaign with one member (wallet 10; the launch guard refuses more).
+    let wallet = [10u8; 32];
+    clean_wallet_4g1(&pool, &wallet).await;
+    assert_no_pending_campaign(&pool).await;
+    let campaign_repo = PostgresCampaignRepository::new(pool.clone());
+    let campaign_id = seed_account_and_campaign(&pool, wallet, 55555_i64).await;
+    let sector_id = campaign_repo.get_campaign(campaign_id).await
+        .expect("get_campaign error").expect("seeded campaign").sector_id;
 
     // Admin auth fails closed, so every request below must carry the key.
     // Obviously-fake test value — the real key lives only on the box. See guard rail 3
@@ -2062,15 +1991,10 @@ async fn admin_launch_campaign_returns_200_then_409() {
         .header("x-admin-key", TEST_ADMIN_KEY)
         .body(Body::empty())
         .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "first launch must return 200");
+    let status1 = app.oneshot(req).await.unwrap().status();
 
-    // Verify DB: campaign must now be Active with ends_at set
-    let updated = campaign_repo.get_campaign(campaign_id).await
-        .expect("get_campaign error")
-        .expect("campaign not found after launch");
-    assert_eq!(updated.state, CampaignLifecycle::Active, "state must be Active after launch");
-    assert!(updated.ends_at.is_some(), "ends_at must be Some after launch");
+    // Read the DB after the first launch
+    let updated = campaign_repo.get_campaign(campaign_id).await.expect("get_campaign error");
 
     // Second POST — expect 409 (oneshot consumed app above; build a new one)
     let app2 = mercs_server::routes::router(Arc::clone(&state));
@@ -2080,34 +2004,90 @@ async fn admin_launch_campaign_returns_200_then_409() {
         .header("x-admin-key", TEST_ADMIN_KEY)
         .body(Body::empty())
         .unwrap();
-    let resp2 = app2.oneshot(req2).await.unwrap();
-    assert_eq!(resp2.status(), StatusCode::CONFLICT, "second launch must return 409");
+    let status2 = app2.oneshot(req2).await.unwrap().status();
 
     std::env::remove_var("ADMIN_API_KEY");
 
-    // Cleanup
+    // Cleanup before asserting
     sqlx::query("ALTER TABLE input_logs DISABLE TRIGGER ALL")
         .execute(&pool).await.expect("disable triggers for cleanup");
     sqlx::query("DELETE FROM input_logs WHERE campaign_id = $1")
         .bind(campaign_id).execute(&pool).await.expect("cleanup input_logs");
     sqlx::query("ALTER TABLE input_logs ENABLE TRIGGER ALL")
         .execute(&pool).await.expect("re-enable triggers after cleanup");
-
-    // CASCADE on campaign_id removes player_campaign_membership rows
-    sqlx::query("DELETE FROM campaign_instances WHERE campaign_id = $1")
-        .bind(campaign_id).execute(&pool).await.expect("cleanup campaign_instances");
-
-    for w in &wallets {
-        sqlx::query("DELETE FROM player_accounts WHERE wallet_address = $1")
-            .bind(w).execute(&pool).await.expect("cleanup player_accounts");
-    }
-
+    clean_wallet_4g1(&pool, &wallet).await;
     use redis::AsyncCommands;
     let mut conn = redis_mgr.clone();
     conn.del::<_, ()>(format!("sector:{}:hex_state", sector_id))
         .await.expect("DEL sector hex_state cleanup");
     conn.srem::<_, _, ()>("sectors:all", sector_id.to_string())
         .await.expect("SREM sectors:all cleanup");
+
+    assert_eq!(status1, StatusCode::OK, "first launch must return 200");
+    let updated = updated.expect("campaign not found after launch");
+    assert_eq!(updated.state, CampaignLifecycle::Active, "state must be Active after launch");
+    assert!(updated.ends_at.is_some(), "ends_at must be Some after launch");
+    assert_eq!(status2, StatusCode::CONFLICT, "second launch must return 409");
+}
+
+/// 5a-3a T2 — a two-member campaign is refused with its own 409 and left untouched (the
+/// launch guard, read under the join lock; GAP-58 until 5b-2).
+#[tokio::test]
+async fn admin_launch_refuses_a_campaign_with_two_members() {
+    use std::sync::Arc;
+    use axum::{body::Body, http::{Request, StatusCode}};
+    use tower::ServiceExt;
+
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    let (a, b) = ([60u8; 32], [61u8; 32]);
+    for w in [a, b] { clean_wallet_4g1(&pool, &w).await; }
+    assert_no_pending_campaign(&pool).await;
+    let c = seed_account_and_campaign(&pool, a, 0x5A3A2_i64).await;
+    seed_account(&pool, b).await;
+    PostgresMembershipRepository::new(pool.clone()).add_member(&b, c, None, None).await.expect("second member");
+
+    let mut state = mercs_server::state::AppState::new(Arc::new(mercs_server::config::Config::default()));
+    state.campaign_repo      = Arc::new(PostgresCampaignRepository::new(pool.clone()));
+    state.membership_repo    = Arc::new(PostgresMembershipRepository::new(pool.clone()));
+    state.campaign_join_repo = Arc::new(PostgresCampaignJoinRepository::new(pool.clone()));
+    state.input_log_repo     = Arc::new(PostgresInputLogRepository::new(pool.clone()));
+    let state = Arc::new(state);
+
+    const TEST_ADMIN_KEY: &str = "test-only-not-a-real-admin-key";
+    std::env::set_var("ADMIN_API_KEY", TEST_ADMIN_KEY);
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/admin/campaign/{}/launch", c))
+        .header("x-admin-key", TEST_ADMIN_KEY)
+        .body(Body::empty())
+        .unwrap();
+    let resp = mercs_server::routes::router(Arc::clone(&state)).oneshot(req).await.unwrap();
+    std::env::remove_var("ADMIN_API_KEY");
+    let status = resp.status();
+    let body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX).await.expect("body"),
+    ).expect("json body");
+
+    let campaign = PostgresCampaignRepository::new(pool.clone()).get_campaign(c).await.expect("get_campaign");
+    let members = PostgresMembershipRepository::new(pool.clone()).list_members_by_campaign(c).await.expect("members");
+    let log_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM input_logs WHERE campaign_id = $1 AND event_type = 'campaign_started'"
+    ).bind(c).fetch_one(&pool).await.expect("log count");
+
+    // Always clean the log, then both wallets, before asserting.
+    sqlx::query("ALTER TABLE input_logs DISABLE TRIGGER ALL").execute(&pool).await.expect("disable triggers");
+    sqlx::query("DELETE FROM input_logs WHERE campaign_id = $1").bind(c).execute(&pool).await.expect("cleanup input_logs");
+    sqlx::query("ALTER TABLE input_logs ENABLE TRIGGER ALL").execute(&pool).await.expect("re-enable triggers");
+    for w in [a, b] { clean_wallet_4g1(&pool, &w).await; }
+
+    assert_eq!(status, StatusCode::CONFLICT, "a two-member launch must return 409");
+    assert_eq!(body, serde_json::json!({"error": "campaign has more than one member"}));
+    assert_eq!(campaign.expect("campaign").state, CampaignLifecycle::Pending, "the campaign stays Pending");
+    assert_eq!(members.len(), 2);
+    for m in &members {
+        assert_eq!((m.gateway_hex_q, m.gateway_hex_r), (None, None), "no hex assigned");
+    }
+    assert_eq!(log_count, 0, "no campaign_started row");
 }
 
 #[tokio::test]
@@ -6357,9 +6337,10 @@ async fn duplicate_membership_names_uq_player_campaign() {
 // ── 5a-2b: the campaign join ─────────────────────────────────────────────────
 
 use mercs_server::repository::{
-    CampaignJoinRepository, JoinOutcome, JoinSeeds, PauseHook, PostgresCampaignJoinRepository,
-    StarterIds,
+    CampaignJoinRepository, JoinOutcome, JoinSeeds, LaunchStart, PauseHook, PostgresCampaignJoinRepository,
+    StarterIds, JOIN_ADVISORY_KEY,
 };
+use mercs_server::campaign_init::LAUNCH_MAX_MEMBERS;
 
 const JOIN_SEEDS: JoinSeeds = JoinSeeds { commander: 0x1111_1111, foreman: 0x2222_2222, map: 0x3333_3333 };
 
@@ -6638,6 +6619,30 @@ fn join_pause_hook() -> (PauseHook, tokio::sync::mpsc::UnboundedReceiver<()>, to
     (hook, parked_rx, gate_tx)
 }
 
+/// Waits (≤ 10 s) until B is held or done: B parked at its own seam, B waiting on the join
+/// key in `pg_locks` (filtered by `JOIN_ADVISORY_KEY`, Reviewer 5a-2b F2), or B finished. The
+/// third exit lets a no-lock negative reach the test's own assertions instead of the deadline.
+async fn wait_until_b_is_held<T>(
+    wide: &sqlx::PgPool,
+    parked: &mut tokio::sync::mpsc::UnboundedReceiver<()>,
+    b: &tokio::task::JoinHandle<T>,
+) {
+    use std::time::Duration;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if parked.try_recv().is_ok() || b.is_finished() { return; }
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_locks
+             WHERE locktype = 'advisory' AND objsubid = 1 AND NOT granted
+               AND classid = (($1::bigint >> 32) & 4294967295)::oid
+               AND objid = ($1::bigint & 4294967295)::oid"
+        ).bind(JOIN_ADVISORY_KEY).fetch_one(wide).await.expect("pg_locks poll failed");
+        if waiting == 1 { return; }
+        assert!(tokio::time::Instant::now() < deadline, "B neither parked, waited on the lock, nor finished");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 /// Runs A and B through the seam protocol (Section 5 doc): A parks; B either parks at its own
 /// seam or waits on the join lock; then the gate opens. Returns both results.
 async fn race_joins(
@@ -6657,16 +6662,7 @@ async fn race_joins(
 
     let rb = repo.clone();
     let task_b = tokio::spawn(async move { rb.join_campaign(&b, cap, JOIN_SEEDS).await });
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        if parked.try_recv().is_ok() { break; }
-        let waiting: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND objsubid = 1 AND NOT granted"
-        ).fetch_one(wide).await.expect("pg_locks poll failed");
-        if waiting == 1 { break; }
-        assert!(tokio::time::Instant::now() < deadline, "B neither parked nor waited on the lock");
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    wait_until_b_is_held(wide, &mut parked, &task_b).await;
 
     gate.send(true).expect("open the gate");
     let ra = task_a.await.expect("A panicked");
@@ -6763,4 +6759,62 @@ async fn campaign_join_without_an_account_rolls_back() {
     clean_wallet_4g1(&pool, &wallet).await;
     assert!(matches!(res, Err(RepositoryError::Internal(_))), "expected Internal, got {res:?}");
     assert_eq!(pending, 0, "the created campaign rolled back");
+}
+
+// ── 5a-3a: the launch under the join lock ────────────────────────────────────
+
+/// 5a-3a T1 (Reviewer 5a-2b F1/CF1) — a launch parked after its guard, before its activation,
+/// holds the join lock: a racing join waits, then lands in a **different** campaign, and the
+/// launched campaign keeps exactly the members the launch read.
+#[tokio::test]
+async fn launch_serialises_against_a_racing_join() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    let (member, joiner) = ([58u8; 32], [59u8; 32]);
+    for w in [member, joiner] { clean_wallet_4g1(&pool, &w).await; }
+    assert_no_pending_campaign(&pool).await;
+    let c = seed_account_and_campaign(&pool, member, 0x5A3A1_i64).await;
+    seed_account(&pool, joiner).await;
+    let wide = wide_pool().await;
+    let ends_at = chrono::Utc::now() + chrono::Duration::days(90);
+    let tickers = serde_json::json!({ "MILITARY_DOMINANCE": 0.0 });
+
+    let (hook, mut parked, gate) = join_pause_hook();
+    let launcher = std::sync::Arc::new(PostgresCampaignJoinRepository::with_pause_seam(wide.clone(), hook));
+    let task_a = tokio::spawn(async move { launcher.begin_launch(c, LAUNCH_MAX_MEMBERS, ends_at, tickers).await });
+    tokio::time::timeout(std::time::Duration::from_secs(10), parked.recv())
+        .await.expect("the launch never parked").expect("the launch never parked");
+
+    let joining = PostgresCampaignJoinRepository::new(wide.clone());
+    let task_b = tokio::spawn(async move { joining.join_campaign(&joiner, 2, JOIN_SEEDS).await });
+    wait_until_b_is_held(&wide, &mut parked, &task_b).await;
+    gate.send(true).expect("open the gate");
+    let launch = task_a.await.expect("the launch panicked");
+    let join = task_b.await.expect("the join panicked");
+
+    // Collect, clean, then assert.
+    let launched = PostgresCampaignRepository::new(pool.clone()).get_campaign(c).await.expect("get_campaign");
+    let launched_members = campaign_members(&pool, c).await;
+    let joiner_campaign: Option<uuid::Uuid> = match &join {
+        Ok(JoinOutcome::Joined(ids) | JoinOutcome::AlreadyMember(ids)) => Some(ids.campaign_id),
+        _ => None,
+    };
+    let joiner_hex = match joiner_campaign {
+        Some(jc) => PostgresMembershipRepository::new(pool.clone()).get_membership(&joiner, jc).await
+            .expect("get_membership").map(|m| (m.gateway_hex_q, m.gateway_hex_r)),
+        None => None,
+    };
+    for w in [member, joiner] { clean_wallet_4g1(&pool, &w).await; }
+
+    match launch.expect("begin_launch") {
+        LaunchStart::Started { members, .. } => assert_eq!(members.len(), 1, "the launch read one member"),
+        other => panic!("expected Started, got {other:?}"),
+    }
+    let ids = match join {
+        Ok(JoinOutcome::Joined(ids)) => ids,
+        other => panic!("expected Ok(Joined), got {other:?}"),
+    };
+    assert_ne!(ids.campaign_id, c, "joiner in a different campaign");
+    assert_eq!(launched.expect("launched campaign").state, CampaignLifecycle::Active);
+    assert_eq!(launched_members, 1, "the launched campaign has exactly the member the launch read");
+    assert_eq!(joiner_hex, Some((None, None)), "the joiner's hex is NULL");
 }

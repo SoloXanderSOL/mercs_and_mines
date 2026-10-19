@@ -5,10 +5,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use super::campaign::{CampaignLifecycle, CampaignRepository, InMemoryCampaignRepository, NewCampaignInstance};
-use super::campaign_join::{CampaignJoinRepository, JoinOutcome, JoinSeeds, StarterIds, NO_STARTER_SET};
+use super::campaign_join::{CampaignJoinRepository, JoinOutcome, JoinSeeds, LaunchStart, StarterIds, NO_STARTER_SET};
 use super::commander::{CommanderRepository, InMemoryCommanderRepository};
 use super::crew::{CrewRecord, CrewRepository, InMemoryCrewRepository};
 use super::foreman::{ForemanRepository, InMemoryForemanRepository};
@@ -136,6 +137,41 @@ impl CampaignJoinRepository for InMemoryCampaignJoinRepository {
         let ids = StarterIds { campaign_id, commander_id, foreman_id, section_id, crew_id };
         starters.insert((wallet.to_vec(), campaign_id), ids);
         Ok(JoinOutcome::Joined(ids))
+    }
+
+    /// The Postgres order under the join Mutex, so it is serialised against in-memory joins
+    /// through this instance. Every store call returns an owned value.
+    async fn begin_launch(
+        &self,
+        campaign_id: Uuid,
+        max_members: usize,
+        ends_at: DateTime<Utc>,
+        victory_tickers: serde_json::Value,
+    ) -> Result<LaunchStart, RepositoryError> {
+        let _join_lock = self.starters.lock().await;
+
+        let Some(campaign) = self.campaigns.get_campaign(campaign_id).await? else {
+            return Ok(LaunchStart::NotFound);
+        };
+        if campaign.state != CampaignLifecycle::Pending {
+            return Ok(LaunchStart::NotPending);
+        }
+
+        // Already sorted `joined_at` by the store.
+        let members = self.memberships.list_members_by_campaign(campaign_id).await?;
+        if members.is_empty() {
+            return Ok(LaunchStart::NoMembers);
+        }
+        if members.len() > max_members {
+            return Ok(LaunchStart::TooManyMembers(members.len()));
+        }
+
+        if !self.campaigns.activate_campaign(campaign_id, ends_at, victory_tickers).await? {
+            // Unreachable from the join under the lock; only an out-of-band state write
+            // reaches it (backstop, the `uq_player_campaign` class).
+            return Ok(LaunchStart::NotPending);
+        }
+        Ok(LaunchStart::Started { campaign, members })
     }
 }
 
@@ -274,6 +310,111 @@ mod tests {
         assert!(older.created_at < newer.created_at, "precondition: distinct creation times");
         let ids = joined(s.join.join_campaign(&[42u8; 32], 1, SEEDS).await.unwrap());
         assert_eq!(ids.campaign_id, older.campaign_id, "joined the older campaign");
+    }
+
+    // ── begin_launch (5a-3a) ────────────────────────────────────────────────
+
+    fn launch_ends_at() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2027-01-17T00:00:00Z").unwrap().with_timezone(&Utc)
+    }
+
+    fn launch_tickers() -> serde_json::Value {
+        serde_json::json!({ "MILITARY_DOMINANCE": 0.0 })
+    }
+
+    async fn pending_campaign(s: &Stores) -> Uuid {
+        s.campaigns.create_campaign(&NewCampaignInstance { sector_id: Uuid::new_v4(), map_seed: 9 }).await.unwrap().campaign_id
+    }
+
+    async fn state_of(s: &Stores, c: Uuid) -> CampaignLifecycle {
+        s.campaigns.get_campaign(c).await.unwrap().expect("campaign").state
+    }
+
+    /// T3 — a one-member Pending campaign starts, and the store holds what was passed in.
+    #[tokio::test]
+    async fn begin_launch_in_memory_starts() {
+        let s = stores();
+        let c = pending_campaign(&s).await;
+        s.memberships.add_member(&[42u8; 32], c, None, None).await.unwrap();
+        match s.join.begin_launch(c, 1, launch_ends_at(), launch_tickers()).await.unwrap() {
+            LaunchStart::Started { campaign, members } => {
+                assert_eq!(campaign.campaign_id, c);
+                assert_eq!(members.len(), 1);
+                assert_eq!(members[0].wallet_address, vec![42u8; 32]);
+            }
+            other => panic!("expected Started, got {other:?}"),
+        }
+        let got = s.campaigns.get_campaign(c).await.unwrap().unwrap();
+        assert_eq!(got.state, CampaignLifecycle::Active);
+        assert_eq!(got.ends_at, Some(launch_ends_at()));
+        assert_eq!(got.victory_tickers, launch_tickers());
+    }
+
+    /// T4 — an unknown id.
+    #[tokio::test]
+    async fn begin_launch_in_memory_not_found() {
+        let s = stores();
+        let r = s.join.begin_launch(Uuid::new_v4(), 1, launch_ends_at(), launch_tickers()).await.unwrap();
+        assert!(matches!(r, LaunchStart::NotFound), "got {r:?}");
+    }
+
+    /// T5 — a second launch of the same campaign.
+    #[tokio::test]
+    async fn begin_launch_in_memory_not_pending() {
+        let s = stores();
+        let c = pending_campaign(&s).await;
+        s.memberships.add_member(&[42u8; 32], c, None, None).await.unwrap();
+        let first = s.join.begin_launch(c, 1, launch_ends_at(), launch_tickers()).await.unwrap();
+        assert!(matches!(first, LaunchStart::Started { .. }), "got {first:?}");
+        let again = s.join.begin_launch(c, 1, launch_ends_at(), launch_tickers()).await.unwrap();
+        assert!(matches!(again, LaunchStart::NotPending), "got {again:?}");
+    }
+
+    /// T6 — an empty campaign is refused and stays Pending.
+    #[tokio::test]
+    async fn begin_launch_in_memory_no_members() {
+        let s = stores();
+        let c = pending_campaign(&s).await;
+        let r = s.join.begin_launch(c, 1, launch_ends_at(), launch_tickers()).await.unwrap();
+        assert!(matches!(r, LaunchStart::NoMembers), "got {r:?}");
+        assert_eq!(state_of(&s, c).await, CampaignLifecycle::Pending);
+    }
+
+    /// T7 — two members over a one-member cap are refused, and the campaign stays Pending.
+    #[tokio::test]
+    async fn begin_launch_in_memory_too_many_members() {
+        let s = stores();
+        let c = pending_campaign(&s).await;
+        s.memberships.add_member(&[42u8; 32], c, None, None).await.unwrap();
+        s.memberships.add_member(&[43u8; 32], c, None, None).await.unwrap();
+        let r = s.join.begin_launch(c, 1, launch_ends_at(), launch_tickers()).await.unwrap();
+        assert!(matches!(r, LaunchStart::TooManyMembers(2)), "got {r:?}");
+        assert_eq!(state_of(&s, c).await, CampaignLifecycle::Pending);
+    }
+
+    /// T8 — the launch takes the join Mutex: while it is held, the launch cannot finish.
+    #[tokio::test]
+    async fn begin_launch_in_memory_takes_the_join_lock() {
+        let campaigns = Arc::new(InMemoryCampaignRepository::new());
+        let memberships = Arc::new(InMemoryMembershipRepository::new());
+        let join = Arc::new(InMemoryCampaignJoinRepository::new(
+            campaigns.clone(), memberships.clone(),
+            Arc::new(InMemoryCommanderRepository::new()), Arc::new(InMemoryForemanRepository::new()),
+            Arc::new(InMemorySectionRepository::new()), Arc::new(InMemoryCrewRepository::new()),
+        ));
+        let c = campaigns.create_campaign(&NewCampaignInstance { sector_id: Uuid::new_v4(), map_seed: 9 }).await.unwrap().campaign_id;
+        memberships.add_member(&[44u8; 32], c, None, None).await.unwrap();
+
+        let guard = join.starters.lock().await;
+        let j = join.clone();
+        let mut handle = tokio::spawn(async move { j.begin_launch(c, 1, launch_ends_at(), launch_tickers()).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut handle).await.is_err(),
+            "begin_launch finished while the join lock was held"
+        );
+        drop(guard);
+        let r = handle.await.expect("launch panicked").unwrap();
+        assert!(matches!(r, LaunchStart::Started { .. }), "got {r:?}");
     }
 
     /// M6 — a membership written outside the join has no starter set.

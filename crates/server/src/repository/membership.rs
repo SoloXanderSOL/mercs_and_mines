@@ -104,6 +104,29 @@ pub(crate) async fn insert_membership(
     .map_err(|e| RepositoryError::Internal(e.to_string()))
 }
 
+/// `list_members_by_campaign`'s SELECT on a caller's connection (the launch, 5a-3a). The SQL
+/// literal is the trait method's, byte for byte. Its `ORDER BY joined_at ASC` is load-bearing:
+/// it feeds `assign_gateway_hexes`' slot order.
+pub(crate) async fn member_rows(
+    conn: &mut PgConnection,
+    campaign_id: Uuid,
+) -> Result<Vec<PlayerCampaignMembership>, RepositoryError> {
+        let rows = sqlx::query_as!(
+            PlayerCampaignMembership,
+            r#"SELECT
+                membership_id, wallet_address, campaign_id,
+                gateway_hex_q, gateway_hex_r, joined_at, is_active
+               FROM player_campaign_membership
+               WHERE campaign_id = $1
+               ORDER BY joined_at ASC"#,
+            campaign_id,
+        )
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        Ok(rows)
+}
+
 #[async_trait]
 impl MembershipRepository for PostgresMembershipRepository {
     async fn add_member(
@@ -183,20 +206,9 @@ impl MembershipRepository for PostgresMembershipRepository {
         &self,
         campaign_id: Uuid,
     ) -> Result<Vec<PlayerCampaignMembership>, RepositoryError> {
-        let rows = sqlx::query_as!(
-            PlayerCampaignMembership,
-            r#"SELECT
-                membership_id, wallet_address, campaign_id,
-                gateway_hex_q, gateway_hex_r, joined_at, is_active
-               FROM player_campaign_membership
-               WHERE campaign_id = $1
-               ORDER BY joined_at ASC"#,
-            campaign_id,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| RepositoryError::Internal(e.to_string()))?;
-        Ok(rows)
+        let mut conn = self.pool.acquire().await
+            .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        member_rows(&mut conn, campaign_id).await
     }
 
     async fn list_campaigns_by_player(

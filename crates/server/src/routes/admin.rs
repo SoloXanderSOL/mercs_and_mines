@@ -63,9 +63,10 @@ async fn launch_campaign(
     // If initialization fails mid-flight after activation (e.g. Redis upsert fails),
     // the campaign may be left in Active state. Recovery requires a manual DB reset:
     // `UPDATE campaign_instances SET state = 'Pending' WHERE campaign_id = '...'`
+    // Activation now precedes map gen (5a-3a: it commits under the join lock first).
     match initialize_campaign(
         campaign_id,
-        state.campaign_repo.as_ref(),
+        &*state.campaign_join_repo,
         state.membership_repo.as_ref(),
         state.sector_repo.as_ref(),
         state.input_log_repo.as_ref(),
@@ -94,9 +95,14 @@ async fn launch_campaign(
                 (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "internal server error"}))).into_response()
             }
         },
-        Err(InitError::NotPending) | Err(InitError::WasAlreadyActive) => (
+        Err(InitError::NotPending) => (
             StatusCode::CONFLICT,
             Json(json!({"error": "campaign is not in Pending state"})),
+        )
+            .into_response(),
+        Err(InitError::TooManyMembers(_)) => (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "campaign has more than one member"})),
         )
             .into_response(),
         Err(InitError::CampaignNotFound) => {

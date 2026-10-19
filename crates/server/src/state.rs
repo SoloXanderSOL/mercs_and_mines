@@ -8,8 +8,10 @@ use crate::convoy_expiry::ConvoyEvent;
 use crate::repository::{
     AccountRepository, InMemoryAccountRepository,
     CampaignRepository, InMemoryCampaignRepository,
+    CampaignJoinRepository, InMemoryCampaignJoinRepository,
     ConvoyRepository, InMemoryConvoyRepository,
     CommanderRepository, InMemoryCommanderRepository,
+    InMemoryCrewRepository, InMemoryForemanRepository,
     InputLogRepository, InMemoryInputLogRepository,
     MembershipRepository, InMemoryMembershipRepository,
     SectionRepository, InMemorySectionRepository,
@@ -40,7 +42,11 @@ pub struct AppState {
     pub commander_repo:  Arc<dyn CommanderRepository  + Send + Sync>,
     pub membership_repo: Arc<dyn MembershipRepository + Send + Sync>,
     pub section_repo:    Arc<dyn SectionRepository    + Send + Sync>,
-    pub sector_repo:     Arc<dyn SectorStateRepository>,
+    /// The join and the launch (5a-3a). In memory it shares the campaign, membership,
+    /// Commander and Section stores above (plus its own Foreman and Crew stores), so a test
+    /// that replaces any of those four fields replaces this one alongside.
+    pub campaign_join_repo: Arc<dyn CampaignJoinRepository>,
+    pub sector_repo:    Arc<dyn SectorStateRepository>,
     pub timer_repo:      Arc<dyn TimerRepository>,
     pub convoy_repo:     Arc<dyn ConvoyRepository>,
     /// Sender map for convoy event WebSocket notifications, keyed by campaign_id.
@@ -56,16 +62,27 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(config: Arc<Config>) -> Self {
+        // Each join-shared store is built once; the `dyn` fields and the one in-memory join
+        // hold the same instances (Reviewer 5a-2b CF2).
+        let campaigns   = Arc::new(InMemoryCampaignRepository::new());
+        let memberships = Arc::new(InMemoryMembershipRepository::new());
+        let commanders  = Arc::new(InMemoryCommanderRepository::new());
+        let foremen     = Arc::new(InMemoryForemanRepository::new());
+        let sections    = Arc::new(InMemorySectionRepository::new());
+        let crews       = Arc::new(InMemoryCrewRepository::new());
         Self {
             session_repo:        Arc::new(InMemorySessionStateRepository::new()),
             input_log_repo:      Arc::new(InMemoryInputLogRepository::new()),
             sessions:           DashMap::new(),
             pending_challenges: DashMap::new(),
             account_repo:        Arc::new(InMemoryAccountRepository::new()),
-            campaign_repo:       Arc::new(InMemoryCampaignRepository::new()),
-            commander_repo:      Arc::new(InMemoryCommanderRepository::new()),
-            membership_repo:     Arc::new(InMemoryMembershipRepository::new()),
-            section_repo:        Arc::new(InMemorySectionRepository::new()),
+            campaign_repo:       campaigns.clone(),
+            commander_repo:      commanders.clone(),
+            membership_repo:     memberships.clone(),
+            section_repo:        sections.clone(),
+            campaign_join_repo:  Arc::new(InMemoryCampaignJoinRepository::new(
+                campaigns, memberships, commanders, foremen, sections, crews,
+            )),
             sector_repo:         Arc::new(InMemorySectorStateRepository::new()),
             timer_repo:          Arc::new(InMemoryTimerRepository::new()),
             convoy_repo:         Arc::new(InMemoryConvoyRepository),

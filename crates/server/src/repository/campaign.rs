@@ -205,25 +205,9 @@ impl CampaignRepository for PostgresCampaignRepository {
         &self,
         campaign_id: Uuid,
     ) -> Result<Option<CampaignInstance>, RepositoryError> {
-        sqlx::query_as!(
-            CampaignInstance,
-            r#"SELECT
-                   campaign_id,
-                   sector_id,
-                   map_seed,
-                   state AS "state: CampaignLifecycle",
-                   victory_tickers AS "victory_tickers: JsonValue",
-                   started_at,
-                   ends_at,
-                   created_at,
-                   updated_at
-               FROM campaign_instances
-               WHERE campaign_id = $1"#,
-            campaign_id
-        )
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| RepositoryError::Internal(e.to_string()))
+        let mut conn = self.pool.acquire().await
+            .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        campaign_row(&mut conn, campaign_id).await
     }
 
     async fn update_sector_state(
@@ -318,6 +302,47 @@ impl CampaignRepository for PostgresCampaignRepository {
         ends_at: DateTime<Utc>,
         victory_tickers: serde_json::Value,
     ) -> Result<bool, RepositoryError> {
+        let mut conn = self.pool.acquire().await
+            .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        activate_row(&mut conn, campaign_id, ends_at, victory_tickers).await
+    }
+}
+
+/// `get_campaign`'s SELECT on a caller's connection (the launch, 5a-3a). The SQL literal is
+/// the trait method's, byte for byte (its `.sqlx/` name hashes the text).
+pub(crate) async fn campaign_row(
+    conn: &mut PgConnection,
+    campaign_id: Uuid,
+) -> Result<Option<CampaignInstance>, RepositoryError> {
+        sqlx::query_as!(
+            CampaignInstance,
+            r#"SELECT
+                   campaign_id,
+                   sector_id,
+                   map_seed,
+                   state AS "state: CampaignLifecycle",
+                   victory_tickers AS "victory_tickers: JsonValue",
+                   started_at,
+                   ends_at,
+                   created_at,
+                   updated_at
+               FROM campaign_instances
+               WHERE campaign_id = $1"#,
+            campaign_id
+        )
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|e| RepositoryError::Internal(e.to_string()))
+}
+
+/// `activate_campaign`'s UPDATE on a caller's connection (the launch, 5a-3a). The SQL literal
+/// is the trait method's, byte for byte. `true` iff the row was `Pending` and is now `Active`.
+pub(crate) async fn activate_row(
+    conn: &mut PgConnection,
+    campaign_id: Uuid,
+    ends_at: DateTime<Utc>,
+    victory_tickers: serde_json::Value,
+) -> Result<bool, RepositoryError> {
         let result = sqlx::query!(
             r#"UPDATE campaign_instances
                SET state            = $1,
@@ -333,11 +358,10 @@ impl CampaignRepository for PostgresCampaignRepository {
             campaign_id,
             CampaignLifecycle::Pending as CampaignLifecycle,
         )
-        .execute(&self.pool)
+        .execute(&mut *conn)
         .await
         .map_err(|e| RepositoryError::Internal(e.to_string()))?;
         Ok(result.rows_affected() == 1)
-    }
 }
 
 // ── In-memory implementation ────────────────────────────────────────────────
