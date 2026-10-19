@@ -123,7 +123,16 @@ As of 2026-10-18:
   is unchanged (5a-3 rewires it). GAP-70: `assign_gateway_hexes` round-robins Solo overflow
   (`rim_indices[slot % len]`, no draw moves, no R7); the overflow `warn!` is gone.
   `delete_memberships_by_campaign` is deleted (trait and both impls, one `.sqlx` file).
-  **Next: 5a-2b** (the join transaction).
+  **5a-2b complete (`e0952a2`, `da5d9a0`, `b3711f8`, 2026-10-18; deployed):**
+  `CampaignJoinRepository::join_campaign` writes the membership and the four starters
+  (`AcquiredVia::Starter`) in one transaction under `JOIN_ADVISORY_KEY`. **5a-3a complete
+  (`8473f14`, 2026-10-19):** `CampaignJoinRepository::begin_launch(campaign_id, max_members,
+  ends_at, victory_tickers) -> LaunchStart { Started { campaign, members }, NotFound,
+  NotPending, NoMembers, TooManyMembers(n) }` reads, guards and activates under the same key
+  (Reviewer 5a-2b F1); `initialize_campaign` does map gen, hexes, Redis and `campaign_started`
+  after its commit. `LAUNCH_MAX_MEMBERS = 1` (GAP-58, until 5b-2) → `409` "campaign has more
+  than one member"; `InitError::WasAlreadyActive` is gone. `AppState.campaign_join_repo`
+  (Postgres in `main.rs`). No route calls the join yet. **Next: 5a-3b** (the join route).
 - **Section 6:** Not started.
 - **Sections 7 (Personnel Entity Model) and 8 (Combat Engine to canon):** created
   2026-10-13 (ruling D2); both run before Section 6. Strike Mining and Base Building moved
@@ -214,11 +223,11 @@ As of 2026-10-18:
   scenarios) and `shellcheck` run in the `deploy-script` job on every push, and the deploy
   job needs it (GAP-33).
 
-**337/337 tests green (1 `shared` + 136 `mercs_server` lib + 2 `aar_determinism` + 127
-`db_infrastructure` + 71 `sim_engine`; single-threaded, verified at `0b84e70`). Workspace
-version `0.3.0`. `.sqlx/` holds 70 files; the latest migration is `0030_join_schema`.
-`main` = `dev` = `3b186b9` (5a-2a, deployed 2026-10-18); `dev` is ahead with 5a-2b, unpushed.
-Next: 5a-2b; see the Phase 1 document.** Any brick that changes what `resolve_mission` produces for
+**361/361 tests green (1 `shared` + 148 `mercs_server` lib + 2 `aar_determinism` + 139
+`db_infrastructure` + 71 `sim_engine`; single-threaded, verified at `8473f14`). Workspace
+version `0.3.0`. `.sqlx/` holds 74 files; the latest migration is `0030_join_schema`.
+`main` = `b3711f8` (5a-2b, deployed 2026-10-18); `dev` is ahead with 5a-3a, unpushed.
+Next: 5a-3b; see the Phase 1 document.** Any brick that changes what `resolve_mission` produces for
 a given seed bumps the workspace version in the same brick. 4b-1 reused `sim-engine`'s `OutcomeType` rather than
 defining a new enum, and writes **no input-log entry** — the rank-up entry was removed
 from scope. **ODQ-22 and ODQ-23 were ruled 2026-09-03 — engagement and mission outcomes
@@ -367,6 +376,10 @@ begins.
   stored on the record structs. At most one starter per `(campaign, wallet)` by the
   `<t>_one_starter` index; exactly one by the join transaction.
 
+  **`JOIN_ADVISORY_KEY` has two takers:** `join_campaign` and `begin_launch` (5a-3a). Any new
+  writer that moves a campaign out of `Pending`, or writes a membership, takes it
+  (`lock_joins`) as the first statement of the same transaction.
+
 * **Key-Value Store (Redis):** Live Sector hex state, deployment timers (global sorted
   set + per-sector sorted set for cancel path), active session state. **Persisted Redis
   types (`DeploymentTimer`, `TimerType`, `SectorState`) change additively only:** new
@@ -437,10 +450,15 @@ constraints — parallel execution causes FK-23503 failures that are not caused 
 code under test. Any test report produced without `--test-threads=1` is unreliable and
 must be re-run before reporting results to the Director.
 
-**Test wallets:** `tests/` uses wallet seeds 0–9, 13–19, 21–41 and 88, with 10–12 taken by
-a range literal (`(10u8..=12)`). **20 is the auth tests' signing-key seed**
+**Test wallets:** `tests/` uses wallet seeds 0–10, 13–19, 21–61 and 88; 11 and 12 (a range
+literal until 5a-3a) stay reserved. **20 is the auth tests' signing-key seed**
 (`SigningKey::from_bytes(&[20u8; 32])`). It is used in memory only, and its derived
-public key is not `[20u8; 32]`. The next free seed is **42**.
+public key is not `[20u8; 32]`. The next free seed is **62**.
+
+**One in-memory join per `AppState`:** `AppState::new` builds each join-shared store once and
+one `InMemoryCampaignJoinRepository` over the same `Arc`s. A test that replaces a join-read
+field (`campaign_repo`, `membership_repo`, `commander_repo`, `section_repo`) replaces
+`campaign_join_repo` alongside, or the join and the launch keep reading the old stores.
 
 **Race tests:** Race tests force interleaving with a pause seam after the read, never a held
 lock alone: a held lock cannot make a remove-the-lock negative fail. Wait until B is parked
