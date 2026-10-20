@@ -78,8 +78,23 @@ pub enum LaunchStart {
     TooManyMembers(usize),
 }
 
+/// What a replacement claim did (5a-4, ODQ-33). Outcomes, not errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplacementOutcome {
+    /// Every Commander was KIA; this is the new replacement's `commander_id`.
+    Granted(Uuid),
+    /// No membership row for this wallet and campaign.
+    NotMember,
+    /// The member has a Commander that is not KIA (Shattered and a live replacement count).
+    HasLiving,
+}
+
 /// The refusal for a member whose starter set is missing or partial.
 pub(crate) const NO_STARTER_SET: &str = "campaign join: member has no starter set";
+
+/// The refusal for a member with no Commander at all. The join writes a starter with every
+/// membership, so only test rows can produce it; the route maps it to an integrity `500`.
+pub(crate) const NO_COMMANDERS: &str = "replacement claim: member has no Commanders";
 
 /// A player entering a campaign.
 ///
@@ -115,6 +130,20 @@ pub trait CampaignJoinRepository: Send + Sync {
         ends_at: DateTime<Utc>,
         victory_tickers: serde_json::Value,
     ) -> Result<LaunchStart, RepositoryError>;
+
+    // TODO(phase-2-§10j): alpha-only replacement; removed when the Phase 2 Bootcamp hire ships (ODQ-33).
+    /// The alpha KIA replacement (5a-4, ODQ-33). In one transaction under the member's
+    /// membership row lock (`FOR UPDATE`, never `JOIN_ADVISORY_KEY`): `NotMember` without a
+    /// membership row (whatever its `is_active`); `Internal(NO_COMMANDERS)` when the member has
+    /// no Commander at all; `HasLiving` when any Commander is not KIA; otherwise a Rank 1
+    /// Commander rolled from `seed` and written with `acquired_via = 'replacement'`. The seed is
+    /// provenance, not a logged input. Off every hire counter.
+    async fn claim_replacement(
+        &self,
+        campaign_id: Uuid,
+        wallet: &[u8],
+        seed: u32,
+    ) -> Result<ReplacementOutcome, RepositoryError>;
 }
 
 // ── Postgres reads, on the transaction's connection only ─────────────────────
@@ -207,7 +236,8 @@ pub(crate) async fn starter_ids(
 
 // ── PostgresCampaignJoinRepository ───────────────────────────────────────────
 
-/// A test hook awaited once inside the join's transaction (see `with_pause_seam`).
+/// A test hook awaited once inside a transaction of this repository (see `with_pause_seam`):
+/// the join, the launch and the replacement claim each fire it at one point.
 pub type PauseHook = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 /// The join as one Postgres transaction.
@@ -235,9 +265,10 @@ impl PostgresCampaignJoinRepository {
     /// The join with a pause hook, awaited once after the live-membership check and the
     /// pick or create, before any insert. It exists for the race tests in the integration
     /// binary, which never compiles the lib with `cfg(test)`. Production pays one `Option`
-    /// check. **The hook fires in both methods:** `begin_launch` awaits it after the guard,
-    /// before the activation. A test that parks only one racer gives the other its own
-    /// instance from `new` on the same pool (both take the same database key).
+    /// check. **The hook fires in all three methods:** `join_campaign` as above;
+    /// `begin_launch` after the guard, before the activation; `claim_replacement` right after
+    /// the eligibility read, before the zero/living branch. A test that parks only one racer
+    /// gives the other its own instance from `new` on the same pool.
     #[doc(hidden)]
     pub fn with_pause_seam(pool: PgPool, hook: PauseHook) -> Self {
         Self { pool, pause: Some(hook) }
@@ -346,5 +377,61 @@ impl CampaignJoinRepository for PostgresCampaignJoinRepository {
 
         tx.commit().await.map_err(|e| RepositoryError::Internal(e.to_string()))?;
         Ok(LaunchStart::Started { campaign, members })
+    }
+
+    /// `FOR UPDATE` is deliberate, not `FOR NO KEY UPDATE`: every roster insert's membership-FK
+    /// check takes `FOR KEY SHARE` on this row, which `FOR UPDATE` blocks, so the "all KIA"
+    /// read holds against any roster writer for this member until commit. The only other
+    /// Commander writer, `resolve_deployment`, only ever turns KIA on, so a race can only make
+    /// a claim answer `HasLiving` too conservatively. `commander_records_one_live_replacement`
+    /// (0031) is the backstop; its `23505` surfaces as `Internal`.
+    async fn claim_replacement(
+        &self,
+        campaign_id: Uuid,
+        wallet: &[u8],
+        seed: u32,
+    ) -> Result<ReplacementOutcome, RepositoryError> {
+        // Every early return drops `tx`, which rolls back and releases the row lock.
+        let mut tx = self.pool.begin().await
+            .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+
+        let member = sqlx::query_scalar!(
+            "SELECT membership_id FROM player_campaign_membership WHERE campaign_id = $1 AND wallet_address = $2 FOR UPDATE",
+            campaign_id,
+            wallet,
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        if member.is_none() {
+            return Ok(ReplacementOutcome::NotMember);
+        }
+
+        let counts = sqlx::query!(
+            r#"SELECT count(*) AS "total!", count(*) FILTER (WHERE NOT is_kia) AS "living!" FROM commander_records WHERE campaign_id = $1 AND player_wallet = $2"#,
+            campaign_id,
+            wallet,
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+
+        if let Some(hook) = &self.pause {
+            hook().await;
+        }
+
+        if counts.total == 0 {
+            return Err(RepositoryError::Internal(NO_COMMANDERS.into()));
+        }
+        if counts.living > 0 {
+            return Ok(ReplacementOutcome::HasLiving);
+        }
+
+        let record = generate_commander(wallet.to_vec(), campaign_id, seed);
+        let commander_id = record.commander_id;
+        insert_commander(&mut tx, record, AcquiredVia::Replacement).await?;
+
+        tx.commit().await.map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        Ok(ReplacementOutcome::Granted(commander_id))
     }
 }

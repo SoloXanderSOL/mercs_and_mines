@@ -7004,3 +7004,319 @@ async fn launch_serialises_against_a_racing_join() {
     assert_eq!(launched_members, 1, "the launched campaign has exactly the member the launch read");
     assert_eq!(joiner_hex, Some((None, None)), "the joiner's hex is NULL");
 }
+
+// ── 5a-4: the alpha KIA replacement ──────────────────────────────────────────
+
+use mercs_server::repository::ReplacementOutcome;
+
+/// Pre-cleans `wallet`, then seeds its account, an `Active` campaign (activated at once, so the
+/// join's pick never sees it), its membership and `n` generated Commanders. Returns
+/// (campaign_id, commander ids).
+async fn seed_active_member(pool: &sqlx::PgPool, wallet: [u8; 32], map_seed: i64, n: u32) -> (uuid::Uuid, Vec<uuid::Uuid>) {
+    clean_wallet_4g1(pool, &wallet).await;
+    let c = seed_account_and_campaign(pool, wallet, map_seed).await;
+    let activated = PostgresCampaignRepository::new(pool.clone())
+        .activate_campaign(c, chrono::Utc::now() + chrono::Duration::days(90), serde_json::json!({}))
+        .await
+        .expect("activate_campaign failed");
+    assert!(activated, "the seeded campaign must activate");
+    let mut ids = Vec::new();
+    for i in 0..n {
+        ids.push(pg_commander(pool, wallet, c, 0x5A40 + i).await);
+    }
+    (c, ids)
+}
+
+/// Sets a boolean flag (`is_kia` or `is_shattered`) by direct unchecked SQL (test-only).
+async fn set_commander_flag(pool: &sqlx::PgPool, commander_id: uuid::Uuid, column: &str) {
+    let r = sqlx::query(&format!("UPDATE commander_records SET {column} = TRUE WHERE commander_id = $1"))
+        .bind(commander_id).execute(pool).await
+        .unwrap_or_else(|e| panic!("set {column} failed: {e}"));
+    assert_eq!(r.rows_affected(), 1, "set {column}: the Commander must exist");
+}
+
+/// The member's rows with `acquired_via = 'replacement'`.
+async fn replacement_rows(pool: &sqlx::PgPool, wallet: [u8; 32]) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM commander_records WHERE player_wallet = $1 AND acquired_via = 'replacement'")
+        .bind(wallet.to_vec()).fetch_one(pool).await.expect("replacement count failed")
+}
+
+const CLAIM_SEED: u32 = 0x5A4_0001;
+
+/// 5a-4 P1 — an all-KIA member gets one Rank 1 replacement, written as `'replacement'`.
+#[tokio::test]
+async fn claim_replacement_grants_one_to_an_all_kia_member() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    let wallet = [63u8; 32];
+    let (c, ids) = seed_active_member(&pool, wallet, 0x5A41_i64, 1).await;
+    set_commander_flag(&pool, ids[0], "is_kia").await;
+
+    let res = PostgresCampaignJoinRepository::new(pool.clone()).claim_replacement(c, &wallet, CLAIM_SEED).await;
+    let (rec, via) = match &res {
+        Ok(ReplacementOutcome::Granted(id)) => (
+            PostgresCommanderRepository::new(pool.clone()).get_commander(*id).await.expect("get_commander"),
+            Some(acquired_via_of(&pool, "commander_records", "commander_id", *id).await),
+        ),
+        _ => (None, None),
+    };
+    clean_wallet_4g1(&pool, &wallet).await;
+
+    assert!(matches!(res, Ok(ReplacementOutcome::Granted(_))), "expected Granted, got {res:?}");
+    let rec = rec.expect("the replacement row");
+    assert_eq!(via.as_deref(), Some("replacement"));
+    assert_eq!((rec.rank, rec.xp, rec.stress, rec.is_kia, rec.is_shattered), (1, 0, 0, false, false));
+    assert!(rec.commander_grade.is_some(), "a replacement carries its Grade");
+    assert_eq!((rec.player_wallet, rec.campaign_id, rec.prng_seed_state), (wallet.to_vec(), c, CLAIM_SEED as i64));
+}
+
+/// 5a-4 P2 — per wipe: once the replacement dies, the member may claim again.
+#[tokio::test]
+async fn claim_replacement_again_after_the_replacement_dies() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    let wallet = [64u8; 32];
+    let (c, ids) = seed_active_member(&pool, wallet, 0x5A42_i64, 1).await;
+    set_commander_flag(&pool, ids[0], "is_kia").await;
+    let repo = PostgresCampaignJoinRepository::new(pool.clone());
+
+    let first = repo.claim_replacement(c, &wallet, CLAIM_SEED).await;
+    if let Ok(ReplacementOutcome::Granted(id)) = &first {
+        set_commander_flag(&pool, *id, "is_kia").await;
+    }
+    let second = repo.claim_replacement(c, &wallet, CLAIM_SEED + 1).await;
+    let rows = replacement_rows(&pool, wallet).await;
+    clean_wallet_4g1(&pool, &wallet).await;
+
+    let (a, b) = match (first, second) {
+        (Ok(ReplacementOutcome::Granted(a)), Ok(ReplacementOutcome::Granted(b))) => (a, b),
+        other => panic!("expected two Granted, got {other:?}"),
+    };
+    assert_ne!(a, b);
+    assert_eq!(rows, 2, "two replacements, one of them dead");
+}
+
+/// 5a-4 P3 — a living Commander blocks the claim.
+#[tokio::test]
+async fn claim_replacement_refuses_a_living_commander() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    let wallet = [65u8; 32];
+    let (c, _) = seed_active_member(&pool, wallet, 0x5A43_i64, 1).await;
+    let res = PostgresCampaignJoinRepository::new(pool.clone()).claim_replacement(c, &wallet, CLAIM_SEED).await;
+    let rows = replacement_rows(&pool, wallet).await;
+    clean_wallet_4g1(&pool, &wallet).await;
+    assert!(matches!(res, Ok(ReplacementOutcome::HasLiving)), "expected HasLiving, got {res:?}");
+    assert_eq!(rows, 0);
+}
+
+/// 5a-4 P4 — Shattered counts as living (ODQ-33).
+#[tokio::test]
+async fn claim_replacement_refuses_a_shattered_commander() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    let wallet = [66u8; 32];
+    let (c, ids) = seed_active_member(&pool, wallet, 0x5A44_i64, 1).await;
+    set_commander_flag(&pool, ids[0], "is_shattered").await;
+    let res = PostgresCampaignJoinRepository::new(pool.clone()).claim_replacement(c, &wallet, CLAIM_SEED).await;
+    let rows = replacement_rows(&pool, wallet).await;
+    clean_wallet_4g1(&pool, &wallet).await;
+    assert!(matches!(res, Ok(ReplacementOutcome::HasLiving)), "expected HasLiving, got {res:?}");
+    assert_eq!(rows, 0);
+}
+
+/// 5a-4 P5 — a live replacement blocks a second claim.
+#[tokio::test]
+async fn claim_replacement_refuses_while_the_replacement_lives() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    let wallet = [67u8; 32];
+    let (c, ids) = seed_active_member(&pool, wallet, 0x5A45_i64, 1).await;
+    set_commander_flag(&pool, ids[0], "is_kia").await;
+    let repo = PostgresCampaignJoinRepository::new(pool.clone());
+    let first = repo.claim_replacement(c, &wallet, CLAIM_SEED).await;
+    let second = repo.claim_replacement(c, &wallet, CLAIM_SEED + 1).await;
+    let rows = replacement_rows(&pool, wallet).await;
+    clean_wallet_4g1(&pool, &wallet).await;
+    assert!(matches!(first, Ok(ReplacementOutcome::Granted(_))), "expected Granted, got {first:?}");
+    assert!(matches!(second, Ok(ReplacementOutcome::HasLiving)), "expected HasLiving, got {second:?}");
+    assert_eq!(rows, 1);
+}
+
+/// 5a-4 P6 — the in-transaction membership miss is `NotMember` (the route's second `403`).
+#[tokio::test]
+async fn claim_replacement_non_member_is_not_member() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    let wallet = [68u8; 32];
+    clean_wallet_4g1(&pool, &wallet).await;
+    seed_account(&pool, wallet).await;
+    let campaigns = PostgresCampaignRepository::new(pool.clone());
+    let c = campaigns
+        .create_campaign(&NewCampaignInstance { sector_id: uuid::Uuid::new_v4(), map_seed: 0x5A46_i64 })
+        .await.expect("create campaign").campaign_id;
+    let activated = campaigns
+        .activate_campaign(c, chrono::Utc::now() + chrono::Duration::days(90), serde_json::json!({}))
+        .await.expect("activate_campaign");
+
+    let res = PostgresCampaignJoinRepository::new(pool.clone()).claim_replacement(c, &wallet, CLAIM_SEED).await;
+    let rows = replacement_rows(&pool, wallet).await;
+    // No roster or membership row names this campaign, so clean_wallet_4g1 can't find it.
+    delete_campaign(&pool, c).await;
+    clean_wallet_4g1(&pool, &wallet).await;
+
+    assert!(activated, "the campaign must activate");
+    assert!(matches!(res, Ok(ReplacementOutcome::NotMember)), "expected NotMember, got {res:?}");
+    assert_eq!(rows, 0);
+}
+
+/// 5a-4 P7 — a member with no Commander at all is an integrity error, and nothing is granted.
+/// Collect → clean → assert, so a granted row (under N3a) is cleaned too.
+#[tokio::test]
+async fn claim_replacement_zero_commanders_is_internal() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    let wallet = [69u8; 32];
+    let (c, _) = seed_active_member(&pool, wallet, 0x5A47_i64, 0).await;
+    let res = PostgresCampaignJoinRepository::new(pool.clone()).claim_replacement(c, &wallet, CLAIM_SEED).await;
+    let rows = replacement_rows(&pool, wallet).await;
+    clean_wallet_4g1(&pool, &wallet).await;
+    match res {
+        Err(RepositoryError::Internal(m)) => assert!(m.contains("no Commanders"), "unexpected text: {m}"),
+        other => panic!("expected Internal, got {other:?}"),
+    }
+    assert_eq!(rows, 0, "nothing is granted");
+}
+
+/// Waits (≤ 10 s) until B is held or done: B parked at its own seam (the no-lock negative's
+/// exit), B finished, or `pg_stat_activity` shows B waiting on a lock in the claim's
+/// membership `FOR UPDATE`. A row-lock wait never shows in `pg_locks` as the join key, so
+/// `wait_until_b_is_held` can't see it.
+async fn wait_until_b_waits_on_the_membership_row<T>(
+    wide: &sqlx::PgPool,
+    parked: &mut tokio::sync::mpsc::UnboundedReceiver<()>,
+    b: &tokio::task::JoinHandle<T>,
+) {
+    use std::time::Duration;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if parked.try_recv().is_ok() || b.is_finished() { return; }
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity
+             WHERE datname = current_database() AND pid <> pg_backend_pid()
+               AND wait_event_type = 'Lock'
+               AND query LIKE '%FROM player_campaign_membership%FOR UPDATE%'"
+        ).fetch_one(wide).await.expect("pg_stat_activity poll failed");
+        if waiting == 1 { return; }
+        assert!(tokio::time::Instant::now() < deadline, "B neither parked, waited on the membership row, nor finished");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// 5a-4 P8 — two concurrent claims by one all-KIA member yield exactly one replacement: A
+/// parks after its eligibility read holding the membership row; B waits on the row (or, with
+/// the lock removed, parks at its own seam); the gate releases every parked racer.
+#[tokio::test]
+async fn concurrent_replacement_claims_yield_one() {
+    use std::time::Duration;
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    let wallet = [70u8; 32];
+    let (c, ids) = seed_active_member(&pool, wallet, 0x5A48_i64, 1).await;
+    set_commander_flag(&pool, ids[0], "is_kia").await;
+    let wide = wide_pool().await;
+
+    let (hook, mut parked, gate) = join_pause_hook();
+    let repo = std::sync::Arc::new(PostgresCampaignJoinRepository::with_pause_seam(wide.clone(), hook));
+    let ra = repo.clone();
+    let task_a = tokio::spawn(async move { ra.claim_replacement(c, &wallet, CLAIM_SEED).await });
+    tokio::time::timeout(Duration::from_secs(10), parked.recv())
+        .await.expect("A never parked").expect("A never parked");
+    let rb = repo.clone();
+    let task_b = tokio::spawn(async move { rb.claim_replacement(c, &wallet, CLAIM_SEED + 1).await });
+    wait_until_b_waits_on_the_membership_row(&wide, &mut parked, &task_b).await;
+    gate.send(true).expect("open the gate");
+    let ra = task_a.await.expect("A panicked");
+    let rb = task_b.await.expect("B panicked");
+
+    let rows = replacement_rows(&pool, wallet).await;
+    clean_wallet_4g1(&pool, &wallet).await;
+
+    let (ra, rb) = match (ra, rb) {
+        (Ok(a), Ok(b)) => (a, b),
+        other => panic!("both calls Ok: {other:?}"),
+    };
+    assert!(
+        matches!((ra, rb), (ReplacementOutcome::Granted(_), ReplacementOutcome::HasLiving) | (ReplacementOutcome::HasLiving, ReplacementOutcome::Granted(_))),
+        "one Granted and one HasLiving: {ra:?} / {rb:?}"
+    );
+    assert_eq!(rows, 1, "exactly one replacement");
+}
+
+/// 5a-4 P9 — `commander_records_one_live_replacement` refuses a second living replacement
+/// (direct `UPDATE`, unchecked SQL); once the first is KIA, the second is accepted.
+#[tokio::test]
+async fn second_live_replacement_refused_by_index() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    let wallet = [71u8; 32];
+    let (_, ids) = seed_active_member(&pool, wallet, 0x5A49_i64, 2).await;
+    let (a, b) = (ids[0], ids[1]);
+    let sql = "UPDATE commander_records SET acquired_via = 'replacement' WHERE commander_id = $1";
+
+    let first = sqlx::query(sql).bind(a).execute(&pool).await;
+    let second = sqlx::query(sql).bind(b).execute(&pool).await;
+    set_commander_flag(&pool, a, "is_kia").await;
+    let after_death = sqlx::query(sql).bind(b).execute(&pool).await;
+    clean_wallet_4g1(&pool, &wallet).await;
+
+    assert_eq!(first.expect("the first replacement must be accepted").rows_affected(), 1);
+    assert_unique_violation(second, "commander_records_one_live_replacement");
+    assert_eq!(after_death.expect("a dead replacement leaves the index").rows_affected(), 1);
+}
+
+/// 5a-4 P10 — end to end on Postgres: a real join, the launch's state change, the starter
+/// dies, and the route grants a `'replacement'` Commander (`201`).
+#[tokio::test]
+async fn replacement_route_end_to_end_on_postgres() {
+    use axum::{body::Body, http::{Request, StatusCode}};
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    let wallet = [72u8; 32];
+    clean_wallet_4g1(&pool, &wallet).await;
+    assert_no_pending_campaign(&pool).await; // the join's pick is global
+    seed_account(&pool, wallet).await;
+
+    let mut state = pg_route_state(&pool);
+    std::sync::Arc::make_mut(&mut state.config).server.join_enabled = true; // 5a-3c: joins are off by default
+    let state = std::sync::Arc::new(state);
+    let token = insert_session(&state, wallet);
+    let post = |uri: String| Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+
+    let (join_status, join_body) = send(&state, post("/api/campaign/join".into())).await;
+    let joined: serde_json::Value = serde_json::from_str(&join_body).unwrap_or(serde_json::Value::Null);
+    let uuid_of = |v: &serde_json::Value, key: &str| v[key].as_str().and_then(|s| uuid::Uuid::parse_str(s).ok());
+    let (campaign_id, starter) = (uuid_of(&joined, "campaign_id"), uuid_of(&joined, "commander_id"));
+
+    let mut claim = None;
+    if let (Some(c), Some(s)) = (campaign_id, starter) {
+        let activated = PostgresCampaignRepository::new(pool.clone())
+            .activate_campaign(c, chrono::Utc::now() + chrono::Duration::days(90), serde_json::json!({}))
+            .await
+            .expect("activate_campaign");
+        set_commander_flag(&pool, s, "is_kia").await;
+        let (status, body) = send(&state, post(format!("/api/campaign/{c}/replacement-commander"))).await;
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+        let via = match uuid_of(&body, "commander_id") {
+            Some(id) => Some(acquired_via_of(&pool, "commander_records", "commander_id", id).await),
+            None => None,
+        };
+        claim = Some((activated, status, body, via));
+    }
+    let rows = replacement_rows(&pool, wallet).await;
+    clean_wallet_4g1(&pool, &wallet).await;
+
+    assert_eq!(join_status, StatusCode::CREATED, "{join_body}");
+    let (activated, status, body, via) = claim.expect("the join returned ids");
+    assert!(activated, "the joined campaign must activate");
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(uuid_of(&body, "campaign_id"), campaign_id);
+    assert_ne!(uuid_of(&body, "commander_id"), starter);
+    assert_eq!(via.as_deref(), Some("replacement"));
+    assert_eq!(rows, 1);
+}

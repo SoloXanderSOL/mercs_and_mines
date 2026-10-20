@@ -1,24 +1,27 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
     routing::post,
     Json, Router,
 };
 use serde_json::json;
+use uuid::Uuid;
 
 use sim_engine::rng::generate_seed;
 
 use crate::auth::AuthSession;
-use crate::repository::{JoinOutcome, JoinSeeds, StarterIds, SECTOR_PLAYER_CAP};
+use crate::repository::{CampaignLifecycle, JoinOutcome, JoinSeeds, ReplacementOutcome, StarterIds, SECTOR_PLAYER_CAP};
 use crate::state::AppState;
 
-use super::{internal_error, service_unavailable, unauthorized, AppError};
+use super::{conflict, forbidden, internal_error, not_found, service_unavailable, unauthorized, AppError};
 
 pub fn router() -> Router<Arc<AppState>> {
-    Router::new().route("/api/campaign/join", post(post_campaign_join))
+    Router::new()
+        .route("/api/campaign/join", post(post_campaign_join))
+        .route("/api/campaign/:campaign_id/replacement-commander", post(post_replacement_commander))
 }
 
 /// The response body. Built here so the repository's `StarterIds` never becomes the API
@@ -72,16 +75,69 @@ async fn post_campaign_join(
     })
 }
 
+// TODO(phase-2-§10j): alpha-only replacement; removed when the Phase 2 Bootcamp hire ships (ODQ-33).
+/// The alpha KIA replacement (5a-4, ODQ-33): `201` with a new Rank 1 Commander for a member
+/// whose Commanders are all KIA.
+///
+/// - Order (5a-3b's house pattern): `401` → `404` campaign → `403` non-member (any membership
+///   row) → `409` not `Active` (read before the transaction, as dispatch does) → the claim.
+/// - **Not behind the join switch** (Reviewer 5a-3c CF3): only a member gets past `403`, and
+///   while joins are closed production has none.
+/// - In the claim: `403` again if the membership vanished, `409` if any Commander is not KIA
+///   (Shattered counts as living), and `500` for a member with no Commander at all.
+/// - Not a logged input: the generator roll is a server decision stored in its record.
+async fn post_replacement_commander(
+    AuthSession(token): AuthSession,
+    State(state): State<Arc<AppState>>,
+    Path(campaign_id): Path<Uuid>,
+) -> Result<impl IntoResponse, AppError> {
+    let wallet: Vec<u8> = bs58::decode(&token.wallet_address)
+        .into_vec()
+        .map_err(|_| unauthorized("session wallet is not valid base58"))?;
+
+    let campaign = match state.campaign_repo.get_campaign(campaign_id).await {
+        Ok(Some(c)) => c,
+        Ok(None) => return Err(not_found("campaign not found")),
+        Err(e) => {
+            return Err(internal_error(format!("post_replacement_commander: get_campaign failed for campaign {campaign_id}: {e}")));
+        }
+    };
+    match state.membership_repo.get_membership(&wallet, campaign_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return Err(forbidden("not a member of this campaign")),
+        Err(e) => {
+            return Err(internal_error(format!("post_replacement_commander: membership read failed for campaign {campaign_id}: {e}")));
+        }
+    }
+    if campaign.state != CampaignLifecycle::Active {
+        return Err(conflict("campaign is not active"));
+    }
+
+    let outcome = state
+        .campaign_join_repo
+        .claim_replacement(campaign_id, &wallet, generate_seed())
+        .await
+        .map_err(|e| internal_error(format!("post_replacement_commander: claim failed for campaign {campaign_id}: {e}")))?;
+
+    match outcome {
+        ReplacementOutcome::Granted(id) => Ok((
+            StatusCode::CREATED,
+            Json(json!({"campaign_id": campaign_id, "commander_id": id})),
+        )),
+        ReplacementOutcome::NotMember => Err(forbidden("not a member of this campaign")),
+        ReplacementOutcome::HasLiving => Err(conflict("member has a living Commander")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::repository::{CampaignLifecycle, NewCampaignInstance};
+    use crate::repository::NewCampaignInstance;
     use axum::body::Body;
     use axum::http::Request;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
-    use uuid::Uuid;
 
     const WALLET: [u8; 32] = [7u8; 32];
 
@@ -188,5 +244,175 @@ mod tests {
         state.membership_repo.add_member(&WALLET, campaign.campaign_id, None, None).await.unwrap();
         let (status, body) = join(Arc::new(state), Some("t")).await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    }
+
+    // ── 5a-4: the alpha KIA replacement ──────────────────────────────────────
+
+    const OTHER: [u8; 32] = [8u8; 32];
+
+    async fn claim(state: Arc<AppState>, token: Option<&str>, campaign: &str) -> (StatusCode, serde_json::Value) {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/campaign/{campaign}/replacement-commander"));
+        if let Some(t) = token {
+            req = req.header("authorization", format!("Bearer {t}"));
+        }
+        let resp = router().with_state(state).oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+    }
+
+    async fn activate(state: &AppState, campaign_id: Uuid) {
+        let ok = state.campaign_repo
+            .activate_campaign(campaign_id, chrono::Utc::now() + chrono::Duration::days(90), json!({}))
+            .await
+            .unwrap();
+        assert!(ok, "the campaign must activate");
+    }
+
+    /// `WALLET` joins (switch on) and its campaign is launched. Returns (campaign, starter).
+    async fn active_member() -> (Arc<AppState>, Uuid, Uuid) {
+        let state = Arc::new(joined_state());
+        let (status, body) = join(state.clone(), Some("t")).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (campaign_id, commander_id) = (id(&body, "campaign_id"), id(&body, "commander_id"));
+        activate(&state, campaign_id).await;
+        (state, campaign_id, commander_id)
+    }
+
+    /// An `Active` campaign that `WALLET` is not a member of (`OTHER` is).
+    async fn active_campaign_without_wallet(state: &AppState) -> Uuid {
+        let c = state.campaign_repo
+            .create_campaign(&NewCampaignInstance { sector_id: Uuid::new_v4(), map_seed: 1 })
+            .await
+            .unwrap()
+            .campaign_id;
+        state.membership_repo.add_member(&OTHER, c, None, None).await.unwrap();
+        activate(state, c).await;
+        c
+    }
+
+    /// L1 — no session is `401`.
+    #[tokio::test]
+    async fn replacement_requires_a_session() {
+        let (state, campaign_id, _) = active_member().await;
+        let (status, _) = claim(state, None, &campaign_id.to_string()).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// L2 — an unknown campaign is `404`.
+    #[tokio::test]
+    async fn replacement_unknown_campaign_is_404() {
+        let state = Arc::new(joined_state());
+        let (status, body) = claim(state, Some("t"), &Uuid::new_v4().to_string()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body, json!({"error": "campaign not found"}));
+    }
+
+    /// L3 — a non-member is `403`, and nothing is written.
+    #[tokio::test]
+    async fn replacement_non_member_is_403() {
+        let state = joined_state();
+        let c = active_campaign_without_wallet(&state).await;
+        let state = Arc::new(state);
+        let (status, body) = claim(state.clone(), Some("t"), &c.to_string()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body, json!({"error": "not a member of this campaign"}));
+        assert!(state.commander_repo.list_commanders_by_campaign(c).await.unwrap().is_empty());
+    }
+
+    /// L4 — a member of a campaign that is not `Active` is `409`, even with every Commander KIA.
+    #[tokio::test]
+    async fn replacement_campaign_not_active_is_409() {
+        let state = Arc::new(joined_state());
+        let (status, body) = join(state.clone(), Some("t")).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (c, starter) = (id(&body, "campaign_id"), id(&body, "commander_id"));
+        state.commander_repo.set_kia(starter).await.unwrap();
+        let (status, body) = claim(state.clone(), Some("t"), &c.to_string()).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body, json!({"error": "campaign is not active"}));
+        assert_eq!(state.commander_repo.list_commanders_by_campaign(c).await.unwrap().len(), 1);
+    }
+
+    /// L5 — a living starter is `409`.
+    #[tokio::test]
+    async fn replacement_with_a_living_commander_is_409() {
+        let (state, c, _) = active_member().await;
+        let (status, body) = claim(state.clone(), Some("t"), &c.to_string()).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body, json!({"error": "member has a living Commander"}));
+        assert_eq!(state.commander_repo.list_commanders_by_campaign(c).await.unwrap().len(), 1);
+    }
+
+    /// L6 — Shattered counts as living (ODQ-33: Rehabilitation is its recovery path).
+    #[tokio::test]
+    async fn replacement_with_a_shattered_commander_is_409() {
+        let (state, c, starter) = active_member().await;
+        state.commander_repo.set_shattered(starter).await.unwrap();
+        let (status, body) = claim(state.clone(), Some("t"), &c.to_string()).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body, json!({"error": "member has a living Commander"}));
+        assert_eq!(state.commander_repo.list_commanders_by_campaign(c).await.unwrap().len(), 1);
+    }
+
+    /// L7 — an all-KIA member gets one Rank 1 replacement; a second claim while it lives is `409`.
+    #[tokio::test]
+    async fn all_kia_member_gets_one_replacement_then_409() {
+        let (state, c, starter) = active_member().await;
+        state.commander_repo.set_kia(starter).await.unwrap();
+
+        let (status, body) = claim(state.clone(), Some("t"), &c.to_string()).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(id(&body, "campaign_id"), c);
+        let rep = state.commander_repo.get_commander(id(&body, "commander_id")).await.unwrap().expect("replacement");
+        assert_ne!(rep.commander_id, starter);
+        assert_eq!((rep.rank, rep.xp, rep.stress, rep.is_kia, rep.is_shattered), (1, 0, 0, false, false));
+        assert!(rep.commander_grade.is_some(), "a replacement carries its Grade");
+        assert_eq!((rep.player_wallet.clone(), rep.campaign_id), (WALLET.to_vec(), c));
+
+        let (status, body) = claim(state.clone(), Some("t"), &c.to_string()).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body, json!({"error": "member has a living Commander"}));
+        assert_eq!(state.commander_repo.list_commanders_by_campaign(c).await.unwrap().len(), 2);
+    }
+
+    /// L8 — a member with no Commander at all is an integrity `500`.
+    #[tokio::test]
+    async fn replacement_with_zero_commanders_is_500() {
+        let state = joined_state();
+        let c = active_campaign_without_wallet(&state).await;
+        state.membership_repo.add_member(&WALLET, c, None, None).await.unwrap();
+        let state = Arc::new(state);
+        let (status, body) = claim(state.clone(), Some("t"), &c.to_string()).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert!(state.commander_repo.list_commanders_by_campaign(c).await.unwrap().is_empty(), "nothing is granted");
+    }
+
+    /// L9 — per wipe, not once per membership: a dead replacement can be replaced.
+    #[tokio::test]
+    async fn a_dead_replacement_can_be_replaced() {
+        let (state, c, starter) = active_member().await;
+        state.commander_repo.set_kia(starter).await.unwrap();
+        let (status, first) = claim(state.clone(), Some("t"), &c.to_string()).await;
+        assert_eq!(status, StatusCode::CREATED, "{first}");
+        state.commander_repo.set_kia(id(&first, "commander_id")).await.unwrap();
+
+        let (status, second) = claim(state.clone(), Some("t"), &c.to_string()).await;
+        assert_eq!(status, StatusCode::CREATED, "{second}");
+        assert_ne!(id(&second, "commander_id"), id(&first, "commander_id"));
+        assert_eq!(state.commander_repo.list_commanders_by_campaign(c).await.unwrap().len(), 3);
+    }
+
+    /// L10 — a malformed id: unsigned is `401` (the session extractor runs first), signed is
+    /// axum's path rejection `400`.
+    #[tokio::test]
+    async fn replacement_malformed_id_is_401_then_400() {
+        let state = Arc::new(joined_state());
+        let (status, _) = claim(state.clone(), None, "not-a-uuid").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _) = claim(state, Some("t"), "not-a-uuid").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 }

@@ -9,7 +9,10 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use super::campaign::{CampaignLifecycle, CampaignRepository, InMemoryCampaignRepository, NewCampaignInstance};
-use super::campaign_join::{CampaignJoinRepository, JoinOutcome, JoinSeeds, LaunchStart, StarterIds, NO_STARTER_SET};
+use super::campaign_join::{
+    CampaignJoinRepository, JoinOutcome, JoinSeeds, LaunchStart, ReplacementOutcome, StarterIds, NO_COMMANDERS,
+    NO_STARTER_SET,
+};
 use super::commander::{CommanderRepository, InMemoryCommanderRepository};
 use super::crew::{CrewRecord, CrewRepository, InMemoryCrewRepository};
 use super::foreman::{ForemanRepository, InMemoryForemanRepository};
@@ -45,6 +48,10 @@ pub struct InMemoryCampaignJoinRepository {
     crews:       Arc<InMemoryCrewRepository>,
     /// The join lock, and the starter ids of every join made through this instance.
     starters:    tokio::sync::Mutex<HashMap<(Vec<u8>, Uuid), StarterIds>>,
+    /// The replacement-claim lock (5a-4), never `starters`: the Postgres claim never takes the
+    /// join key. It serialises claims through this instance, so this impl does not model
+    /// `commander_records_one_live_replacement` (0031); the stores hold no `acquired_via`.
+    claims:      tokio::sync::Mutex<()>,
 }
 
 impl InMemoryCampaignJoinRepository {
@@ -64,6 +71,7 @@ impl InMemoryCampaignJoinRepository {
             sections,
             crews,
             starters: tokio::sync::Mutex::new(HashMap::new()),
+            claims:   tokio::sync::Mutex::new(()),
         }
     }
 }
@@ -172,6 +180,36 @@ impl CampaignJoinRepository for InMemoryCampaignJoinRepository {
             return Ok(LaunchStart::NotPending);
         }
         Ok(LaunchStart::Started { campaign, members })
+    }
+
+    /// The Postgres order under `claims`. Eligibility is read from the Commander store, so
+    /// there is no replacement map.
+    async fn claim_replacement(
+        &self,
+        campaign_id: Uuid,
+        wallet: &[u8],
+        seed: u32,
+    ) -> Result<ReplacementOutcome, RepositoryError> {
+        let _claim_lock = self.claims.lock().await;
+
+        if self.memberships.get_membership(wallet, campaign_id).await?.is_none() {
+            return Ok(ReplacementOutcome::NotMember);
+        }
+        let mine: Vec<_> = self.commanders.list_commanders_by_campaign(campaign_id).await?
+            .into_iter()
+            .filter(|c| c.player_wallet == wallet)
+            .collect();
+        if mine.is_empty() {
+            return Err(RepositoryError::Internal(NO_COMMANDERS.into()));
+        }
+        if mine.iter().any(|c| !c.is_kia) {
+            return Ok(ReplacementOutcome::HasLiving);
+        }
+
+        let record = generate_commander(wallet.to_vec(), campaign_id, seed);
+        let commander_id = record.commander_id;
+        self.commanders.create_commander(record).await?;
+        Ok(ReplacementOutcome::Granted(commander_id))
     }
 }
 

@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT count(*) AS \"total!\", count(*) FILTER (WHERE NOT is_kia) AS \"living!\" FROM commander_records WHERE campaign_id = $1 AND player_wallet = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "total!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "living!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Bytea"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "b11dd17d300c40adbdf18832474ce781de713e5e7d0fbfe834ff74375025cae9"
+}

@@ -43,7 +43,7 @@ pub use campaign::{
 };
 pub use campaign_join::{
     CampaignJoinRepository, JoinOutcome, JoinSeeds, LaunchStart, PauseHook, PostgresCampaignJoinRepository,
-    StarterIds, JOIN_ADVISORY_KEY, SECTOR_PLAYER_CAP,
+    ReplacementOutcome, StarterIds, JOIN_ADVISORY_KEY, SECTOR_PLAYER_CAP,
 };
 pub use campaign_join_in_memory::InMemoryCampaignJoinRepository;
 pub use convoy::{ConvoyDbRecord, ConvoyRepository, InMemoryConvoyRepository, PostgresConvoyRepository};
