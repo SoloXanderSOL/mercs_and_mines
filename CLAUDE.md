@@ -152,7 +152,21 @@ As of 2026-10-18:
   production until INF-6's rate limit is live; the Director turns it on.** A test that joins
   turns it on itself (the lib `joined_state()`; E1 via `Arc::make_mut(&mut state.config)`);
   `pg_route_state` leaves it off. Both bare dispatch `500`s go through `internal_error`
-  (CF5). **5a-3b and 5a-3c deploy together.** **Next: 5a-4** (the KIA replacement).
+  (CF5). **5a-3b and 5a-3c deployed together (`ce8096e`, 2026-10-20).** **5a-4 built
+  (`2caa944`, 2026-10-20; the alpha KIA replacement, ODQ-33):** `POST
+  /api/campaign/:campaign_id/replacement-commander` (`routes/campaign.rs`; **not** behind the
+  join switch): `401` → `404` → `403` non-member (any membership row) → `409` not `Active`
+  (read before the transaction) → `CampaignJoinRepository::claim_replacement(campaign_id,
+  wallet, seed: u32) -> ReplacementOutcome { Granted(Uuid), NotMember, HasLiving }` → `201`
+  `{campaign_id, commander_id}` / `403` / `409` "member has a living Commander" / `500`. The
+  Postgres claim is one transaction under the member's membership row (`SELECT … FOR UPDATE`,
+  deliberate, never `JOIN_ADVISORY_KEY`), then one count/living read, then `insert_commander`
+  with `AcquiredVia::Replacement`. Zero Commanders → `Internal(NO_COMMANDERS)` → `500`;
+  Shattered and a live replacement count as living; per wipe, not once per membership.
+  Migration `0031_one_live_replacement` is the backstop partial unique
+  (`WHERE acquired_via = 'replacement' AND NOT is_kia`). The in-memory claim takes its own
+  `claims` Mutex and does not model the index. Alpha-only: `TODO(phase-2-§10j)` ×2 (Phase 2
+  §10j removes them). Not a logged input, no R7. **Next: INF-6.**
 - **Section 6:** Not started.
 - **Sections 7 (Personnel Entity Model) and 8 (Combat Engine to canon):** created
   2026-10-13 (ruling D2); both run before Section 6. Strike Mining and Base Building moved
@@ -243,11 +257,11 @@ As of 2026-10-18:
   scenarios) and `shellcheck` run in the `deploy-script` job on every push, and the deploy
   job needs it (GAP-33).
 
-**379/379 tests green (1 `shared` + 164 `mercs_server` lib + 2 `aar_determinism` + 141
-`db_infrastructure` + 71 `sim_engine`; single-threaded, verified at `32199dc`). Workspace
-version `0.3.0`. `.sqlx/` holds 74 files; the latest migration is `0030_join_schema`.
-`main` = `145338e` (5a-3a, deployed 2026-10-19); `dev` is ahead with 5a-3b and 5a-3c, unpushed.
-Next: 5a-4; see the Phase 1 document.** Any brick that changes what `resolve_mission` produces for
+**399/399 tests green (1 `shared` + 174 `mercs_server` lib + 2 `aar_determinism` + 151
+`db_infrastructure` + 71 `sim_engine`; single-threaded, verified at `2caa944`). Workspace
+version `0.3.0`. `.sqlx/` holds 76 files; the latest migration is `0031_one_live_replacement`.
+`main` = `ce8096e` (5a-3b + 5a-3c, deployed 2026-10-20); `dev` is ahead with 5a-4, unpushed.
+Next: INF-6; see the Phase 1 document.** Any brick that changes what `resolve_mission` produces for
 a given seed bumps the workspace version in the same brick. 4b-1 reused `sim-engine`'s `OutcomeType` rather than
 defining a new enum, and writes **no input-log entry** — the rank-up entry was removed
 from scope. **ODQ-22 and ODQ-23 were ruled 2026-09-03 — engagement and mission outcomes
@@ -394,9 +408,14 @@ begins.
 
   `acquired_via` (`0030`) is written by the `insert_*` helpers' `via` parameter, never
   stored on the record structs. At most one starter per `(campaign, wallet)` by the
-  `<t>_one_starter` index; exactly one by the join transaction.
+  `<t>_one_starter` index; exactly one by the join transaction. `Replacement` (Commanders
+  only) has one writer, `claim_replacement` (5a-4): at most one living replacement per
+  `(campaign, wallet)` by `commander_records_one_live_replacement` (`0031`, the backstop);
+  the claim's membership row lock is the guard.
 
-  **`JOIN_ADVISORY_KEY` has two takers:** `join_campaign` and `begin_launch` (5a-3a). Any new
+  **`JOIN_ADVISORY_KEY` has two takers:** `join_campaign` and `begin_launch` (5a-3a). The
+  replacement claim (5a-4) takes only its member's membership row (`FOR UPDATE`, deliberate:
+  it blocks every roster insert's `FOR KEY SHARE` FK check), never the key. Any new
   writer that moves a campaign out of `Pending`, or writes a membership, takes it
   (`lock_joins`) as the first statement of the same transaction. `update_sector_state` is
   unconditional by id, so it never touches a `Pending` campaign without the key. Future
@@ -474,10 +493,10 @@ constraints — parallel execution causes FK-23503 failures that are not caused 
 code under test. Any test report produced without `--test-threads=1` is unreliable and
 must be re-run before reporting results to the Director.
 
-**Test wallets:** `tests/` uses wallet seeds 0–10, 13–19, 21–62 and 88; 11 and 12 (a range
+**Test wallets:** `tests/` uses wallet seeds 0–10, 13–19, 21–72 and 88; 11 and 12 (a range
 literal until 5a-3a) stay reserved. **20 is the auth tests' signing-key seed**
 (`SigningKey::from_bytes(&[20u8; 32])`). It is used in memory only, and its derived
-public key is not `[20u8; 32]`. The next free seed is **63**.
+public key is not `[20u8; 32]`. The next free seed is **73**.
 
 **One in-memory join per `AppState`:** `AppState::new` builds each join-shared store once and
 one `InMemoryCampaignJoinRepository` over the same `Arc`s. A test that replaces a join-read
@@ -492,7 +511,11 @@ at its own seam or shows `granted = false` in `pg_locks`; use a dedicated pool (
 connections); and require every racer's result to be `Ok` where a unique constraint would
 otherwise hide the race. An in-transaction pause seam is an injected hook on the Postgres
 impl (`None` in production, `#[doc(hidden)] pub` constructor), because integration tests
-never see `cfg(test)`. Precedent: `PostgresCampaignJoinRepository::with_pause_seam` (5a-2b).
+never see `cfg(test)`. Precedent: `PostgresCampaignJoinRepository::with_pause_seam` (5a-2b);
+its one `PauseHook` fires in three methods (`join_campaign`, `begin_launch`,
+`claim_replacement`). A racer waiting on a **row lock** never shows as the advisory key in
+`pg_locks`: detect it in `pg_stat_activity` (`wait_event_type = 'Lock'` plus the statement
+text), as `wait_until_b_waits_on_the_membership_row` does (5a-4).
 
 **Independent oracle:** A gate's expected value is never read from the code it checks. Pin
 it to a literal taken from canon or from a measurement made before the change (4d-2 N3: a
