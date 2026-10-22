@@ -12,6 +12,7 @@ pub mod convoy_collision;
 pub mod convoy_expiry;
 pub mod lifecycle;
 pub mod map_gen;
+pub mod rate_limit;
 pub mod repeat_warn;
 pub mod repository;
 pub mod routes;

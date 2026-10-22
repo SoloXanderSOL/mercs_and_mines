@@ -10,12 +10,15 @@ pub mod convoy_events;
 pub mod convoys;
 pub mod ws_combat;
 
+use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::{
-    extract::{Path, State},
-    http::StatusCode,
-    response::{IntoResponse, Json},
+    extract::{connect_info::MockConnectInfo, rejection::JsonRejection, ConnectInfo, Path, State},
+    http::{header, HeaderMap, StatusCode},
+    response::{IntoResponse, Json, Response},
     routing::{get, post},
     Router,
 };
@@ -45,6 +48,7 @@ use crate::api_types::{
 };
 use crate::commander_gen::mission_tier;
 use crate::state::AppState;
+use crate::rate_limit::{client_key, ClientKey, RateLimits, RetryAfter};
 use crate::repository::commander::log_rank_up;
 use crate::repository::{CampaignLifecycle, CombatSession, DeploymentStart, InputLogRepository, NewDeployment, RepositoryError};
 use shared::command::{command_cap, CommandCap};
@@ -90,6 +94,51 @@ fn forbidden(msg: impl Into<String>) -> AppError {
 /// not a fault.
 fn service_unavailable(msg: impl Into<String>) -> AppError {
     (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": msg.into()})))
+}
+
+/// A throttled request (INF-6c-1): the fixed JSON body plus `Retry-After` in whole seconds.
+/// No journal line: a limit is policy, not a fault.
+fn too_many_requests(r: RetryAfter) -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(header::RETRY_AFTER, r.0.to_string())],
+        Json(json!({"error": "rate limited"})),
+    )
+        .into_response()
+}
+
+/// The request's rate-limit key (`rate_limit::client_key`). `None` means the router was
+/// served without `into_make_service_with_connect_info`, which production never does, so it
+/// is a `500` through `internal_error`. The first `Shared` key per `AppState` is journalled.
+fn client_ip(
+    ci: Option<ConnectInfo<SocketAddr>>,
+    headers: &HeaderMap,
+    limits: &RateLimits,
+) -> Result<ClientKey, AppError> {
+    let Some(ConnectInfo(peer)) = ci else {
+        return Err(internal_error("no ConnectInfo: router served without into_make_service_with_connect_info"));
+    };
+    let key = client_key(peer, headers);
+    if key == ClientKey::Shared && !limits.shared_warned.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            "client IP unknown: a loopback peer without exactly one X-Real-IP; using the shared \
+             rate-limit bucket. Check nginx's `proxy_set_header X-Real-IP $remote_addr`"
+        );
+    }
+    Ok(key)
+}
+
+/// The peer the test helpers present (TEST-NET-1, non-loopback, so keyed by the peer).
+#[doc(hidden)]
+pub const TEST_PEER: SocketAddr =
+    SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1)), 1);
+
+/// Gives a test router a peer address for `ConnectInfo`. A real `ConnectInfo` extension
+/// takes precedence over `MockConnectInfo`, so a misuse in production is a no-op. `pub`
+/// (not `cfg(test)`) because integration tests use it.
+#[doc(hidden)]
+pub fn with_test_peer(router: Router, peer: SocketAddr) -> Router {
+    router.layer(MockConnectInfo(peer))
 }
 
 fn unauthorized(msg: impl Into<String>) -> AppError {
@@ -181,10 +230,24 @@ async fn get_version() -> Json<Value> {
 
 // ── Auth endpoints ─────────────────────────────────────────────────────────
 
+/// Rate-limited per client IP, in one bucket shared with `verify` (INF-6c-1). A malformed
+/// body is counted, then answered with axum's own rejection, unchanged.
 async fn post_auth_challenge(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<ChallengeRequest>,
-) -> impl IntoResponse {
+    ci: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    body: Result<Json<ChallengeRequest>, JsonRejection>,
+) -> Result<Response, AppError> {
+    let ip = client_ip(ci, &headers, &state.rate_limits)?;
+    let now_i = Instant::now();
+    if let Err(r) = state.rate_limits.sign_in_ip.check(ip, now_i) {
+        return Ok(too_many_requests(r));
+    }
+    let Json(req) = match body {
+        Ok(j) => j,
+        Err(rej) => return Ok(rej.into_response()),
+    };
+
     let nonce = Uuid::new_v4().to_string();
     let now = Utc::now().timestamp();
     let challenge_text = crate::auth::build_challenge(&req.wallet_address, &nonce, now);
@@ -198,16 +261,31 @@ async fn post_auth_challenge(
         },
     );
 
-    Json(json!({
+    Ok(Json(json!({
         "challenge":  challenge_text,
         "expires_in": expiry_secs,
     }))
+    .into_response())
 }
 
+/// Rate-limited per client IP, in the bucket shared with `challenge` (INF-6c-1). No
+/// per-wallet limit: the body's wallet is unverified here (GAP-77).
 async fn post_auth_verify(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<VerifyRequest>,
-) -> Result<impl IntoResponse, AppError> {
+    ci: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    body: Result<Json<VerifyRequest>, JsonRejection>,
+) -> Result<Response, AppError> {
+    let ip = client_ip(ci, &headers, &state.rate_limits)?;
+    let now_i = Instant::now();
+    if let Err(r) = state.rate_limits.sign_in_ip.check(ip, now_i) {
+        return Ok(too_many_requests(r));
+    }
+    let Json(req) = match body {
+        Ok(j) => j,
+        Err(rej) => return Ok(rej.into_response()),
+    };
+
     let now = Utc::now().timestamp();
 
     // Look up and consume the pending challenge (one-time use)
@@ -252,7 +330,7 @@ async fn post_auth_verify(
 
     let v = serde_json::to_value(&token)
         .map_err(|e| internal_error(format!("session token serialization failed: {e}")))?;
-    Ok(Json(v))
+    Ok(Json(v).into_response())
 }
 
 async fn get_auth_session(
@@ -803,8 +881,9 @@ mod tests {
         let buf = Buf::default();
         let w = buf.clone();
         let sub = tracing_subscriber::fmt().with_writer(move || w.clone()).with_ansi(false).finish();
-        let (status, Json(body)) =
-            tracing::subscriber::with_default(sub, || internal_error("secret-text-7f3a"));
+        // keep line!() on the same line as the internal_error call: T1 pins #[track_caller]
+        let call = || (internal_error("secret-text-7f3a"), line!());
+        let ((status, Json(body)), line) = tracing::subscriber::with_default(sub, call);
         let journal = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
 
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -816,6 +895,136 @@ mod tests {
         assert!(!body.to_string().contains("secret-text-7f3a"), "the message leaked: {body}");
         assert!(journal.contains("secret-text-7f3a"), "the journal lost the message: {journal}");
         assert!(journal.contains(&format!("error_id={id}")), "the journal lacks the id: {journal}");
-        assert!(journal.contains("routes/mod.rs"), "the journal lacks the call site: {journal}");
+        assert!(journal.contains(&format!("routes/mod.rs:{line}:")), "journal names the call site: {journal}");
+    }
+
+    // ── INF-6c-1: sign-in rate limit, client IP ───────────────────────────────
+
+    use super::{router, with_test_peer, TEST_PEER};
+    use crate::config::Config;
+    use crate::state::AppState;
+    use axum::body::Body;
+    use axum::http::{header, HeaderMap, Request};
+    use axum::Router;
+    use http_body_util::BodyExt;
+    use std::net::SocketAddr;
+    use std::sync::atomic::Ordering;
+    use tower::ServiceExt;
+
+    fn fresh_state() -> Arc<AppState> {
+        Arc::new(AppState::new(Arc::new(Config::default())))
+    }
+
+    /// One POST through `app`. `json_body: false` sends no `content-type`.
+    async fn post(
+        app: Router,
+        uri: &str,
+        body: serde_json::Value,
+        json_body: bool,
+        real_ip: Option<&str>,
+    ) -> (StatusCode, HeaderMap, serde_json::Value) {
+        let mut req = Request::builder().method("POST").uri(uri);
+        if json_body {
+            req = req.header("content-type", "application/json");
+        }
+        if let Some(ip) = real_ip {
+            req = req.header("x-real-ip", ip);
+        }
+        let resp = app.oneshot(req.body(Body::from(body.to_string())).unwrap()).await.unwrap();
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, headers, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+    }
+
+    async fn challenge(state: &Arc<AppState>, peer: SocketAddr, real_ip: Option<&str>) -> StatusCode {
+        let app = with_test_peer(router(state.clone()), peer);
+        post(app, "/api/auth/challenge", json!({"wallet_address": "w"}), true, real_ip).await.0
+    }
+
+    /// `verify` for a wallet with no pending challenge: a `400`, still counted.
+    async fn verify(state: &Arc<AppState>) -> StatusCode {
+        let app = with_test_peer(router(state.clone()), TEST_PEER);
+        let body = json!({"wallet_address": "nobody", "challenge": "c", "signature": "s"});
+        post(app, "/api/auth/verify", body, true, None).await.0
+    }
+
+    #[tokio::test]
+    async fn sign_in_shares_one_ip_bucket() {
+        let state = fresh_state();
+        let mut statuses = Vec::new();
+        for _ in 0..10 {
+            statuses.push(challenge(&state, TEST_PEER, None).await);
+        }
+        for _ in 0..10 {
+            statuses.push(verify(&state).await);
+        }
+        statuses.push(challenge(&state, TEST_PEER, None).await);
+        let mut expected = vec![StatusCode::OK; 10];
+        expected.extend([StatusCode::BAD_REQUEST; 10]);
+        expected.push(StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(statuses, expected);
+    }
+
+    #[tokio::test]
+    async fn sign_in_counts_a_malformed_body() {
+        let state = fresh_state();
+        let mut statuses = Vec::new();
+        for _ in 0..20 {
+            let app = with_test_peer(router(state.clone()), TEST_PEER);
+            statuses.push(post(app, "/api/auth/challenge", json!({"wallet_address": "w"}), false, None).await.0);
+        }
+        statuses.push(challenge(&state, TEST_PEER, None).await);
+        let mut expected = vec![StatusCode::UNSUPPORTED_MEDIA_TYPE; 20];
+        expected.push(StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(statuses, expected, "axum's rejection is unchanged, and it is counted");
+    }
+
+    #[tokio::test]
+    async fn a_spoofed_x_real_ip_from_a_non_loopback_peer_shares_the_peer_bucket() {
+        let state = fresh_state();
+        let mut statuses = Vec::new();
+        for i in 0..21 {
+            statuses.push(challenge(&state, TEST_PEER, Some(&format!("198.51.100.{i}"))).await);
+        }
+        let mut expected = vec![StatusCode::OK; 20];
+        expected.push(StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(statuses, expected);
+    }
+
+    #[tokio::test]
+    async fn rate_limited_answer_has_the_fixed_body_and_retry_after() {
+        let state = fresh_state();
+        for _ in 0..20 {
+            assert_eq!(challenge(&state, TEST_PEER, None).await, StatusCode::OK);
+        }
+        let app = with_test_peer(router(state.clone()), TEST_PEER);
+        let (status, headers, body) =
+            post(app, "/api/auth/challenge", json!({"wallet_address": "w"}), true, None).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body, json!({"error": "rate limited"}));
+        let secs: u64 = headers[header::RETRY_AFTER].to_str().unwrap().parse().unwrap();
+        assert!((1..=60).contains(&secs), "Retry-After {secs}");
+    }
+
+    /// Served without a peer, the route cannot key the request. `challenge` has no other
+    /// `500` path, so this one is the missing-`ConnectInfo` arm.
+    #[tokio::test]
+    async fn missing_connect_info_is_a_500() {
+        let state = fresh_state();
+        let (status, _, body) =
+            post(router(state), "/api/auth/challenge", json!({"wallet_address": "w"}), true, None).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["error"], "internal error");
+        assert!(body["error_id"].is_string(), "an error_id is present: {body}");
+    }
+
+    #[tokio::test]
+    async fn a_loopback_peer_without_x_real_ip_warns_once() {
+        let state = fresh_state();
+        challenge(&state, TEST_PEER, None).await;
+        assert!(!state.rate_limits.shared_warned.load(Ordering::Relaxed), "a keyed peer does not warn");
+        challenge(&state, "127.0.0.1:1".parse().unwrap(), None).await;
+        assert!(state.rate_limits.shared_warned.load(Ordering::Relaxed), "the shared bucket warns");
     }
 }

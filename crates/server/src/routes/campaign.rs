@@ -1,9 +1,11 @@
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::{
-    extract::{Path, State},
-    http::StatusCode,
-    response::IntoResponse,
+    extract::{ConnectInfo, Path, State},
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
     routing::post,
     Json, Router,
 };
@@ -16,7 +18,10 @@ use crate::auth::AuthSession;
 use crate::repository::{CampaignLifecycle, JoinOutcome, JoinSeeds, ReplacementOutcome, StarterIds, SECTOR_PLAYER_CAP};
 use crate::state::AppState;
 
-use super::{conflict, forbidden, internal_error, not_found, service_unavailable, unauthorized, AppError};
+use super::{
+    client_ip, conflict, forbidden, internal_error, not_found, service_unavailable, too_many_requests,
+    unauthorized, AppError,
+};
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -46,12 +51,25 @@ fn starter_ids_body(ids: &StarterIds) -> serde_json::Value {
 ///   stored in their records.
 /// - While the join switch is off (5a-3c), every signed-in caller gets `503` before any
 ///   database read or the join lock.
+/// - Rate limits (INF-6c-1), after the switch: `429` per client IP, then `429` per wallet.
+///   While the switch is off nothing is counted.
 async fn post_campaign_join(
     AuthSession(session): AuthSession,
     State(state): State<Arc<AppState>>,
-) -> Result<impl IntoResponse, AppError> {
+    ci: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
     if !state.config.server.join_enabled {
         return Err(service_unavailable("campaign joins are closed"));
+    }
+
+    let ip = client_ip(ci, &headers, &state.rate_limits)?;
+    let now = Instant::now();
+    if let Err(r) = state.rate_limits.join_ip.check(ip, now) {
+        return Ok(too_many_requests(r));
+    }
+    if let Err(r) = state.rate_limits.join_wallet.check(session.wallet_address.clone(), now) {
+        return Ok(too_many_requests(r));
     }
 
     let wallet: Vec<u8> = bs58::decode(&session.wallet_address)
@@ -72,15 +90,18 @@ async fn post_campaign_join(
     Ok(match outcome {
         JoinOutcome::Joined(ids) => (StatusCode::CREATED, Json(starter_ids_body(&ids))),
         JoinOutcome::AlreadyMember(ids) => (StatusCode::OK, Json(starter_ids_body(&ids))),
-    })
+    }
+    .into_response())
 }
 
 // TODO(phase-2-§10j): alpha-only replacement; removed when the Phase 2 Bootcamp hire ships (ODQ-33).
 /// The alpha replacement (5a-4, ODQ-33; ODQ-46 since 5a-5): `201` with a new Rank 1 Commander
 /// for a member with no usable Commander (every one KIA or Shattered).
 ///
-/// - Order (5a-3b's house pattern): `401` → `404` campaign → `403` non-member (any membership
-///   row) → `409` not `Active` (read before the transaction, as dispatch does) → the claim.
+/// - Order (5a-3b's house pattern): `401` → `429` per client IP → `429` per wallet (INF-6c-1;
+///   a throttled caller costs no read and no row lock) → `404` campaign → `403` non-member (any
+///   membership row) → `409` not `Active` (read before the transaction, as dispatch does) →
+///   the claim.
 /// - **Not behind the join switch** (Reviewer 5a-3c CF3): only a member gets past `403`, and
 ///   while joins are closed production has none.
 /// - In the claim: `403` again if the membership vanished, `409` if any Commander is usable
@@ -89,8 +110,19 @@ async fn post_campaign_join(
 async fn post_replacement_commander(
     AuthSession(token): AuthSession,
     State(state): State<Arc<AppState>>,
+    ci: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
     Path(campaign_id): Path<Uuid>,
-) -> Result<impl IntoResponse, AppError> {
+) -> Result<Response, AppError> {
+    let ip = client_ip(ci, &headers, &state.rate_limits)?;
+    let now = Instant::now();
+    if let Err(r) = state.rate_limits.replacement_ip.check(ip, now) {
+        return Ok(too_many_requests(r));
+    }
+    if let Err(r) = state.rate_limits.replacement_wallet.check(token.wallet_address.clone(), now) {
+        return Ok(too_many_requests(r));
+    }
+
     let wallet: Vec<u8> = bs58::decode(&token.wallet_address)
         .into_vec()
         .map_err(|_| unauthorized("session wallet is not valid base58"))?;
@@ -123,7 +155,8 @@ async fn post_replacement_commander(
         ReplacementOutcome::Granted(id) => Ok((
             StatusCode::CREATED,
             Json(json!({"campaign_id": campaign_id, "commander_id": id})),
-        )),
+        )
+            .into_response()),
         ReplacementOutcome::NotMember => Err(forbidden("not a member of this campaign")),
         ReplacementOutcome::HasUsable => Err(conflict("member has a usable Commander")),
     }
@@ -134,6 +167,7 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::repository::NewCampaignInstance;
+    use crate::routes::{with_test_peer, TEST_PEER};
     use axum::body::Body;
     use axum::http::Request;
     use http_body_util::BodyExt;
@@ -168,7 +202,10 @@ mod tests {
         if let Some(t) = token {
             req = req.header("authorization", format!("Bearer {t}"));
         }
-        let resp = router().with_state(state).oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+        let resp = with_test_peer(router().with_state(state), TEST_PEER)
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
         let status = resp.status();
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
@@ -257,7 +294,10 @@ mod tests {
         if let Some(t) = token {
             req = req.header("authorization", format!("Bearer {t}"));
         }
-        let resp = router().with_state(state).oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+        let resp = with_test_peer(router().with_state(state), TEST_PEER)
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
         let status = resp.status();
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
@@ -415,5 +455,78 @@ mod tests {
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         let (status, _) = claim(state, Some("t"), "not-a-uuid").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    // ── INF-6c-1: rate limits ────────────────────────────────────────────────
+
+    /// Adds a live session `token` for `wallet` (in-memory only).
+    fn add_session(state: &AppState, wallet: [u8; 32], token: &str) {
+        let wallet = bs58::encode(wallet).into_string();
+        let now = chrono::Utc::now().timestamp();
+        state.sessions.insert(token.into(), shared::SessionToken {
+            token_id: token.into(),
+            account_id: wallet.clone(),
+            wallet_address: wallet,
+            issued_at: now,
+            expires_at: now + 600,
+        });
+    }
+
+    /// `joined_state` plus sessions `"w0"`…`"w{n-1}"` for wallets `[100 + i; 32]`.
+    fn with_sessions(n: u8) -> Arc<AppState> {
+        let state = joined_state();
+        for i in 0..n {
+            add_session(&state, [100 + i; 32], &format!("w{i}"));
+        }
+        Arc::new(state)
+    }
+
+    #[tokio::test]
+    async fn join_per_wallet_limit() {
+        let state = Arc::new(joined_state());
+        let mut statuses = Vec::new();
+        for _ in 0..4 {
+            statuses.push(join(state.clone(), Some("t")).await.0);
+        }
+        assert_eq!(
+            statuses,
+            [StatusCode::CREATED, StatusCode::OK, StatusCode::OK, StatusCode::TOO_MANY_REQUESTS]
+        );
+    }
+
+    #[tokio::test]
+    async fn join_per_ip_limit() {
+        let state = with_sessions(11);
+        let mut statuses = Vec::new();
+        for i in 0..11 {
+            statuses.push(join(state.clone(), Some(&format!("w{i}"))).await.0);
+        }
+        let mut expected = vec![StatusCode::CREATED; 10];
+        expected.push(StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(statuses, expected);
+    }
+
+    #[tokio::test]
+    async fn replacement_per_wallet_limit() {
+        let state = Arc::new(joined_state());
+        let mut statuses = Vec::new();
+        for _ in 0..4 {
+            statuses.push(claim(state.clone(), Some("t"), &Uuid::new_v4().to_string()).await.0);
+        }
+        let mut expected = vec![StatusCode::NOT_FOUND; 3];
+        expected.push(StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(statuses, expected, "the limit is checked before the campaign read");
+    }
+
+    #[tokio::test]
+    async fn replacement_per_ip_limit() {
+        let state = with_sessions(11);
+        let mut statuses = Vec::new();
+        for i in 0..11 {
+            statuses.push(claim(state.clone(), Some(&format!("w{i}")), &Uuid::new_v4().to_string()).await.0);
+        }
+        let mut expected = vec![StatusCode::NOT_FOUND; 10];
+        expected.push(StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(statuses, expected);
     }
 }

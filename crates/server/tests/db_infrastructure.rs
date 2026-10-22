@@ -4036,7 +4036,9 @@ async fn send(
 ) -> (axum::http::StatusCode, String) {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
-    let resp = mercs_server::routes::router(std::sync::Arc::clone(state)).oneshot(req).await.unwrap();
+    use mercs_server::routes::{with_test_peer, TEST_PEER};
+    let app = with_test_peer(mercs_server::routes::router(std::sync::Arc::clone(state)), TEST_PEER);
+    let resp = app.oneshot(req).await.unwrap();
     let status = resp.status();
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     (status, String::from_utf8(bytes.to_vec()).unwrap())

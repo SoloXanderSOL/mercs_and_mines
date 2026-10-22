@@ -108,5 +108,5 @@ async fn main() {
             "listening on {bind_addr}, but could not read the bound address ({e}); skipping the public-bind check"
         ),
     }
-    axum::serve(listener, app).await.expect("Server error");
+    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.expect("Server error");
 }

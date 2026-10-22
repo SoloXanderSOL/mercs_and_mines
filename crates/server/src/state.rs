@@ -5,6 +5,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
 use crate::config::Config;
 use crate::convoy_expiry::ConvoyEvent;
+use crate::rate_limit::RateLimits;
 use crate::repository::{
     AccountRepository, InMemoryAccountRepository,
     CampaignRepository, InMemoryCampaignRepository,
@@ -58,6 +59,8 @@ pub struct AppState {
     /// Redis connection manager. None only in unit-test contexts that use in-memory repos.
     /// Production startup panics if REDIS_URL is unset; always Some in prod.
     pub redis: Option<redis::aio::ConnectionManager>,
+    /// The sign-in, join and replacement rate limits (INF-6c-1). Fresh per `AppState`.
+    pub rate_limits: RateLimits,
 }
 
 impl AppState {
@@ -90,6 +93,7 @@ impl AppState {
             config,
             pool:               None,
             redis:              None,
+            rate_limits:        RateLimits::new(),
         }
     }
 }
