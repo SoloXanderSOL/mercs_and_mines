@@ -190,6 +190,13 @@ jobs:
     # this condition, any of those would ship a non-main build to the production droplet.
     # Deploy is main-only, full stop.
     if: github.ref == 'refs/heads/main'
+    # GAP-55: two deploys never race on mercs-server.prev or app.prev/. GitHub keeps one
+    # running and one pending deploy per group; a third arrival cancels the pending one
+    # even when in-progress runs are not cancelled, so the newest commit wins. That is intended.
+    # Job level, not workflow level, so dev and PR builds are never serialised.
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
     # Pinned with the build job for consistency (GAP-47); this job only runs scp/ssh/rsync.
     runs-on: ubuntu-24.04
     # Secrets reach steps only through env:, never interpolated into a run: body.
@@ -234,13 +241,16 @@ jobs:
 
       # --exclude='_dev/' keeps app/_dev/ (base_demo.html and any future scratch pages)
       # off the public host. nginx also denies /_dev/ — belt and braces, both are canon.
-      # app/ goes up before the restart (as it always has); a rollback restores the
-      # binary only, not app/ (GAP-54).
+      # GAP-54: app/ is staged in a sibling app.new directory and the live app/ is
+      # untouched until remote_deploy.sh swaps it (app -> app.prev, app.new -> app), so a
+      # rollback can restore the old front-end with the old binary. link-dest hard-links every file
+      # unchanged since the live app/, so the upload stays as small as before; rsync writes
+      # a changed file by temp-and-rename, so a hard-linked file is never edited in place.
       - name: Upload app directory to server
         run: |
-          rsync -a --delete --exclude='_dev/' \
+          rsync -a --delete --exclude='_dev/' --link-dest="$APP_PATH/app/" \
             app/ \
-            "$DEPLOY_USER@$DEPLOY_HOST:$APP_PATH/app/"
+            "$DEPLOY_USER@$DEPLOY_HOST:$APP_PATH/app.new/"
 
       # Backup, swap, restart, SHA probe and rollback are one droplet-side script, tested
       # by the deploy-script job. It exits 0 (deployed), 1 (failed, rollback verified) or

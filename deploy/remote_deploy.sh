@@ -26,6 +26,11 @@ POLL_SECS="${POLL_SECS:-2}"
 CURRENT="$APP_PATH/mercs-server"
 NEW="$APP_PATH/mercs-server.new"
 PREV="$APP_PATH/mercs-server.prev"
+# The front-end moves with the binary (GAP-54): CI uploads app.new/, the swap renames
+# app -> app.prev and app.new -> app, and a rollback renames app.prev back.
+APP_DIR="$APP_PATH/app"
+APP_NEW="$APP_PATH/app.new"
+APP_PREV="$APP_PATH/app.prev"
 LAST_SHA=none
 
 # Reads the served build SHA into SHA. On any failure SHA is empty, SHA_ERR says why,
@@ -84,8 +89,14 @@ rollback() {
   echo "Restoring mercs-server.prev..."
   mv "$PREV" "$CURRENT" || rollback_failed "could not move mercs-server.prev into place."
   chmod +x "$CURRENT" || rollback_failed "could not make the restored binary executable."
-  sudo systemctl reset-failed "$SERVICE" || true
-  sudo systemctl restart "$SERVICE" || rollback_failed "systemctl restart failed after the restore."
+  if [ -d "$APP_PREV" ]; then
+    echo "Restoring app.prev/..."
+    { rm -rf "$APP_DIR" && mv "$APP_PREV" "$APP_DIR"; } || rollback_failed "could not move app.prev/ into place."
+  else
+    echo "no app.prev/: app/ was not swapped, so there is nothing to restore."
+  fi
+  sudo -n systemctl reset-failed "$SERVICE" || true
+  sudo -n systemctl restart "$SERVICE" || rollback_failed "systemctl restart failed after the restore."
 
   if [ -n "$OLD_SHA" ]; then
     if wait_for_sha "$OLD_SHA"; then
@@ -104,7 +115,7 @@ rollback() {
 deploy_failed() {
   echo "::error::DEPLOY FAILED — $1"
   echo "----- last 50 journal lines -----"
-  sudo journalctl -u "$SERVICE" -n 50 --no-pager || true
+  sudo -n journalctl -u "$SERVICE" -n 50 --no-pager || true
   echo "---------------------------------"
   rollback
 }
@@ -113,6 +124,18 @@ if [ ! -f "$NEW" ]; then
   echo "::error::$NEW not found — nothing to deploy. The running service was not touched."
   exit 2
 fi
+if [ ! -d "$APP_NEW" ]; then
+  echo "::error::$APP_NEW is missing or not a directory — nothing to deploy. The running service was not touched."
+  exit 2
+fi
+
+# Probe every privileged command before anything changes (GAP-55). A refused command
+# would otherwise fail after the swap, and its rollback's restart would be refused too,
+# reporting "production may be down" while the old process is still running untouched.
+for cmd in "systemctl reset-failed $SERVICE" "systemctl restart $SERVICE" "journalctl -u $SERVICE -n 50 --no-pager"; do
+  # shellcheck disable=SC2086  # word-splitting $cmd is the point
+  sudo -n -l $cmd >/dev/null 2>&1 || { echo "::error::sudo -n -l refused '$cmd'. The running service was not touched."; exit 2; }
+done
 
 # 1. The running build's SHA, read before anything changes.
 OLD_SHA=""
@@ -138,16 +161,25 @@ if [ -f "$CURRENT" ]; then
 else
   echo "no previous binary; rollback unavailable"
 fi
+if ! rm -rf "$APP_PREV"; then
+  echo "::error::could not remove the stale app.prev/. The running service was not touched."
+  exit 2
+fi
 
-# 3. Swap.
+# 3. Swap: the binary, then app/. A host with no live app/ (a first deploy) has nothing
+# to keep, so it skips straight to installing app.new/.
 mv "$NEW" "$CURRENT" || deploy_failed "could not move mercs-server.new into place."
 chmod +x "$CURRENT" || deploy_failed "could not make the new binary executable."
+if [ -e "$APP_DIR" ]; then
+  mv "$APP_DIR" "$APP_PREV" || deploy_failed "could not move app/ to app.prev/."
+fi
+mv "$APP_NEW" "$APP_DIR" || deploy_failed "could not move app.new/ into place."
 
 # 4. Restart. `systemctl restart` succeeds once the process forks, so it proves nothing
 # by itself; the SHA poll below is the evidence. main.rs connects Postgres and Redis and
 # runs every migration before it binds, so a served SHA proves the whole startup path.
-sudo systemctl reset-failed "$SERVICE" || true
-sudo systemctl restart "$SERVICE" || deploy_failed "systemctl restart failed."
+sudo -n systemctl reset-failed "$SERVICE" || true
+sudo -n systemctl restart "$SERVICE" || deploy_failed "systemctl restart failed."
 
 # 5. Prove the new build is the one serving.
 echo "Polling $VERSION_URL for build_sha $EXPECTED_SHA, up to ${TIMEOUT_SECS}s..."
