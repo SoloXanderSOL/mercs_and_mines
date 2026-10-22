@@ -153,9 +153,39 @@ jobs:
       - name: Run deploy harness
         run: bash deploy/test_remote_deploy.sh
 
+  audit:
+    name: Dependency audit
+    # INF-6a: fails on any RustSec advisory, unsound crate or yanked crate not ignored in
+    # .cargo/audit.toml, on every push and PR; the deploy job needs it green. The advisory
+    # DB is fetched live, so this job can go red with no code change. The escape hatch is a
+    # dated ignore entry (ID + reason + re-check date) in the same commit as the fix.
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # The binary is cached under its pinned version: a clean install takes minutes.
+      # Bump the version here and in the install step together.
+      - name: Cache cargo-audit
+        id: cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: ${{ runner.os }}-ubuntu-24.04-cargo-audit-0.22.2
+
+      - name: Install cargo-audit
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: cargo install cargo-audit --locked --version 0.22.2
+
+      - name: Run cargo audit
+        run: cargo audit
+
   deploy:
     name: Deploy to DigitalOcean
-    needs: [build, deploy-script]
+    needs: [build, deploy-script, audit]
     # This workflow also runs on dev pushes, pull requests and workflow_dispatch. Without
     # this condition, any of those would ship a non-main build to the production droplet.
     # Deploy is main-only, full stop.

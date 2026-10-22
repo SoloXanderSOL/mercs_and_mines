@@ -1,0 +1,23 @@
+# cargo-audit config, read by the `audit` CI job (INF-6a), which gates deploys.
+# Every ignore carries a reason and a re-check date. The dates are documentation, not
+# enforced: re-check at the date and at the Security_Mandate §2i quarterly review.
+# A yanked crate cannot be ignored here (cargo-audit has no per-crate yanked key);
+# update it out of Cargo.lock instead.
+[advisories]
+ignore = [
+  # rsa, Marvin timing attack, no fixed release. In Cargo.lock via sqlx-mysql, never
+  # compiled (we build sqlx with "postgres" only). Re-check 2027-01-22.
+  "RUSTSEC-2023-0071",
+  # anyhow, unsound Error::downcast_mut. In Cargo.lock via wit-bindgen (wasm component
+  # tooling), never compiled. Re-check 2027-01-22.
+  "RUSTSEC-2026-0190",
+  # event-listener, unsound (!Send tags cross threads via StackSlot). COMPILED, via
+  # sqlx-core; no fixed release. Re-check 2026-11-22.
+  "RUSTSEC-2026-0221",
+]
+
+[output]
+deny = ["unsound", "yanked"]
+# Required: cargo-audit 0.22.2 gives this key no default, so an [output] table without it
+# fails to parse.
+quiet = false
