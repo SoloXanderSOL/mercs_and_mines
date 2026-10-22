@@ -78,15 +78,16 @@ pub enum LaunchStart {
     TooManyMembers(usize),
 }
 
-/// What a replacement claim did (5a-4, ODQ-33). Outcomes, not errors.
+/// What a replacement claim did (5a-4, ODQ-33; usable since 5a-5, ODQ-46). Outcomes, not errors.
+/// A Commander is **usable** when it is neither KIA nor Shattered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplacementOutcome {
-    /// Every Commander was KIA; this is the new replacement's `commander_id`.
+    /// No Commander is usable; this is the new replacement's `commander_id`.
     Granted(Uuid),
     /// No membership row for this wallet and campaign.
     NotMember,
-    /// The member has a Commander that is not KIA (Shattered and a live replacement count).
-    HasLiving,
+    /// The member has a usable Commander (a usable replacement counts).
+    HasUsable,
 }
 
 /// The refusal for a member whose starter set is missing or partial.
@@ -135,7 +136,8 @@ pub trait CampaignJoinRepository: Send + Sync {
     /// The alpha KIA replacement (5a-4, ODQ-33). In one transaction under the member's
     /// membership row lock (`FOR UPDATE`, never `JOIN_ADVISORY_KEY`): `NotMember` without a
     /// membership row (whatever its `is_active`); `Internal(NO_COMMANDERS)` when the member has
-    /// no Commander at all; `HasLiving` when any Commander is not KIA; otherwise a Rank 1
+    /// no Commander at all; `HasUsable` when any Commander is neither KIA nor Shattered
+    /// (ODQ-46, 5a-5); otherwise a Rank 1
     /// Commander rolled from `seed` and written with `acquired_via = 'replacement'`. The seed is
     /// provenance, not a logged input. Off every hire counter.
     async fn claim_replacement(
@@ -245,8 +247,10 @@ pub type PauseHook = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + 
 /// - **The lock is global** (`JOIN_ADVISORY_KEY`, the transaction's first statement) and
 ///   serialises every join server-wide. This is accepted at alpha scale.
 /// - **`<t>_one_starter` and `uq_player_campaign` are backstops** (Reviewer 5a-1 CF4, 5a-0
-///   CF3). If either fires on this path (only possible across two server processes), the
-///   client gets a `500`. Never string-match `Internal`'s text for `23505`.
+///   CF3). `pg_advisory_xact_lock` is database-wide, so the join lock serialises joins from
+///   any number of server processes, and either backstop is reachable only through an
+///   out-of-band write. If one fires, the client gets a `500`. Never string-match
+///   `Internal`'s text for `23505`.
 /// - The generators' `assert!`s (`pick_band`, `pick`) are reachable only through a bad
 ///   constant (Reviewer 7d-1 CF3): the join uses the non-`_with_weights` forms, i.e.
 ///   `DEFAULT_GRADE_WEIGHTS`.
@@ -267,7 +271,7 @@ impl PostgresCampaignJoinRepository {
     /// binary, which never compiles the lib with `cfg(test)`. Production pays one `Option`
     /// check. **The hook fires in all three methods:** `join_campaign` as above;
     /// `begin_launch` after the guard, before the activation; `claim_replacement` right after
-    /// the eligibility read, before the zero/living branch. A test that parks only one racer
+    /// the eligibility read, before the zero/usable branch. A test that parks only one racer
     /// gives the other its own instance from `new` on the same pool.
     #[doc(hidden)]
     pub fn with_pause_seam(pool: PgPool, hook: PauseHook) -> Self {
@@ -380,11 +384,14 @@ impl CampaignJoinRepository for PostgresCampaignJoinRepository {
     }
 
     /// `FOR UPDATE` is deliberate, not `FOR NO KEY UPDATE`: every roster insert's membership-FK
-    /// check takes `FOR KEY SHARE` on this row, which `FOR UPDATE` blocks, so the "all KIA"
-    /// read holds against any roster writer for this member until commit. The only other
-    /// Commander writer, `resolve_deployment`, only ever turns KIA on, so a race can only make
-    /// a claim answer `HasLiving` too conservatively. `commander_records_one_live_replacement`
-    /// (0031) is the backstop; its `23505` surfaces as `Internal`.
+    /// check takes `FOR KEY SHARE` on this row, which `FOR UPDATE` blocks, so the "none usable"
+    /// read holds against any roster writer for this member until commit. The row lock
+    /// serialises claims from any number of server processes; the index below is reachable
+    /// only through an out-of-band write or a future second writer of `'replacement'`.
+    /// `resolve_deployment` and `set_shattered` only ever turn KIA or Shattered on, never off
+    /// (no `src` path clears `is_shattered`), so a race can only make a claim answer
+    /// `HasUsable` too conservatively. `commander_records_one_live_replacement` (0032) is the
+    /// backstop; its `23505` surfaces as `Internal`.
     async fn claim_replacement(
         &self,
         campaign_id: Uuid,
@@ -407,8 +414,9 @@ impl CampaignJoinRepository for PostgresCampaignJoinRepository {
             return Ok(ReplacementOutcome::NotMember);
         }
 
+        // TODO(phase-2-§14): Shattered clause retires with Rehabilitation (ODQ-46).
         let counts = sqlx::query!(
-            r#"SELECT count(*) AS "total!", count(*) FILTER (WHERE NOT is_kia) AS "living!" FROM commander_records WHERE campaign_id = $1 AND player_wallet = $2"#,
+            r#"SELECT count(*) AS "total!", count(*) FILTER (WHERE NOT is_kia AND NOT is_shattered) AS "usable!" FROM commander_records WHERE campaign_id = $1 AND player_wallet = $2"#,
             campaign_id,
             wallet,
         )
@@ -423,8 +431,8 @@ impl CampaignJoinRepository for PostgresCampaignJoinRepository {
         if counts.total == 0 {
             return Err(RepositoryError::Internal(NO_COMMANDERS.into()));
         }
-        if counts.living > 0 {
-            return Ok(ReplacementOutcome::HasLiving);
+        if counts.usable > 0 {
+            return Ok(ReplacementOutcome::HasUsable);
         }
 
         let record = generate_commander(wallet.to_vec(), campaign_id, seed);

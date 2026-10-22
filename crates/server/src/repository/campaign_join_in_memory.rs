@@ -50,7 +50,13 @@ pub struct InMemoryCampaignJoinRepository {
     starters:    tokio::sync::Mutex<HashMap<(Vec<u8>, Uuid), StarterIds>>,
     /// The replacement-claim lock (5a-4), never `starters`: the Postgres claim never takes the
     /// join key. It serialises claims through this instance, so this impl does not model
-    /// `commander_records_one_live_replacement` (0031); the stores hold no `acquired_via`.
+    /// `commander_records_one_live_replacement` (0032: at most one usable replacement per
+    /// campaign and wallet); the stores hold no `acquired_via`.
+    ///
+    /// It is independent of `starters` (Reviewer 5a-4 F6): a claim that interleaves with a
+    /// first join's non-atomic writes (membership, then Commander) can see a member with zero
+    /// Commanders and answer `500`. Test-only: Postgres can't reach it, because an uncommitted
+    /// membership is invisible there and the claim answers `NotMember`.
     claims:      tokio::sync::Mutex<()>,
 }
 
@@ -202,8 +208,9 @@ impl CampaignJoinRepository for InMemoryCampaignJoinRepository {
         if mine.is_empty() {
             return Err(RepositoryError::Internal(NO_COMMANDERS.into()));
         }
-        if mine.iter().any(|c| !c.is_kia) {
-            return Ok(ReplacementOutcome::HasLiving);
+        // TODO(phase-2-§14): Shattered clause retires with Rehabilitation (ODQ-46).
+        if mine.iter().any(|c| !c.is_kia && !c.is_shattered) {
+            return Ok(ReplacementOutcome::HasUsable);
         }
 
         let record = generate_commander(wallet.to_vec(), campaign_id, seed);

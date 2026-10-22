@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT count(*) AS \"total!\", count(*) FILTER (WHERE NOT is_kia) AS \"living!\" FROM commander_records WHERE campaign_id = $1 AND player_wallet = $2",
+  "query": "SELECT count(*) AS \"total!\", count(*) FILTER (WHERE NOT is_kia AND NOT is_shattered) AS \"usable!\" FROM commander_records WHERE campaign_id = $1 AND player_wallet = $2",
   "describe": {
     "columns": [
       {
@@ -10,7 +10,7 @@
       },
       {
         "ordinal": 1,
-        "name": "living!",
+        "name": "usable!",
         "type_info": "Int8"
       }
     ],
@@ -25,5 +25,5 @@
       null
     ]
   },
-  "hash": "b11dd17d300c40adbdf18832474ce781de713e5e7d0fbfe834ff74375025cae9"
+  "hash": "ff694386b6d471c0065703f6d49c4224c96a402f7223a99abb43d6bfbc69e858"
 }

@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO card_mint_pending\n            (card_mint_id, player_wallet, campaign_id, commander_id, deployment_id, session_id, commander_name, rank, foil, commander_grade, acquired_via)\n        SELECT $1, c.player_wallet, c.campaign_id, c.commander_id, d.deployment_id, d.session_id, c.name, $5, $2, c.commander_grade, c.acquired_via\n        FROM commander_records c\n        JOIN deployment_records d ON d.commander_id = c.commander_id\n        WHERE c.commander_id = $3 AND d.deployment_id = $4",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Bool",
+        "Uuid",
+        "Uuid",
+        "Int2"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a38ccd43b76758ae10fddc45b1400ccb379434eece9a6db79cec3bc31a6a84ce"
+}

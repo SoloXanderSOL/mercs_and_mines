@@ -3146,6 +3146,11 @@ fn roster_check_expectations() -> Vec<(&'static str, Vec<(&'static str, std::col
             ("augmentee_records_fitting_source_canon", strings(FittingSource::ALL.map(FittingSource::as_str))),
             ("augmentee_records_casualty_class_canon", strings(CasualtyClass::ALL.map(CasualtyClass::as_str))),
         ]),
+        // 5a-5 (0032, ODQ-47): the death card copies the Commander's provenance, so it lists
+        // every value the Commander's CHECK does.
+        ("card_mint_pending", vec![
+            ("card_mint_pending_acquired_via_canon", strings(AcquiredVia::ALL.map(AcquiredVia::as_str))),
+        ]),
     ]
 }
 
@@ -7094,7 +7099,7 @@ async fn claim_replacement_again_after_the_replacement_dies() {
     assert_eq!(rows, 2, "two replacements, one of them dead");
 }
 
-/// 5a-4 P3 — a living Commander blocks the claim.
+/// 5a-4 P3 — a usable Commander blocks the claim.
 #[tokio::test]
 async fn claim_replacement_refuses_a_living_commander() {
     let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
@@ -7103,13 +7108,14 @@ async fn claim_replacement_refuses_a_living_commander() {
     let res = PostgresCampaignJoinRepository::new(pool.clone()).claim_replacement(c, &wallet, CLAIM_SEED).await;
     let rows = replacement_rows(&pool, wallet).await;
     clean_wallet_4g1(&pool, &wallet).await;
-    assert!(matches!(res, Ok(ReplacementOutcome::HasLiving)), "expected HasLiving, got {res:?}");
+    assert!(matches!(res, Ok(ReplacementOutcome::HasUsable)), "expected HasUsable, got {res:?}");
     assert_eq!(rows, 0);
 }
 
-/// 5a-4 P4 — Shattered counts as living (ODQ-33).
+/// 5a-4 P4, flipped by 5a-5 — a Shattered Commander is not usable (ODQ-46: Phase 1 has no
+/// Rehabilitation), so a member whose every Commander is Shattered gets a replacement.
 #[tokio::test]
-async fn claim_replacement_refuses_a_shattered_commander() {
+async fn claim_replacement_grants_when_every_commander_is_shattered() {
     let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
     let wallet = [66u8; 32];
     let (c, ids) = seed_active_member(&pool, wallet, 0x5A44_i64, 1).await;
@@ -7117,8 +7123,8 @@ async fn claim_replacement_refuses_a_shattered_commander() {
     let res = PostgresCampaignJoinRepository::new(pool.clone()).claim_replacement(c, &wallet, CLAIM_SEED).await;
     let rows = replacement_rows(&pool, wallet).await;
     clean_wallet_4g1(&pool, &wallet).await;
-    assert!(matches!(res, Ok(ReplacementOutcome::HasLiving)), "expected HasLiving, got {res:?}");
-    assert_eq!(rows, 0);
+    assert!(matches!(res, Ok(ReplacementOutcome::Granted(_))), "expected Granted, got {res:?}");
+    assert_eq!(rows, 1);
 }
 
 /// 5a-4 P5 — a live replacement blocks a second claim.
@@ -7134,7 +7140,7 @@ async fn claim_replacement_refuses_while_the_replacement_lives() {
     let rows = replacement_rows(&pool, wallet).await;
     clean_wallet_4g1(&pool, &wallet).await;
     assert!(matches!(first, Ok(ReplacementOutcome::Granted(_))), "expected Granted, got {first:?}");
-    assert!(matches!(second, Ok(ReplacementOutcome::HasLiving)), "expected HasLiving, got {second:?}");
+    assert!(matches!(second, Ok(ReplacementOutcome::HasUsable)), "expected HasUsable, got {second:?}");
     assert_eq!(rows, 1);
 }
 
@@ -7239,8 +7245,8 @@ async fn concurrent_replacement_claims_yield_one() {
         other => panic!("both calls Ok: {other:?}"),
     };
     assert!(
-        matches!((ra, rb), (ReplacementOutcome::Granted(_), ReplacementOutcome::HasLiving) | (ReplacementOutcome::HasLiving, ReplacementOutcome::Granted(_))),
-        "one Granted and one HasLiving: {ra:?} / {rb:?}"
+        matches!((ra, rb), (ReplacementOutcome::Granted(_), ReplacementOutcome::HasUsable) | (ReplacementOutcome::HasUsable, ReplacementOutcome::Granted(_))),
+        "one Granted and one HasUsable: {ra:?} / {rb:?}"
     );
     assert_eq!(rows, 1, "exactly one replacement");
 }
@@ -7264,6 +7270,127 @@ async fn second_live_replacement_refused_by_index() {
     assert_eq!(first.expect("the first replacement must be accepted").rows_affected(), 1);
     assert_unique_violation(second, "commander_records_one_live_replacement");
     assert_eq!(after_death.expect("a dead replacement leaves the index").rows_affected(), 1);
+}
+
+/// 5a-5 P11 — per wipe, Shattered included (ODQ-46): the original is KIA → `Granted`; the
+/// replacement is then Shattered → `Granted` again, and the index accepts the second insert.
+#[tokio::test]
+async fn claim_replacement_grants_again_when_the_replacement_is_shattered() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    let wallet = [73u8; 32];
+    let (c, ids) = seed_active_member(&pool, wallet, 0x5A51_i64, 1).await;
+    set_commander_flag(&pool, ids[0], "is_kia").await;
+    let repo = PostgresCampaignJoinRepository::new(pool.clone());
+
+    let first = repo.claim_replacement(c, &wallet, CLAIM_SEED).await;
+    if let Ok(ReplacementOutcome::Granted(id)) = &first {
+        set_commander_flag(&pool, *id, "is_shattered").await;
+    }
+    let second = repo.claim_replacement(c, &wallet, CLAIM_SEED + 1).await;
+    let rows = replacement_rows(&pool, wallet).await;
+    clean_wallet_4g1(&pool, &wallet).await;
+
+    let (a, b) = match (first, second) {
+        (Ok(ReplacementOutcome::Granted(a)), Ok(ReplacementOutcome::Granted(b))) => (a, b),
+        other => panic!("expected two Granted, got {other:?}"),
+    };
+    assert_ne!(a, b);
+    assert_eq!(rows, 2, "two replacements, one of them Shattered");
+}
+
+/// 5a-5 P12 — a Shattered `'replacement'` row does not occupy
+/// `commander_records_one_live_replacement` (0032): a usable `'replacement'` row beside it is
+/// accepted (direct `UPDATE`s, unchecked SQL, P9's style). P9 pins the refusal of two usable rows.
+#[tokio::test]
+async fn shattered_replacement_does_not_occupy_the_index() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    let wallet = [74u8; 32];
+    let (_, ids) = seed_active_member(&pool, wallet, 0x5A52_i64, 2).await;
+    let (a, b) = (ids[0], ids[1]);
+    let sql = "UPDATE commander_records SET acquired_via = 'replacement' WHERE commander_id = $1";
+
+    set_commander_flag(&pool, a, "is_shattered").await;
+    let first = sqlx::query(sql).bind(a).execute(&pool).await;
+    let second = sqlx::query(sql).bind(b).execute(&pool).await;
+    clean_wallet_4g1(&pool, &wallet).await;
+
+    assert_eq!(first.expect("the Shattered replacement must be accepted").rows_affected(), 1);
+    assert_eq!(second.expect("a usable replacement beside a Shattered one must be accepted").rows_affected(), 1);
+}
+
+/// The card's `acquired_via` for one Commander, `None` when the column is `NULL`. Unlike
+/// `acquired_via_of` it does not panic on `NULL`, so a failing P13 still cleans first.
+async fn card_acquired_via(pool: &sqlx::PgPool, commander_id: uuid::Uuid) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar("SELECT acquired_via FROM card_mint_pending WHERE commander_id = $1")
+        .bind(commander_id).fetch_one(pool).await
+}
+
+/// 5a-5 P13 (ODQ-47) — each death card copies its Commander's provenance: three Commanders
+/// marked `'starter'`, `'replacement'` and `'hired'` (the fixture's own value) die by a mission
+/// Wipeout through `resolve_deployment` (`mark_commander_kia`), and each card carries its value.
+#[tokio::test]
+async fn death_card_records_commander_provenance() {
+    use sim_engine::game_types::OutcomeType;
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    let wallet = [75u8; 32];
+    let (_, ids) = seed_active_member(&pool, wallet, 0x5A53_i64, 3).await;
+    for (id, via) in [(ids[0], "starter"), (ids[1], "replacement")] {
+        let r = sqlx::query("UPDATE commander_records SET acquired_via = $1 WHERE commander_id = $2")
+            .bind(via).bind(id).execute(&pool).await.expect("provenance update failed");
+        assert_eq!(r.rows_affected(), 1, "the Commander must exist");
+    }
+    let repo = PostgresCommanderRepository::new(pool.clone());
+    let cfg = sim_engine::config::SimConfig::default();
+
+    let mut killed = Vec::new();
+    for id in &ids {
+        let d = new_deployment_4g1(*id, chrono::Utc::now());
+        let started = repo.start_deployment(&d).await;
+        let resolved = repo.resolve_deployment(d.deployment_id, *id, 2, 1, 0.0, &OutcomeType::Wipeout, &cfg).await;
+        killed.push((started, resolved.map(|e| e.is_kia)));
+    }
+    let mut cards = Vec::new();
+    for id in &ids {
+        cards.push(card_acquired_via(&pool, *id).await);
+    }
+    clean_wallet_4g1(&pool, &wallet).await;
+
+    for (started, kia) in killed {
+        assert_eq!(started.expect("start_deployment failed"), DeploymentStart::Started);
+        assert!(kia.expect("resolve failed"), "a Wipeout kills the Commander");
+    }
+    let cards: Vec<Option<String>> = cards.into_iter().map(|c| c.expect("card read failed")).collect();
+    assert_eq!(cards, vec![Some("starter".to_string()), Some("replacement".to_string()), Some("hired".to_string())]);
+}
+
+/// 5a-5 P14 — `card_mint_pending_acquired_via_canon` refuses an unknown value and accepts
+/// `NULL` (a CHECK passes a `NULL` expression). Literals only.
+#[tokio::test]
+async fn card_acquired_via_check_refuses_unknown_and_accepts_null() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    let wallet = [76u8; 32];
+    clean_wallet_4g1(&pool, &wallet).await;
+    seed_account(&pool, wallet).await;
+    let insert = |via: Option<&'static str>| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(
+                "INSERT INTO card_mint_pending
+                    (card_mint_id, player_wallet, campaign_id, commander_id, deployment_id, session_id, commander_name, rank, foil, acquired_via)
+                 VALUES ($1, $2, $3, $4, $5, $6, 'P14', 1, FALSE, $7)"
+            )
+            .bind(uuid::Uuid::new_v4()).bind(wallet.to_vec()).bind(uuid::Uuid::new_v4())
+            .bind(uuid::Uuid::new_v4()).bind(uuid::Uuid::new_v4()).bind(uuid::Uuid::new_v4())
+            .bind(via)
+            .execute(&pool).await
+        }
+    };
+    let bogus = insert(Some("bogus")).await;
+    let null = insert(None).await;
+    clean_wallet_4g1(&pool, &wallet).await;
+
+    assert_check_violation(&bogus.expect_err("'bogus' must be refused"), "card_mint_pending_acquired_via_canon");
+    assert_eq!(null.expect("NULL must be accepted").rows_affected(), 1);
 }
 
 /// 5a-4 P10 — end to end on Postgres: a real join, the launch's state change, the starter

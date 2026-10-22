@@ -109,6 +109,10 @@ pub struct CardMintPending {
     pub foil:           bool,
     /// Copied from the Commander row, as Postgres copies `c.commander_grade` (Reviewer 4a-2 F2).
     pub commander_grade: Option<String>,
+    /// Always `None` here, unlike `commander_grade` above: the in-memory Commander store holds
+    /// no provenance (`acquired_via` is an `insert_*` parameter, never a record field), so the
+    /// Postgres `card_mint_pending.acquired_via` column (0032, ODQ-47) is the only oracle.
+    pub acquired_via: Option<String>,
 }
 
 /// `create_commander` stores stress in 0..=100 and keeps `update_stress`'s invariant:
@@ -358,8 +362,8 @@ async fn mark_commander_kia(
     // Commander died at, the locked one (Reviewer 4e-1 F1).
     let r = sqlx::query!(
         r#"INSERT INTO card_mint_pending
-            (card_mint_id, player_wallet, campaign_id, commander_id, deployment_id, session_id, commander_name, rank, foil, commander_grade)
-        SELECT $1, c.player_wallet, c.campaign_id, c.commander_id, d.deployment_id, d.session_id, c.name, $5, $2, c.commander_grade
+            (card_mint_id, player_wallet, campaign_id, commander_id, deployment_id, session_id, commander_name, rank, foil, commander_grade, acquired_via)
+        SELECT $1, c.player_wallet, c.campaign_id, c.commander_id, d.deployment_id, d.session_id, c.name, $5, $2, c.commander_grade, c.acquired_via
         FROM commander_records c
         JOIN deployment_records d ON d.commander_id = c.commander_id
         WHERE c.commander_id = $3 AND d.deployment_id = $4"#,
@@ -990,6 +994,7 @@ impl CommanderRepository for InMemoryCommanderRepository {
                 rank:           eff.old_rank, // the locked rank, as Postgres binds (F1)
                 foil:           glorious,
                 commander_grade: rec.commander_grade.clone(),
+                acquired_via:   None, // no provenance in memory (see the field)
             });
             // TODO(phase-2): grief spike — see `mark_commander_kia` (Postgres section).
         }

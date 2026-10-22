@@ -76,15 +76,15 @@ async fn post_campaign_join(
 }
 
 // TODO(phase-2-§10j): alpha-only replacement; removed when the Phase 2 Bootcamp hire ships (ODQ-33).
-/// The alpha KIA replacement (5a-4, ODQ-33): `201` with a new Rank 1 Commander for a member
-/// whose Commanders are all KIA.
+/// The alpha replacement (5a-4, ODQ-33; ODQ-46 since 5a-5): `201` with a new Rank 1 Commander
+/// for a member with no usable Commander (every one KIA or Shattered).
 ///
 /// - Order (5a-3b's house pattern): `401` → `404` campaign → `403` non-member (any membership
 ///   row) → `409` not `Active` (read before the transaction, as dispatch does) → the claim.
 /// - **Not behind the join switch** (Reviewer 5a-3c CF3): only a member gets past `403`, and
 ///   while joins are closed production has none.
-/// - In the claim: `403` again if the membership vanished, `409` if any Commander is not KIA
-///   (Shattered counts as living), and `500` for a member with no Commander at all.
+/// - In the claim: `403` again if the membership vanished, `409` if any Commander is usable
+///   (neither KIA nor Shattered), and `500` for a member with no Commander at all.
 /// - Not a logged input: the generator roll is a server decision stored in its record.
 async fn post_replacement_commander(
     AuthSession(token): AuthSession,
@@ -125,7 +125,7 @@ async fn post_replacement_commander(
             Json(json!({"campaign_id": campaign_id, "commander_id": id})),
         )),
         ReplacementOutcome::NotMember => Err(forbidden("not a member of this campaign")),
-        ReplacementOutcome::HasLiving => Err(conflict("member has a living Commander")),
+        ReplacementOutcome::HasUsable => Err(conflict("member has a usable Commander")),
     }
 }
 
@@ -336,25 +336,26 @@ mod tests {
         assert_eq!(state.commander_repo.list_commanders_by_campaign(c).await.unwrap().len(), 1);
     }
 
-    /// L5 — a living starter is `409`.
+    /// L5 — a usable starter is `409`.
     #[tokio::test]
     async fn replacement_with_a_living_commander_is_409() {
         let (state, c, _) = active_member().await;
         let (status, body) = claim(state.clone(), Some("t"), &c.to_string()).await;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
-        assert_eq!(body, json!({"error": "member has a living Commander"}));
+        assert_eq!(body, json!({"error": "member has a usable Commander"}));
         assert_eq!(state.commander_repo.list_commanders_by_campaign(c).await.unwrap().len(), 1);
     }
 
-    /// L6 — Shattered counts as living (ODQ-33: Rehabilitation is its recovery path).
+    /// L6 — a Shattered Commander is not usable (ODQ-46: Phase 1 has no Rehabilitation), so a
+    /// member whose only Commander is Shattered gets a replacement.
     #[tokio::test]
-    async fn replacement_with_a_shattered_commander_is_409() {
+    async fn replacement_with_only_a_shattered_commander_is_granted() {
         let (state, c, starter) = active_member().await;
         state.commander_repo.set_shattered(starter).await.unwrap();
         let (status, body) = claim(state.clone(), Some("t"), &c.to_string()).await;
-        assert_eq!(status, StatusCode::CONFLICT, "{body}");
-        assert_eq!(body, json!({"error": "member has a living Commander"}));
-        assert_eq!(state.commander_repo.list_commanders_by_campaign(c).await.unwrap().len(), 1);
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_ne!(id(&body, "commander_id"), starter);
+        assert_eq!(state.commander_repo.list_commanders_by_campaign(c).await.unwrap().len(), 2);
     }
 
     /// L7 — an all-KIA member gets one Rank 1 replacement; a second claim while it lives is `409`.
@@ -374,7 +375,7 @@ mod tests {
 
         let (status, body) = claim(state.clone(), Some("t"), &c.to_string()).await;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
-        assert_eq!(body, json!({"error": "member has a living Commander"}));
+        assert_eq!(body, json!({"error": "member has a usable Commander"}));
         assert_eq!(state.commander_repo.list_commanders_by_campaign(c).await.unwrap().len(), 2);
     }
 
