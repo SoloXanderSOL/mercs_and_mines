@@ -36,8 +36,7 @@ pub async fn ws_stream_handler(
         Ok(Some(s)) => s,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
-            tracing::error!("[session] consume_session error for {session_id}: {e}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            return super::internal_error(format!("[session] consume_session error for {session_id}: {e}")).into_response();
         }
     };
 
@@ -53,8 +52,7 @@ pub async fn ws_stream_handler(
     let params_payload = match serde_json::to_value(&session.params) {
         Ok(v) => v,
         Err(e) => {
-            tracing::error!("request serialization failed for {session_id}: {e}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            return super::internal_error(format!("request serialization failed for {session_id}: {e}")).into_response();
         }
     };
 

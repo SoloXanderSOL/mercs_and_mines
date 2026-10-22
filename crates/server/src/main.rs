@@ -97,6 +97,16 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
         .unwrap_or_else(|_| panic!("Failed to bind {}", bind_addr));
-    tracing::info!("Mercs & Mines server listening on {}", bind_addr);
+    match listener.local_addr() {
+        Ok(addr) => {
+            tracing::info!("Mercs & Mines server listening on {addr}");
+            if let Some(w) = mercs_server::config::public_bind_warning(&addr) {
+                tracing::warn!("{w}");
+            }
+        }
+        Err(e) => tracing::warn!(
+            "listening on {bind_addr}, but could not read the bound address ({e}); skipping the public-bind check"
+        ),
+    }
     axum::serve(listener, app).await.expect("Server error");
 }

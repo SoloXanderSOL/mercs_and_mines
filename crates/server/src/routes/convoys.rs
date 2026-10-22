@@ -304,7 +304,9 @@ mod tests {
     }
 
     /// Reviewer 5a-3b CF5: a failed campaign read is a `500` built by `internal_error`, so
-    /// it carries the route's JSON body.
+    /// it carries the route's JSON body. Since GAP-76 that body is generic, so the arm is
+    /// identified by construction, not by text: the closed pool sits only on
+    /// `campaign_repo`, and `get_campaign` is the first fallible I/O after the wallet decode.
     #[tokio::test]
     async fn dispatch_campaign_read_failure_is_500_with_a_body() {
         let pool = sqlx::postgres::PgPoolOptions::new()
@@ -317,8 +319,12 @@ mod tests {
         let (status, body) = dispatch_as(Arc::new(state), "t", campaign_id, (1, 0)).await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         let v: serde_json::Value = serde_json::from_slice(&body).expect("a JSON body");
-        let error = v["error"].as_str().unwrap_or_else(|| panic!("no error string: {v}"));
-        assert!(error.starts_with("dispatch_convoy: get_campaign failed for campaign "), "{error}");
+        let id: Uuid = v["error_id"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| panic!("error_id is not a UUID: {v}"));
+        assert_eq!(v, serde_json::json!({"error": "internal error", "error_id": id}));
+        assert!(!v.to_string().contains("get_campaign"), "the message leaked: {v}");
     }
 
     #[tokio::test]

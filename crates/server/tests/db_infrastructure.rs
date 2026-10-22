@@ -4147,6 +4147,9 @@ async fn auth_verify_rejects_an_expired_challenge() {
 
 /// INF-4 (GAP-52): a failed account upsert answers `500` and leaves no session behind.
 /// The account store is a Postgres repository over a closed pool; no database is needed.
+/// Since GAP-76 the body is generic, so the arm is identified by construction, not by
+/// text: the route's only other `500` arm runs after `issue_session`, which
+/// `sessions.is_empty()` rejects.
 #[tokio::test]
 async fn auth_verify_answers_500_and_issues_no_session_when_the_upsert_fails() {
     let closed = PgPoolOptions::new()
@@ -4162,7 +4165,13 @@ async fn auth_verify_answers_500_and_issues_no_session_when_the_upsert_fails() {
 
     let (status, body) = verify_with(&state, &key, &challenge, &challenge).await;
     assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR, "{body}");
-    assert!(body.contains("account upsert"), "wrong 500 arm: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
+    let id: uuid::Uuid = v["error_id"]
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("error_id is not a UUID: {v}"));
+    assert_eq!(v, serde_json::json!({"error": "internal error", "error_id": id}));
+    assert!(!body.contains("account upsert"), "the message leaked: {body}");
     assert!(state.sessions.is_empty(), "a 500 must not leave a live session");
 }
 

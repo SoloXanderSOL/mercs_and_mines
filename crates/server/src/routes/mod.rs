@@ -59,13 +59,17 @@ fn not_found(msg: impl Into<String>) -> AppError {
     (StatusCode::NOT_FOUND, Json(json!({"error": msg.into()})))
 }
 
-/// Every `500` built here leaves a journal line naming its call site, so an operator
-/// never sees a client-side `500` the server did not record.
+/// The only builder of a `500`. The client gets a fixed body and an `error_id`;
+/// the journal line carries the full message, the same id and the call site.
 #[track_caller]
 fn internal_error(msg: impl Into<String>) -> AppError {
     let msg = msg.into();
-    tracing::error!(at = %std::panic::Location::caller(), "{msg}");
-    (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": msg})))
+    let error_id = Uuid::new_v4();
+    tracing::error!(at = %std::panic::Location::caller(), %error_id, "{msg}");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({"error": "internal error", "error_id": error_id})),
+    )
 }
 
 /// A `422` with the route's JSON error body, which tells it apart from axum's plain-text
@@ -607,8 +611,7 @@ async fn post_combat_stream_start(
         created_at: Utc::now(),
     };
     if let Err(e) = state.session_repo.save_session(id, session).await {
-        tracing::error!("[session] failed to save combat session {id}: {e}");
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "failed to create session"}))).into_response();
+        return internal_error(format!("[session] failed to save combat session {id}: {e}")).into_response();
     }
     Json(json!({"session_id": id.to_string()})).into_response()
 }
@@ -666,7 +669,10 @@ async fn get_combat_aar(
         .find(|e| e.event_type == "session_start")
         .ok_or_else(|| not_found("no session_start entry for this session"))?;
     let request: CombatResolveRequest = serde_json::from_value(start.payload["request"].clone())
-        .map_err(|e| bad_request(format!("session_start is not a combat request: {e}")))?;
+        .map_err(|e| {
+            tracing::warn!(%session_id, "AAR: session_start is not a combat request: {e}");
+            bad_request("session_start is not a combat request")
+        })?;
     let timestamp = start.payload["timestamp"]
         .as_str()
         .ok_or_else(|| internal_error("session_start payload missing timestamp"))?
@@ -765,4 +771,51 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(convoy_events::router())
         .with_state(state)
         .fallback_service(ServeDir::new("app").append_index_html_on_directories(true))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::internal_error;
+    use axum::{http::StatusCode, Json};
+    use serde_json::json;
+    use std::sync::{Arc, Mutex};
+    use uuid::Uuid;
+
+    /// A capture buffer for the journal line. `Arc<Mutex<Vec<u8>>>` is not itself a
+    /// `MakeWriter`, so the test hands the subscriber a closure returning this wrapper.
+    #[derive(Clone, Default)]
+    struct Buf(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Buf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// GAP-76: the client sees a fixed body and an id; the journal keeps the message, the
+    /// same id and the call site.
+    #[test]
+    fn internal_error_journals_the_message_and_returns_a_generic_body() {
+        let buf = Buf::default();
+        let w = buf.clone();
+        let sub = tracing_subscriber::fmt().with_writer(move || w.clone()).with_ansi(false).finish();
+        let (status, Json(body)) =
+            tracing::subscriber::with_default(sub, || internal_error("secret-text-7f3a"));
+        let journal = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let id: Uuid = body["error_id"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| panic!("error_id is not a UUID: {body}"));
+        assert_eq!(body, json!({"error": "internal error", "error_id": id}));
+        assert!(!body.to_string().contains("secret-text-7f3a"), "the message leaked: {body}");
+        assert!(journal.contains("secret-text-7f3a"), "the journal lost the message: {journal}");
+        assert!(journal.contains(&format!("error_id={id}")), "the journal lacks the id: {journal}");
+        assert!(journal.contains("routes/mod.rs"), "the journal lacks the call site: {journal}");
+    }
 }

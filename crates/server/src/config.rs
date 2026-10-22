@@ -8,10 +8,6 @@ use sim_engine::config::SimConfig;
 
 // ── Helper readers ────────────────────────────────────────────────────────────
 
-fn env_str(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_string())
-}
-
 /// Reads `key` as a `T`. Unset → `default`, silently. Set but unparseable (`str::parse`
 /// does not trim) → `default`, with a warning naming the key and the raw value. A value
 /// that parses is used exactly as before, so no environment changes what it yields.
@@ -31,13 +27,10 @@ fn env_lookup(key: &str) -> Option<String> {
     std::env::var(key).ok()
 }
 
-fn env_i64(key: &str, default: i64) -> i64 { parse_or_warn(env_lookup, key, default) }
 fn env_u32(key: &str, default: u32) -> u32 { parse_or_warn(env_lookup, key, default) }
 fn env_u64(key: &str, default: u64) -> u64 { parse_or_warn(env_lookup, key, default) }
-fn env_usize(key: &str, default: usize) -> usize { parse_or_warn(env_lookup, key, default) }
 fn env_f64(key: &str, default: f64) -> f64 { parse_or_warn(env_lookup, key, default) }
 fn env_i32(key: &str, default: i32) -> i32 { parse_or_warn(env_lookup, key, default) }
-fn env_bool(key: &str, default: bool) -> bool { parse_or_warn(env_lookup, key, default) }
 
 pub(crate) const DECISIVE_SUCCESS_REWARD_MULT_KEY: &str = "DECISIVE_SUCCESS_REWARD_MULT";
 
@@ -125,15 +118,32 @@ impl Default for ServerConfig {
 
 impl ServerConfig {
     fn from_env() -> Self {
+        Self::from_lookup(env_lookup)
+    }
+
+    /// Reads every field through `get`, so tests pass a fixed map and never touch the
+    /// process environment (Reviewer 5a-3c F1).
+    fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
         Self {
-            bind_addr:                  env_str  ("SERVER_BIND_ADDR",            DEFAULT_BIND_ADDR),
-            session_duration_secs:      env_i64  ("SESSION_DURATION_SECS",       7200),
-            challenge_expiry_secs:      env_i64  ("CHALLENGE_EXPIRY_SECS",       60),
-            combat_session_stale_secs:  env_u64  ("COMBAT_SESSION_STALE_SECS",   300),
-            default_max_ticks:          env_usize("DEFAULT_MAX_TICKS",           50),
-            join_enabled:               env_bool ("MERCS_JOIN_ENABLED",          false),
+            bind_addr:                  get("SERVER_BIND_ADDR").unwrap_or_else(|| DEFAULT_BIND_ADDR.to_string()),
+            session_duration_secs:      parse_or_warn(&get, "SESSION_DURATION_SECS",     7200),
+            challenge_expiry_secs:      parse_or_warn(&get, "CHALLENGE_EXPIRY_SECS",     60),
+            combat_session_stale_secs:  parse_or_warn(&get, "COMBAT_SESSION_STALE_SECS", 300),
+            default_max_ticks:          parse_or_warn(&get, "DEFAULT_MAX_TICKS",         50),
+            join_enabled:               parse_or_warn(&get, "MERCS_JOIN_ENABLED",        false),
         }
     }
+}
+
+/// The boot warning for a non-loopback bind (Security_Mandate §2i). `None` on loopback,
+/// IPv4-mapped loopback included; otherwise the text `main` journals once.
+pub fn public_bind_warning(addr: &std::net::SocketAddr) -> Option<String> {
+    if addr.ip().to_canonical().is_loopback() {
+        return None;
+    }
+    Some(format!(
+        "server is bound to {addr}, which is not a loopback address: it is reachable without nginx, bypassing its controls; bind 127.0.0.1 with SERVER_BIND_ADDR unless this is local development (Security_Mandate §2i)"
+    ))
 }
 
 // ── Top-level config ──────────────────────────────────────────────────────────
@@ -205,9 +215,10 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::{
-        finite_f64_or_warn, parse_or_warn, u32_with_warn, Config, ServerConfig,
+        finite_f64_or_warn, parse_or_warn, public_bind_warning, u32_with_warn, Config, ServerConfig,
         DECISIVE_SUCCESS_REWARD_MULT_KEY, DEFAULT_BIND_ADDR,
     };
+    use std::net::SocketAddr;
     use std::collections::HashMap;
 
     /// Fixed-map lookup — the reward-mult tests never mutate the process environment.
@@ -309,20 +320,13 @@ mod tests {
     /// The bind address must be loopback unless someone deliberately overrides it.
     /// Safety is the default state, not a systemd drop-in bolted on afterwards —
     /// that drop-in is defence in depth, not the guarantee. See Security_Mandate.md 2i.
-    ///
-    /// Both cases live in one test on purpose: they mutate the process-global
-    /// SERVER_BIND_ADDR, and separate `#[test]` fns would race under a parallel runner.
-    /// Note the repo's own `.env` sets SERVER_BIND_ADDR=0.0.0.0:3000 and the canonical
-    /// test command sources it, so the unset case MUST clear the variable explicitly.
+    /// Read through `from_lookup`, so the repo `.env` (which binds 0.0.0.0) cannot leak in.
     #[test]
     fn bind_addr_defaults_to_loopback_and_honours_override() {
-        let restore = std::env::var("SERVER_BIND_ADDR").ok();
-
         // No SERVER_BIND_ADDR anywhere → loopback.
-        std::env::remove_var("SERVER_BIND_ADDR");
         assert_eq!(DEFAULT_BIND_ADDR, "127.0.0.1:3000");
         assert_eq!(
-            ServerConfig::from_env().bind_addr,
+            ServerConfig::from_lookup(lookup(&[])).bind_addr,
             "127.0.0.1:3000",
             "with SERVER_BIND_ADDR unset the server must bind loopback, not 0.0.0.0"
         );
@@ -333,16 +337,41 @@ mod tests {
         );
 
         // Explicit override still works — local dev must be able to bind the LAN.
-        std::env::set_var("SERVER_BIND_ADDR", "0.0.0.0:3000");
         assert_eq!(
-            ServerConfig::from_env().bind_addr,
+            ServerConfig::from_lookup(lookup(&[("SERVER_BIND_ADDR", "0.0.0.0:3000")])).bind_addr,
             "0.0.0.0:3000",
             "an explicit SERVER_BIND_ADDR must still be honoured"
         );
+    }
 
-        match restore {
-            Some(v) => std::env::set_var("SERVER_BIND_ADDR", v),
-            None => std::env::remove_var("SERVER_BIND_ADDR"),
+    /// INF-6b — with nothing set, `from_lookup` keeps the join switch closed.
+    #[test]
+    fn server_config_from_lookup_keeps_joins_closed_when_unset() {
+        assert_eq!(ServerConfig::from_lookup(lookup(&[])).join_enabled, false);
+    }
+
+    /// INF-6b — `from_lookup` reads the join switch through its lookup.
+    #[test]
+    fn server_config_from_lookup_reads_the_join_switch() {
+        assert_eq!(ServerConfig::from_lookup(lookup(&[("MERCS_JOIN_ENABLED", "true")])).join_enabled, true);
+    }
+
+    /// INF-6b — an unspecified (all-interfaces) bind warns, naming the address.
+    #[test]
+    fn public_bind_warning_fires_for_unspecified_addresses() {
+        for a in ["0.0.0.0:3000", "[::]:3000"] {
+            let addr: SocketAddr = a.parse().unwrap();
+            let w = public_bind_warning(&addr).unwrap_or_else(|| panic!("{a} must warn"));
+            assert!(w.contains(&addr.to_string()), "the warning must name {a}: {w}");
+        }
+    }
+
+    /// INF-6b — a loopback bind is silent, IPv4-mapped loopback included.
+    #[test]
+    fn public_bind_warning_is_silent_on_loopback() {
+        for a in ["127.0.0.1:3000", "[::1]:3000", "[::ffff:127.0.0.1]:3000"] {
+            let addr: SocketAddr = a.parse().unwrap();
+            assert_eq!(public_bind_warning(&addr), None, "{a} is loopback");
         }
     }
 }

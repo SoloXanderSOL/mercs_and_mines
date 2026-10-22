@@ -86,17 +86,16 @@ async fn launch_campaign(
                 })),
             )
                 .into_response(),
-            Ok(None) => {
-                tracing::error!(
-                    "launch_campaign internal error: campaign {} not found after successful init",
-                    campaign_id
-                );
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "internal server error"}))).into_response()
-            }
-            Err(e) => {
-                tracing::error!("launch_campaign internal error: get_campaign failed after init: {:?}", e);
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "internal server error"}))).into_response()
-            }
+            Ok(None) => super::internal_error(format!(
+                "launch_campaign internal error: campaign {} not found after successful init",
+                campaign_id
+            ))
+            .into_response(),
+            Err(e) => super::internal_error(format!(
+                "launch_campaign internal error: get_campaign failed after init: {:?}",
+                e
+            ))
+            .into_response(),
         },
         Err(InitError::NotPending) => (
             StatusCode::CONFLICT,
@@ -111,10 +110,7 @@ async fn launch_campaign(
         Err(InitError::CampaignNotFound) => {
             (StatusCode::NOT_FOUND, Json(json!({"error": "campaign not found"}))).into_response()
         }
-        Err(e) => {
-            tracing::error!("launch_campaign internal error: {:?}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "internal server error"}))).into_response()
-        }
+        Err(e) => super::internal_error(format!("launch_campaign internal error: {:?}", e)).into_response(),
     }
 }
 
