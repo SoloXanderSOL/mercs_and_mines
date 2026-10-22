@@ -11,9 +11,6 @@ ignore = [
   # anyhow, unsound Error::downcast_mut. In Cargo.lock via wit-bindgen (wasm component
   # tooling), never compiled. Re-check 2027-01-22.
   "RUSTSEC-2026-0190",
-  # event-listener, unsound (!Send tags cross threads via StackSlot). COMPILED, via
-  # sqlx-core; no fixed release. Re-check 2026-11-22.
-  "RUSTSEC-2026-0221",
 ]
 
 [output]
