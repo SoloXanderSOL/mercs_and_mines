@@ -147,15 +147,16 @@ As of 2026-10-18:
   Reviewer 5a-3b F1):** `ServerConfig::join_enabled` (default `false`) is read from
   `MERCS_JOIN_ENABLED` by `env_bool` (`parse_or_warn`: exactly `true` opens; anything else
   warns and stays closed; documented in `.env.example`). Order: `401` (`AuthSession`) →
-  `503` `{"error":"campaign joins are closed"}` (`service_unavailable()`) → wallet decode →
-  join, so the `503` precedes every database read and `JOIN_ADVISORY_KEY`. **Off in
-  production until INF-6's rate limit is live; the Director turns it on.** A test that joins
+  `503` `{"error":"campaign joins are closed"}` (`service_unavailable()`) → `429` per client
+  IP → `429` per wallet (INF-6c-1) → wallet decode → join, so the `503` precedes every
+  database read and `JOIN_ADVISORY_KEY`. **Off in production; the Director turns it on
+  after all of INF-6 deploys.** A test that joins
   turns it on itself (the lib `joined_state()`; E1 via `Arc::make_mut(&mut state.config)`);
   `pg_route_state` leaves it off. Both bare dispatch `500`s go through `internal_error`
   (CF5). **5a-3b and 5a-3c deployed together (`ce8096e`, 2026-10-20).** **5a-4 built
   (`2caa944`, 2026-10-20; the alpha KIA replacement, ODQ-33):** `POST
   /api/campaign/:campaign_id/replacement-commander` (`routes/campaign.rs`; **not** behind the
-  join switch): `401` → `404` → `403` non-member (any membership row) → `409` not `Active`
+  join switch): `401` → `429` per client IP → `429` per wallet (INF-6c-1) → `404` → `403` non-member (any membership row) → `409` not `Active`
   (read before the transaction) → `CampaignJoinRepository::claim_replacement(campaign_id,
   wallet, seed: u32) -> ReplacementOutcome { Granted(Uuid), NotMember, HasUsable }` → `201`
   `{campaign_id, commander_id}` / `403` / `409` "member has a usable Commander" / `500`. The
@@ -173,7 +174,7 @@ As of 2026-10-18:
   `card_mint_pending.acquired_via` (`card_mint_pending_acquired_via_canon`, with a guard row),
   which `mark_commander_kia` copies from `c.acquired_via`. Postgres is its only oracle: the
   in-memory card carries `acquired_via: None`. **Next: INF-6** (split 6a → 6b → 6c-1 →
-  6c-2 → 6d; 6a deployed, 6b built, see INF-6a and INF-6b below).
+  6c-2 → 6d; 6a and 6b deployed, 6c-1 built; see INF-6a, INF-6b and INF-6c-1 below).
 - **Section 6:** Not started.
 - **Sections 7 (Personnel Entity Model) and 8 (Combat Engine to canon):** created
   2026-10-13 (ruling D2); both run before Section 6. Strike Mining and Base Building moved
@@ -258,7 +259,9 @@ As of 2026-10-18:
   **only** `500` builder (since INF-6b): it journals the full message, an `error_id`
   (`Uuid::new_v4()`) and the call site, and returns exactly
   `{"error":"internal error","error_id":"<uuid>"}`. **No literal `500`:** every one is an
-  `internal_error` call written at the site (never `.map_err(internal_error)`). CI runs on pushes to `main` and `dev` and on every pull request (GAP-32);
+  `internal_error` call written at the site (never `.map_err(internal_error)`). The other
+  response helpers: `forbidden()`, `service_unavailable()`, and `too_many_requests()`
+  (`429 {"error":"rate limited"}` + `Retry-After`, INF-6c-1). CI runs on pushes to `main` and `dev` and on every pull request (GAP-32);
   deploy is still main-only. The droplet-side deploy is `deploy/remote_deploy.sh`: it reads
   the running build's SHA, swaps, restarts, polls `/api/version` until `build_sha` equals the
   commit, and rolls back with explicit checks. Its exit codes are a contract: **0** deployed,
@@ -272,7 +275,7 @@ As of 2026-10-18:
   `0b5c2c6` (deploy hardening). Before it, `main` = `dev` = `d975249`, a lockfile-only
   commit (rustls 0.23.46, rustls-webpki 0.103.16, webpki-roots 1.0.10). **The `audit` CI job
   gates `deploy`** (`needs: [build, deploy-script, audit]`): cached cargo-audit 0.22.2 runs
-  `cargo audit` against `.cargo/audit.toml` (three dated ignores; `[output] deny =
+  `cargo audit` against `.cargo/audit.toml` (two dated ignores, `rsa` and `anyhow`, since `5d55f92`; `[output] deny =
   ["unsound", "yanked"]`; `quiet = false` is required by 0.22.2). The advisory DB is fetched
   live, so a red run with no code change is expected; the escape hatch is a dated ignore
   entry in the same commit. CI uploads `app/` to `$APP_PATH/app.new/` (`--link-dest` on the
@@ -293,14 +296,34 @@ As of 2026-10-18:
   included, via `to_canonical`); `main` journals it once on `listener.local_addr()`. Local
   dev with the repo `.env` (`0.0.0.0:3000`) sees the warning on purpose. The journal-capture
   pattern for a test is `routes/mod.rs`'s `Buf` + `tracing::subscriber::with_default`. No
-  R7, no migration. **Unpushed.**
+  R7, no migration. **Deployed 2026-10-22 (`e73d0dd`).**
+- **INF-6c-1 (infrastructure; client IP + rate limits; Reviewer 5a-3b F1, 5a-4 CF1, 5a-5 CF,
+  Reviewer INF-6b F1):** Built at `7e1005d`, after `5d55f92` (`event-listener` 5.4.2, the
+  RUSTSEC-2026-0221 ignore dropped). `main.rs` serves
+  `into_make_service_with_connect_info::<SocketAddr>()` (the bind warning stays before it).
+  `rate_limit::client_key(peer, &HeaderMap)` trusts `X-Real-IP` only from a **loopback
+  peer** and never reads `X-Forwarded-For`; anything but exactly one parseable value →
+  `ClientKey::Shared`, journalled once per `AppState` (`RateLimits::shared_warned`); IPv6 is
+  keyed by /64. This depends on nginx's `proxy_set_header X-Real-IP $remote_addr` on
+  `location /api/` (Security_Mandate §2i). `rate_limit::FixedWindow<K>` is a keyed
+  fixed-window limiter: the window is anchored at a key's first hit, the map has a soft
+  cap of 10⁴ swept on pressure, and a map still full refuses new keys (fail closed). **Never
+  call `len()`/`retain()`/`contains_key()` on its `DashMap` while an `entry()` guard is
+  alive** (deadlock). Five limits, all consts (60 s windows): per IP `challenge` + `verify`
+  20 (one shared bucket), join 10, replacement 10; per wallet join 3, replacement 3 (none on
+  sign-in, GAP-77). `AppState.rate_limits` is fresh per `AppState`. The four handlers take
+  `Option<ConnectInfo<SocketAddr>>` + `HeaderMap`; `None` → `500` through `internal_error`
+  (`client_ip`). Sign-in takes `Result<Json<_>, JsonRejection>`, so a malformed body is
+  counted, then answered by axum unchanged. Tests give a router a peer with
+  `routes::with_test_peer(router, TEST_PEER)` (`192.0.2.1:1`; `pub`, `#[doc(hidden)]`). T1
+  pins `#[track_caller]` via `routes/mod.rs:{line}:`. No R7, no migration. **Unpushed.**
 
-**408/408 tests green (1 `shared` + 179 `mercs_server` lib + 2 `aar_determinism` + 155
-`db_infrastructure` + 71 `sim_engine`; single-threaded, verified at `2b479cf`). Workspace
+**428/428 tests green (1 `shared` + 199 `mercs_server` lib + 2 `aar_determinism` + 155
+`db_infrastructure` + 71 `sim_engine`; single-threaded, verified at `7e1005d`). Workspace
 version `0.3.0`. `.sqlx/` holds 76 files; the latest migration is
-`0032_usable_replacement_and_card_provenance`. `main` = `4c8fe40` (INF-6a, deployed and
-droplet-verified 2026-10-22); `dev` is ahead with INF-6b, unpushed.
-Next: INF-6c-1; see the Section 5 document's §5x.** Any brick that changes what `resolve_mission` produces for
+`0032_usable_replacement_and_card_provenance`. `main` = `e73d0dd` (INF-6b, deployed
+2026-10-22); `dev` is ahead with `5d55f92` and INF-6c-1, unpushed.
+Next: INF-6c-2; see the Section 5 document's §5x.** Any brick that changes what `resolve_mission` produces for
 a given seed bumps the workspace version in the same brick. 4b-1 reused `sim-engine`'s `OutcomeType` rather than
 defining a new enum, and writes **no input-log entry** — the rank-up entry was removed
 from scope. **ODQ-22 and ODQ-23 were ruled 2026-09-03 — engagement and mission outcomes
