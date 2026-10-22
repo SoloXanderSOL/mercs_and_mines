@@ -172,7 +172,8 @@ As of 2026-10-18:
   'replacement' AND NOT is_kia AND NOT is_shattered`) and adds the nullable
   `card_mint_pending.acquired_via` (`card_mint_pending_acquired_via_canon`, with a guard row),
   which `mark_commander_kia` copies from `c.acquired_via`. Postgres is its only oracle: the
-  in-memory card carries `acquired_via: None`. **Next: INF-6.**
+  in-memory card carries `acquired_via: None`. **Next: INF-6** (split 6a → 6b → 6c-1 →
+  6c-2 → 6d; 6a built, see INF-6a below).
 - **Section 6:** Not started.
 - **Sections 7 (Personnel Entity Model) and 8 (Combat Engine to canon):** created
   2026-10-13 (ruling D2); both run before Section 6. Strike Mining and Base Building moved
@@ -259,16 +260,32 @@ As of 2026-10-18:
   the running build's SHA, swaps, restarts, polls `/api/version` until `build_sha` equals the
   commit, and rolls back with explicit checks. Its exit codes are a contract: **0** deployed,
   **1** failed with the rollback verified (by SHA, or by health only when the old SHA was
-  unreadable), **2** rollback failed or impossible. `deploy/test_remote_deploy.sh` (8 stub
-  scenarios) and `shellcheck` run in the `deploy-script` job on every push, and the deploy
-  job needs it (GAP-33).
+  unreadable), **2** rollback failed or impossible. `deploy/test_remote_deploy.sh` (13 stub
+  scenarios since INF-6a) and `shellcheck` run in the `deploy-script` job on every push, and
+  the deploy job needs it (GAP-33).
+- **INF-6a (infrastructure; GAP-54, GAP-55, GAP-56 repo half; the gating audit, Director
+  ruling (a) 2026-10-22):** Built at `7e42d82` (`spin` 0.9.8 → 0.9.9, `Cargo.lock` only,
+  never compiled; cargo-audit cannot ignore a yanked crate) + `81fc1af` (audit job) +
+  `0b5c2c6` (deploy hardening). Before it, `main` = `dev` = `d975249`, a lockfile-only
+  commit (rustls 0.23.46, rustls-webpki 0.103.16, webpki-roots 1.0.10). **The `audit` CI job
+  gates `deploy`** (`needs: [build, deploy-script, audit]`): cached cargo-audit 0.22.2 runs
+  `cargo audit` against `.cargo/audit.toml` (three dated ignores; `[output] deny =
+  ["unsound", "yanked"]`; `quiet = false` is required by 0.22.2). The advisory DB is fetched
+  live, so a red run with no code change is expected; the escape hatch is a dated ignore
+  entry in the same commit. CI uploads `app/` to `$APP_PATH/app.new/` (`--link-dest` on the
+  live `app/`); the script swaps `app` → `app.prev`, `app.new` → `app` after the binary, and
+  a rollback restores `app.prev/` too. Every `sudo` is `sudo -n`, behind a pre-swap
+  `sudo -n -l` probe per command (exit 2, nothing touched). The deploy job has
+  `concurrency: deploy-production` (the newest pending deploy wins). The unit is
+  `mercs-and-mines`; the deploy-user secret is `DEV_SERVER_USER`. **Unpushed.** The Director's
+  GAP-56 host pass (the `deploy` user, then the service off root) follows its deploy.
 
 **403/403 tests green (1 `shared` + 174 `mercs_server` lib + 2 `aar_determinism` + 155
 `db_infrastructure` + 71 `sim_engine`; single-threaded, verified at `4e104d1`). Workspace
 version `0.3.0`. `.sqlx/` holds 76 files; the latest migration is
-`0032_usable_replacement_and_card_provenance`. `main` = `4eb1b1b` (5a-4, deployed
-2026-10-20); `dev` is ahead with 5a-5, unpushed.
-Next: INF-6; see the Phase 1 document.** Any brick that changes what `resolve_mission` produces for
+`0032_usable_replacement_and_card_provenance`. `main` = `d975249` (5a-5 + the TLS lockfile
+bump, deployed 2026-10-22); `dev` is ahead with INF-6a, unpushed.
+Next: INF-6b; see the Section 5 document's §5x.** Any brick that changes what `resolve_mission` produces for
 a given seed bumps the workspace version in the same brick. 4b-1 reused `sim-engine`'s `OutcomeType` rather than
 defining a new enum, and writes **no input-log entry** — the rank-up entry was removed
 from scope. **ODQ-22 and ODQ-23 were ruled 2026-09-03 — engagement and mission outcomes
@@ -548,9 +565,16 @@ Cargo flags such as `--no-fail-fast` go **before** `--`; after it they are passe
 test binary, which rejects them.
 
 **Deploy harness:** `bash deploy/test_remote_deploy.sh` runs the real deploy script
-against shims (about 12 s, no root or network needed). Run it after any change under
-`deploy/`. The `deploy-script` CI job also lints both scripts with `shellcheck`, which is
+against shims (13 scenarios, about 20 s, no root or network needed). Run it after any
+change under `deploy/`. Knobs: `FAIL_RESTART=<n>` fails the n-th restart; `SUDO_DENY=1`
+refuses every privileged call, the probe included. A new branch in the script gets a
+scenario. The `deploy-script` CI job also lints both scripts with `shellcheck`, which is
 also installed in WSL (0.9.0): run it before committing any `deploy/` change.
+
+**Dependency audit:** run `cargo audit` locally (cargo-audit 0.22.2 is installed in WSL)
+after any `Cargo.lock` change, since the `audit` job gates deploys. A new ignore in
+`.cargo/audit.toml` carries the ID, a reason and a re-check date. A yanked crate cannot be
+ignored: update it out of the lockfile instead.
 
 If a system package is missing (redis-server, libssl-dev, etc.), do not attempt
 `apt install`. Surface it to the Director with a single copy-pasteable sudo command.
