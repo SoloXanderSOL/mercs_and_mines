@@ -173,7 +173,7 @@ As of 2026-10-18:
   `card_mint_pending.acquired_via` (`card_mint_pending_acquired_via_canon`, with a guard row),
   which `mark_commander_kia` copies from `c.acquired_via`. Postgres is its only oracle: the
   in-memory card carries `acquired_via: None`. **Next: INF-6** (split 6a → 6b → 6c-1 →
-  6c-2 → 6d; 6a built, see INF-6a below).
+  6c-2 → 6d; 6a deployed, 6b built, see INF-6a and INF-6b below).
 - **Section 6:** Not started.
 - **Sections 7 (Personnel Entity Model) and 8 (Combat Engine to canon):** created
   2026-10-13 (ruling D2); both run before Section 6. Strike Mining and Base Building moved
@@ -254,8 +254,11 @@ As of 2026-10-18:
   `option_env!("MERCS_BUILD_SHA")`, set by CI on the release build; `"unknown"` locally);
   the admin key is compared as SHA-256 digests with a XOR-fold (ODQ-20); `post_auth_verify`
   upserts the account before issuing the session, so a `500` leaves no live token (GAP-52,
-  with four auth-verify route tests); `internal_error` is `#[track_caller]` and logs every
-  `500` it builds. CI runs on pushes to `main` and `dev` and on every pull request (GAP-32);
+  with four auth-verify route tests); `internal_error` is `#[track_caller]` and is the
+  **only** `500` builder (since INF-6b): it journals the full message, an `error_id`
+  (`Uuid::new_v4()`) and the call site, and returns exactly
+  `{"error":"internal error","error_id":"<uuid>"}`. **No literal `500`:** every one is an
+  `internal_error` call written at the site (never `.map_err(internal_error)`). CI runs on pushes to `main` and `dev` and on every pull request (GAP-32);
   deploy is still main-only. The droplet-side deploy is `deploy/remote_deploy.sh`: it reads
   the running build's SHA, swaps, restarts, polls `/api/version` until `build_sha` equals the
   commit, and rolls back with explicit checks. Its exit codes are a contract: **0** deployed,
@@ -277,15 +280,27 @@ As of 2026-10-18:
   a rollback restores `app.prev/` too. Every `sudo` is `sudo -n`, behind a pre-swap
   `sudo -n -l` probe per command (exit 2, nothing touched). The deploy job has
   `concurrency: deploy-production` (the newest pending deploy wins). The unit is
-  `mercs-and-mines`; the deploy-user secret is `DEV_SERVER_USER`. **Unpushed.** The Director's
-  GAP-56 host pass (the `deploy` user, then the service off root) follows its deploy.
+  `mercs-and-mines`; the deploy-user secret is `DEV_SERVER_USER`. **Deployed and
+  droplet-verified 2026-10-22 (`4c8fe40`).** The Director's GAP-56 host pass is done: CI
+  deploys as `deploy`, and the service runs as `mercs`.
+- **INF-6b (infrastructure; GAP-76, Reviewer 5a-3c F1, the boot bind warning):** Built at
+  `2b479cf`. `internal_error` is the only `500` builder (generic body + `error_id`; see
+  INF-4). The six former literal `500`s (`ws_combat.rs` ×2, `admin.rs` ×3,
+  `post_combat_stream_start`) go through it, and the AAR's `400` no longer echoes serde's
+  error over the logged payload (journalled with `warn!`). `ServerConfig::from_lookup(get)`
+  (`from_env` = `from_lookup(env_lookup)`); `config.rs` no longer mutates the process
+  environment. `config::public_bind_warning(&SocketAddr)` is `None` on loopback (IPv4-mapped
+  included, via `to_canonical`); `main` journals it once on `listener.local_addr()`. Local
+  dev with the repo `.env` (`0.0.0.0:3000`) sees the warning on purpose. The journal-capture
+  pattern for a test is `routes/mod.rs`'s `Buf` + `tracing::subscriber::with_default`. No
+  R7, no migration. **Unpushed.**
 
-**403/403 tests green (1 `shared` + 174 `mercs_server` lib + 2 `aar_determinism` + 155
-`db_infrastructure` + 71 `sim_engine`; single-threaded, verified at `4e104d1`). Workspace
+**408/408 tests green (1 `shared` + 179 `mercs_server` lib + 2 `aar_determinism` + 155
+`db_infrastructure` + 71 `sim_engine`; single-threaded, verified at `2b479cf`). Workspace
 version `0.3.0`. `.sqlx/` holds 76 files; the latest migration is
-`0032_usable_replacement_and_card_provenance`. `main` = `d975249` (5a-5 + the TLS lockfile
-bump, deployed 2026-10-22); `dev` is ahead with INF-6a, unpushed.
-Next: INF-6b; see the Section 5 document's §5x.** Any brick that changes what `resolve_mission` produces for
+`0032_usable_replacement_and_card_provenance`. `main` = `4c8fe40` (INF-6a, deployed and
+droplet-verified 2026-10-22); `dev` is ahead with INF-6b, unpushed.
+Next: INF-6c-1; see the Section 5 document's §5x.** Any brick that changes what `resolve_mission` produces for
 a given seed bumps the workspace version in the same brick. 4b-1 reused `sim-engine`'s `OutcomeType` rather than
 defining a new enum, and writes **no input-log entry** — the rank-up entry was removed
 from scope. **ODQ-22 and ODQ-23 were ruled 2026-09-03 — engagement and mission outcomes
