@@ -157,16 +157,22 @@ As of 2026-10-18:
   /api/campaign/:campaign_id/replacement-commander` (`routes/campaign.rs`; **not** behind the
   join switch): `401` → `404` → `403` non-member (any membership row) → `409` not `Active`
   (read before the transaction) → `CampaignJoinRepository::claim_replacement(campaign_id,
-  wallet, seed: u32) -> ReplacementOutcome { Granted(Uuid), NotMember, HasLiving }` → `201`
-  `{campaign_id, commander_id}` / `403` / `409` "member has a living Commander" / `500`. The
+  wallet, seed: u32) -> ReplacementOutcome { Granted(Uuid), NotMember, HasUsable }` → `201`
+  `{campaign_id, commander_id}` / `403` / `409` "member has a usable Commander" / `500`. The
   Postgres claim is one transaction under the member's membership row (`SELECT … FOR UPDATE`,
-  deliberate, never `JOIN_ADVISORY_KEY`), then one count/living read, then `insert_commander`
+  deliberate, never `JOIN_ADVISORY_KEY`), then one count/usable read, then `insert_commander`
   with `AcquiredVia::Replacement`. Zero Commanders → `Internal(NO_COMMANDERS)` → `500`;
-  Shattered and a live replacement count as living; per wipe, not once per membership.
-  Migration `0031_one_live_replacement` is the backstop partial unique
-  (`WHERE acquired_via = 'replacement' AND NOT is_kia`). The in-memory claim takes its own
-  `claims` Mutex and does not model the index. Alpha-only: `TODO(phase-2-§10j)` ×2 (Phase 2
-  §10j removes them). Not a logged input, no R7. **Next: INF-6.**
+  per wipe, not once per membership. The in-memory claim takes its own `claims` Mutex and
+  does not model the index. Alpha-only: `TODO(phase-2-§10j)` ×2 (Phase 2 §10j removes them).
+  Not a logged input, no R7. **5a-5 built (`4e104d1`, 2026-10-22; ODQ-46, ODQ-47):** a
+  Commander is **usable** when it is neither KIA nor Shattered; the claim grants when none is
+  usable (`HasUsable` otherwise), in both impls, with `TODO(phase-2-§14)` ×2 on the
+  eligibility reads (the Shattered clause retires with §14 Rehabilitation). Migration `0032`
+  re-cuts `commander_records_one_live_replacement` under the same name (`WHERE acquired_via =
+  'replacement' AND NOT is_kia AND NOT is_shattered`) and adds the nullable
+  `card_mint_pending.acquired_via` (`card_mint_pending_acquired_via_canon`, with a guard row),
+  which `mark_commander_kia` copies from `c.acquired_via`. Postgres is its only oracle: the
+  in-memory card carries `acquired_via: None`. **Next: INF-6.**
 - **Section 6:** Not started.
 - **Sections 7 (Personnel Entity Model) and 8 (Combat Engine to canon):** created
   2026-10-13 (ruling D2); both run before Section 6. Strike Mining and Base Building moved
@@ -257,10 +263,11 @@ As of 2026-10-18:
   scenarios) and `shellcheck` run in the `deploy-script` job on every push, and the deploy
   job needs it (GAP-33).
 
-**399/399 tests green (1 `shared` + 174 `mercs_server` lib + 2 `aar_determinism` + 151
-`db_infrastructure` + 71 `sim_engine`; single-threaded, verified at `2caa944`). Workspace
-version `0.3.0`. `.sqlx/` holds 76 files; the latest migration is `0031_one_live_replacement`.
-`main` = `ce8096e` (5a-3b + 5a-3c, deployed 2026-10-20); `dev` is ahead with 5a-4, unpushed.
+**403/403 tests green (1 `shared` + 174 `mercs_server` lib + 2 `aar_determinism` + 155
+`db_infrastructure` + 71 `sim_engine`; single-threaded, verified at `4e104d1`). Workspace
+version `0.3.0`. `.sqlx/` holds 76 files; the latest migration is
+`0032_usable_replacement_and_card_provenance`. `main` = `4eb1b1b` (5a-4, deployed
+2026-10-20); `dev` is ahead with 5a-5, unpushed.
 Next: INF-6; see the Phase 1 document.** Any brick that changes what `resolve_mission` produces for
 a given seed bumps the workspace version in the same brick. 4b-1 reused `sim-engine`'s `OutcomeType` rather than
 defining a new enum, and writes **no input-log entry** — the rank-up entry was removed
@@ -409,9 +416,13 @@ begins.
   `acquired_via` (`0030`) is written by the `insert_*` helpers' `via` parameter, never
   stored on the record structs. At most one starter per `(campaign, wallet)` by the
   `<t>_one_starter` index; exactly one by the join transaction. `Replacement` (Commanders
-  only) has one writer, `claim_replacement` (5a-4): at most one living replacement per
-  `(campaign, wallet)` by `commander_records_one_live_replacement` (`0031`, the backstop);
-  the claim's membership row lock is the guard.
+  only) has one writer, `claim_replacement` (5a-4): at most one usable (neither KIA nor
+  Shattered) replacement per `(campaign, wallet)` by `commander_records_one_live_replacement`
+  (re-cut by `0032`, the backstop); the claim's membership row lock is the guard. That row
+  lock serialises claims from any number of server processes, so the index is reachable only
+  through an out-of-band write or a future second writer of `'replacement'`. A death card
+  copies the Commander's `acquired_via` (`card_mint_pending.acquired_via`, `0032`; Postgres
+  only).
 
   **`JOIN_ADVISORY_KEY` has two takers:** `join_campaign` and `begin_launch` (5a-3a). The
   replacement claim (5a-4) takes only its member's membership row (`FOR UPDATE`, deliberate:
@@ -493,10 +504,10 @@ constraints — parallel execution causes FK-23503 failures that are not caused 
 code under test. Any test report produced without `--test-threads=1` is unreliable and
 must be re-run before reporting results to the Director.
 
-**Test wallets:** `tests/` uses wallet seeds 0–10, 13–19, 21–72 and 88; 11 and 12 (a range
+**Test wallets:** `tests/` uses wallet seeds 0–10, 13–19, 21–76 and 88; 11 and 12 (a range
 literal until 5a-3a) stay reserved. **20 is the auth tests' signing-key seed**
 (`SigningKey::from_bytes(&[20u8; 32])`). It is used in memory only, and its derived
-public key is not `[20u8; 32]`. The next free seed is **73**.
+public key is not `[20u8; 32]`. The next free seed is **77**.
 
 **One in-memory join per `AppState`:** `AppState::new` builds each join-shared store once and
 one `InMemoryCampaignJoinRepository` over the same `Arc`s. A test that replaces a join-read
