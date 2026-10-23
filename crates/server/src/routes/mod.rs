@@ -11,7 +11,6 @@ pub mod convoys;
 pub mod ws_combat;
 
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -90,8 +89,7 @@ fn forbidden(msg: impl Into<String>) -> AppError {
     (StatusCode::FORBIDDEN, Json(json!({"error": msg.into()})))
 }
 
-/// A `503` with the house JSON body. No journal line: a closed switch is configuration,
-/// not a fault.
+/// A `503` with the house JSON body. The helper journals nothing; a caller that refuses under load journals through its own `RateWarn`.
 fn service_unavailable(msg: impl Into<String>) -> AppError {
     (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": msg.into()})))
 }
@@ -109,7 +107,7 @@ fn too_many_requests(r: RetryAfter) -> Response {
 
 /// The request's rate-limit key (`rate_limit::client_key`). `None` means the router was
 /// served without `into_make_service_with_connect_info`, which production never does, so it
-/// is a `500` through `internal_error`. The first `Shared` key per `AppState` is journalled.
+/// is a `500` through `internal_error`. A `Shared` key is journalled on its first request, then at most hourly with a count.
 fn client_ip(
     ci: Option<ConnectInfo<SocketAddr>>,
     headers: &HeaderMap,
@@ -119,11 +117,14 @@ fn client_ip(
         return Err(internal_error("no ConnectInfo: router served without into_make_service_with_connect_info"));
     };
     let key = client_key(peer, headers);
-    if key == ClientKey::Shared && !limits.shared_warned.swap(true, Ordering::Relaxed) {
-        tracing::warn!(
-            "client IP unknown: a loopback peer without exactly one X-Real-IP; using the shared \
-             rate-limit bucket. Check nginx's `proxy_set_header X-Real-IP $remote_addr`"
-        );
+    if key == ClientKey::Shared {
+        if let Some(n) = limits.shared_warn.hit(Instant::now()) {
+            tracing::warn!(
+                requests = n,
+                "client IP unknown: a loopback peer without exactly one X-Real-IP; using the shared \
+                 rate-limit bucket. Check nginx's `proxy_set_header X-Real-IP $remote_addr`"
+            );
+        }
     }
     Ok(key)
 }
@@ -260,13 +261,16 @@ async fn post_auth_challenge(
     let challenge_text = crate::auth::build_challenge(&req.wallet_address, &nonce, now);
     let expiry_secs = state.config.server.challenge_expiry_secs;
 
-    state.pending_challenges.insert(
+    state.challenge_cap.insert(
+        &state.pending_challenges,
         crate::auth::challenge_key(&challenge_text),
         crate::state::PendingChallenge {
             wallet_address: req.wallet_address.clone(),
             challenge_text: challenge_text.clone(),
             expires_at: now + expiry_secs,
         },
+        now,
+        now_i,
     );
 
     Ok(Json(json!({
@@ -318,8 +322,12 @@ async fn post_auth_verify(
     crate::auth::verify_wallet_signature(&req.wallet_address, &req.challenge, &req.signature)
         .map_err(|e| bad_request(format!("signature invalid: {e}")))?;
 
-    // Issue the 2-hour session
-    let token = crate::auth::issue_session(&state, &req.wallet_address);
+    // Admit the session: the per-address quota evicts that address's oldest; the backstop
+    // refuses only when nothing would be evicted (ODQ-48). The challenge is already
+    // consumed, so a refused client asks for a new one. No `Retry-After`: a slot frees only
+    // when a session expires.
+    let token = crate::auth::admit_session(&state, &req.wallet_address, ip)
+        .map_err(|_| service_unavailable("sign-in is at capacity, try again later"))?;
 
     let v = serde_json::to_value(&token)
         .map_err(|e| internal_error(format!("session token serialization failed: {e}")))?;
@@ -901,7 +909,6 @@ mod tests {
     use axum::Router;
     use http_body_util::BodyExt;
     use std::net::SocketAddr;
-    use std::sync::atomic::Ordering;
     use tower::ServiceExt;
 
     fn fresh_state() -> Arc<AppState> {
@@ -1187,10 +1194,18 @@ mod tests {
         state.pending_challenges.insert([2u8; 32], pending(now + 3600));
         state.sessions.insert("expired".into(), session("expired", now - 100));
         state.sessions.insert("live".into(), session("live", now + 3600));
+        // Admitted through the index, so the prune has something to prune (N-l).
+        let key = crate::rate_limit::ClientKey::V4(std::net::Ipv4Addr::new(192, 0, 2, 9));
+        let first = crate::auth::admit_session(&state, "w", key).expect("under the cap").token_id;
+        let second = crate::auth::admit_session(&state, "w", key).expect("under the cap").token_id;
+        state.sessions.get_mut(&first).expect("admitted").expires_at = now - 100;
 
         let h = tokio::spawn(crate::auth::run_auth_sweep_task(state.clone()));
         let swept = tokio::time::timeout(Duration::from_secs(5), async {
-            while state.pending_challenges.contains_key(&[1u8; 32]) || state.sessions.contains_key("expired") {
+            while state.pending_challenges.contains_key(&[1u8; 32])
+                || state.sessions.contains_key("expired")
+                || state.sessions.contains_key(&first)
+            {
                 tokio::task::yield_now().await;
             }
         })
@@ -1199,14 +1214,58 @@ mod tests {
         assert!(swept.is_ok(), "the sweep task did not clear the expired entries");
         assert!(state.pending_challenges.contains_key(&[2u8; 32]), "the live challenge is kept");
         assert!(state.sessions.contains_key("live"), "the live session is kept");
+        assert!(state.sessions.contains_key(&second), "the live admitted session is kept");
+        assert_eq!(state.session_index.indexed(), 1, "the sweep prunes the index after its retain");
     }
 
     #[tokio::test]
-    async fn a_loopback_peer_without_x_real_ip_warns_once() {
+    async fn a_loopback_peer_without_x_real_ip_warns_at_most_hourly() {
         let state = fresh_state();
         challenge(&state, TEST_PEER, None).await;
-        assert!(!state.rate_limits.shared_warned.load(Ordering::Relaxed), "a keyed peer does not warn");
+        assert!(!state.rate_limits.shared_warn.fired(), "a keyed peer does not warn");
         challenge(&state, "127.0.0.1:1".parse().unwrap(), None).await;
-        assert!(state.rate_limits.shared_warned.load(Ordering::Relaxed), "the shared bucket warns");
+        assert!(state.rate_limits.shared_warn.fired(), "the shared bucket warns");
+        let now = std::time::Instant::now();
+        assert_eq!(state.rate_limits.shared_warn.hit(now), None, "within the hour: counted, not journalled");
+        assert_eq!(
+            state.rate_limits.shared_warn.hit(now + std::time::Duration::from_secs(3601)),
+            Some(2),
+            "after the hour: the count since the last line"
+        );
+    }
+
+    /// The backstop refuses a real sign-in and logs nobody out (ODQ-48). A small-cap index is
+    /// swapped in, so nothing is pre-filled. Seed 20 is in-memory only, and its key is not weak.
+    #[tokio::test]
+    async fn verify_answers_503_when_sign_in_is_at_capacity() {
+        use ed25519_dalek::{Signer, SigningKey};
+        let mut s = AppState::new(Arc::new(Config::default()));
+        s.session_index = crate::auth::SessionIndex::new(crate::auth::SESSION_QUOTA, 1);
+        let state = Arc::new(s);
+        let now = chrono::Utc::now().timestamp();
+        state.sessions.insert(
+            "held".into(),
+            shared::SessionToken {
+                token_id: "held".into(),
+                account_id: "a".into(),
+                wallet_address: "w".into(),
+                issued_at: now,
+                expires_at: now + 3600,
+            },
+        );
+        let key = SigningKey::from_bytes(&[20u8; 32]);
+        let wallet = bs58::encode(key.verifying_key().to_bytes()).into_string();
+        let app = with_test_peer(router(state.clone()), TEST_PEER);
+        let (status, _, body) = post(app, "/api/auth/challenge", json!({"wallet_address": wallet}), true, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let text = body["challenge"].as_str().expect("a challenge").to_string();
+        let signature = bs58::encode(key.sign(text.as_bytes()).to_bytes()).into_string();
+        let app = with_test_peer(router(state.clone()), TEST_PEER);
+        let req = json!({"wallet_address": wallet, "challenge": text, "signature": signature});
+        let (status, _, body) = post(app, "/api/auth/verify", req, true, None).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["error"], "sign-in is at capacity, try again later");
+        assert!(state.sessions.contains_key("held"), "a refusal logs nobody out");
+        assert_eq!(state.sessions.len(), 1);
     }
 }

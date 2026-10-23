@@ -3,6 +3,7 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
+use crate::auth::{ChallengeCap, SessionIndex, CHALLENGE_CAP, SESSION_CAP, SESSION_QUOTA};
 use crate::config::Config;
 use crate::convoy_expiry::ConvoyEvent;
 use crate::rate_limit::RateLimits;
@@ -36,8 +37,12 @@ pub struct AppState {
     pub input_log_repo:  Arc<dyn InputLogRepository + Send + Sync>,
     /// Active 2-hour sessions, keyed by token_id. The auth sweep removes expired ones.
     pub sessions: DashMap<String, shared::SessionToken>,
+    /// The per-address session quota and the global backstop over `sessions` (ODQ-48).
+    pub session_index: SessionIndex,
     /// Pending sign-in challenges, keyed by challenge_key of the challenge text. One-time use: verify removes the entry whatever the outcome; the auth sweep removes expired ones.
     pub pending_challenges: DashMap<[u8; 32], PendingChallenge>,
+    /// The pending-challenge cap (ODQ-48). Production inserts go through it.
+    pub challenge_cap: ChallengeCap,
     pub campaign_repo:   Arc<dyn CampaignRepository  + Send + Sync>,
     pub commander_repo:  Arc<dyn CommanderRepository  + Send + Sync>,
     pub membership_repo: Arc<dyn MembershipRepository + Send + Sync>,
@@ -76,7 +81,9 @@ impl AppState {
             session_repo:        Arc::new(InMemorySessionStateRepository::new()),
             input_log_repo:      Arc::new(InMemoryInputLogRepository::new()),
             sessions:           DashMap::new(),
+            session_index:      SessionIndex::new(SESSION_QUOTA, SESSION_CAP),
             pending_challenges: DashMap::new(),
+            challenge_cap:      ChallengeCap::new(CHALLENGE_CAP),
             campaign_repo:       campaigns.clone(),
             commander_repo:      commanders.clone(),
             membership_repo:     memberships.clone(),

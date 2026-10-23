@@ -38,6 +38,7 @@ pub struct GcnLedgerEntry {
     pub recorded_at: DateTime<Utc>,
 }
 
+/// Accounts are created only by the join (`insert_account_if_absent`, GAP-79); nothing in sign-in writes here.
 #[async_trait]
 pub trait AccountRepository: Send + Sync {
     async fn get_account(&self, wallet: &Pubkey) -> Result<Option<PlayerAccount>, RepositoryError>;

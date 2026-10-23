@@ -1,5 +1,6 @@
-use std::sync::Arc;
-use std::time::Duration;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 use axum::{
     extract::{FromRef, FromRequestParts},
     http::{request::Parts, StatusCode},
@@ -13,6 +14,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use shared::SessionToken;
 use crate::state::{AppState, PendingChallenge};
+use crate::rate_limit::{ClientKey, RateWarn, SweepThrottle};
 
 // ── Challenge keys and wallet validation ───────────────────────────────────
 
@@ -59,8 +61,138 @@ pub fn sweep_expired_sessions(map: &DashMap<String, SessionToken>, now: i64) -> 
     removed
 }
 
-/// Sweeps both auth maps every `AUTH_SWEEP_INTERVAL_SECS`, so entries nobody looks up
-/// again still leave memory. Run under `supervisor::supervise`.
+// ── Bounded lists (ODQ-48) ─────────────────────────────────────────────────
+
+/// Live sessions per `ClientKey` before a new one signs out that key's oldest.
+pub const SESSION_QUOTA: usize = 10;
+/// Live sessions in all before a sign-in that would evict nobody is refused (`503`).
+pub const SESSION_CAP: usize = 100_000;
+/// Pending challenges before a new one evicts an arbitrary entry.
+pub const CHALLENGE_CAP: usize = 100_000;
+
+/// A sign-in refused at the session backstop.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SessionsFull;
+
+/// The per-`ClientKey` session quota and the global backstop, kept beside `sessions`.
+///
+/// - Each key's deque holds `(token_id, expires_at)` in issue order. Entries that have
+///   expired, or that the extractor or the sweep removed from `sessions`, are pruned lazily.
+/// - `ClientKey::Shared` is never indexed: only the backstop applies to it.
+/// - **Lock order is always this index, then `sessions`' shards.** Never take the index
+///   while a `sessions` guard is alive. The `std` `Mutex` is never held across an `.await`.
+pub struct SessionIndex {
+    inner: Mutex<HashMap<ClientKey, VecDeque<(String, i64)>>>,
+    quota: usize,
+    cap: usize,
+    full_warn: RateWarn,
+}
+
+impl SessionIndex {
+    pub fn new(quota: usize, cap: usize) -> Self {
+        Self { inner: Mutex::new(HashMap::new()), quota, cap, full_warn: RateWarn::new() }
+    }
+
+    /// Admits `token` for `key` in one decision under the index lock. A key at its quota
+    /// evicts its oldest session. Otherwise, if `sessions` is at the backstop, the sign-in is
+    /// refused and nothing is evicted, so a refusal never logs anyone out.
+    pub fn admit(
+        &self,
+        sessions: &DashMap<String, SessionToken>,
+        key: ClientKey,
+        token: SessionToken,
+        now: i64,
+        at: Instant,
+    ) -> Result<(), SessionsFull> {
+        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let live = match inner.get_mut(&key) {
+            Some(q) => {
+                q.retain(|(id, exp)| *exp >= now && sessions.contains_key(id));
+                q.len()
+            }
+            None => 0,
+        };
+        let evicts = key != ClientKey::Shared && live >= self.quota;
+        if !evicts && sessions.len() >= self.cap {
+            if let Some(n) = self.full_warn.hit(at) {
+                tracing::warn!(refused = n, cap = self.cap, "sign-in refused: the session map is at its backstop");
+            }
+            return Err(SessionsFull);
+        }
+        if key != ClientKey::Shared {
+            let q = inner.entry(key).or_default();
+            if evicts {
+                if let Some((oldest, _)) = q.pop_front() {
+                    sessions.remove(&oldest);
+                }
+            }
+            q.push_back((token.token_id.clone(), token.expires_at));
+        }
+        sessions.insert(token.token_id.clone(), token);
+        Ok(())
+    }
+
+    /// Drops index entries that have expired or are gone from `sessions`, and empty keys.
+    /// The sweep task calls it after `sweep_expired_sessions`.
+    pub fn prune(&self, sessions: &DashMap<String, SessionToken>, now: i64) {
+        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        inner.retain(|_, q| {
+            q.retain(|(id, exp)| *exp >= now && sessions.contains_key(id));
+            !q.is_empty()
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn indexed(&self) -> usize {
+        let inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        inner.values().map(VecDeque::len).sum()
+    }
+}
+
+/// The pending-challenge cap: at the cap, sweep expired entries (at most once per
+/// `SWEEP_MIN_INTERVAL`), then evict an arbitrary entry. Soft: two concurrent inserts at
+/// the cap may each evict one. It is the only production writer of `pending_challenges`.
+pub struct ChallengeCap {
+    cap: usize,
+    sweep: SweepThrottle,
+    evict_warn: RateWarn,
+}
+
+impl ChallengeCap {
+    pub fn new(cap: usize) -> Self {
+        Self { cap, sweep: SweepThrottle::new(), evict_warn: RateWarn::new() }
+    }
+
+    /// Inserts `value` under `key`, making room first if the map is at the cap. No guard is
+    /// alive at any `len`, `retain` or `remove` (the INF-6c-1 deadlock rule).
+    pub fn insert(
+        &self,
+        map: &DashMap<[u8; 32], PendingChallenge>,
+        key: [u8; 32],
+        value: PendingChallenge,
+        now: i64,
+        at: Instant,
+    ) {
+        if !map.contains_key(&key) && map.len() >= self.cap {
+            if self.sweep.allow(at) {
+                sweep_expired_challenges(map, now);
+            }
+            if map.len() >= self.cap {
+                let victim = map.iter().next().map(|e| *e.key());
+                if let Some(k) = victim {
+                    map.remove(&k);
+                }
+                if let Some(n) = self.evict_warn.hit(at) {
+                    tracing::warn!(evicted = n, cap = self.cap, "pending-challenge map at its cap: evicting arbitrary entries");
+                }
+            }
+        }
+        map.insert(key, value);
+    }
+}
+
+/// Sweeps both auth maps every `AUTH_SWEEP_INTERVAL_SECS`, then prunes the session index, so
+/// entries nobody looks up again still leave memory. Run under `supervisor::supervise`.
 pub async fn run_auth_sweep_task(state: Arc<AppState>) {
     let mut interval = tokio::time::interval(Duration::from_secs(AUTH_SWEEP_INTERVAL_SECS));
     loop {
@@ -68,6 +200,7 @@ pub async fn run_auth_sweep_task(state: Arc<AppState>) {
         let now = Utc::now().timestamp();
         sweep_expired_challenges(&state.pending_challenges, now);
         sweep_expired_sessions(&state.sessions, now);
+        state.session_index.prune(&state.sessions, now);
     }
 }
 
@@ -123,9 +256,13 @@ pub fn verify_wallet_signature(
 
 // ── Token issuance ─────────────────────────────────────────────────────────
 
-/// Issues a new SessionToken and inserts it into the session store.
+/// Builds a session for `wallet_address` and admits it through the session index (ODQ-48).
 /// account_id = wallet_address for Phase 0 (no DB yet — Batch 8 replaces this).
-pub fn issue_session(state: &Arc<AppState>, wallet_address: &str) -> SessionToken {
+pub fn admit_session(
+    state: &AppState,
+    wallet_address: &str,
+    key: ClientKey,
+) -> Result<SessionToken, SessionsFull> {
     let now = Utc::now().timestamp();
     let token = SessionToken {
         token_id:       Uuid::new_v4().to_string(),
@@ -134,8 +271,8 @@ pub fn issue_session(state: &Arc<AppState>, wallet_address: &str) -> SessionToke
         issued_at:      now,
         expires_at:     now + state.config.server.session_duration_secs,
     };
-    state.sessions.insert(token.token_id.clone(), token.clone());
-    token
+    state.session_index.admit(&state.sessions, key, token.clone(), now, Instant::now())?;
+    Ok(token)
 }
 
 // ── AuthSession extractor ──────────────────────────────────────────────────
@@ -251,5 +388,113 @@ mod tests {
         assert!(!map.contains_key("expired"), "the expired session is gone");
         assert!(map.contains_key("boundary"), "the boundary session is kept");
         assert!(map.contains_key("live"), "the live session is kept");
+    }
+
+    fn key(n: u8) -> ClientKey {
+        ClientKey::V4(std::net::Ipv4Addr::new(192, 0, 2, n))
+    }
+
+    fn admit(ix: &SessionIndex, map: &DashMap<String, SessionToken>, k: ClientKey, id: &str) -> Result<(), SessionsFull> {
+        ix.admit(map, k, session(id, NOW + 60), NOW, Instant::now())
+    }
+
+    #[test]
+    fn session_index_evicts_the_oldest_at_the_quota() {
+        let (ix, map) = (SessionIndex::new(2, 100), DashMap::new());
+        for id in ["s1", "s2", "s3"] {
+            assert_eq!(admit(&ix, &map, key(1), id), Ok(()));
+        }
+        assert!(!map.contains_key("s1"), "the oldest is signed out");
+        assert!(map.contains_key("s2") && map.contains_key("s3"));
+        assert_eq!(map.len(), 2);
+        assert_eq!(ix.indexed(), 2);
+    }
+
+    #[test]
+    fn session_index_refuses_at_the_backstop_and_evicts_nothing() {
+        let (ix, map) = (SessionIndex::new(10, 3), DashMap::new());
+        for (n, id) in [(1, "s1"), (2, "s2"), (3, "s3")] {
+            assert_eq!(admit(&ix, &map, key(n), id), Ok(()));
+        }
+        assert_eq!(admit(&ix, &map, key(4), "s4"), Err(SessionsFull));
+        assert_eq!(map.len(), 3, "a refusal logs nobody out");
+        assert!(!map.contains_key("s4"));
+        assert!(ix.full_warn.fired(), "the refusal is journalled");
+    }
+
+    #[test]
+    fn session_index_admits_a_quota_full_key_at_the_backstop() {
+        let (ix, map) = (SessionIndex::new(2, 2), DashMap::new());
+        for id in ["s1", "s2"] {
+            assert_eq!(admit(&ix, &map, key(1), id), Ok(()));
+        }
+        assert_eq!(admit(&ix, &map, key(1), "s3"), Ok(()), "evicting frees the slot, so no refusal");
+        assert!(!map.contains_key("s1") && map.contains_key("s3"));
+        assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn session_index_never_indexes_the_shared_key() {
+        let (ix, map) = (SessionIndex::new(1, 100), DashMap::new());
+        for id in ["s1", "s2", "s3"] {
+            assert_eq!(admit(&ix, &map, ClientKey::Shared, id), Ok(()));
+        }
+        assert_eq!(map.len(), 3, "no quota under Shared");
+        assert_eq!(ix.indexed(), 0);
+    }
+
+    /// The stale entry is the newer one, so a skipped prune would evict the live `s1` (N-n).
+    #[test]
+    fn session_index_prunes_stale_entries_lazily() {
+        let (ix, map) = (SessionIndex::new(2, 100), DashMap::new());
+        for id in ["s1", "s2"] {
+            assert_eq!(admit(&ix, &map, key(1), id), Ok(()));
+        }
+        map.remove("s2").expect("admitted");
+        assert_eq!(admit(&ix, &map, key(1), "s3"), Ok(()));
+        assert!(map.contains_key("s1") && map.contains_key("s3"), "the stale entry made room; nothing was evicted");
+        assert_eq!(ix.indexed(), 2);
+    }
+
+    #[test]
+    fn challenge_cap_evicts_one_when_every_entry_is_live() {
+        let (cap, map) = (ChallengeCap::new(2), DashMap::new());
+        let t0 = Instant::now();
+        for k in 1..=3u8 {
+            cap.insert(&map, [k; 32], challenge(NOW + 60), NOW, t0);
+        }
+        assert_eq!(map.len(), 2, "one arbitrary entry was evicted");
+        assert!(map.contains_key(&[3u8; 32]), "the new challenge is stored");
+        assert!(cap.evict_warn.fired(), "the eviction is journalled");
+    }
+
+    #[test]
+    fn challenge_cap_sweeps_expired_entries_before_evicting() {
+        let (cap, map) = (ChallengeCap::new(2), DashMap::new());
+        let t0 = Instant::now();
+        cap.insert(&map, [1u8; 32], challenge(NOW - 1), NOW, t0);
+        cap.insert(&map, [2u8; 32], challenge(NOW + 60), NOW, t0);
+        cap.insert(&map, [3u8; 32], challenge(NOW + 60), NOW, t0);
+        assert!(!map.contains_key(&[1u8; 32]), "the expired entry was swept");
+        assert!(map.contains_key(&[2u8; 32]) && map.contains_key(&[3u8; 32]), "the live entries are kept");
+        assert!(!cap.evict_warn.fired(), "the sweep freed a slot, so nothing was evicted");
+    }
+
+    /// Two clocks, both injected: `now` (i64) decides expiry, `at` (Instant) the throttle.
+    #[test]
+    fn challenge_cap_sweeps_at_most_once_a_second() {
+        let (cap, map) = (ChallengeCap::new(3), DashMap::new());
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        for k in 1..=3u8 {
+            cap.insert(&map, [k; 32], challenge(NOW + 10), NOW, t0);
+        }
+        cap.insert(&map, [4u8; 32], challenge(NOW + 1000), NOW, t0);
+        assert_eq!(map.len(), 3, "the first sweep found nothing expired, so one entry was evicted");
+        cap.insert(&map, [5u8; 32], challenge(NOW + 1000), NOW + 50, t0 + ms(500));
+        assert_eq!(map.len(), 3, "throttled: no sweep, so the expired entries stay and one is evicted");
+        cap.insert(&map, [6u8; 32], challenge(NOW + 1000), NOW + 50, t0 + ms(1500));
+        assert!(map.contains_key(&[6u8; 32]));
+        assert!(map.iter().all(|e| e.value().expires_at >= NOW + 50), "a second later the sweep runs again");
     }
 }

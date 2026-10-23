@@ -10,7 +10,7 @@
 
 use std::hash::Hash;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::http::HeaderMap;
@@ -24,8 +24,9 @@ pub const JOIN_PER_WALLET: u32 = 3;
 pub const REPLACEMENT_PER_IP: u32 = 10;
 pub const REPLACEMENT_PER_WALLET: u32 = 3;
 pub const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
-/// Keys per limiter before a sweep; still full after the sweep → refused (fail closed).
-pub const RATE_LIMIT_MAP_CAP: usize = 10_000;
+/// Keys per limiter before a sweep; still full after the sweep → the new key is admitted
+/// uncounted (fail open, ODQ-48) and the overflow is journalled.
+pub const RATE_LIMIT_MAP_CAP: usize = 100_000;
 
 /// What a request is counted against. IPv4 whole; IPv6 by its /64 (`V6Net` holds the top
 /// 64 bits), so one host can't mint fresh buckets from its own prefix. `Shared` is the one
@@ -84,31 +85,52 @@ struct Window {
 /// A keyed fixed-window limiter.
 ///
 /// - The window is anchored at a key's first hit, not at the wall clock.
-/// - The map is capped. A new key arriving at the cap sweeps expired windows once; if the
-///   map is still full, the new key is refused (fail closed). Keys already present keep
-///   working. The cap is soft: concurrent new keys can overshoot it by at most the
-///   concurrency.
+/// - The map is capped. A new key arriving at the cap sweeps expired windows, at most once
+///   per `SWEEP_MIN_INTERVAL`; if the map is still full, the new key is admitted uncounted
+///   (fail open, ODQ-48) and `overflow` journals it. Keys already present keep working. The
+///   cap is soft: concurrent new keys can overshoot it by at most the concurrency.
 /// - **Never call `len()`, `retain()` or `contains_key()` while an `entry()` guard is
 ///   alive:** `entry` holds its shard's write lock, so any of them deadlocks on that shard.
 pub struct FixedWindow<K> {
+    name: &'static str,
     map: DashMap<K, Window>,
     limit: u32,
     window: Duration,
     cap: usize,
+    sweep: SweepThrottle,
+    overflow: RateWarn,
 }
 
 impl<K: Eq + Hash + Clone> FixedWindow<K> {
-    pub fn new(limit: u32, window: Duration, cap: usize) -> Self {
-        Self { map: DashMap::new(), limit, window, cap }
+    pub fn new(name: &'static str, limit: u32, window: Duration, cap: usize) -> Self {
+        Self {
+            name,
+            map: DashMap::new(),
+            limit,
+            window,
+            cap,
+            sweep: SweepThrottle::new(),
+            overflow: RateWarn::new(),
+        }
     }
 
     /// Counts one request for `key` at `now`. `Err` carries the seconds to wait.
     pub fn check(&self, key: K, now: Instant) -> Result<(), RetryAfter> {
         // Pressure step: no entry guard is alive here.
         if !self.map.contains_key(&key) && self.map.len() >= self.cap {
-            self.map.retain(|_, w| now < w.start + self.window);
+            if self.sweep.allow(now) {
+                self.map.retain(|_, w| now < w.start + self.window);
+            }
             if self.map.len() >= self.cap {
-                return Err(RetryAfter(self.window.as_secs()));
+                if let Some(n) = self.overflow.hit(now) {
+                    tracing::warn!(
+                        limiter = self.name,
+                        admitted = n,
+                        cap = self.cap,
+                        "rate-limit map full: admitting new keys uncounted (fail open)"
+                    );
+                }
+                return Ok(());
             }
         }
         match self.map.entry(key) {
@@ -135,6 +157,11 @@ impl<K: Eq + Hash + Clone> FixedWindow<K> {
     fn len(&self) -> usize {
         self.map.len()
     }
+
+    #[cfg(test)]
+    fn contains(&self, key: &K) -> bool {
+        self.map.contains_key(key)
+    }
 }
 
 /// Whole seconds from `now` to `end`, rounded up, minimum 1.
@@ -142,6 +169,74 @@ fn retry_secs(end: Instant, now: Instant) -> u64 {
     let left = end.saturating_duration_since(now);
     let secs = left.as_secs() + u64::from(left.subsec_nanos() > 0);
     secs.max(1)
+}
+
+/// How often a `RateWarn` journals after its first line.
+pub const RATE_WARN_INTERVAL: Duration = Duration::from_secs(3600);
+/// The shortest gap between two sweeps of one capped map.
+pub const SWEEP_MIN_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Milliseconds from `base` to `now`, plus 1, so that `0` can mean "never". A `now` before
+/// `base` saturates.
+fn stamp(base: Instant, now: Instant) -> u64 {
+    now.saturating_duration_since(base).as_millis() as u64 + 1
+}
+
+/// True on the first call, then at most once per `every`. Claimed by `compare_exchange`, so
+/// of two concurrent callers only one gets `true`.
+fn claim(base: Instant, last: &AtomicU64, now: Instant, every: Duration) -> bool {
+    let at = stamp(base, now);
+    let prev = last.load(Ordering::Relaxed);
+    let due = prev == 0 || at.saturating_sub(prev) >= every.as_millis() as u64;
+    due && last.compare_exchange(prev, at, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+}
+
+/// Journals a repeating condition without flooding (ODQ-48; Reviewer INF-6c-1 F2): the first
+/// hit, then at most once per `RATE_WARN_INTERVAL`, each time with the number of hits since
+/// the last line. The caller owns the `warn!` text. There is deliberately no `Default`.
+pub struct RateWarn {
+    base: Instant,
+    last_ms: AtomicU64,
+    pending: AtomicU64,
+}
+
+impl RateWarn {
+    pub fn new() -> Self {
+        Self { base: Instant::now(), last_ms: AtomicU64::new(0), pending: AtomicU64::new(0) }
+    }
+
+    /// Counts one hit at `now`. `Some(n)` means this caller journals: `n` hits since the
+    /// last line, this one included.
+    pub fn hit(&self, now: Instant) -> Option<u64> {
+        self.pending.fetch_add(1, Ordering::Relaxed);
+        if claim(self.base, &self.last_ms, now, RATE_WARN_INTERVAL) {
+            Some(self.pending.swap(0, Ordering::Relaxed))
+        } else {
+            None
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fired(&self) -> bool {
+        self.last_ms.load(Ordering::Relaxed) != 0
+    }
+}
+
+/// At most one sweep per `SWEEP_MIN_INTERVAL`. The first is never refused, so a map's first
+/// sweep at its cap always runs.
+pub struct SweepThrottle {
+    base: Instant,
+    last_ms: AtomicU64,
+}
+
+impl SweepThrottle {
+    pub fn new() -> Self {
+        Self { base: Instant::now(), last_ms: AtomicU64::new(0) }
+    }
+
+    pub fn allow(&self, now: Instant) -> bool {
+        claim(self.base, &self.last_ms, now, SWEEP_MIN_INTERVAL)
+    }
 }
 
 /// The five limiters, one set per `AppState`. Per-wallet limiters exist only for the two
@@ -152,23 +247,23 @@ pub struct RateLimits {
     pub join_wallet: FixedWindow<String>,
     pub replacement_ip: FixedWindow<ClientKey>,
     pub replacement_wallet: FixedWindow<String>,
-    /// Set by the first request that falls into `ClientKey::Shared`, so its warning is
-    /// journalled once per `AppState` (once per process).
-    pub shared_warned: AtomicBool,
+    /// Journals requests that fall into `ClientKey::Shared`: the first, then at most hourly
+    /// with a count.
+    pub shared_warn: RateWarn,
 }
 
 impl RateLimits {
     pub fn new() -> Self {
-        fn w<K: Eq + Hash + Clone>(limit: u32) -> FixedWindow<K> {
-            FixedWindow::new(limit, RATE_LIMIT_WINDOW, RATE_LIMIT_MAP_CAP)
+        fn w<K: Eq + Hash + Clone>(name: &'static str, limit: u32) -> FixedWindow<K> {
+            FixedWindow::new(name, limit, RATE_LIMIT_WINDOW, RATE_LIMIT_MAP_CAP)
         }
         Self {
-            sign_in_ip: w(SIGN_IN_PER_IP),
-            join_ip: w(JOIN_PER_IP),
-            join_wallet: w(JOIN_PER_WALLET),
-            replacement_ip: w(REPLACEMENT_PER_IP),
-            replacement_wallet: w(REPLACEMENT_PER_WALLET),
-            shared_warned: AtomicBool::new(false),
+            sign_in_ip: w("sign_in_ip", SIGN_IN_PER_IP),
+            join_ip: w("join_ip", JOIN_PER_IP),
+            join_wallet: w("join_wallet", JOIN_PER_WALLET),
+            replacement_ip: w("replacement_ip", REPLACEMENT_PER_IP),
+            replacement_wallet: w("replacement_wallet", REPLACEMENT_PER_WALLET),
+            shared_warn: RateWarn::new(),
         }
     }
 }
@@ -238,7 +333,7 @@ mod tests {
 
     #[test]
     fn fixed_window_allows_the_limit_then_refuses() {
-        let fw = FixedWindow::new(3, Duration::from_secs(60), 100);
+        let fw = FixedWindow::new("t", 3, Duration::from_secs(60), 100);
         let t0 = Instant::now();
         for _ in 0..3 {
             assert_eq!(fw.check("a", t0), Ok(()));
@@ -249,7 +344,7 @@ mod tests {
 
     #[test]
     fn fixed_window_resets_after_the_window() {
-        let fw = FixedWindow::new(1, Duration::from_secs(60), 100);
+        let fw = FixedWindow::new("t", 1, Duration::from_secs(60), 100);
         let t0 = Instant::now();
         assert_eq!(fw.check("a", t0), Ok(()));
         assert!(fw.check("a", t0 + Duration::from_secs(59)).is_err());
@@ -258,7 +353,7 @@ mod tests {
 
     #[test]
     fn fixed_window_sweeps_expired_keys_at_the_cap() {
-        let fw = FixedWindow::new(5, Duration::from_secs(60), 2);
+        let fw = FixedWindow::new("t", 5, Duration::from_secs(60), 2);
         let t0 = Instant::now();
         assert_eq!(fw.check("a", t0), Ok(()));
         assert_eq!(fw.check("b", t0), Ok(()));
@@ -266,19 +361,49 @@ mod tests {
         assert_eq!(fw.len(), 1, "the sweep removed both expired keys");
     }
 
+    /// ODQ-48: still full after the sweep → admitted uncounted (fail open), and journalled.
     #[test]
-    fn fixed_window_fails_closed_when_still_full() {
-        let fw = FixedWindow::new(5, Duration::from_secs(60), 2);
+    fn fixed_window_fails_open_when_still_full() {
+        let fw = FixedWindow::new("t", 5, Duration::from_secs(60), 2);
         let t0 = Instant::now();
         assert_eq!(fw.check("a", t0), Ok(()));
         assert_eq!(fw.check("b", t0), Ok(()));
-        assert_eq!(fw.check("c", t0 + Duration::from_secs(1)), Err(RetryAfter(60)));
+        assert_eq!(fw.check("c", t0 + Duration::from_secs(1)), Ok(()), "admitted, not refused");
+        assert_eq!(fw.len(), 2, "admitted uncounted");
+        assert!(!fw.contains(&"c"));
+        assert!(fw.overflow.fired(), "the overflow is journalled");
         assert_eq!(fw.check("a", t0 + Duration::from_secs(1)), Ok(()), "a key already in the map keeps working");
+    }
+
+    /// ODQ-48: at most one sweep a second. `d` finds `b` expired, but the last sweep was
+    /// 0.5 s ago, so `d` is admitted uncounted with `b` still present.
+    #[test]
+    fn fixed_window_sweeps_at_most_once_a_second() {
+        let fw = FixedWindow::new("t", 5, Duration::from_secs(60), 2);
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        assert_eq!(fw.check("a", t0), Ok(()));
+        assert_eq!(fw.check("b", t0 + ms(500)), Ok(()));
+        assert_eq!(fw.check("c", t0 + ms(60_200)), Ok(()));
+        assert!(!fw.contains(&"a") && fw.contains(&"b") && fw.contains(&"c"), "the first sweep ran");
+        assert_eq!(fw.check("d", t0 + ms(60_700)), Ok(()));
+        assert!(fw.contains(&"b") && !fw.contains(&"d"), "throttled: no sweep, d admitted uncounted");
+        assert_eq!(fw.check("e", t0 + ms(61_300)), Ok(()));
+        assert!(!fw.contains(&"b") && fw.contains(&"e"), "a second later the sweep runs again");
+    }
+
+    #[test]
+    fn rate_warn_fires_first_then_at_most_hourly_with_the_count() {
+        let w = RateWarn::new();
+        let t0 = Instant::now();
+        assert_eq!(w.hit(t0), Some(1), "the first hit is journalled");
+        assert_eq!(w.hit(t0 + Duration::from_secs(3599)), None, "within the hour: counted only");
+        assert_eq!(w.hit(t0 + Duration::from_secs(3600)), Some(2), "on the hour: the count since the last line");
     }
 
     #[test]
     fn retry_after_rounds_up_with_a_minimum_of_one() {
-        let fw = FixedWindow::new(1, Duration::from_secs(60), 100);
+        let fw = FixedWindow::new("t", 1, Duration::from_secs(60), 100);
         let t0 = Instant::now();
         assert_eq!(fw.check("a", t0), Ok(()));
         assert_eq!(fw.check("a", t0 + Duration::from_millis(500)), Err(RetryAfter(60)));
