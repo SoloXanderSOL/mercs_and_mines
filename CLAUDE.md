@@ -174,7 +174,8 @@ As of 2026-10-18:
   `card_mint_pending.acquired_via` (`card_mint_pending_acquired_via_canon`, with a guard row),
   which `mark_commander_kia` copies from `c.acquired_via`. Postgres is its only oracle: the
   in-memory card carries `acquired_via: None`. **Next: INF-6** (split 6a → 6b → 6c-1 →
-  6c-2a → 6c-2b → 6d; 6a, 6b and 6c-1 deployed, 6c-2a built; see INF-6a … INF-6c-2a below).
+  6c-2a → 6c-2b-1 → 6c-2b-2 → 6d; 6a, 6b, 6c-1 and 6c-2a deployed, 6c-2b-1 built; see INF-6a
+  … INF-6c-2b-1 below).
 - **Section 6:** Not started.
 - **Sections 7 (Personnel Entity Model) and 8 (Combat Engine to canon):** created
   2026-10-13 (ruling D2); both run before Section 6. Strike Mining and Base Building moved
@@ -254,8 +255,8 @@ As of 2026-10-18:
   `49dd10a` — public `GET /api/version` → `{version, build_sha}` (`build_sha` from
   `option_env!("MERCS_BUILD_SHA")`, set by CI on the release build; `"unknown"` locally);
   the admin key is compared as SHA-256 digests with a XOR-fold (ODQ-20); `post_auth_verify`
-  upserts the account before issuing the session, so a `500` leaves no live token (GAP-52,
-  with four auth-verify route tests); `internal_error` is `#[track_caller]` and is the
+  upserted the account before issuing the session (GAP-52; the upsert is gone since
+  INF-6c-2b-1, GAP-79); `internal_error` is `#[track_caller]` and is the
   **only** `500` builder (since INF-6b): it journals the full message, an `error_id`
   (`Uuid::new_v4()`) and the call site, and returns exactly
   `{"error":"internal error","error_id":"<uuid>"}`. **No literal `500`:** every one is an
@@ -334,14 +335,26 @@ As of 2026-10-18:
   `sweep_expired_challenges` / `sweep_expired_sessions(map, now)`, which keep `expires_at
   >= now` (the boundary both refusals still accept). No cap or eviction yet (INF-6c-2b,
   ODQ-48). Auth signing-key seeds (in memory only): 20 and 77. No R7, no migration.
-  **Unpushed.**
+  **Deployed 2026-10-23 (`492ae98`).**
+- **INF-6c-2b-1 (infrastructure; GAP-80, GAP-79 (a)):** Built at `276dea4`. **Sign-in
+  verifies strictly** (`verify_wallet_signature` → `verify_strict`; no `Verifier` import),
+  and `decode_wallet` refuses any address that is off-curve or a small-order (weak) key
+  (`VerifyingKey::from_bytes` + `!is_weak()`), so `challenge` answers them `400 "invalid
+  wallet address"`. The forged-signature tests use the identity key `[1, 0×31]` with
+  signature `[1, 0×63]` (deterministic; the all-zero key is not). **Sign-in writes nothing
+  to Postgres:** `verify` no longer upserts, and `AppState.account_repo` is gone. The join
+  creates the `player_accounts` row (`postgres_account::insert_account_if_absent`, `ON
+  CONFLICT DO NOTHING`, right after `lock_joins`). `verify`'s `500` arms: `client_ip` and
+  token serialisation. The auth sweep task is covered by `auth_sweep_task_sweeps_both_maps`;
+  **its `main.rs` spawn is guarded by a count gate only** (`tokio::spawn(supervise(` = 3).
+  No R7, no migration. **Unpushed.**
 
-**437/437 tests green (1 `shared` + 206 `mercs_server` lib + 2 `aar_determinism` + 157
-`db_infrastructure` + 71 `sim_engine`; single-threaded, verified at `a72d3e2`). Workspace
-version `0.3.0`. `.sqlx/` holds 76 files; the latest migration is
-`0032_usable_replacement_and_card_provenance`. `main` = `e878837` (INF-6c-1, deployed
-2026-10-22); `dev` is ahead with INF-6c-2a, unpushed.
-Next: INF-6c-2b; see the Section 5 document's §5x.** Any brick that changes what `resolve_mission` produces for
+**442/442 tests green (1 `shared` + 212 `mercs_server` lib + 2 `aar_determinism` + 156
+`db_infrastructure` + 71 `sim_engine`; single-threaded, verified at `276dea4`). Workspace
+version `0.3.0`. `.sqlx/` holds 77 files; the latest migration is
+`0032_usable_replacement_and_card_provenance`. `main` = `492ae98` (INF-6c-2a, deployed
+2026-10-23); `dev` is ahead with INF-6c-2b-1, unpushed.
+Next: INF-6c-2b-2; see the Section 5 document's §5x.** Any brick that changes what `resolve_mission` produces for
 a given seed bumps the workspace version in the same brick. 4b-1 reused `sim-engine`'s `OutcomeType` rather than
 defining a new enum, and writes **no input-log entry** — the rank-up entry was removed
 from scope. **ODQ-22 and ODQ-23 were ruled 2026-09-03 — engagement and mission outcomes
@@ -480,6 +493,10 @@ begins.
   Every repository trait returns `RepositoryError` (`NotFound`/`Internal`), never
   `sqlx::Error`; map with an explicit `map_err`, never a `From` impl.
 
+  **Accounts and sign-in (INF-6c-2b-1):** sign-in verifies strictly and `decode_wallet`
+  refuses weak and off-curve keys (GAP-80). The join creates the `player_accounts` row, and
+  sign-in writes nothing to Postgres (GAP-79).
+
   Commander roster strings live in `sim_engine::roster`, mirrored by `0018`'s CHECKs; it
   also holds the Foreman pools and `CommanderGrade`, mirrored by `0019`'s
   `commander_records_commander_grade_canon`. `commander_grade` is persisted, never
@@ -580,7 +597,13 @@ must be re-run before reporting results to the Director.
 **Test wallets:** `tests/` uses wallet seeds 0–10, 13–19, 21–76 and 88; 11 and 12 (a range
 literal until 5a-3a) stay reserved. **20 and 77 are the auth tests' signing-key seeds**
 (`SigningKey::from_bytes(&[20u8; 32])`; 77 since INF-6c-2a). They are used in memory only,
-and their derived public keys are not `[n; 32]`. The next free seed is **78**.
+and their derived public keys are not `[n; 32]`. The next free seed is **78**. A wallet that
+goes through `challenge` must be a non-weak curve point (since INF-6c-2b-1): `[9u8; 32]` is
+one; `[0u8; 32]` is weak, and 126 of the 256 `[n; 32]` patterns (`[2u8; 32]` the smallest)
+are off-curve.
+
+**Gate-only wiring:** the auth sweep task's spawn in `main.rs` has no test (`main` is not
+tested); `grep -c 'tokio::spawn(supervise(' crates/server/src/main.rs` = 3 guards it.
 
 **One in-memory join per `AppState`:** `AppState::new` builds each join-shared store once and
 one `InMemoryCampaignJoinRepository` over the same `Arc`s. A test that replaces a join-read
