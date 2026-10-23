@@ -145,7 +145,7 @@ As of 2026-10-18:
   `OneCampaign` is gone. A failed launch is retired to `Archived` (`admin.rs`). No migration,
   no `.sqlx` change, no R7. **5a-3c complete (`32199dc`, 2026-10-19; the join switch,
   Reviewer 5a-3b F1):** `ServerConfig::join_enabled` (default `false`) is read from
-  `MERCS_JOIN_ENABLED` by `env_bool` (`parse_or_warn`: exactly `true` opens; anything else
+  `MERCS_JOIN_ENABLED` by `ServerConfig::from_lookup` (`parse_or_warn`: exactly `true` opens; anything else
   warns and stays closed; documented in `.env.example`). Order: `401` (`AuthSession`) →
   `503` `{"error":"campaign joins are closed"}` (`service_unavailable()`) → `429` per client
   IP → `429` per wallet (INF-6c-1) → wallet decode → join, so the `503` precedes every
@@ -174,7 +174,7 @@ As of 2026-10-18:
   `card_mint_pending.acquired_via` (`card_mint_pending_acquired_via_canon`, with a guard row),
   which `mark_commander_kia` copies from `c.acquired_via`. Postgres is its only oracle: the
   in-memory card carries `acquired_via: None`. **Next: INF-6** (split 6a → 6b → 6c-1 →
-  6c-2 → 6d; 6a and 6b deployed, 6c-1 built; see INF-6a, INF-6b and INF-6c-1 below).
+  6c-2a → 6c-2b → 6d; 6a, 6b and 6c-1 deployed, 6c-2a built; see INF-6a … INF-6c-2a below).
 - **Section 6:** Not started.
 - **Sections 7 (Personnel Entity Model) and 8 (Combat Engine to canon):** created
   2026-10-13 (ruling D2); both run before Section 6. Strike Mining and Base Building moved
@@ -316,14 +316,32 @@ As of 2026-10-18:
   (`client_ip`). Sign-in takes `Result<Json<_>, JsonRejection>`, so a malformed body is
   counted, then answered by axum unchanged. Tests give a router a peer with
   `routes::with_test_peer(router, TEST_PEER)` (`192.0.2.1:1`; `pub`, `#[doc(hidden)]`). T1
-  pins `#[track_caller]` via `routes/mod.rs:{line}:`. No R7, no migration. **Unpushed.**
+  pins `#[track_caller]` via `routes/mod.rs:{line}:`. No R7, no migration. **Deployed
+  2026-10-22 (`e878837`).**
+- **INF-6c-2a (infrastructure; sign-in hardening, GAP-77, the challenge memory leak):** Built
+  at `a72d3e2`. `pending_challenges` is a `DashMap<[u8; 32], PendingChallenge>` keyed by
+  `auth::challenge_key` (SHA-256 of the challenge text, which the client sends back
+  verbatim); nothing parses the `Nonce:` line. `PendingChallenge` stores the
+  `wallet_address` it was issued to, and **`verify` refuses (`400 "challenge mismatch"`) a
+  request naming another wallet**: without that check, key B could redeem wallet A's
+  challenge. `verify` still `remove`s on lookup whatever the outcome. `challenge` refuses a
+  `wallet_address` that is not bs58 of 32 bytes (`auth::decode_wallet` → `400 "invalid
+  wallet address"`) after the rate-limit check and before anything stores it. Both sign-in
+  routes carry `DefaultBodyLimit::max(AUTH_BODY_LIMIT)` (4096) **per route**, never on the
+  `Router`: the overflow is axum's own plain-text `413`, a `JsonRejection` after the
+  limiter, so it is counted. `auth::run_auth_sweep_task` (a third `supervise`d task,
+  `"auth_sweep"`, every `AUTH_SWEEP_INTERVAL_SECS` = 60) calls
+  `sweep_expired_challenges` / `sweep_expired_sessions(map, now)`, which keep `expires_at
+  >= now` (the boundary both refusals still accept). No cap or eviction yet (INF-6c-2b,
+  ODQ-48). Auth signing-key seeds (in memory only): 20 and 77. No R7, no migration.
+  **Unpushed.**
 
-**428/428 tests green (1 `shared` + 199 `mercs_server` lib + 2 `aar_determinism` + 155
-`db_infrastructure` + 71 `sim_engine`; single-threaded, verified at `7e1005d`). Workspace
+**437/437 tests green (1 `shared` + 206 `mercs_server` lib + 2 `aar_determinism` + 157
+`db_infrastructure` + 71 `sim_engine`; single-threaded, verified at `a72d3e2`). Workspace
 version `0.3.0`. `.sqlx/` holds 76 files; the latest migration is
-`0032_usable_replacement_and_card_provenance`. `main` = `e73d0dd` (INF-6b, deployed
-2026-10-22); `dev` is ahead with `5d55f92` and INF-6c-1, unpushed.
-Next: INF-6c-2; see the Section 5 document's §5x.** Any brick that changes what `resolve_mission` produces for
+`0032_usable_replacement_and_card_provenance`. `main` = `e878837` (INF-6c-1, deployed
+2026-10-22); `dev` is ahead with INF-6c-2a, unpushed.
+Next: INF-6c-2b; see the Section 5 document's §5x.** Any brick that changes what `resolve_mission` produces for
 a given seed bumps the workspace version in the same brick. 4b-1 reused `sim-engine`'s `OutcomeType` rather than
 defining a new enum, and writes **no input-log entry** — the rank-up entry was removed
 from scope. **ODQ-22 and ODQ-23 were ruled 2026-09-03 — engagement and mission outcomes
@@ -560,9 +578,9 @@ code under test. Any test report produced without `--test-threads=1` is unreliab
 must be re-run before reporting results to the Director.
 
 **Test wallets:** `tests/` uses wallet seeds 0–10, 13–19, 21–76 and 88; 11 and 12 (a range
-literal until 5a-3a) stay reserved. **20 is the auth tests' signing-key seed**
-(`SigningKey::from_bytes(&[20u8; 32])`). It is used in memory only, and its derived
-public key is not `[20u8; 32]`. The next free seed is **77**.
+literal until 5a-3a) stay reserved. **20 and 77 are the auth tests' signing-key seeds**
+(`SigningKey::from_bytes(&[20u8; 32])`; 77 since INF-6c-2a). They are used in memory only,
+and their derived public keys are not `[n; 32]`. The next free seed is **78**.
 
 **One in-memory join per `AppState`:** `AppState::new` builds each join-shared store once and
 one `InMemoryCampaignJoinRepository` over the same `Arc`s. A test that replaces a join-read
