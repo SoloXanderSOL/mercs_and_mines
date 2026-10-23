@@ -4147,36 +4147,6 @@ async fn auth_verify_rejects_an_expired_challenge() {
     assert!(state.sessions.is_empty(), "a refused verify issues no session");
 }
 
-/// INF-4 (GAP-52): a failed account upsert answers `500` and leaves no session behind.
-/// The account store is a Postgres repository over a closed pool; no database is needed.
-/// Since GAP-76 the body is generic, so the arm is identified by construction, not by
-/// text: the route's only other `500` arm runs after `issue_session`, which
-/// `sessions.is_empty()` rejects.
-#[tokio::test]
-async fn auth_verify_answers_500_and_issues_no_session_when_the_upsert_fails() {
-    let closed = PgPoolOptions::new()
-        .connect_lazy("postgres://unused@127.0.0.1:1/unused")
-        .expect("lazy pool");
-    closed.close().await;
-    let mut state = default_state();
-    state.account_repo = std::sync::Arc::new(PostgresAccountRepository::new(closed));
-    let state = std::sync::Arc::new(state);
-    let key = auth_test_key();
-    let wallet = bs58::encode(key.verifying_key().to_bytes()).into_string();
-    let challenge = fetch_challenge(&state, &wallet).await;
-
-    let (status, body) = verify_with(&state, &key, &challenge, &challenge).await;
-    assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR, "{body}");
-    let v: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
-    let id: uuid::Uuid = v["error_id"]
-        .as_str()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| panic!("error_id is not a UUID: {v}"));
-    assert_eq!(v, serde_json::json!({"error": "internal error", "error_id": id}));
-    assert!(!body.contains("account upsert"), "the message leaked: {body}");
-    assert!(state.sessions.is_empty(), "a 500 must not leave a live session");
-}
-
 /// INF-6c-2a (GAP-77): a third party's `challenge` for the same wallet no longer replaces
 /// the victim's pending one.
 #[tokio::test]
@@ -6978,19 +6948,23 @@ async fn concurrent_joins_for_the_last_seat_respect_the_cap() {
     assert_eq!(campaigns.len(), 2, "two campaigns in all");
 }
 
-/// 5a-2b P10 — a join with no account fails, and the campaign it created rolls back with it.
+/// 5a-2b P10, recast at INF-6c-2b-1 (GAP-79): a join with no account row creates it.
 #[tokio::test]
-async fn campaign_join_without_an_account_rolls_back() {
+async fn campaign_join_creates_a_missing_account() {
     let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
     let wallet = [57u8; 32];
     clean_wallet_4g1(&pool, &wallet).await;
     assert_no_pending_campaign(&pool).await;
 
     let res = PostgresCampaignJoinRepository::new(pool.clone()).join_campaign(&wallet, 2, JOIN_SEEDS).await;
-    let pending = pending_campaign_count(&pool).await;
+    let accounts: i64 = sqlx::query_scalar("SELECT count(*) FROM player_accounts WHERE wallet_address = $1")
+        .bind(wallet.to_vec())
+        .fetch_one(&pool)
+        .await
+        .expect("account count failed");
     clean_wallet_4g1(&pool, &wallet).await;
-    assert!(matches!(res, Err(RepositoryError::Internal(_))), "expected Internal, got {res:?}");
-    assert_eq!(pending, 0, "the created campaign rolled back");
+    assert!(matches!(res, Ok(JoinOutcome::Joined(_))), "expected Joined, got {res:?}");
+    assert_eq!(accounts, 1, "the join created exactly one account row");
 }
 
 // ── 5a-3a: the launch under the join lock ────────────────────────────────────

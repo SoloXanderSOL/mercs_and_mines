@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO player_accounts (wallet_address) VALUES ($1) ON CONFLICT (wallet_address) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Bytea"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "dd4cdfd4d03b3a0be8d7b50d4b4bb8c98ac6d41a25149d090f5d989328e35041"
+}

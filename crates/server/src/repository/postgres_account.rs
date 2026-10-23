@@ -1,10 +1,23 @@
 use async_trait::async_trait;
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 
 use super::{
     account::{AccountRepository, GcnLedgerEntry, PlayerAccount, PlayerProfile},
     RepositoryError, WalletAddress,
 };
+
+/// Creates the wallet's player account if it has none, inside the caller's transaction.
+/// Every other column has a default (0002). The join calls it (GAP-79); sign-in writes no account.
+pub(crate) async fn insert_account_if_absent(conn: &mut PgConnection, wallet: &[u8]) -> Result<(), RepositoryError> {
+    sqlx::query!(
+        "INSERT INTO player_accounts (wallet_address) VALUES ($1) ON CONFLICT (wallet_address) DO NOTHING",
+        wallet,
+    )
+    .execute(&mut *conn)
+    .await
+    .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+    Ok(())
+}
 
 pub struct PostgresAccountRepository {
     pool: PgPool,

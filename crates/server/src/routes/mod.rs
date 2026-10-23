@@ -318,26 +318,6 @@ async fn post_auth_verify(
     crate::auth::verify_wallet_signature(&req.wallet_address, &req.challenge, &req.signature)
         .map_err(|e| bad_request(format!("signature invalid: {e}")))?;
 
-    // Upsert the player account (idempotent — subsequent logins preserve ledger and trust_standing).
-    // It runs before the session is issued, so a failed upsert leaves no live token (GAP-52).
-    // Wallet address was verified by verify_wallet_signature above, so decode cannot fail here.
-    let pubkey_bytes: [u8; 32] = bs58::decode(&req.wallet_address)
-        .into_vec()
-        .map_err(|e| bad_request(format!("wallet decode: {e}")))?
-        .try_into()
-        .map_err(|_| bad_request("wallet address must be 32 bytes"))?;
-    state
-        .account_repo
-        .upsert_account(crate::repository::PlayerAccount {
-            wallet: crate::repository::WalletAddress::from_bytes(pubkey_bytes),
-            trust_standing: 0,
-            gcn_balance: 0,
-            profile: crate::repository::PlayerProfile { display_name: None, sector_id: None },
-            gcn_ledger: vec![],
-        })
-        .await
-        .map_err(|e| internal_error(format!("account upsert: {e}")))?;
-
     // Issue the 2-hour session
     let token = crate::auth::issue_session(&state, &req.wallet_address);
 
@@ -1039,8 +1019,6 @@ mod tests {
 
     // ── INF-6c-2a: address validation, body limit ─────────────────────────────
 
-    use super::AUTH_BODY_LIMIT;
-
     /// One raw JSON POST from `TEST_PEER`; returns the status.
     async fn post_raw(state: &Arc<AppState>, uri: &str, body: String) -> StatusCode {
         let app = with_test_peer(router(state.clone()), TEST_PEER);
@@ -1122,9 +1100,105 @@ mod tests {
     #[tokio::test]
     async fn challenge_admits_a_body_of_exactly_the_limit() {
         let state = fresh_state();
-        let body = padded(&format!(r#""wallet_address":"{}""#, test_wallet()), AUTH_BODY_LIMIT);
-        assert_eq!(body.len(), AUTH_BODY_LIMIT);
+        let body = padded(&format!(r#""wallet_address":"{}""#, test_wallet()), 4096);
+        assert_eq!(body.len(), 4096);
         assert_eq!(post_raw(&state, "/api/auth/challenge", body).await, StatusCode::OK);
+    }
+
+    /// Reviewer INF-6c-2a F2: the limit from the other side, with a literal size.
+    #[tokio::test]
+    async fn challenge_refuses_a_body_one_byte_over_the_limit() {
+        let state = fresh_state();
+        let body = padded(&format!(r#""wallet_address":"{}""#, test_wallet()), 4097);
+        assert_eq!(body.len(), 4097);
+        assert_eq!(post_raw(&state, "/api/auth/challenge", body).await, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    // ── INF-6c-2b-1: weak keys, the identity forgery, the sweep task ──────────
+
+    /// The identity point `[1, 0×31]`: a weak key.
+    fn identity_wallet() -> String {
+        let mut b = [0u8; 32];
+        b[0] = 1;
+        bs58::encode(b).into_string()
+    }
+
+    /// R = identity, s = 0: valid for the identity key under non-strict `verify`, for any text.
+    fn forged_signature() -> String {
+        let mut b = [0u8; 64];
+        b[0] = 1;
+        bs58::encode(b).into_string()
+    }
+
+    #[tokio::test]
+    async fn challenge_refuses_a_weak_wallet_address_and_stores_nothing() {
+        let state = fresh_state();
+        for addr in ["11111111111111111111111111111111".to_string(), identity_wallet()] {
+            let app = with_test_peer(router(state.clone()), TEST_PEER);
+            let (status, _, body) =
+                post(app, "/api/auth/challenge", json!({"wallet_address": addr}), true, None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{addr}: {body}");
+            assert_eq!(body["error"], "invalid wallet address", "{addr}");
+        }
+        assert!(state.pending_challenges.is_empty(), "a refused address is never stored");
+    }
+
+    /// `challenge` refuses the identity wallet, so the pending entry is inserted directly.
+    #[tokio::test]
+    async fn verify_refuses_a_forged_signature_for_the_identity_wallet() {
+        let state = fresh_state();
+        let text = "Mercs & Mines — forged-signature test";
+        state.pending_challenges.insert(
+            crate::auth::challenge_key(text),
+            crate::state::PendingChallenge {
+                wallet_address: identity_wallet(),
+                challenge_text: text.to_string(),
+                expires_at: chrono::Utc::now().timestamp() + 60,
+            },
+        );
+        let app = with_test_peer(router(state.clone()), TEST_PEER);
+        let req = json!({"wallet_address": identity_wallet(), "challenge": text, "signature": forged_signature()});
+        let (status, _, body) = post(app, "/api/auth/verify", req, true, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let err = body["error"].as_str().unwrap_or_default();
+        assert!(err.starts_with("signature invalid"), "answered before the signature step: {body}");
+        assert!(state.sessions.is_empty(), "a forged signature issues no session");
+    }
+
+    /// Reviewer INF-6c-2a F1: the spawned task sweeps both maps on its immediate first tick.
+    #[tokio::test]
+    async fn auth_sweep_task_sweeps_both_maps() {
+        use std::time::Duration;
+        let state = fresh_state();
+        let now = chrono::Utc::now().timestamp();
+        let pending = |expires_at| crate::state::PendingChallenge {
+            wallet_address: "w".into(),
+            challenge_text: "c".into(),
+            expires_at,
+        };
+        let session = |id: &str, expires_at| shared::SessionToken {
+            token_id: id.into(),
+            account_id: "a".into(),
+            wallet_address: "w".into(),
+            issued_at: 0,
+            expires_at,
+        };
+        state.pending_challenges.insert([1u8; 32], pending(now - 100));
+        state.pending_challenges.insert([2u8; 32], pending(now + 3600));
+        state.sessions.insert("expired".into(), session("expired", now - 100));
+        state.sessions.insert("live".into(), session("live", now + 3600));
+
+        let h = tokio::spawn(crate::auth::run_auth_sweep_task(state.clone()));
+        let swept = tokio::time::timeout(Duration::from_secs(5), async {
+            while state.pending_challenges.contains_key(&[1u8; 32]) || state.sessions.contains_key("expired") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        h.abort();
+        assert!(swept.is_ok(), "the sweep task did not clear the expired entries");
+        assert!(state.pending_challenges.contains_key(&[2u8; 32]), "the live challenge is kept");
+        assert!(state.sessions.contains_key("live"), "the live session is kept");
     }
 
     #[tokio::test]

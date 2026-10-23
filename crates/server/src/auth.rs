@@ -7,7 +7,7 @@ use axum::{
 };
 use chrono::Utc;
 use dashmap::DashMap;
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -21,9 +21,10 @@ pub fn challenge_key(text: &str) -> [u8; 32] {
     Sha256::digest(text.as_bytes()).into()
 }
 
-/// A wallet address is bs58 of exactly 32 bytes. Not a curve-point check: a 32-byte non-point gets a challenge it can never verify.
+/// A wallet address is bs58 of exactly 32 bytes that decode to a curve point that is not small-order. A small-order key can be signed for without its private key unless verification is strict (GAP-80); an off-curve address can never sign.
 pub fn decode_wallet(addr: &str) -> Option<[u8; 32]> {
-    bs58::decode(addr).into_vec().ok()?.try_into().ok()
+    let b: [u8; 32] = bs58::decode(addr).into_vec().ok()?.try_into().ok()?;
+    VerifyingKey::from_bytes(&b).ok().filter(|k| !k.is_weak()).map(|_| b)
 }
 
 // ── Expiry sweeps ──────────────────────────────────────────────────────────
@@ -92,6 +93,7 @@ pub fn build_challenge(wallet_address: &str, nonce: &str, timestamp: i64) -> Str
 
 /// Verifies a base58-encoded Ed25519 signature over the challenge string.
 /// Returns Ok(()) if valid, Err(message) if anything fails.
+/// Strict RFC 8032 verification: small-order keys and small-order R are refused (GAP-80).
 pub fn verify_wallet_signature(
     wallet_address: &str,
     challenge: &str,
@@ -115,7 +117,7 @@ pub fn verify_wallet_signature(
     let signature = Signature::from_bytes(&sig_arr);
 
     verifying_key
-        .verify(challenge.as_bytes(), &signature)
+        .verify_strict(challenge.as_bytes(), &signature)
         .map_err(|e| format!("signature verification failed: {e}"))
 }
 
@@ -212,6 +214,31 @@ mod tests {
         assert!(!map.contains_key(&[1u8; 32]), "the expired challenge is gone");
         assert!(map.contains_key(&[2u8; 32]), "the boundary challenge is kept");
         assert!(map.contains_key(&[3u8; 32]), "the live challenge is kept");
+    }
+
+    fn identity_address() -> String {
+        let mut b = [0u8; 32];
+        b[0] = 1;
+        bs58::encode(b).into_string()
+    }
+
+    /// GAP-80: weak keys (the all-zero and the identity point) and off-curve bytes are refused.
+    /// `[2u8; 32]` is the smallest `[n; 32]` that is not a curve point.
+    #[test]
+    fn decode_wallet_refuses_weak_and_off_curve_keys() {
+        assert_eq!(decode_wallet(&bs58::encode([0u8; 32]).into_string()), None, "all-zero is weak");
+        assert_eq!(decode_wallet(&identity_address()), None, "the identity is weak");
+        assert_eq!(decode_wallet(&bs58::encode([2u8; 32]).into_string()), None, "off-curve");
+        assert_eq!(decode_wallet(&bs58::encode([9u8; 32]).into_string()), Some([9u8; 32]));
+    }
+
+    /// GAP-80: identity key, R = identity, s = 0 passes non-strict `verify` on every text.
+    #[test]
+    fn verify_wallet_signature_refuses_the_identity_forgery() {
+        let mut sig = [0u8; 64];
+        sig[0] = 1;
+        let forged = bs58::encode(sig).into_string();
+        assert!(verify_wallet_signature(&identity_address(), "any fixed text", &forged).is_err());
     }
 
     #[test]

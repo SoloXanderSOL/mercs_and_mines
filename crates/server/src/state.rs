@@ -7,7 +7,6 @@ use crate::config::Config;
 use crate::convoy_expiry::ConvoyEvent;
 use crate::rate_limit::RateLimits;
 use crate::repository::{
-    AccountRepository, InMemoryAccountRepository,
     CampaignRepository, InMemoryCampaignRepository,
     CampaignJoinRepository, InMemoryCampaignJoinRepository,
     ConvoyRepository, InMemoryConvoyRepository,
@@ -39,7 +38,6 @@ pub struct AppState {
     pub sessions: DashMap<String, shared::SessionToken>,
     /// Pending sign-in challenges, keyed by challenge_key of the challenge text. One-time use: verify removes the entry whatever the outcome; the auth sweep removes expired ones.
     pub pending_challenges: DashMap<[u8; 32], PendingChallenge>,
-    pub account_repo:    Arc<dyn AccountRepository    + Send + Sync>,
     pub campaign_repo:   Arc<dyn CampaignRepository  + Send + Sync>,
     pub commander_repo:  Arc<dyn CommanderRepository  + Send + Sync>,
     pub membership_repo: Arc<dyn MembershipRepository + Send + Sync>,
@@ -79,7 +77,6 @@ impl AppState {
             input_log_repo:      Arc::new(InMemoryInputLogRepository::new()),
             sessions:           DashMap::new(),
             pending_challenges: DashMap::new(),
-            account_repo:        Arc::new(InMemoryAccountRepository::new()),
             campaign_repo:       campaigns.clone(),
             commander_repo:      commanders.clone(),
             membership_repo:     memberships.clone(),

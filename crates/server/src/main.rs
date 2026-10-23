@@ -4,7 +4,7 @@ use sqlx::postgres::PgPoolOptions;
 use mercs_server::config::Config;
 use mercs_server::lifecycle::run_sector_lifecycle_task;
 use mercs_server::repository::{
-    PostgresAccountRepository, PostgresCampaignJoinRepository, PostgresCampaignRepository,
+    PostgresCampaignJoinRepository, PostgresCampaignRepository,
     PostgresConvoyRepository,
     PostgresCommanderRepository, PostgresInputLogRepository,
     PostgresMembershipRepository,
@@ -62,7 +62,6 @@ async fn main() {
     let config = Arc::new(Config::from_env());
     let bind_addr = config.server.bind_addr.clone();
     let mut state = AppState::new(config.clone());
-    state.account_repo    = Arc::new(PostgresAccountRepository::new(pool.clone()));
     state.campaign_repo   = Arc::new(PostgresCampaignRepository::new(pool.clone()));
     state.commander_repo  = Arc::new(PostgresCommanderRepository::new(pool.clone()));
     state.membership_repo = Arc::new(PostgresMembershipRepository::new(pool.clone()));

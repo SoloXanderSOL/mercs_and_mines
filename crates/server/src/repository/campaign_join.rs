@@ -18,6 +18,7 @@ use super::commander::insert_commander;
 use super::crew::{insert_crew, CrewRecord};
 use super::foreman::insert_foreman;
 use super::membership::{insert_membership, member_rows, PlayerCampaignMembership};
+use super::postgres_account::insert_account_if_absent;
 use super::section::{insert_section, starter_section};
 use super::{AcquiredVia, RepositoryError};
 use crate::commander_gen::generate_commander;
@@ -99,9 +100,7 @@ pub(crate) const NO_COMMANDERS: &str = "replacement claim: member has no Command
 
 /// A player entering a campaign.
 ///
-/// - **Precondition:** a `player_accounts` row exists for `wallet`. In production,
-///   `post_auth_verify` upserts it before issuing a session. Without it, Postgres fails
-///   `23503` → `Internal`.
+/// - **Account row:** the join creates the wallet's player_accounts row if it is absent (insert_account_if_absent, right after lock_joins; GAP-79). Sign-in writes nothing to Postgres.
 /// - **S1/S7:** a membership is live when its campaign is `Pending`, `Active` or `Ending`,
 ///   **whatever its `is_active`**. A live membership returns `AlreadyMember` (oldest
 ///   `joined_at`, then `campaign_id`). The join never reactivates.
@@ -293,6 +292,7 @@ impl CampaignJoinRepository for PostgresCampaignJoinRepository {
         let mut tx = self.pool.begin().await
             .map_err(|e| RepositoryError::Internal(e.to_string()))?;
         lock_joins(&mut tx).await?;
+        insert_account_if_absent(&mut tx, wallet).await?;
 
         // S1: `AlreadyMember` comes only from this read, never from an insert error.
         if let Some(campaign_id) = live_membership(&mut tx, wallet).await? {
@@ -388,7 +388,7 @@ impl CampaignJoinRepository for PostgresCampaignJoinRepository {
     /// read holds against any roster writer for this member until commit. The row lock
     /// serialises claims from any number of server processes; the index below is reachable
     /// only through an out-of-band write or a future second writer of `'replacement'`.
-    /// `resolve_deployment` and `set_shattered` only ever turn KIA or Shattered on, never off
+    /// `resolve_deployment`, `set_shattered` and `update_stress` only ever turn KIA or Shattered on, never off
     /// (no `src` path clears `is_shattered`), so a race can only make a claim answer
     /// `HasUsable` too conservatively. `commander_records_one_live_replacement` (0032) is the
     /// backstop; its `23505` surfaces as `Internal`.
