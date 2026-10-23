@@ -24,6 +24,8 @@ use crate::repository::{
 pub use crate::repository::CombatSession;
 
 pub struct PendingChallenge {
+    /// The validated wallet this challenge was issued to; verify requires the request to name the same one.
+    pub wallet_address: String,
     /// The full challenge string the client must sign.
     pub challenge_text: String,
     /// Unix timestamp — challenge expires after cfg.server.challenge_expiry_secs.
@@ -33,11 +35,10 @@ pub struct PendingChallenge {
 pub struct AppState {
     pub session_repo:    Arc<dyn SessionStateRepository + Send + Sync>,
     pub input_log_repo:  Arc<dyn InputLogRepository + Send + Sync>,
-    /// Active 2-hour sessions, keyed by token_id.
+    /// Active 2-hour sessions, keyed by token_id. The auth sweep removes expired ones.
     pub sessions: DashMap<String, shared::SessionToken>,
-    /// Pending TEEPIN challenges, keyed by wallet_address.
-    /// One-time use — removed on verify.
-    pub pending_challenges: DashMap<String, PendingChallenge>,
+    /// Pending sign-in challenges, keyed by challenge_key of the challenge text. One-time use: verify removes the entry whatever the outcome; the auth sweep removes expired ones.
+    pub pending_challenges: DashMap<[u8; 32], PendingChallenge>,
     pub account_repo:    Arc<dyn AccountRepository    + Send + Sync>,
     pub campaign_repo:   Arc<dyn CampaignRepository  + Send + Sync>,
     pub commander_repo:  Arc<dyn CommanderRepository  + Send + Sync>,

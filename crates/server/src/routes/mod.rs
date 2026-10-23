@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::{
-    extract::{connect_info::MockConnectInfo, rejection::JsonRejection, ConnectInfo, Path, State},
+    extract::{connect_info::MockConnectInfo, rejection::JsonRejection, ConnectInfo, DefaultBodyLimit, Path, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Json, Response},
     routing::{get, post},
@@ -230,6 +230,9 @@ async fn get_version() -> Json<Value> {
 
 // ── Auth endpoints ─────────────────────────────────────────────────────────
 
+/// Body cap for the two sign-in routes, layered per route. The overflow reaches the handler as a JsonRejection after the rate-limit check, so it is counted.
+pub const AUTH_BODY_LIMIT: usize = 4096;
+
 /// Rate-limited per client IP, in one bucket shared with `verify` (INF-6c-1). A malformed
 /// body is counted, then answered with axum's own rejection, unchanged.
 async fn post_auth_challenge(
@@ -248,14 +251,19 @@ async fn post_auth_challenge(
         Err(rej) => return Ok(rej.into_response()),
     };
 
+    if crate::auth::decode_wallet(&req.wallet_address).is_none() {
+        return Err(bad_request("invalid wallet address"));
+    }
+
     let nonce = Uuid::new_v4().to_string();
     let now = Utc::now().timestamp();
     let challenge_text = crate::auth::build_challenge(&req.wallet_address, &nonce, now);
     let expiry_secs = state.config.server.challenge_expiry_secs;
 
     state.pending_challenges.insert(
-        req.wallet_address.clone(),
+        crate::auth::challenge_key(&challenge_text),
         crate::state::PendingChallenge {
+            wallet_address: req.wallet_address.clone(),
             challenge_text: challenge_text.clone(),
             expires_at: now + expiry_secs,
         },
@@ -291,13 +299,18 @@ async fn post_auth_verify(
     // Look up and consume the pending challenge (one-time use)
     let pending = state
         .pending_challenges
-        .remove(&req.wallet_address)
-        .ok_or_else(|| bad_request("no pending challenge for this wallet — call /api/auth/challenge first"))?;
+        .remove(&crate::auth::challenge_key(&req.challenge))
+        .ok_or_else(|| bad_request("no pending challenge — call /api/auth/challenge first"))?;
 
     if now > pending.1.expires_at {
         return Err(bad_request("challenge expired — request a new one"));
     }
     if req.challenge != pending.1.challenge_text {
+        return Err(bad_request("challenge mismatch"));
+    }
+    // The key is no longer the wallet, so the wallet is checked here: otherwise key B could
+    // redeem a challenge issued to wallet A.
+    if pending.1.wallet_address != req.wallet_address {
         return Err(bad_request("challenge mismatch"));
     }
 
@@ -832,8 +845,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/units",                     get(get_units))
         .route("/api/version",                   get(get_version))
         .route("/api/equipment",                 get(get_equipment))
-        .route("/api/auth/challenge",            post(post_auth_challenge))
-        .route("/api/auth/verify",               post(post_auth_verify))
+        .route("/api/auth/challenge",            post(post_auth_challenge).layer(DefaultBodyLimit::max(AUTH_BODY_LIMIT)))
+        .route("/api/auth/verify",               post(post_auth_verify).layer(DefaultBodyLimit::max(AUTH_BODY_LIMIT)))
         .route("/api/auth/session",              get(get_auth_session))
         .route("/api/mission/resolve",           post(post_mission_resolve))
         .route("/api/combat/resolve",            post(post_combat_resolve))
@@ -937,9 +950,14 @@ mod tests {
         (status, headers, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
     }
 
+    /// A valid wallet address: bs58 of 32 bytes (in memory only).
+    fn test_wallet() -> String {
+        bs58::encode([9u8; 32]).into_string()
+    }
+
     async fn challenge(state: &Arc<AppState>, peer: SocketAddr, real_ip: Option<&str>) -> StatusCode {
         let app = with_test_peer(router(state.clone()), peer);
-        post(app, "/api/auth/challenge", json!({"wallet_address": "w"}), true, real_ip).await.0
+        post(app, "/api/auth/challenge", json!({"wallet_address": test_wallet()}), true, real_ip).await.0
     }
 
     /// `verify` for a wallet with no pending challenge: a `400`, still counted.
@@ -1000,7 +1018,7 @@ mod tests {
         }
         let app = with_test_peer(router(state.clone()), TEST_PEER);
         let (status, headers, body) =
-            post(app, "/api/auth/challenge", json!({"wallet_address": "w"}), true, None).await;
+            post(app, "/api/auth/challenge", json!({"wallet_address": test_wallet()}), true, None).await;
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(body, json!({"error": "rate limited"}));
         let secs: u64 = headers[header::RETRY_AFTER].to_str().unwrap().parse().unwrap();
@@ -1017,6 +1035,96 @@ mod tests {
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body["error"], "internal error");
         assert!(body["error_id"].is_string(), "an error_id is present: {body}");
+    }
+
+    // ── INF-6c-2a: address validation, body limit ─────────────────────────────
+
+    use super::AUTH_BODY_LIMIT;
+
+    /// One raw JSON POST from `TEST_PEER`; returns the status.
+    async fn post_raw(state: &Arc<AppState>, uri: &str, body: String) -> StatusCode {
+        let app = with_test_peer(router(state.clone()), TEST_PEER);
+        let req = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        app.oneshot(req).await.unwrap().status()
+    }
+
+    /// `fields` (a JSON object's members, without braces) plus a `pad` field, exactly `n` bytes.
+    fn padded(fields: &str, n: usize) -> String {
+        let base = format!(r#"{{{fields},"pad":""}}"#).len();
+        let body = format!(r#"{{{fields},"pad":"{}"}}"#, "x".repeat(n - base));
+        assert_eq!(body.len(), n);
+        body
+    }
+
+    #[tokio::test]
+    async fn challenge_refuses_an_invalid_wallet_address_and_stores_nothing() {
+        let state = fresh_state();
+        let bad = [
+            "w".to_string(),
+            "0OIl".to_string(),
+            String::new(),
+            bs58::encode([9u8; 31]).into_string(),
+            bs58::encode([9u8; 33]).into_string(),
+            "1".repeat(4000),
+        ];
+        for addr in &bad {
+            let app = with_test_peer(router(state.clone()), TEST_PEER);
+            let (status, _, body) =
+                post(app, "/api/auth/challenge", json!({"wallet_address": addr}), true, None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "address {addr:.20}…: {body}");
+            if addr == "w" {
+                assert_eq!(body["error"], "invalid wallet address");
+            }
+        }
+        assert!(state.pending_challenges.is_empty(), "a refused address is never stored");
+    }
+
+    #[tokio::test]
+    async fn challenge_counts_an_invalid_wallet_address() {
+        let state = fresh_state();
+        let body = json!({"wallet_address": "w"}).to_string();
+        for _ in 0..20 {
+            assert_eq!(post_raw(&state, "/api/auth/challenge", body.clone()).await, StatusCode::BAD_REQUEST);
+        }
+        let last = post_raw(&state, "/api/auth/challenge", body).await;
+        assert_eq!(last, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn challenge_counts_an_oversized_body() {
+        let state = fresh_state();
+        let body = padded(&format!(r#""wallet_address":"{}""#, test_wallet()), 5120);
+        for _ in 0..20 {
+            let s = post_raw(&state, "/api/auth/challenge", body.clone()).await;
+            assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE);
+        }
+        let last = post_raw(&state, "/api/auth/challenge", body).await;
+        assert_eq!(last, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn verify_counts_an_oversized_body() {
+        let state = fresh_state();
+        let body = padded(r#""wallet_address":"w","challenge":"c","signature":"s""#, 5120);
+        for _ in 0..20 {
+            let s = post_raw(&state, "/api/auth/verify", body.clone()).await;
+            assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE);
+        }
+        let last = post_raw(&state, "/api/auth/verify", body).await;
+        assert_eq!(last, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn challenge_admits_a_body_of_exactly_the_limit() {
+        let state = fresh_state();
+        let body = padded(&format!(r#""wallet_address":"{}""#, test_wallet()), AUTH_BODY_LIMIT);
+        assert_eq!(body.len(), AUTH_BODY_LIMIT);
+        assert_eq!(post_raw(&state, "/api/auth/challenge", body).await, StatusCode::OK);
     }
 
     #[tokio::test]

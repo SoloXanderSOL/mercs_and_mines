@@ -93,6 +93,14 @@ async fn main() {
         move || mercs_server::convoy_expiry::run_convoy_expiry_task(Arc::clone(&expiry_state)),
     ));
 
+    let sweep_state = Arc::clone(&state);
+    tokio::spawn(supervise(
+        "auth_sweep",
+        Duration::from_secs(5),
+        Duration::from_secs(60),
+        move || mercs_server::auth::run_auth_sweep_task(Arc::clone(&sweep_state)),
+    ));
+
     let app = mercs_server::routes::router(state);
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await

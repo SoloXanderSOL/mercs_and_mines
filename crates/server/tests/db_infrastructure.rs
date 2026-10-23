@@ -4177,6 +4177,36 @@ async fn auth_verify_answers_500_and_issues_no_session_when_the_upsert_fails() {
     assert!(state.sessions.is_empty(), "a 500 must not leave a live session");
 }
 
+/// INF-6c-2a (GAP-77): a third party's `challenge` for the same wallet no longer replaces
+/// the victim's pending one.
+#[tokio::test]
+async fn auth_verify_survives_a_second_challenge_for_the_same_wallet() {
+    let state = std::sync::Arc::new(default_state());
+    let key = auth_test_key();
+    let wallet = bs58::encode(key.verifying_key().to_bytes()).into_string();
+    let text_a = fetch_challenge(&state, &wallet).await;
+    let _text_b = fetch_challenge(&state, &wallet).await;
+
+    let (status, body) = verify_with(&state, &key, &text_a, &text_a).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    assert_eq!(state.sessions.len(), 1);
+}
+
+/// INF-6c-2a: a challenge issued to one wallet cannot be redeemed by another key. Seed 77
+/// is a second signing key, in memory only, like 20.
+#[tokio::test]
+async fn auth_verify_refuses_a_challenge_issued_to_another_wallet() {
+    let state = std::sync::Arc::new(default_state());
+    let key_a = auth_test_key();
+    let wallet_a = bs58::encode(key_a.verifying_key().to_bytes()).into_string();
+    let text = fetch_challenge(&state, &wallet_a).await;
+
+    let key_b = ed25519_dalek::SigningKey::from_bytes(&[77u8; 32]);
+    let (status, body) = verify_with(&state, &key_b, &text, &text).await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+    assert!(state.sessions.is_empty(), "a refused verify issues no session");
+}
+
 #[tokio::test]
 async fn mission_resolve_requires_a_session() {
     let state = default_state();
