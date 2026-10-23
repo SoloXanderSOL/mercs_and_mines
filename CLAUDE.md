@@ -174,8 +174,8 @@ As of 2026-10-18:
   `card_mint_pending.acquired_via` (`card_mint_pending_acquired_via_canon`, with a guard row),
   which `mark_commander_kia` copies from `c.acquired_via`. Postgres is its only oracle: the
   in-memory card carries `acquired_via: None`. **Next: INF-6** (split 6a → 6b → 6c-1 →
-  6c-2a → 6c-2b-1 → 6c-2b-2 → 6d; 6a, 6b, 6c-1 and 6c-2a deployed, 6c-2b-1 built; see INF-6a
-  … INF-6c-2b-1 below).
+  6c-2a → 6c-2b-1 → 6c-2b-2 → 6d; 6a through 6c-2b-1 deployed, 6c-2b-2 built; see INF-6a
+  … INF-6c-2b-2 below).
 - **Section 6:** Not started.
 - **Sections 7 (Personnel Entity Model) and 8 (Combat Engine to canon):** created
   2026-10-13 (ruling D2); both run before Section 6. Strike Mining and Base Building moved
@@ -347,14 +347,48 @@ As of 2026-10-18:
   CONFLICT DO NOTHING`, right after `lock_joins`). `verify`'s `500` arms: `client_ip` and
   token serialisation. The auth sweep task is covered by `auth_sweep_task_sweeps_both_maps`;
   **its `main.rs` spawn is guarded by a count gate only** (`tokio::spawn(supervise(` = 3).
-  No R7, no migration. **Unpushed.**
+  No R7, no migration. **Deployed 2026-10-23 (`7be446c`, with a `Cargo.lock`-only tokio
+  1.54.1 bump for RUSTSEC-2026-0386).**
+- **INF-6c-2b-2 (infrastructure; bounded sign-in lists, ODQ-48; Reviewer INF-6c-1 F1/F2):**
+  Built at `45574d0`. It supersedes INF-6c-1's fail-closed cap and once-per-`AppState`
+  warning. **The limiters fail open:** `RATE_LIMIT_MAP_CAP` = 10⁵; a new key at a map still
+  full after the sweep is admitted **uncounted** (no `entry()`) and journalled through the
+  limiter's own `overflow: RateWarn`, named by `FixedWindow::new(name, …)` (the five names
+  are the `RateLimits` field names). A capped map sweeps at most once per
+  `SWEEP_MIN_INTERVAL` (1 s, `SweepThrottle`; the first sweep always runs).
+  **`rate_limit::RateWarn`** journals a repeating condition on its first hit, then at most
+  once per `RATE_WARN_INTERVAL` (3600 s) with the count since the last line; `hit(now)`
+  returns `Some(n)` to the caller that journals, and the caller owns the text. Eight
+  instances from four construction sites: five limiter `overflow`s,
+  `RateLimits.shared_warn` (replaces `shared_warned`), the session backstop and the
+  challenge eviction. **No `Default` for `RateWarn` or `SweepThrottle`.** Test them on
+  injected `Instant`s taken **after** `new()` (a `now` before `base` saturates to 0).
+  **Sessions:** `AppState.session_index: auth::SessionIndex` (a `std` `Mutex` over
+  `ClientKey` → `(token_id, expires_at)` in issue order) beside the unchanged `sessions`
+  map. `auth::admit_session(state, wallet, key)` replaces `issue_session`: a key at
+  `SESSION_QUOTA` (10) signs out its own oldest; otherwise, at `SESSION_CAP` (10⁵) live
+  sessions, the sign-in is refused (`503 {"error":"sign-in is at capacity, try again
+  later"}`, via `service_unavailable`) and nothing is evicted. `ClientKey::Shared` is never
+  indexed (backstop only). **Lock order: index → `sessions` shards**; never take the index
+  while a `sessions` guard is alive. Stale entries are pruned lazily, and the auth sweep
+  task prunes the index after its `retain` (`SessionIndex::prune`). Sessions inserted
+  directly by fixtures are unindexed: they count toward the backstop only.
+  **Challenges:** `AppState.challenge_cap: auth::ChallengeCap` (`CHALLENGE_CAP` = 10⁵) is
+  the only production writer of `pending_challenges`; at the cap it sweeps expired entries
+  (throttled), then evicts an arbitrary one (soft cap). A test that needs a small cap swaps
+  the `pub` field on `AppState::new(…)`'s value before `Arc::new` (no pre-fill). The
+  quota-of-10 rationale assumes the default session and challenge durations; the caps stay
+  consts. `AccountRepository` documents that only the join creates accounts (Reviewer
+  INF-6c-2b-1 F1). A dead-code warning in a negative's mutation ICEs rustc 1.95 (no `test
+  result` line): write negatives warning-free (`cond || true`, `false && cond`). No R7, no
+  migration, no `.sqlx/` change. **Unpushed.**
 
-**442/442 tests green (1 `shared` + 212 `mercs_server` lib + 2 `aar_determinism` + 156
-`db_infrastructure` + 71 `sim_engine`; single-threaded, verified at `276dea4`). Workspace
+**453/453 tests green (1 `shared` + 223 `mercs_server` lib + 2 `aar_determinism` + 156
+`db_infrastructure` + 71 `sim_engine`; single-threaded, verified at `45574d0`). Workspace
 version `0.3.0`. `.sqlx/` holds 77 files; the latest migration is
-`0032_usable_replacement_and_card_provenance`. `main` = `492ae98` (INF-6c-2a, deployed
-2026-10-23); `dev` is ahead with INF-6c-2b-1, unpushed.
-Next: INF-6c-2b-2; see the Section 5 document's §5x.** Any brick that changes what `resolve_mission` produces for
+`0032_usable_replacement_and_card_provenance`. `main` = `7be446c` (INF-6c-2b-1 + tokio
+1.54.1, deployed 2026-10-23); `dev` is ahead with INF-6c-2b-2, unpushed.
+Next: INF-6d; see the Section 5 document's §5x.** Any brick that changes what `resolve_mission` produces for
 a given seed bumps the workspace version in the same brick. 4b-1 reused `sim-engine`'s `OutcomeType` rather than
 defining a new enum, and writes **no input-log entry** — the rank-up entry was removed
 from scope. **ODQ-22 and ODQ-23 were ruled 2026-09-03 — engagement and mission outcomes
