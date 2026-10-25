@@ -173,9 +173,9 @@ As of 2026-10-18:
   'replacement' AND NOT is_kia AND NOT is_shattered`) and adds the nullable
   `card_mint_pending.acquired_via` (`card_mint_pending_acquired_via_canon`, with a guard row),
   which `mark_commander_kia` copies from `c.acquired_via`. Postgres is its only oracle: the
-  in-memory card carries `acquired_via: None`. **Next: INF-6** (split 6a → 6b → 6c-1 →
-  6c-2a → 6c-2b-1 → 6c-2b-2 → 6d; 6a through 6c-2b-1 deployed, 6c-2b-2 built; see INF-6a
-  … INF-6c-2b-2 below).
+  in-memory card carries `acquired_via: None`. **INF-6** (split 6a → 6b → 6c-1 →
+  6c-2a → 6c-2b-1 → 6c-2b-2 → 6d; 6a through 6c-2b-2 deployed, 6d built; see INF-6a
+  … INF-6d below), then the Breakpoint freeze: no §5b until 2026-11-18.
 - **Section 6:** Not started.
 - **Sections 7 (Personnel Entity Model) and 8 (Combat Engine to canon):** created
   2026-10-13 (ruling D2); both run before Section 6. Strike Mining and Base Building moved
@@ -263,7 +263,9 @@ As of 2026-10-18:
   `internal_error` call written at the site (never `.map_err(internal_error)`). The other
   response helpers: `forbidden()`, `service_unavailable()`, and `too_many_requests()`
   (`429 {"error":"rate limited"}` + `Retry-After`, INF-6c-1). CI runs on pushes to `main` and `dev` and on every pull request (GAP-32);
-  deploy is still main-only. The droplet-side deploy is `deploy/remote_deploy.sh`: it reads
+  deploy is still main-only. `.github/workflows/audit.yml` (INF-6d, GAP-81) also runs
+  `cargo audit` weekly (Mondays 06:17 UTC) and on `workflow_dispatch`, from `main`'s copy;
+  `release.yml` must never get a `schedule:` trigger (a scheduled run there would deploy). The droplet-side deploy is `deploy/remote_deploy.sh`: it reads
   the running build's SHA, swaps, restarts, polls `/api/version` until `build_sha` equals the
   commit, and rolls back with explicit checks. Its exit codes are a contract: **0** deployed,
   **1** failed with the rollback verified (by SHA, or by health only when the old SHA was
@@ -379,16 +381,38 @@ As of 2026-10-18:
   the `pub` field on `AppState::new(…)`'s value before `Arc::new` (no pre-fill). The
   quota-of-10 rationale assumes the default session and challenge durations; the caps stay
   consts. `AccountRepository` documents that only the join creates accounts (Reviewer
-  INF-6c-2b-1 F1). A dead-code warning in a negative's mutation ICEs rustc 1.95 (no `test
-  result` line): write negatives warning-free (`cond || true`, `false && cond`). No R7, no
-  migration, no `.sqlx/` change. **Unpushed.**
+  INF-6c-2b-1 F1). No R7, no migration, no `.sqlx/` change. **Deployed 2026-10-23
+  (`a374602`).**
+- **INF-6d (infrastructure; WebSocket caps, GAP-82, GAP-81):** Built at `84d655f`
+  (toolchain pin) + `53d4c72` (code + tests) + `de136e1` (`audit.yml`). **The toolchain is
+  pinned to rustc 1.99.1 by `rust-toolchain.toml` (GAP-82),** so WSL, CI and production
+  build on one compiler; a bump is its own commit with a full build, test run and audit.
+  CI keeps `dtolnay/rust-toolchain@stable` and the file wins at the first cargo call (a
+  `rustc --version` step logs the real compiler). Negatives still mutate conditions or
+  constants and stay warning-free, so the 0-warnings gate holds. **Combat socket:** frames
+  and messages over 4 KiB (`COMBAT_WS_MAX_MESSAGE`) end the session through the receive
+  loop's error arm; the Close waits up to one `tick_stream_delay_ms` for the resolver's
+  cancel check. The tick-serialisation arm warns and cancels the resolver before its
+  `break`. **Convoy events socket:** 1 KiB cap (`CONVOY_WS_MAX_MESSAGE`); the handler
+  `select!`s over its channel and the unsplit socket (no `split()`), so a client Close
+  (answered on the next read: keep reading after `Message::Close`) or an over-cap frame
+  ends it. The channel is bounded at `state::CONVOY_EVENT_CHANNEL` = 64, and the handler
+  holds only a `WeakSender`. The producer clones the sender out of the map guard, then
+  `deliver` `try_send`s: `Full` drops that sender and journals through
+  `ExpiryWarns.events_full` (a `RateWarn`, now `Debug`); `Closed` is silent. Both removals
+  are `remove_if(… same_channel)`, so a closing socket never takes a newer one's sender.
+  The one-sender fan-out is still GAP-75 → 5b-2. A peer that stops reading but keeps TCP
+  open can park its handler in `socket.send().await` (memory bounded at 64 events). Live
+  socket tests serve through `routes::serve_on_loopback` (`cfg(test)`) and connect with
+  the dev-dependencies `tokio-tungstenite` 0.24 + `futures-util` 0.3. No R7, no migration,
+  no `.sqlx/` change. **Unpushed.**
 
-**453/453 tests green (1 `shared` + 223 `mercs_server` lib + 2 `aar_determinism` + 156
-`db_infrastructure` + 71 `sim_engine`; single-threaded, verified at `45574d0`). Workspace
-version `0.3.0`. `.sqlx/` holds 77 files; the latest migration is
-`0032_usable_replacement_and_card_provenance`. `main` = `7be446c` (INF-6c-2b-1 + tokio
-1.54.1, deployed 2026-10-23); `dev` is ahead with INF-6c-2b-2, unpushed.
-Next: INF-6d; see the Section 5 document's §5x.** Any brick that changes what `resolve_mission` produces for
+**461/461 tests green (1 `shared` + 231 `mercs_server` lib + 2 `aar_determinism` + 156
+`db_infrastructure` + 71 `sim_engine`; single-threaded, verified at `53d4c72` on rustc
+1.99.1). Workspace version `0.3.0`. `.sqlx/` holds 77 files; the latest migration is
+`0032_usable_replacement_and_card_provenance`. `main` = `a374602` (INF-6c-2b-2, deployed
+2026-10-23); `dev` is ahead with INF-6d, unpushed.
+Next: the Breakpoint freeze; no §5b until 2026-11-18.** Any brick that changes what `resolve_mission` produces for
 a given seed bumps the workspace version in the same brick. 4b-1 reused `sim-engine`'s `OutcomeType` rather than
 defining a new enum, and writes **no input-log entry** — the rank-up entry was removed
 from scope. **ODQ-22 and ODQ-23 were ruled 2026-09-03 — engagement and mission outcomes
@@ -499,7 +523,8 @@ begins.
 
 * **Protocols:** HTTP/HTTPS + JSON for all meta-actions (login, inventory, contracts).
   WebSockets for the Live Tactical Dashboard tick feed, real-time combat logs, and
-  deployment timer push notifications. No UDP.
+  deployment timer push notifications. No UDP. Every socket caps inbound frames (combat
+  4 KiB, convoy events 1 KiB, INF-6d), and every server-to-client channel is bounded.
 
 * **Relational DB (Postgres + sqlx):** Accounts, Commander records, campaign instances,
   transaction ledger, input logs. All schema changes are sqlx migrations — never
@@ -685,7 +710,8 @@ scenario. The `deploy-script` CI job also lints both scripts with `shellcheck`, 
 also installed in WSL (0.9.0): run it before committing any `deploy/` change.
 
 **Dependency audit:** run `cargo audit` locally (cargo-audit 0.22.2 is installed in WSL)
-after any `Cargo.lock` change, since the `audit` job gates deploys. A new ignore in
+after any `Cargo.lock` change, since the `audit` job gates deploys (`audit.yml` also audits
+`main` weekly). A new ignore in
 `.cargo/audit.toml` carries the ID, a reason and a re-check date. A yanked crate cannot be
 ignored: update it out of the lockfile instead.
 
