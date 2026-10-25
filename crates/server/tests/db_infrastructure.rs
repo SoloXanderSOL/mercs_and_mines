@@ -672,6 +672,98 @@ async fn sector_state_repository_redis_is_correct() {
         .expect("SREM cleanup failed");
 }
 
+/// BP-1: `delete_sector` removes the hex state key and the `sectors:all` member, and a
+/// second delete is `Ok`.
+#[tokio::test]
+async fn redis_delete_sector_removes_key_and_set_member() {
+    use redis::AsyncCommands;
+    let url = match std::env::var("TEST_REDIS_URL").ok() {
+        Some(u) => u,
+        None => {
+            eprintln!("TEST_REDIS_URL not set — skipping redis_delete_sector_removes_key_and_set_member");
+            return;
+        }
+    };
+    let client = redis::Client::open(url).expect("Invalid TEST_REDIS_URL");
+    let mgr = redis::aio::ConnectionManager::new(client).await.expect("Failed to connect to Redis");
+    let repo = RedisSectorStateRepository::new(mgr.clone());
+    let mut conn = mgr.clone();
+
+    let sector_id = uuid::Uuid::new_v4();
+    repo.upsert_sector(SectorState {
+        sector_id,
+        campaign_id: uuid::Uuid::new_v4(),
+        occupation_status: OccupationStatus::Neutral,
+        owner: None,
+        deployed_unit_count: 0,
+        terrain: std::collections::HashMap::new(),
+        magma_veins: vec![],
+        hex_occupancy: std::collections::HashMap::new(),
+    }).await.expect("upsert_sector failed");
+    let member_before: bool = conn.sismember("sectors:all", sector_id.to_string()).await.expect("SISMEMBER");
+
+    repo.delete_sector(sector_id).await.expect("delete_sector failed");
+    let fetched = repo.get_sector(sector_id).await.expect("get_sector failed");
+    let member_after: bool = conn.sismember("sectors:all", sector_id.to_string()).await.expect("SISMEMBER");
+    let again = repo.delete_sector(sector_id).await;
+
+    // Clean (a no-op when the delete worked), then assert.
+    conn.del::<_, ()>(format!("sector:{}:hex_state", sector_id)).await.ok();
+    conn.srem::<_, _, ()>("sectors:all", sector_id.to_string()).await.ok();
+
+    assert!(member_before, "the upsert adds the sectors:all member");
+    assert!(fetched.is_none(), "the sector is gone");
+    assert!(!member_after, "the sectors:all member is gone");
+    again.expect("a second delete is Ok");
+}
+
+/// BP-1: on Postgres, `retire_if_active` archives only an `Active` campaign; `Pending`,
+/// `Ending` and a missing id are `false` and unchanged. Fixture campaigns no wallet reaches.
+#[tokio::test]
+async fn pg_retire_if_active_moves_only_active() {
+    let Some(pool) = test_pool().await else {
+        eprintln!("TEST_DATABASE_URL not set — skipping pg_retire_if_active_moves_only_active");
+        return;
+    };
+    let repo = PostgresCampaignRepository::new(pool.clone());
+    let cases = [
+        (CampaignLifecycle::Active,  CampaignLifecycle::Archived),
+        (CampaignLifecycle::Pending, CampaignLifecycle::Pending),
+        (CampaignLifecycle::Ending,  CampaignLifecycle::Ending),
+    ];
+
+    // Collect.
+    let mut ids = Vec::new();
+    let mut seen = Vec::new();
+    for (i, (from, _)) in cases.iter().enumerate() {
+        let c = repo
+            .create_campaign(&NewCampaignInstance { sector_id: uuid::Uuid::new_v4(), map_seed: 0xB1_00 + i as i64 })
+            .await
+            .expect("create_campaign failed")
+            .campaign_id;
+        ids.push(c);
+        repo.update_sector_state(c, from.clone()).await.expect("update_sector_state failed");
+        let retired = repo.retire_if_active(c).await;
+        let state = repo.get_campaign(c).await.expect("get_campaign failed").map(|r| r.state);
+        seen.push((retired, state));
+    }
+    let missing = repo.retire_if_active(uuid::Uuid::new_v4()).await;
+
+    // Clean.
+    for c in &ids {
+        sqlx::query("DELETE FROM campaign_instances WHERE campaign_id = $1")
+            .bind(c).execute(&pool).await.expect("fixture cleanup failed");
+    }
+
+    // Assert.
+    for ((from, to), (retired, state)) in cases.iter().zip(seen) {
+        let expect_retired = *from == CampaignLifecycle::Active;
+        assert_eq!(retired.expect("retire_if_active failed"), expect_retired, "{from:?}");
+        assert_eq!(state, Some(to.clone()), "{from:?}");
+    }
+    assert!(!missing.expect("retire_if_active on a miss failed"), "a missing id is false");
+}
+
 #[tokio::test]
 async fn convoy_record_crud() {
     let Some(pool) = test_pool().await else {

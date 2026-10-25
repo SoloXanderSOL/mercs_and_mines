@@ -1,0 +1,42 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE campaign_instances SET state = $1, updated_at = now() WHERE campaign_id = $2 AND state = $3",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        {
+          "Custom": {
+            "name": "sector_state",
+            "kind": {
+              "Enum": [
+                "Pending",
+                "Active",
+                "Ending",
+                "Ended",
+                "Archived"
+              ]
+            }
+          }
+        },
+        "Uuid",
+        {
+          "Custom": {
+            "name": "sector_state",
+            "kind": {
+              "Enum": [
+                "Pending",
+                "Active",
+                "Ending",
+                "Ended",
+                "Archived"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0016b79a6088fa2fda795801ceb39b268cb3b071d47eb49641ff34b8bf2b201e"
+}

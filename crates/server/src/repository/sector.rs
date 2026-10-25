@@ -52,6 +52,9 @@ pub trait SectorStateRepository: Send + Sync {
     async fn set_player_presence(&self, sector_id: SectorId, players: &[WalletAddress]) -> Result<(), RepositoryError>;
     async fn add_hex_occupant(&self, sector_id: SectorId, q: i32, r: i32, entry: HexOccupant) -> Result<(), RepositoryError>;
     async fn remove_hex_occupant(&self, sector_id: SectorId, q: i32, r: i32, unit_id: Uuid) -> Result<(), RepositoryError>;
+    /// Removes the sector, its player presence and its `sectors:all` entry (BP-1).
+    /// Idempotent: a missing sector is `Ok(())`.
+    async fn delete_sector(&self, sector_id: SectorId) -> Result<(), RepositoryError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -121,6 +124,12 @@ impl SectorStateRepository for InMemorySectorStateRepository {
             vec.retain(|e| e.id != unit_id);
         }
         self.upsert_sector(state).await
+    }
+
+    async fn delete_sector(&self, sector_id: SectorId) -> Result<(), RepositoryError> {
+        self.sectors.remove(&sector_id);
+        self.presence.remove(&sector_id);
+        Ok(())
     }
 }
 
@@ -235,5 +244,52 @@ impl SectorStateRepository for RedisSectorStateRepository {
             vec.retain(|e| e.id != unit_id);
         }
         self.upsert_sector(state).await
+    }
+
+    /// The mirror of `upsert_sector`'s pipe, atomic: `SREM` the `sectors:all` entry, then
+    /// `DEL` the hex state and the presence keys. `DEL`/`SREM` of a missing key return 0.
+    async fn delete_sector(&self, sector_id: SectorId) -> Result<(), RepositoryError> {
+        let mut conn = self.conn.clone();
+        redis::pipe()
+            .atomic()
+            .srem("sectors:all", sector_id.to_string())
+            .del(Self::hex_state_key(sector_id))
+            .del(Self::presence_key(sector_id))
+            .query_async::<()>(&mut conn)
+            .await
+            .map_err(|e| RepositoryError::Internal(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sector(sector_id: SectorId) -> SectorState {
+        SectorState {
+            sector_id,
+            campaign_id: Uuid::new_v4(),
+            occupation_status: OccupationStatus::Neutral,
+            owner: None,
+            deployed_unit_count: 0,
+            terrain: HashMap::new(),
+            magma_veins: Vec::new(),
+            hex_occupancy: HashMap::new(),
+        }
+    }
+
+    /// BP-1: the delete removes the sector and its presence, and a second delete is `Ok`.
+    #[tokio::test]
+    async fn in_memory_delete_sector_removes_and_is_idempotent() {
+        let repo = InMemorySectorStateRepository::new();
+        let id = Uuid::new_v4();
+        repo.upsert_sector(sector(id)).await.unwrap();
+        repo.set_player_presence(id, &[WalletAddress([9u8; 32])]).await.unwrap();
+        assert!(repo.get_sector(id).await.unwrap().is_some());
+
+        repo.delete_sector(id).await.unwrap();
+        assert!(repo.get_sector(id).await.unwrap().is_none(), "the sector is gone");
+        assert!(repo.get_player_presence(id).await.unwrap().is_empty(), "the presence is gone");
+        repo.delete_sector(id).await.expect("a second delete is Ok");
     }
 }

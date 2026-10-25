@@ -148,6 +148,11 @@ pub trait CampaignRepository: Send + Sync {
         ends_at: DateTime<Utc>,
         victory_tickers: serde_json::Value,
     ) -> Result<bool, RepositoryError>;
+
+    /// Moves an `Active` campaign to `Archived` (BP-1). Returns true if it was `Active` and
+    /// is now `Archived` (1 row updated); false for any other state or a missing id. It never
+    /// moves a campaign out of `Pending`, so it does not take `JOIN_ADVISORY_KEY`.
+    async fn retire_if_active(&self, campaign_id: Uuid) -> Result<bool, RepositoryError>;
 }
 
 // ── Postgres implementation ──────────────────────────────────────────────────
@@ -305,6 +310,19 @@ impl CampaignRepository for PostgresCampaignRepository {
         let mut conn = self.pool.acquire().await
             .map_err(|e| RepositoryError::Internal(e.to_string()))?;
         activate_row(&mut conn, campaign_id, ends_at, victory_tickers).await
+    }
+
+    async fn retire_if_active(&self, campaign_id: Uuid) -> Result<bool, RepositoryError> {
+        let result = sqlx::query!(
+            "UPDATE campaign_instances SET state = $1, updated_at = now() WHERE campaign_id = $2 AND state = $3",
+            CampaignLifecycle::Archived as CampaignLifecycle,
+            campaign_id,
+            CampaignLifecycle::Active   as CampaignLifecycle,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        Ok(result.rows_affected() == 1)
     }
 }
 
@@ -496,6 +514,17 @@ impl CampaignRepository for InMemoryCampaignRepository {
         c.updated_at = now;
         Ok(true)
     }
+
+    async fn retire_if_active(&self, campaign_id: Uuid) -> Result<bool, RepositoryError> {
+        match self.store.get_mut(&campaign_id) {
+            Some(mut c) if c.state == CampaignLifecycle::Active => {
+                c.state = CampaignLifecycle::Archived;
+                c.updated_at = Utc::now();
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -650,5 +679,23 @@ mod tests {
         repo.update_sector_state(e.campaign_id, CampaignLifecycle::Ended).await.unwrap();
         assert!(!repo.activate_campaign(e.campaign_id, ends_at, tickers).await.unwrap());
         assert_eq!(repo.get_campaign(e.campaign_id).await.unwrap().unwrap().state, CampaignLifecycle::Ended);
+    }
+
+    /// BP-1: only an `Active` campaign is archived; every other state, and a miss, is `false`.
+    #[tokio::test]
+    async fn in_memory_retire_if_active_moves_only_active() {
+        let repo = InMemoryCampaignRepository::new();
+        let cases = [
+            (CampaignLifecycle::Active,  true,  CampaignLifecycle::Archived),
+            (CampaignLifecycle::Pending, false, CampaignLifecycle::Pending),
+            (CampaignLifecycle::Ending,  false, CampaignLifecycle::Ending),
+        ];
+        for (i, (from, retired, to)) in cases.into_iter().enumerate() {
+            let c = create(&repo, i as i64).await;
+            repo.update_sector_state(c.campaign_id, from.clone()).await.unwrap();
+            assert_eq!(repo.retire_if_active(c.campaign_id).await.unwrap(), retired, "{from:?}");
+            assert_eq!(repo.get_campaign(c.campaign_id).await.unwrap().unwrap().state, to, "{from:?}");
+        }
+        assert!(!repo.retire_if_active(Uuid::new_v4()).await.unwrap(), "a missing id is false");
     }
 }

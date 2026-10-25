@@ -208,6 +208,9 @@ mod tests {
         async fn activate_campaign(&self, _: Uuid, _: DateTime<Utc>, _: Value) -> Result<bool, crate::repository::RepositoryError> {
             unimplemented!()
         }
+        async fn retire_if_active(&self, _: Uuid) -> Result<bool, crate::repository::RepositoryError> {
+            unimplemented!()
+        }
     }
 
     #[tokio::test]

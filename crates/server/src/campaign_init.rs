@@ -10,7 +10,7 @@ use crate::map_gen::{
     PlayerSpawnRequest, SpawnType,
 };
 use crate::repository::{
-    CampaignJoinRepository, InputLogRepository, LaunchStart,
+    CampaignJoinRepository, CampaignRepository, InputLogRepository, LaunchStart,
     MembershipRepository, OccupationStatus, RepositoryError,
     SectorState, SectorStateRepository,
     VictoryTickerType,
@@ -20,14 +20,49 @@ use crate::repository::{
 /// Sector state per member (GAP-58); 5b-2 fixes that and removes this guard.
 pub const LAUNCH_MAX_MEMBERS: usize = 1;
 
+/// What failed after the campaign went `Active`.
+#[derive(Debug)]
+pub enum PostActivation {
+    Repository(RepositoryError),
+    GatewayAssignmentFailed,
+}
+
 #[derive(Debug)]
 pub enum InitError {
     NotPending,
     CampaignNotFound,
     NoMembersFound,
     TooManyMembers(usize),
-    GatewayAssignmentFailed,
+    /// `begin_launch` failed; the campaign is still `Pending`.
     RepositoryError(RepositoryError),
+    /// The campaign is `Active` and the failure came after that. `sector_id` is the
+    /// campaign's sector, which may already be written.
+    AfterActivation { sector_id: Uuid, cause: PostActivation },
+}
+
+#[derive(Debug)]
+pub enum RetireError {
+    Retire(RepositoryError),
+    DeleteSector(RepositoryError),
+}
+
+/// Retires an `Active` campaign to `Archived` and deletes its sector. Returns `false`, and
+/// deletes nothing, when the campaign was not `Active`. Shared by the join's failed launch
+/// (BP-1) and the demo's abandon (BP-1b).
+///
+/// Retire first, then delete: deleting first and then failing the retire would leave an
+/// `Active` campaign with no map.
+pub async fn retire_campaign(
+    campaign_repo: &dyn CampaignRepository,
+    sector_repo:   &dyn SectorStateRepository,
+    campaign_id:   Uuid,
+    sector_id:     Uuid,
+) -> Result<bool, RetireError> {
+    let retired = campaign_repo.retire_if_active(campaign_id).await.map_err(RetireError::Retire)?;
+    if retired {
+        sector_repo.delete_sector(sector_id).await.map_err(RetireError::DeleteSector)?;
+    }
+    Ok(retired)
 }
 
 pub async fn initialize_campaign(
@@ -59,6 +94,10 @@ pub async fn initialize_campaign(
         LaunchStart::NoMembers => return Err(InitError::NoMembersFound),
         LaunchStart::TooManyMembers(n) => return Err(InitError::TooManyMembers(n)),
     };
+
+    // The campaign is Active from here: every failure below is post-activation.
+    let sector_id = campaign.sector_id;
+    let after = |cause: PostActivation| InitError::AfterActivation { sector_id, cause };
 
     // 3.2 — derive u32 PRNG root from i64 map_seed
     let seed_u32 = (campaign.map_seed as u32) ^ ((campaign.map_seed >> 32) as u32);
@@ -93,11 +132,11 @@ pub async fn initialize_campaign(
         owner: None,
         deployed_unit_count: 0,
         hex_occupancy: std::collections::HashMap::new(),
-    }).await.map_err(InitError::RepositoryError)?;
+    }).await.map_err(|e| after(PostActivation::Repository(e)))?;
 
     // 3.9 — assign gateway hexes in DB
     if assignments.len() != members.len() {
-        return Err(InitError::GatewayAssignmentFailed);
+        return Err(after(PostActivation::GatewayAssignmentFailed));
     }
     for assignment in &assignments {
         membership_repo.assign_gateway_hex(
@@ -105,7 +144,7 @@ pub async fn initialize_campaign(
             campaign_id,
             assignment.q,
             assignment.r,
-        ).await.map_err(InitError::RepositoryError)?;
+        ).await.map_err(|e| after(PostActivation::Repository(e)))?;
     }
 
     // 3.10 — append campaign_started input log entry (the ends_at just written)
@@ -122,7 +161,7 @@ pub async fn initialize_campaign(
     };
 
     input_log_repo.append_campaign_entry(&campaign_id, &campaign_started).await
-        .map_err(InitError::RepositoryError)?;
+        .map_err(|e| after(PostActivation::Repository(e)))?;
 
     Ok(())
 }
