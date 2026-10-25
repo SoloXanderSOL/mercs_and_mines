@@ -1,16 +1,17 @@
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use dashmap::DashMap;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{self, error::TrySendError};
 use uuid::Uuid;
 
 use crate::convoy_collision::check_same_hex_collision;
+use crate::rate_limit::RateWarn;
 use crate::repeat_warn::{KeyedRepeatWarn, RepeatWarn};
 use crate::repository::{HexOccupant, TimerType};
-use crate::state::AppState;
+use crate::state::{AppState, CONVOY_EVENT_CHANNEL};
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub enum ConvoyEvent {
@@ -28,12 +29,42 @@ pub const EXPIRY_POLL_INTERVAL_SECS: u64 = 10;
 pub const EXPIRY_WARN_EVERY_TICKS: u32 = (3600 / EXPIRY_POLL_INTERVAL_SECS) as u32;
 
 fn notify_player_convoy_arrived(
-    senders:     &DashMap<Uuid, UnboundedSender<ConvoyEvent>>,
+    senders: &DashMap<Uuid, mpsc::Sender<ConvoyEvent>>,
     campaign_id: Uuid,
-    event:       ConvoyEvent,
+    event: ConvoyEvent,
+    full: &RateWarn,
 ) {
-    if let Some(sender) = senders.get(&campaign_id) {
-        let _ = sender.send(event);
+    // Clone the sender out so the map guard is dropped before any removal: a
+    // removal under the guard waits on the shard it holds.
+    let Some(ours) = senders.get(&campaign_id).map(|s| s.clone()) else {
+        return;
+    };
+    deliver(senders, campaign_id, ours, event, full, Instant::now());
+}
+
+/// Sends without waiting. A full channel means the socket has stopped reading, so its
+/// sender is dropped (journalled at most hourly); a closed one is a normal disconnect
+/// and stays silent. Only `ours` is removed, never a sender that replaced it after the clone.
+fn deliver(
+    senders: &DashMap<Uuid, mpsc::Sender<ConvoyEvent>>,
+    campaign_id: Uuid,
+    ours: mpsc::Sender<ConvoyEvent>,
+    event: ConvoyEvent,
+    full: &RateWarn,
+    now: Instant,
+) {
+    if let Err(e) = ours.try_send(event) {
+        if matches!(e, TrySendError::Full(_)) {
+            if let Some(n) = full.hit(now) {
+                tracing::warn!(
+                    campaign_id = %campaign_id,
+                    dropped = n,
+                    capacity = CONVOY_EVENT_CHANNEL,
+                    "convoy events channel full: the socket is not reading, its sender is dropped"
+                );
+            }
+        }
+        senders.remove_if(&campaign_id, |_, s| s.same_channel(&ours));
     }
 }
 
@@ -49,6 +80,9 @@ pub struct ExpiryWarns {
     pub phantom: KeyedRepeatWarn,
     /// Keyed by the raw zset member: a poisoned member may not be a UUID (GAP-53).
     pub poisoned: KeyedRepeatWarn<String>,
+    /// A convoy events socket whose channel was full (it stopped reading); journalled
+    /// on the first drop, then at most hourly with a count.
+    pub events_full: RateWarn,
 }
 
 impl ExpiryWarns {
@@ -61,6 +95,7 @@ impl ExpiryWarns {
             cancel_timer: KeyedRepeatWarn::new(EXPIRY_WARN_EVERY_TICKS),
             phantom: KeyedRepeatWarn::new(EXPIRY_WARN_EVERY_TICKS),
             poisoned: KeyedRepeatWarn::new(EXPIRY_WARN_EVERY_TICKS),
+            events_full: RateWarn::new(),
         }
     }
 }
@@ -180,7 +215,7 @@ pub async fn poll_expiry_once(state: &AppState, warns: &mut ExpiryWarns) {
 
         match landed {
             // 3. Landed by this call: the side effects run here and only here.
-            Some(convoy) => land_side_effects(state, &sector, cid, &convoy).await,
+            Some(convoy) => land_side_effects(state, &sector, cid, &convoy, &warns.events_full).await,
             // 4. Nothing landed: either an earlier poll landed it and only the cancel is
             //    outstanding, or there is no convoy at all (a phantom timer).
             None => match state.convoy_repo.get_convoy(id).await {
@@ -243,6 +278,7 @@ async fn land_side_effects(
     sector: &crate::repository::SectorState,
     cid:    Uuid,
     convoy: &crate::repository::ConvoyDbRecord,
+    full:   &RateWarn,
 ) {
     let sector_id = convoy.sector_id;
     if let Err(e) = state.sector_repo
@@ -294,7 +330,7 @@ async fn land_side_effects(
         destination_r: convoy.destination_r,
         cargo:         convoy.cargo.clone(),
     };
-    notify_player_convoy_arrived(&state.convoy_event_senders, cid, event);
+    notify_player_convoy_arrived(&state.convoy_event_senders, cid, event, full);
 }
 
 pub async fn run_convoy_expiry_task(state: Arc<AppState>) {
@@ -314,6 +350,91 @@ mod tests {
         DeploymentTimer, DueTimers, OccupationStatus, PoisonedTimer, PostgresConvoyRepository,
         RepositoryError, SectorState, TimerRepository, WalletAddress,
     };
+
+    /// A journal capture buffer (the `routes/mod.rs` pattern).
+    #[derive(Clone, Default)]
+    struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Buf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Runs `f` under a capturing subscriber and returns the journal text.
+    fn journal(f: impl FnOnce()) -> String {
+        let buf = Buf::default();
+        let w = buf.clone();
+        let sub = tracing_subscriber::fmt().with_writer(move || w.clone()).with_ansi(false).finish();
+        tracing::subscriber::with_default(sub, f);
+        let text = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        text
+    }
+
+    fn arrived() -> ConvoyEvent {
+        ConvoyEvent::ConvoyArrived {
+            convoy_id: Uuid::new_v4(),
+            destination_q: 3,
+            destination_r: 2,
+            cargo: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn notify_drops_a_full_sender_and_journals() {
+        let senders = DashMap::new();
+        let id = Uuid::new_v4();
+        let (tx, _rx) = mpsc::channel::<ConvoyEvent>(1);
+        senders.insert(id, tx);
+        let full = RateWarn::new();
+
+        let text = journal(|| {
+            notify_player_convoy_arrived(&senders, id, arrived(), &full);
+            assert!(senders.contains_key(&id), "a send with room keeps the sender");
+            notify_player_convoy_arrived(&senders, id, arrived(), &full);
+        });
+        assert!(!senders.contains_key(&id), "a full channel drops its sender");
+        assert!(full.fired(), "the drop is counted");
+        let lines: Vec<&str> = text.lines().filter(|l| l.contains("convoy events channel full")).collect();
+        assert_eq!(lines.len(), 1, "one journal line: {text}");
+        assert!(lines[0].contains(&id.to_string()), "the line names the campaign: {text}");
+    }
+
+    #[test]
+    fn notify_drops_a_closed_sender_silently() {
+        let senders = DashMap::new();
+        let id = Uuid::new_v4();
+        let (tx, rx) = mpsc::channel::<ConvoyEvent>(1);
+        drop(rx);
+        senders.insert(id, tx);
+        let full = RateWarn::new();
+
+        let text = journal(|| notify_player_convoy_arrived(&senders, id, arrived(), &full));
+        assert!(!senders.contains_key(&id), "a closed channel's sender is removed");
+        assert!(!full.fired(), "a disconnect is not a full channel");
+        assert_eq!(text.lines().filter(|l| l.contains("channel full")).count(), 0, "{text}");
+    }
+
+    #[test]
+    fn deliver_keeps_a_sender_that_replaced_ours() {
+        let senders = DashMap::new();
+        let id = Uuid::new_v4();
+        let (b, _rx_b) = mpsc::channel::<ConvoyEvent>(1);
+        let b_probe = b.clone();
+        senders.insert(id, b);
+        let (a, _rx_a) = mpsc::channel::<ConvoyEvent>(1);
+        let full = RateWarn::new();
+        let now = Instant::now();
+
+        deliver(&senders, id, a.clone(), arrived(), &full, now); // fills A
+        deliver(&senders, id, a.clone(), arrived(), &full, now); // A is full
+        let kept = senders.get(&id).map(|s| s.same_channel(&b_probe));
+        assert_eq!(kept, Some(true), "a stale sender's drop must not take the one that replaced it");
+    }
 
     #[tokio::test]
     async fn poll_expiry_suppresses_per_timer_and_evicts() {

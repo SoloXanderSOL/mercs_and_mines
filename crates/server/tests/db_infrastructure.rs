@@ -3702,7 +3702,7 @@ async fn convoy_ws_receives_arrived_event() {
     state.input_log_repo = log_repo.clone();
 
     // Inject WS sender for this campaign — poll_expiry_once will fire into it
-    let (tx, mut rx) = mpsc::unbounded_channel::<ConvoyEvent>();
+    let (tx, mut rx) = mpsc::channel::<ConvoyEvent>(64);
     state.convoy_event_senders.insert(campaign_id, tx);
 
     let state = Arc::new(state);

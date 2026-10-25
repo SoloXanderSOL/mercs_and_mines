@@ -142,6 +142,20 @@ pub fn with_test_peer(router: Router, peer: SocketAddr) -> Router {
     router.layer(MockConnectInfo(peer))
 }
 
+/// Serves `app` on an ephemeral loopback port (with connect info, as production does)
+/// and returns its address, for tests that need a live WebSocket.
+#[cfg(test)]
+pub(crate) async fn serve_on_loopback(app: Router) -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+            .await
+            .unwrap();
+    });
+    addr
+}
+
 fn unauthorized(msg: impl Into<String>) -> AppError {
     (StatusCode::UNAUTHORIZED, Json(json!({"error": msg.into()})))
 }

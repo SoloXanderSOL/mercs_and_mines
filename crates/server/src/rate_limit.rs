@@ -194,6 +194,7 @@ fn claim(base: Instant, last: &AtomicU64, now: Instant, every: Duration) -> bool
 /// Journals a repeating condition without flooding (ODQ-48; Reviewer INF-6c-1 F2): the first
 /// hit, then at most once per `RATE_WARN_INTERVAL`, each time with the number of hits since
 /// the last line. The caller owns the `warn!` text. There is deliberately no `Default`.
+#[derive(Debug)]
 pub struct RateWarn {
     base: Instant,
     last_ms: AtomicU64,

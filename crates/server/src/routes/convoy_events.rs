@@ -15,7 +15,11 @@ use uuid::Uuid;
 use crate::auth::AuthSession;
 use crate::convoy_expiry::ConvoyEvent;
 use crate::repository::CampaignLifecycle;
-use crate::state::AppState;
+use crate::state::{AppState, CONVOY_EVENT_CHANNEL};
+
+/// Largest client frame and message the convoy events socket accepts (1 KiB). The
+/// socket has no inbound protocol: frames are drained and ignored.
+const CONVOY_WS_MAX_MESSAGE: usize = 1024;
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new().route("/api/campaign/:campaign_id/events/ws", get(convoy_events_ws_handler))
@@ -62,28 +66,50 @@ pub async fn convoy_events_ws_handler(
         Ok(w) => w,
         Err(r) => return r.into_response(),
     };
-    ws.on_upgrade(move |socket| handle_convoy_ws(socket, state, campaign_id))
+    ws.max_message_size(CONVOY_WS_MAX_MESSAGE)
+        .max_frame_size(CONVOY_WS_MAX_MESSAGE)
+        .on_upgrade(move |socket| handle_convoy_ws(socket, state, campaign_id))
         .into_response()
 }
 
 async fn handle_convoy_ws(mut socket: WebSocket, state: Arc<AppState>, campaign_id: Uuid) {
-    let (tx, mut rx) = mpsc::unbounded_channel::<ConvoyEvent>();
+    let (tx, mut rx) = mpsc::channel::<ConvoyEvent>(CONVOY_EVENT_CHANNEL);
+    // Hold only a weak handle. When the producer drops a full sender, or a newer
+    // socket for this campaign replaces it, `rx` ends and this handler closes.
+    let weak = tx.downgrade();
     state.convoy_event_senders.insert(campaign_id, tx);
 
-    while let Some(event) = rx.recv().await {
-        let json = match serde_json::to_string(&event) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!("failed to serialize ConvoyEvent: {:?}", e);
-                continue;
-            }
-        };
-        if socket.send(Message::Text(json)).await.is_err() {
-            break; // client disconnected
+    loop {
+        tokio::select! {
+            ev = rx.recv() => match ev {
+                Some(event) => {
+                    let json = match serde_json::to_string(&event) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::warn!("failed to serialize ConvoyEvent: {:?}", e);
+                            continue;
+                        }
+                    };
+                    if socket.send(Message::Text(json)).await.is_err() {
+                        break; // client disconnected
+                    }
+                }
+                None => break,
+            },
+            msg = socket.recv() => match msg {
+                // The client is gone, or sent a frame over the cap.
+                None | Some(Err(_)) => break,
+                // Drained and ignored. A Close is answered on the next read, so keep reading.
+                Some(Ok(_)) => {}
+            },
         }
     }
-
-    state.convoy_event_senders.remove(&campaign_id);
+    let _ = socket.close().await;
+    // Remove our own sender only: a newer socket may have replaced it (GAP-75).
+    let ours = weak.upgrade();
+    state
+        .convoy_event_senders
+        .remove_if(&campaign_id, |_, s| ours.as_ref().is_some_and(|o| o.same_channel(s)));
 }
 
 #[cfg(test)]
@@ -175,6 +201,95 @@ mod tests {
         assert_eq!(open(&state, id, Some("t")).await, StatusCode::CONFLICT, "Pending");
         state.campaign_repo.update_sector_state(id, CampaignLifecycle::Ended).await.unwrap();
         assert_eq!(open(&state, id, Some("t")).await, StatusCode::CONFLICT, "Ended");
+    }
+
+    type Client = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+    type ClientMsg = tokio_tungstenite::tungstenite::Message;
+
+    /// A live events socket for `MEMBER` (token `"t"`) on campaign `id`.
+    async fn connect(addr: std::net::SocketAddr, id: Uuid) -> Client {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut req = format!("ws://{addr}/api/campaign/{id}/events/ws")
+            .into_client_request()
+            .expect("request");
+        req.headers_mut().insert("authorization", "Bearer t".parse().unwrap());
+        let (ws, _) = tokio_tungstenite::connect_async(req).await.expect("connect");
+        ws
+    }
+
+    /// Polls (10 ms steps, 2 s at most) until the campaign's sender is present or absent.
+    async fn wait_for_sender(state: &AppState, id: Uuid, present: bool) {
+        let poll = async {
+            while state.convoy_event_senders.contains_key(&id) != present {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), poll)
+            .await
+            .unwrap_or_else(|_| panic!("the sender never became present = {present}"));
+    }
+
+    /// The next client message, within 2 s.
+    async fn next_msg(ws: &mut Client) -> Option<Result<ClientMsg, tokio_tungstenite::tungstenite::Error>> {
+        use futures_util::StreamExt;
+        tokio::time::timeout(std::time::Duration::from_secs(2), ws.next()).await.expect("timed out")
+    }
+
+    /// The socket closes: a `Close(None)`, then the end of the stream.
+    async fn assert_closes(ws: &mut Client) {
+        let msg = next_msg(ws).await.expect("stream ended").expect("read error");
+        assert!(matches!(msg, ClientMsg::Close(None)), "expected Close(None), got {msg:?}");
+        assert!(matches!(next_msg(ws).await, None | Some(Err(_))), "the socket must end after its Close");
+    }
+
+    /// A live server over `state` with an `Active` campaign `MEMBER` belongs to.
+    async fn live() -> (Arc<AppState>, Uuid, std::net::SocketAddr) {
+        let state = signed_in();
+        let id = campaign(&state, true, true).await;
+        let state = Arc::new(state);
+        let addr = crate::routes::serve_on_loopback(router().with_state(Arc::clone(&state))).await;
+        (state, id, addr)
+    }
+
+    #[tokio::test]
+    async fn events_ws_client_close_ends_the_handler_and_removes_its_sender() {
+        use futures_util::SinkExt;
+        let (state, id, addr) = live().await;
+        let mut ws = connect(addr, id).await;
+        wait_for_sender(&state, id, true).await;
+        ws.send(ClientMsg::Close(None)).await.expect("send Close");
+        assert_closes(&mut ws).await;
+        wait_for_sender(&state, id, false).await;
+    }
+
+    #[tokio::test]
+    async fn events_ws_replaced_socket_leaves_the_new_sender() {
+        use futures_util::StreamExt;
+        let (state, id, addr) = live().await;
+        let mut a = connect(addr, id).await;
+        wait_for_sender(&state, id, true).await;
+        let mut b = connect(addr, id).await;
+        // A closes only once B's insert has replaced A's sender.
+        assert_closes(&mut a).await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), b.next()).await.is_err(),
+            "B must get nothing: A's exit must not take B's sender"
+        );
+        let live = state.convoy_event_senders.get(&id).map(|s| !s.is_closed());
+        assert_eq!(live, Some(true), "the map keeps B's live sender");
+    }
+
+    #[tokio::test]
+    async fn events_ws_over_cap_frame_ends_the_socket() {
+        use futures_util::SinkExt;
+        let (state, id, addr) = live().await;
+        let mut ws = connect(addr, id).await;
+        wait_for_sender(&state, id, true).await;
+        ws.send(ClientMsg::Text("x".repeat(1025))).await.expect("send");
+        assert_closes(&mut ws).await;
+        wait_for_sender(&state, id, false).await;
     }
 
     #[tokio::test]

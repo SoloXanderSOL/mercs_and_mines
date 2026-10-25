@@ -27,6 +27,10 @@ use crate::{
     state::AppState,
 };
 
+/// Largest client frame and message the combat socket accepts (4 KiB). A larger
+/// frame ends the session through the receive loop's error arm.
+const COMBAT_WS_MAX_MESSAGE: usize = 4096;
+
 pub async fn ws_stream_handler(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<Uuid>,
@@ -59,10 +63,12 @@ pub async fn ws_stream_handler(
     let sim_cfg = state.config.sim.clone();
     let default_max_ticks = state.config.server.default_max_ticks;
     let input_log_repo = Arc::clone(&state.input_log_repo);
-    ws.on_upgrade(move |socket| {
-        handle_ws(socket, session.params, params_payload, session_id, sim_cfg, default_max_ticks, input_log_repo)
-    })
-    .into_response()
+    ws.max_message_size(COMBAT_WS_MAX_MESSAGE)
+        .max_frame_size(COMBAT_WS_MAX_MESSAGE)
+        .on_upgrade(move |socket| {
+            handle_ws(socket, session.params, params_payload, session_id, sim_cfg, default_max_ticks, input_log_repo)
+        })
+        .into_response()
 }
 
 async fn handle_ws(
@@ -180,7 +186,13 @@ async fn handle_ws(
                                     break;
                                 }
                             }
-                            Err(_) => break,
+                            Err(e) => {
+                                tracing::warn!("combat tick serialization failed for {session_id} at tick {last_tick}: {e}");
+                                if let Some(tx) = cancel_tx.take() {
+                                    let _ = tx.send(());
+                                }
+                                break;
+                            }
                         }
                         if ended {
                             break;
@@ -195,4 +207,111 @@ async fn handle_ws(
     // Ensure the resolver task is stopped before we return.
     let _ = resolver_handle.await;
     let _ = socket.close().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use futures_util::{SinkExt, StreamExt};
+    use sim_engine::types::{ArmorTag, CombatWeapon, Section, Vehicle, WeaponTag};
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    use super::*;
+    use crate::config::Config;
+    use crate::repository::CombatSession;
+
+    type Client = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    /// A live combat socket: a saved session, ticks every second, up to 1000 ticks.
+    async fn combat_client() -> Client {
+        let mut config = Config::default();
+        config.sim.tick_stream_delay_ms = 1000;
+        let state = Arc::new(AppState::new(Arc::new(config)));
+        let section = Section {
+            id: "test_section".into(),
+            name: "Test Rifles".into(),
+            max_strength: 4,
+            current_strength: 4,
+            individual_hp: 10,
+            accuracy: 60,
+            evasion: 10,
+            weapon: CombatWeapon {
+                name: "Rifle".into(),
+                ap: 2,
+                base_damage: 5,
+                tag: WeaponTag::Slug,
+                accuracy: 0,
+            },
+            armor_at: 0,
+            armor_tag: ArmorTag::Unarmored,
+        };
+        let vehicle = Vehicle {
+            id: "test_vehicle".into(),
+            name: "Test Truck".into(),
+            hp: 50,
+            max_hp: 50,
+            at: 2,
+            armor_tag: ArmorTag::LightArmor,
+            evasion: 5,
+            weapons: vec![],
+        };
+        let params = CombatResolveRequest {
+            section,
+            vehicle,
+            max_ticks: Some(1000),
+            seed_override: Some(42),
+            combat_initiation_type: None,
+            defending_convoy_vehicles: None,
+            commander: None,
+        };
+        let id = Uuid::new_v4();
+        state
+            .session_repo
+            .save_session(id, CombatSession { params, created_at: Utc::now() })
+            .await
+            .expect("save_session");
+        let addr = super::super::serve_on_loopback(super::super::router(state)).await;
+        let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/api/combat/stream/{id}"))
+            .await
+            .expect("connect");
+        ws
+    }
+
+    /// The next client message, within `secs`.
+    async fn next(ws: &mut Client, secs: u64) -> Option<Result<WsMessage, tokio_tungstenite::tungstenite::Error>> {
+        tokio::time::timeout(Duration::from_secs(secs), ws.next()).await.expect("timed out")
+    }
+
+    /// Reads tick 1, checks the combat goes on past it, and returns its index.
+    async fn read_first_tick(ws: &mut Client) -> u32 {
+        let msg = next(ws, 5).await.expect("stream ended").expect("read error");
+        let WsMessage::Text(text) = msg else { panic!("expected tick 1, got {msg:?}") };
+        let tick: CombatTickEvent = serde_json::from_str(&text).expect("tick json");
+        assert!(!tick.combat_ended, "precondition: the fixture's combat must outlast tick 1");
+        tick.tick_index
+    }
+
+    #[tokio::test]
+    async fn combat_ws_over_cap_frame_ends_the_session() {
+        let mut ws = combat_client().await;
+        read_first_tick(&mut ws).await;
+        ws.send(WsMessage::Text("x".repeat(4097))).await.expect("send");
+        let msg = next(&mut ws, 5).await.expect("stream ended").expect("read error");
+        assert!(matches!(msg, WsMessage::Close(None)), "expected Close(None), got {msg:?}");
+        assert!(matches!(next(&mut ws, 5).await, None | Some(Err(_))), "the socket must end after its Close");
+    }
+
+    #[tokio::test]
+    async fn combat_ws_reads_a_frame_at_the_cap() {
+        let mut ws = combat_client().await;
+        let first = read_first_tick(&mut ws).await;
+        ws.send(WsMessage::Text("x".repeat(4096))).await.expect("send");
+        let msg = next(&mut ws, 5).await.expect("stream ended").expect("read error");
+        let WsMessage::Text(text) = msg else { panic!("expected tick 2, got {msg:?}") };
+        let tick: CombatTickEvent = serde_json::from_str(&text).expect("tick json");
+        assert_eq!(tick.tick_index, first + 1, "the session goes on after a frame at the cap");
+    }
 }

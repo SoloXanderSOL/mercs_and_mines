@@ -1,7 +1,7 @@
 #![allow(unused)]
 use std::sync::Arc;
 use dashmap::DashMap;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc;
 use uuid::Uuid;
 use crate::auth::{ChallengeCap, SessionIndex, CHALLENGE_CAP, SESSION_CAP, SESSION_QUOTA};
 use crate::config::Config;
@@ -22,6 +22,10 @@ use crate::repository::{
 };
 
 pub use crate::repository::CombatSession;
+
+/// Capacity of each convoy events socket's channel. A full channel means the
+/// socket has stopped reading, and the producer drops that socket's sender.
+pub const CONVOY_EVENT_CHANNEL: usize = 64;
 
 pub struct PendingChallenge {
     /// The validated wallet this challenge was issued to; verify requires the request to name the same one.
@@ -55,7 +59,7 @@ pub struct AppState {
     pub timer_repo:      Arc<dyn TimerRepository>,
     pub convoy_repo:     Arc<dyn ConvoyRepository>,
     /// Sender map for convoy event WebSocket notifications, keyed by campaign_id.
-    pub convoy_event_senders: DashMap<Uuid, UnboundedSender<ConvoyEvent>>,
+    pub convoy_event_senders: DashMap<Uuid, mpsc::Sender<ConvoyEvent>>,
     pub config: Arc<Config>,
     /// Postgres connection pool. None only in unit-test contexts that use in-memory repos.
     /// Production startup panics if DATABASE_URL is unset; pool is always Some in prod.
