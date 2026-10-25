@@ -4,7 +4,7 @@ name: Release
 # deploy job's main-only guard below is what keeps those runs off production.
 on:
   push:
-    branches: [main, dev]
+    branches: [main, dev, breakpoint]  # breakpoint-only; never merged back to dev or main
   pull_request:
   workflow_dispatch:
 
@@ -31,6 +31,7 @@ jobs:
     # and a newer image can link a newer glibc than the host has (GAP-47). Move this pin,
     # the deploy job's pin and the cache key together whenever the droplet is upgraded.
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     # Versions deliberately match production (Postgres 16, Redis 7): a CI database on a
     # different major version tests the wrong thing. No migration step is needed — the
     # harness runs sqlx::migrate!("../../migrations") against the pool itself.
