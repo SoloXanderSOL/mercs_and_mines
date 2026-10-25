@@ -67,6 +67,9 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Show the toolchain cargo uses
+        run: rustc --version
+
       - name: Cache Cargo
         uses: actions/cache@v5
         with:
