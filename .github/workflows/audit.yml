@@ -1,0 +1,39 @@
+name: Scheduled dependency audit
+
+# Audits main's lockfile weekly, so an advisory published while nobody pushes (the
+# Breakpoint freeze) still turns a run red. release.yml must never get a schedule
+# trigger: a scheduled run there passes deploy's guard and redeploys production.
+on:
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Show the toolchain cargo uses
+        run: rustc --version
+      - name: Restore cargo-audit
+        id: cache
+        uses: actions/cache/restore@v5
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: ${{ runner.os }}-ubuntu-24.04-cargo-audit-0.22.2
+      - name: Install cargo-audit
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: cargo install cargo-audit --locked --version 0.22.2
+      - name: Save cargo-audit
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: ${{ runner.os }}-ubuntu-24.04-cargo-audit-0.22.2
+      - name: Run cargo audit
+        run: cargo audit
