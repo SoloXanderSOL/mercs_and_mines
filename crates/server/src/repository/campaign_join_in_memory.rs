@@ -122,6 +122,15 @@ impl CampaignJoinRepository for InMemoryCampaignJoinRepository {
         let campaign_id = match picked {
             Some(id) => id,
             None => {
+                // The demo cap, counted under the `starters` guard as Postgres counts under
+                // the join lock. Nothing is written before this point on this branch.
+                let mut n = 0i64;
+                for state in [CampaignLifecycle::Pending, CampaignLifecycle::Active, CampaignLifecycle::Ending] {
+                    n += self.campaigns.list_campaigns_by_state(state).await?.len() as i64;
+                }
+                if n >= super::campaign_join::DEMO_LIVE_CAMPAIGN_CAP {
+                    return Ok(JoinOutcome::DemoFull);
+                }
                 self.campaigns
                     .create_campaign(&NewCampaignInstance { sector_id: Uuid::new_v4(), map_seed: seeds.map })
                     .await?
@@ -355,6 +364,29 @@ mod tests {
         assert!(older.created_at < newer.created_at, "precondition: distinct creation times");
         let ids = joined(s.join.join_campaign(&[42u8; 32], 1, SEEDS).await.unwrap());
         assert_eq!(ids.campaign_id, older.campaign_id, "joined the older campaign");
+    }
+
+    /// BP-1 (ODQ-55 (a)): with 999 live campaigns, A's join creates the 1,000th; B's join,
+    /// which would create a 1,001st, is refused and writes nothing; A again is still
+    /// `AlreadyMember`. The literal 999 is the oracle, not the const.
+    #[tokio::test]
+    async fn in_memory_join_refuses_a_new_campaign_at_the_demo_cap() {
+        let s = stores();
+        for i in 0..999 {
+            let c = s.campaigns.create_campaign(&NewCampaignInstance { sector_id: Uuid::new_v4(), map_seed: i }).await.unwrap();
+            assert!(s.campaigns.activate_campaign(c.campaign_id, launch_ends_at(), launch_tickers()).await.unwrap());
+        }
+        let (a, b) = (vec![42u8; 32], vec![43u8; 32]);
+
+        let ids = joined(s.join.join_campaign(&a, 1, SEEDS).await.unwrap());
+        let refused = s.join.join_campaign(&b, 1, SEEDS).await.unwrap();
+        assert_eq!(refused, JoinOutcome::DemoFull);
+        assert!(s.memberships.list_campaigns_by_player(&b).await.unwrap().is_empty(), "B has no membership");
+        assert_eq!(roster_counts(&s, ids.campaign_id, &b).await, [0, 0, 0, 0], "B has no starters");
+        assert_eq!(pending_count(&s).await, 1, "only A's campaign was created");
+
+        let again = s.join.join_campaign(&a, 1, SEEDS).await.unwrap();
+        assert_eq!(again, JoinOutcome::AlreadyMember(ids), "AlreadyMember still passes when full");
     }
 
     // ── begin_launch (5a-3a) ────────────────────────────────────────────────

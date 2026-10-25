@@ -15,7 +15,8 @@ use uuid::Uuid;
 use sim_engine::rng::generate_seed;
 
 use crate::auth::AuthSession;
-use crate::repository::{CampaignLifecycle, JoinOutcome, JoinSeeds, ReplacementOutcome, StarterIds, SECTOR_PLAYER_CAP};
+use crate::campaign_init::{initialize_campaign, retire_campaign, InitError, RetireError};
+use crate::repository::{CampaignLifecycle, JoinOutcome, JoinSeeds, ReplacementOutcome, StarterIds};
 use crate::state::AppState;
 
 use super::{
@@ -41,11 +42,32 @@ fn starter_ids_body(ids: &StarterIds) -> serde_json::Value {
     })
 }
 
+/// The demo's Sector player cap (BP-1, ODQ-51 (a), demo-only): one wallet per campaign.
+const DEMO_PLAYER_CAP: i64 = 1;
+
 /// A player enters a campaign (5a-3b): `201` with the new starter set, or `200` with the
 /// existing one when the wallet already has a live membership (S1/S7).
 ///
-/// - The account precondition holds: `post_auth_verify` upserts the account before
-///   `issue_session`, so a `23503` from the join is a backstop `500`, never a `404`.
+/// - The join creates the wallet's `player_accounts` row (`insert_account_if_absent`,
+///   GAP-79), so a `23503` from it is a backstop `500`, never a `404`.
+/// - **The demo (BP-1, demo-only):** one wallet per campaign (`DEMO_PLAYER_CAP`), and every
+///   join launches its campaign, with no admin key. `begin_launch`'s `NotPending` is success,
+///   so only a still-`Pending` campaign is relaunched. The answers:
+///   - a launch failure **before** activation is `500`; the campaign stays `Pending`, and
+///     the next join relaunches it;
+///   - a failure **after** activation retires the campaign and deletes its sector
+///     (`retire_campaign`), then `500`; the next join gets a new campaign;
+///   - if the retire fails, finds the campaign no longer `Active`, or the sector delete
+///     fails, it is still `500`, journalled with the campaign and sector ids;
+///   - `503 {"error":"the demo is full"}` when the join would create a campaign beyond the
+///     demo's live-campaign cap; a member still gets in.
+/// - **Same-wallet race:** two concurrent joins can both reach the launch. One sees
+///   `NotPending` and answers `200`, even if the other's launch then fails and retires the
+///   campaign. The next join recovers.
+/// - **Abuse bound:** any signed-in wallet, behind the join switch, `join_ip` 30/min and
+///   `join_wallet` 3/min, and at most 1,000 live campaigns. It holds `JOIN_ADVISORY_KEY` for
+///   the join transaction, then again for `begin_launch`'s short transaction. Map generation
+///   and the Redis write run after that commit, outside the lock.
 /// - Every repository error is a `500`. The text is never matched.
 /// - The join is not a logged input: the starters' generator rolls are server decisions
 ///   stored in their records.
@@ -83,15 +105,35 @@ async fn post_campaign_join(
     };
     let outcome = state
         .campaign_join_repo
-        .join_campaign(&wallet, SECTOR_PLAYER_CAP, seeds)
+        .join_campaign(&wallet, DEMO_PLAYER_CAP, seeds)
         .await
         .map_err(|e| internal_error(format!("campaign join failed: {e}")))?;
 
-    Ok(match outcome {
-        JoinOutcome::Joined(ids) => (StatusCode::CREATED, Json(starter_ids_body(&ids))),
-        JoinOutcome::AlreadyMember(ids) => (StatusCode::OK, Json(starter_ids_body(&ids))),
+    let (status, ids) = match outcome {
+        JoinOutcome::Joined(ids) => (StatusCode::CREATED, ids),
+        JoinOutcome::AlreadyMember(ids) => (StatusCode::OK, ids),
+        JoinOutcome::DemoFull => return Err(service_unavailable("the demo is full")),
+    };
+    let c = ids.campaign_id;
+    match initialize_campaign(c, &*state.campaign_join_repo, state.membership_repo.as_ref(),
+                              state.sector_repo.as_ref(), state.input_log_repo.as_ref()).await {
+        Ok(()) | Err(InitError::NotPending) => {}
+        Err(InitError::AfterActivation { sector_id, cause }) => {
+            return Err(match retire_campaign(state.campaign_repo.as_ref(), state.sector_repo.as_ref(), c, sector_id).await {
+                Ok(true) => internal_error(format!(
+                    "demo launch failed after activation: campaign {c} retired, sector {sector_id} deleted: {cause:?}")),
+                Ok(false) => internal_error(format!(
+                    "demo launch failed after activation: campaign {c} no longer Active, sector {sector_id} kept: {cause:?}")),
+                Err(RetireError::Retire(e)) => internal_error(format!(
+                    "demo launch failed after activation and the retire failed: campaign {c} stuck Active, sector {sector_id} kept: {cause:?}; retire: {e}")),
+                Err(RetireError::DeleteSector(e)) => internal_error(format!(
+                    "demo launch failed after activation: campaign {c} retired, sector {sector_id} NOT deleted (SREM sectors:all + DEL by hand): {cause:?}; delete: {e}")),
+            });
+        }
+        Err(e) => return Err(internal_error(format!(
+            "demo launch failed before activation: campaign {c} stays Pending: {e:?}"))),
     }
-    .into_response())
+    Ok((status, Json(starter_ids_body(&ids))).into_response())
 }
 
 // TODO(phase-2-§10j): alpha-only replacement; removed when the Phase 2 Bootcamp hire ships (ODQ-33).
@@ -257,6 +299,11 @@ mod tests {
         let section = state.section_repo.get_section(section_id).await.unwrap().expect("starter Section");
         assert_eq!(section.player_wallet, WALLET.to_vec());
         assert_eq!(section.campaign_id, campaign_id);
+
+        // BP-1: the join launched the campaign.
+        let campaign = state.campaign_repo.get_campaign(campaign_id).await.unwrap().expect("campaign");
+        assert_eq!(campaign.state, CampaignLifecycle::Active, "the join launches its campaign");
+        assert!(state.sector_repo.get_sector(campaign.sector_id).await.unwrap().is_some(), "the launch wrote the sector");
     }
 
     #[tokio::test]
@@ -311,13 +358,14 @@ mod tests {
         assert!(ok, "the campaign must activate");
     }
 
-    /// `WALLET` joins (switch on) and its campaign is launched. Returns (campaign, starter).
+    /// `WALLET` joins (switch on), which launches its campaign (BP-1). Returns (campaign, starter).
     async fn active_member() -> (Arc<AppState>, Uuid, Uuid) {
         let state = Arc::new(joined_state());
         let (status, body) = join(state.clone(), Some("t")).await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
         let (campaign_id, commander_id) = (id(&body, "campaign_id"), id(&body, "commander_id"));
-        activate(&state, campaign_id).await;
+        let campaign = state.campaign_repo.get_campaign(campaign_id).await.unwrap().expect("campaign");
+        assert_eq!(campaign.state, CampaignLifecycle::Active, "the join must launch the campaign");
         (state, campaign_id, commander_id)
     }
 
@@ -369,6 +417,8 @@ mod tests {
         let (status, body) = join(state.clone(), Some("t")).await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
         let (c, starter) = (id(&body, "campaign_id"), id(&body, "commander_id"));
+        // BP-1: the join launched it, so retire it to make it not `Active`.
+        assert!(state.campaign_repo.retire_if_active(c).await.unwrap(), "the launched campaign retires");
         state.commander_repo.set_kia(starter).await.unwrap();
         let (status, body) = claim(state.clone(), Some("t"), &c.to_string()).await;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
@@ -528,5 +578,242 @@ mod tests {
         let mut expected = vec![StatusCode::NOT_FOUND; 30];
         expected.push(StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(statuses, expected);
+    }
+
+    // ── BP-1: the demo's auto-launch and caps ────────────────────────────────
+
+    use crate::repository::{
+        CampaignInstance, CampaignJoinRepository, CampaignRepository, InputLogRepository, LaunchStart,
+        RepositoryError, VictoryTickerType,
+    };
+    use chrono::{DateTime, Utc};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn forced(what: &str) -> RepositoryError {
+        RepositoryError::Internal(format!("forced test failure: {what}"))
+    }
+
+    /// True (and one fewer left) while failures remain. The doubles are called one request
+    /// at a time, so a load then a decrement is enough.
+    fn take_failure(fails_left: &AtomicUsize) -> bool {
+        if fails_left.load(Ordering::SeqCst) == 0 {
+            return false;
+        }
+        fails_left.fetch_sub(1, Ordering::SeqCst);
+        true
+    }
+
+    /// (a) Fails `append_campaign_entry` once (after `upsert_sector`, so a sector exists
+    /// for the delete to remove); everything else delegates.
+    struct FailingCampaignLog {
+        inner: Arc<dyn InputLogRepository + Send + Sync>,
+        fails_left: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl InputLogRepository for FailingCampaignLog {
+        async fn append_entry(&self, s: &Uuid, e: &shared::InputLogEntry) -> Result<(), RepositoryError> {
+            self.inner.append_entry(s, e).await
+        }
+        async fn get_entries_by_session(&self, s: &Uuid) -> Result<Vec<shared::InputLogEntry>, RepositoryError> {
+            self.inner.get_entries_by_session(s).await
+        }
+        async fn save_session_config(&self, c: &shared::SessionConfig) -> Result<(), RepositoryError> {
+            self.inner.save_session_config(c).await
+        }
+        async fn get_session_config(&self, s: &Uuid) -> Result<Option<shared::SessionConfig>, RepositoryError> {
+            self.inner.get_session_config(s).await
+        }
+        async fn append_campaign_entry(&self, c: &Uuid, e: &shared::InputLogEntry) -> Result<(), RepositoryError> {
+            if take_failure(&self.fails_left) {
+                return Err(forced("append_campaign_entry"));
+            }
+            self.inner.append_campaign_entry(c, e).await
+        }
+        async fn start_session(&self, c: &shared::SessionConfig, e: &shared::InputLogEntry) -> Result<(), RepositoryError> {
+            self.inner.start_session(c, e).await
+        }
+    }
+
+    /// (b) Fails `begin_launch` while `fails_left` is above 0. It wraps the state's own join
+    /// instance, so the join still writes the state's stores.
+    struct FailFirstLaunch {
+        inner: Arc<dyn CampaignJoinRepository>,
+        fails_left: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl CampaignJoinRepository for FailFirstLaunch {
+        async fn join_campaign(&self, wallet: &[u8], cap: i64, seeds: JoinSeeds) -> Result<JoinOutcome, RepositoryError> {
+            self.inner.join_campaign(wallet, cap, seeds).await
+        }
+        async fn begin_launch(
+            &self,
+            campaign_id: Uuid,
+            max_members: usize,
+            ends_at: DateTime<Utc>,
+            victory_tickers: serde_json::Value,
+        ) -> Result<LaunchStart, RepositoryError> {
+            if take_failure(&self.fails_left) {
+                return Err(forced("begin_launch"));
+            }
+            self.inner.begin_launch(campaign_id, max_members, ends_at, victory_tickers).await
+        }
+        async fn claim_replacement(&self, campaign_id: Uuid, wallet: &[u8], seed: u32) -> Result<ReplacementOutcome, RepositoryError> {
+            self.inner.claim_replacement(campaign_id, wallet, seed).await
+        }
+    }
+
+    /// (c) `retire_if_active` fails; everything else delegates. A deliberate exception to
+    /// code `CLAUDE.md` §5's "swap the join-read repo together" rule: it delegates to the
+    /// **same** store, so the join and the route still share one store.
+    struct FailingRetire {
+        inner: Arc<dyn CampaignRepository + Send + Sync>,
+    }
+
+    #[async_trait::async_trait]
+    impl CampaignRepository for FailingRetire {
+        async fn create_campaign(&self, p: &NewCampaignInstance) -> Result<CampaignInstance, RepositoryError> {
+            self.inner.create_campaign(p).await
+        }
+        async fn get_campaign(&self, c: Uuid) -> Result<Option<CampaignInstance>, RepositoryError> {
+            self.inner.get_campaign(c).await
+        }
+        async fn update_sector_state(&self, c: Uuid, s: CampaignLifecycle) -> Result<(), RepositoryError> {
+            self.inner.update_sector_state(c, s).await
+        }
+        async fn apply_ticker_delta(&self, c: Uuid, t: VictoryTickerType, d: f64) -> Result<f64, RepositoryError> {
+            self.inner.apply_ticker_delta(c, t, d).await
+        }
+        async fn list_campaigns_by_state(&self, s: CampaignLifecycle) -> Result<Vec<CampaignInstance>, RepositoryError> {
+            self.inner.list_campaigns_by_state(s).await
+        }
+        async fn activate_campaign(&self, c: Uuid, e: DateTime<Utc>, v: serde_json::Value) -> Result<bool, RepositoryError> {
+            self.inner.activate_campaign(c, e, v).await
+        }
+        async fn retire_if_active(&self, _: Uuid) -> Result<bool, RepositoryError> {
+            Err(forced("retire_if_active"))
+        }
+    }
+
+    fn fail_campaign_log_once(state: &mut AppState) {
+        state.input_log_repo = Arc::new(FailingCampaignLog { inner: state.input_log_repo.clone(), fails_left: AtomicUsize::new(1) });
+    }
+
+    fn fail_first_launch(state: &mut AppState) {
+        state.campaign_join_repo = Arc::new(FailFirstLaunch { inner: state.campaign_join_repo.clone(), fails_left: AtomicUsize::new(1) });
+    }
+
+    /// The campaign `wallet` is a member of (exactly one).
+    async fn member_campaign(state: &AppState, wallet: &[u8]) -> CampaignInstance {
+        let rows = state.membership_repo.list_campaigns_by_player(wallet).await.unwrap();
+        assert_eq!(rows.len(), 1, "one membership");
+        state.campaign_repo.get_campaign(rows[0].campaign_id).await.unwrap().expect("campaign")
+    }
+
+    async fn seed_active_campaigns(state: &AppState, n: i64) {
+        for i in 0..n {
+            let c = state.campaign_repo
+                .create_campaign(&NewCampaignInstance { sector_id: Uuid::new_v4(), map_seed: i })
+                .await
+                .unwrap();
+            activate(state, c.campaign_id).await;
+        }
+    }
+
+    /// A failure before activation leaves the campaign `Pending` with no sector; the next
+    /// join relaunches the same campaign.
+    #[tokio::test]
+    async fn join_relaunches_after_a_pre_activation_failure() {
+        let mut state = joined_state();
+        fail_first_launch(&mut state);
+        let state = Arc::new(state);
+
+        let (status, body) = join(state.clone(), Some("t")).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        let first = member_campaign(&state, &WALLET).await;
+        assert_eq!(first.state, CampaignLifecycle::Pending, "still Pending");
+        assert!(state.sector_repo.get_sector(first.sector_id).await.unwrap().is_none(), "no sector yet");
+
+        let (status, body) = join(state.clone(), Some("t")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(id(&body, "campaign_id"), first.campaign_id, "the same campaign");
+        let again = state.campaign_repo.get_campaign(first.campaign_id).await.unwrap().expect("campaign");
+        assert_eq!(again.state, CampaignLifecycle::Active, "the retry relaunched it");
+        assert!(state.sector_repo.get_sector(first.sector_id).await.unwrap().is_some(), "with a sector");
+    }
+
+    /// A failure after activation retires the campaign and deletes its sector; the next
+    /// join gets a new campaign.
+    #[tokio::test]
+    async fn join_retires_after_a_post_activation_failure() {
+        let mut state = joined_state();
+        fail_campaign_log_once(&mut state);
+        let state = Arc::new(state);
+
+        let (status, body) = join(state.clone(), Some("t")).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        let failed = member_campaign(&state, &WALLET).await;
+        assert_eq!(failed.state, CampaignLifecycle::Archived, "retired");
+        assert!(state.sector_repo.get_sector(failed.sector_id).await.unwrap().is_none(), "its sector is deleted");
+
+        let (status, body) = join(state.clone(), Some("t")).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let fresh = id(&body, "campaign_id");
+        assert_ne!(fresh, failed.campaign_id, "a new campaign");
+        let fresh = state.campaign_repo.get_campaign(fresh).await.unwrap().expect("campaign");
+        assert_eq!(fresh.state, CampaignLifecycle::Active);
+    }
+
+    /// When the retire itself fails, the campaign stays `Active` and keeps its sector.
+    #[tokio::test]
+    async fn join_is_500_and_keeps_the_sector_when_the_retire_fails() {
+        let mut state = joined_state();
+        fail_campaign_log_once(&mut state);
+        state.campaign_repo = Arc::new(FailingRetire { inner: state.campaign_repo.clone() });
+        let state = Arc::new(state);
+
+        let (status, body) = join(state.clone(), Some("t")).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        let stuck = member_campaign(&state, &WALLET).await;
+        assert_eq!(stuck.state, CampaignLifecycle::Active, "stuck Active");
+        assert!(state.sector_repo.get_sector(stuck.sector_id).await.unwrap().is_some(), "the sector is kept");
+    }
+
+    /// ODQ-55 (a): 1,000 live campaigns (the literal) and a join that would create another
+    /// is `503`, with nothing written.
+    #[tokio::test]
+    async fn join_is_503_when_the_demo_is_full() {
+        let state = joined_state();
+        seed_active_campaigns(&state, 1000).await;
+        let state = Arc::new(state);
+
+        let (status, body) = join(state.clone(), Some("t")).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body, json!({"error": "the demo is full"}));
+        assert!(state.membership_repo.list_campaigns_by_player(&WALLET).await.unwrap().is_empty(), "no membership");
+    }
+
+    /// Pins `DEMO_PLAYER_CAP` = 1: a launch that failed before activation leaves a 1-member
+    /// `Pending` campaign, and a second wallet never joins it.
+    #[tokio::test]
+    async fn a_second_wallet_never_joins_a_failed_launch() {
+        let mut state = joined_state();
+        fail_first_launch(&mut state);
+        add_session(&state, OTHER, "o");
+        let state = Arc::new(state);
+
+        let (status, body) = join(state.clone(), Some("t")).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        let a = member_campaign(&state, &WALLET).await;
+        assert_eq!(a.state, CampaignLifecycle::Pending);
+        assert_eq!(state.membership_repo.list_members_by_campaign(a.campaign_id).await.unwrap().len(), 1);
+
+        let (status, body) = join(state.clone(), Some("o")).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let b = id(&body, "campaign_id");
+        assert_ne!(b, a.campaign_id, "B gets its own campaign");
+        let b = state.campaign_repo.get_campaign(b).await.unwrap().expect("campaign");
+        assert_eq!(b.state, CampaignLifecycle::Active);
     }
 }

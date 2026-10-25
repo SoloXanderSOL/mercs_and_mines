@@ -28,6 +28,11 @@ use crate::foreman_gen::generate_foreman;
 /// `join_campaign` as a parameter, so tests use a small cap.
 pub const SECTOR_PLAYER_CAP: i64 = 200;
 
+/// The demo's bound on live (`Pending`, `Active`, `Ending`) campaigns (BP-1, ODQ-55 (a),
+/// demo-only): a join that would create one more answers `DemoFull`. Each live campaign
+/// holds one ~86.5 KB Redis sector, and the droplet's Redis has no `maxmemory`.
+pub const DEMO_LIVE_CAMPAIGN_CAP: i64 = 1000;
+
 // sqlx 0.8.6's migrator key is `0x3d32ad9e * crc32_iso_hdlc(db_name)`
 // (`sqlx-postgres-0.8.6/src/migrate.rs:326–330`): both factors are ≥ 0 and the product is
 // < `i64::MAX`, so the migrator's key is never negative and cannot equal this one.
@@ -63,6 +68,9 @@ pub enum JoinOutcome {
     Joined(StarterIds),
     /// The wallet already has a live membership; nothing was written.
     AlreadyMember(StarterIds),
+    /// The join would create a campaign, but the demo already holds its maximum of live
+    /// campaigns (`DEMO_LIVE_CAMPAIGN_CAP`); nothing was written.
+    DemoFull,
 }
 
 /// The launch's view of a campaign under the join lock (5a-3a). Outcomes, not errors (the
@@ -305,6 +313,17 @@ impl CampaignJoinRepository for PostgresCampaignJoinRepository {
         let campaign_id = match pick_pending_campaign(&mut tx, cap).await? {
             Some(id) => id,
             None => {
+                // The demo cap, read under the join lock. `DemoFull` returns without
+                // `commit`: dropping `tx` rolls back the account insert above.
+                let n = sqlx::query_scalar!(
+                    r#"SELECT count(*) AS "n!" FROM campaign_instances WHERE state IN ('Pending','Active','Ending')"#
+                )
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+                if n >= DEMO_LIVE_CAMPAIGN_CAP {
+                    return Ok(JoinOutcome::DemoFull);
+                }
                 insert_campaign(&mut tx, &NewCampaignInstance { sector_id: Uuid::new_v4(), map_seed: seeds.map })
                     .await?
                     .campaign_id

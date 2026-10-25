@@ -5634,8 +5634,8 @@ async fn mission_resolve_refuses_a_pending_campaign() {
         "a refused mission must open no deployment row");
 }
 
-/// 5a-3b E1 — join → admin launch → a mission with the starter Commander and starter
-/// Section → `200`, all on Postgres (`sector_repo` stays in memory, so no Redis). The
+/// 5a-3b E1 — join (which launches the campaign since BP-1) → a mission with the starter
+/// Commander and starter Section → `200`, all on Postgres (`sector_repo` stays in memory, so no Redis). The
 /// battle's outcome comes from the route's seed, so only its invariants are asserted.
 #[tokio::test]
 async fn join_launch_and_first_mission_end_to_end() {
@@ -5668,25 +5668,17 @@ async fn join_launch_and_first_mission_end_to_end() {
     let uuid_of = |key: &str| joined[key].as_str().and_then(|s| uuid::Uuid::parse_str(s).ok());
     let (campaign_id, commander_id, section_id) = (uuid_of("campaign_id"), uuid_of("commander_id"), uuid_of("section_id"));
 
-    // 2. Admin launch (the key is set and removed as in admin_launch_campaign_returns_200_then_409).
-    const TEST_ADMIN_KEY: &str = "test-only-not-a-real-admin-key";
-    let launch_status = match campaign_id {
-        Some(c) => {
-            std::env::set_var("ADMIN_API_KEY", TEST_ADMIN_KEY);
-            let req = Request::builder()
-                .method("POST")
-                .uri(format!("/api/admin/campaign/{c}/launch"))
-                .header("x-admin-key", TEST_ADMIN_KEY)
-                .body(Body::empty())
-                .unwrap();
-            let (s, _) = send(&state, req).await;
-            std::env::remove_var("ADMIN_API_KEY");
-            Some(s)
-        }
+    // 2. The join launched the campaign (BP-1): collect its state and sector now.
+    let launched = match campaign_id {
+        Some(c) => PostgresCampaignRepository::new(pool.clone()).get_campaign(c).await.expect("get_campaign"),
+        None => None,
+    };
+    let sector = match &launched {
+        Some(c) => state.sector_repo.get_sector(c.sector_id).await.expect("get_sector"),
         None => None,
     };
 
-    // 3. The first mission, with the starter Commander and the starter Section.
+    // 3. The first mission, straight after the join, with the starter Commander and Section.
     let (mission_status, mission_bytes) = match (commander_id, section_id) {
         (Some(cmd), Some(sec)) => {
             let app = mercs_server::routes::router(std::sync::Arc::clone(&state));
@@ -5744,7 +5736,8 @@ async fn join_launch_and_first_mission_end_to_end() {
     // Assert.
     assert_eq!(join_status, StatusCode::CREATED, "join: {join_body}");
     let campaign_id = campaign_id.expect("campaign_id in the join body");
-    assert_eq!(launch_status, Some(StatusCode::OK), "admin launch");
+    assert_eq!(launched.map(|c| c.state), Some(CampaignLifecycle::Active), "the join launched the campaign");
+    assert!(sector.is_some(), "the launch wrote the sector");
     assert_eq!(mission_status, Some(StatusCode::OK), "mission: {}", String::from_utf8_lossy(&mission_bytes));
     assert_eq!(deps.len(), 1, "one deployment");
     assert_eq!(deps[0].status, "resolved");
@@ -6798,6 +6791,59 @@ async fn campaign_join_repeat_returns_already_member() {
     }
 }
 
+/// BP-1 (ODQ-55 (a)) — on Postgres, with 999 live campaigns (the literal) A's join creates
+/// the 1,000th; B's join is refused and rolls back, account row included; A again is still
+/// `AlreadyMember`.
+#[tokio::test]
+async fn pg_join_refuses_a_new_campaign_at_the_demo_cap() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    let (a, b) = ([78u8; 32], [79u8; 32]);
+    clean_wallet_4g1(&pool, &a).await;
+    clean_wallet_4g1(&pool, &b).await;
+    let live: i64 = sqlx::query_scalar("SELECT count(*) FROM campaign_instances WHERE state IN ('Pending','Active','Ending')")
+        .fetch_one(&pool).await.expect("live count failed");
+    assert_eq!(live, 0, "dirty test DB: live campaigns exist before this test (void run)");
+
+    let seeded: Vec<uuid::Uuid> = sqlx::query_scalar(
+        "INSERT INTO campaign_instances (sector_id, map_seed, state) \
+         SELECT gen_random_uuid(), g, 'Active' FROM generate_series(1, 999) g RETURNING campaign_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("seed 999 Active campaigns");
+    let repo = PostgresCampaignJoinRepository::new(pool.clone());
+
+    // Collect.
+    let first = repo.join_campaign(&a, 1, JOIN_SEEDS).await;
+    let refused = repo.join_campaign(&b, 1, JOIN_SEEDS).await;
+    let again = repo.join_campaign(&a, 1, JOIN_SEEDS).await;
+    let mut b_rows = Vec::new();
+    for t in ["player_accounts", "player_campaign_membership", "commander_records", "foreman_records", "section_records", "crew_records"] {
+        let n = if t == "player_accounts" {
+            sqlx::query_scalar("SELECT count(*) FROM player_accounts WHERE wallet_address = $1")
+                .bind(b.to_vec()).fetch_one(&pool).await.expect("account count failed")
+        } else {
+            wallet_rows(&pool, t, b).await
+        };
+        b_rows.push((t, n));
+    }
+
+    // Clean: the seeded campaigns by id, then both wallets.
+    sqlx::query("DELETE FROM campaign_instances WHERE campaign_id = ANY($1)")
+        .bind(&seeded).execute(&pool).await.expect("seed cleanup failed");
+    clean_wallet_4g1(&pool, &a).await;
+    clean_wallet_4g1(&pool, &b).await;
+
+    // Assert.
+    assert_eq!(seeded.len(), 999);
+    let ids = joined_ids(first.expect("A's join"));
+    assert_eq!(refused.expect("B's join"), JoinOutcome::DemoFull);
+    for (t, n) in b_rows {
+        assert_eq!(n, 0, "{t}: B wrote nothing");
+    }
+    assert_eq!(again.expect("A's repeat join"), JoinOutcome::AlreadyMember(ids), "AlreadyMember still passes when full");
+}
+
 /// 5a-2b P4 — three wallets at cap 2 fill two campaigns.
 #[tokio::test]
 async fn campaign_join_fills_campaigns_up_to_cap() {
@@ -7529,10 +7575,12 @@ async fn replacement_route_end_to_end_on_postgres() {
 
     let mut claim = None;
     if let (Some(c), Some(s)) = (campaign_id, starter) {
-        let activated = PostgresCampaignRepository::new(pool.clone())
-            .activate_campaign(c, chrono::Utc::now() + chrono::Duration::days(90), serde_json::json!({}))
+        // BP-1: the join launched the campaign.
+        let launched_state = PostgresCampaignRepository::new(pool.clone())
+            .get_campaign(c)
             .await
-            .expect("activate_campaign");
+            .expect("get_campaign")
+            .map(|r| r.state);
         set_commander_flag(&pool, s, "is_kia").await;
         let (status, body) = send(&state, post(format!("/api/campaign/{c}/replacement-commander"))).await;
         let body: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
@@ -7540,14 +7588,20 @@ async fn replacement_route_end_to_end_on_postgres() {
             Some(id) => Some(acquired_via_of(&pool, "commander_records", "commander_id", id).await),
             None => None,
         };
-        claim = Some((activated, status, body, via));
+        claim = Some((launched_state, status, body, via));
     }
     let rows = replacement_rows(&pool, wallet).await;
+    // Clean: the immutable campaign_started row the launch wrote (BP-1), then the wallet.
+    sqlx::query("ALTER TABLE input_logs DISABLE TRIGGER ALL").execute(&pool).await.ok();
+    if let Some(c) = campaign_id {
+        sqlx::query("DELETE FROM input_logs WHERE campaign_id = $1").bind(c).execute(&pool).await.ok();
+    }
+    sqlx::query("ALTER TABLE input_logs ENABLE TRIGGER ALL").execute(&pool).await.ok();
     clean_wallet_4g1(&pool, &wallet).await;
 
     assert_eq!(join_status, StatusCode::CREATED, "{join_body}");
-    let (activated, status, body, via) = claim.expect("the join returned ids");
-    assert!(activated, "the joined campaign must activate");
+    let (launched_state, status, body, via) = claim.expect("the join returned ids");
+    assert_eq!(launched_state, Some(CampaignLifecycle::Active), "the join launched the campaign");
     assert_eq!(status, StatusCode::CREATED, "{body}");
     assert_eq!(uuid_of(&body, "campaign_id"), campaign_id);
     assert_ne!(uuid_of(&body, "commander_id"), starter);
