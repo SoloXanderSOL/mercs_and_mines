@@ -18,10 +18,10 @@ use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 
 /// `challenge` + `verify`, one bucket shared by both routes.
-pub const SIGN_IN_PER_IP: u32 = 20;
-pub const JOIN_PER_IP: u32 = 10;
+pub const SIGN_IN_PER_IP: u32 = 400;
+pub const JOIN_PER_IP: u32 = 30;
 pub const JOIN_PER_WALLET: u32 = 3;
-pub const REPLACEMENT_PER_IP: u32 = 10;
+pub const REPLACEMENT_PER_IP: u32 = 30;
 pub const REPLACEMENT_PER_WALLET: u32 = 3;
 pub const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 /// Keys per limiter before a sweep; still full after the sweep → the new key is admitted

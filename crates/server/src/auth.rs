@@ -64,7 +64,7 @@ pub fn sweep_expired_sessions(map: &DashMap<String, SessionToken>, now: i64) -> 
 // ── Bounded lists (ODQ-48) ─────────────────────────────────────────────────
 
 /// Live sessions per `ClientKey` before a new one signs out that key's oldest.
-pub const SESSION_QUOTA: usize = 10;
+pub const SESSION_QUOTA: usize = 100;
 /// Live sessions in all before a sign-in that would evict nobody is refused (`503`).
 pub const SESSION_CAP: usize = 100_000;
 /// Pending challenges before a new one evicts an arbitrary entry.

@@ -972,15 +972,15 @@ mod tests {
     async fn sign_in_shares_one_ip_bucket() {
         let state = fresh_state();
         let mut statuses = Vec::new();
-        for _ in 0..10 {
+        for _ in 0..200 {
             statuses.push(challenge(&state, TEST_PEER, None).await);
         }
-        for _ in 0..10 {
+        for _ in 0..200 {
             statuses.push(verify(&state).await);
         }
         statuses.push(challenge(&state, TEST_PEER, None).await);
-        let mut expected = vec![StatusCode::OK; 10];
-        expected.extend([StatusCode::BAD_REQUEST; 10]);
+        let mut expected = vec![StatusCode::OK; 200];
+        expected.extend([StatusCode::BAD_REQUEST; 200]);
         expected.push(StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(statuses, expected);
     }
@@ -989,12 +989,12 @@ mod tests {
     async fn sign_in_counts_a_malformed_body() {
         let state = fresh_state();
         let mut statuses = Vec::new();
-        for _ in 0..20 {
+        for _ in 0..400 {
             let app = with_test_peer(router(state.clone()), TEST_PEER);
             statuses.push(post(app, "/api/auth/challenge", json!({"wallet_address": "w"}), false, None).await.0);
         }
         statuses.push(challenge(&state, TEST_PEER, None).await);
-        let mut expected = vec![StatusCode::UNSUPPORTED_MEDIA_TYPE; 20];
+        let mut expected = vec![StatusCode::UNSUPPORTED_MEDIA_TYPE; 400];
         expected.push(StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(statuses, expected, "axum's rejection is unchanged, and it is counted");
     }
@@ -1003,10 +1003,11 @@ mod tests {
     async fn a_spoofed_x_real_ip_from_a_non_loopback_peer_shares_the_peer_bucket() {
         let state = fresh_state();
         let mut statuses = Vec::new();
-        for i in 0..21 {
-            statuses.push(challenge(&state, TEST_PEER, Some(&format!("198.51.100.{i}"))).await);
+        for i in 0..401 {
+            let spoofed = format!("198.51.{}.{}", 100 + i / 256, i % 256);
+            statuses.push(challenge(&state, TEST_PEER, Some(&spoofed)).await);
         }
-        let mut expected = vec![StatusCode::OK; 20];
+        let mut expected = vec![StatusCode::OK; 400];
         expected.push(StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(statuses, expected);
     }
@@ -1014,7 +1015,7 @@ mod tests {
     #[tokio::test]
     async fn rate_limited_answer_has_the_fixed_body_and_retry_after() {
         let state = fresh_state();
-        for _ in 0..20 {
+        for _ in 0..400 {
             assert_eq!(challenge(&state, TEST_PEER, None).await, StatusCode::OK);
         }
         let app = with_test_peer(router(state.clone()), TEST_PEER);
@@ -1024,6 +1025,35 @@ mod tests {
         assert_eq!(body, json!({"error": "rate limited"}));
         let secs: u64 = headers[header::RETRY_AFTER].to_str().unwrap().parse().unwrap();
         assert!((1..=60).contains(&secs), "Retry-After {secs}");
+    }
+
+    /// BP-0 (ODQ-54 (a), demo-only): one address keeps its newest 100 sessions. 101 real
+    /// sign-ins on `AppState::new` cover the production wiring (`state.rs`). The survivor
+    /// checks are what a quota of 10 fails; "the first is gone" holds at any quota below 101.
+    /// Seed 20 is in-memory only, and its key is not weak. 202 requests stay under the bucket.
+    #[tokio::test]
+    async fn session_quota_keeps_the_newest_100() {
+        use ed25519_dalek::{Signer, SigningKey};
+        let state = fresh_state();
+        let key = SigningKey::from_bytes(&[20u8; 32]);
+        let wallet = bs58::encode(key.verifying_key().to_bytes()).into_string();
+        let mut tokens = Vec::new();
+        for i in 0..101 {
+            let app = with_test_peer(router(state.clone()), TEST_PEER);
+            let (status, _, body) =
+                post(app, "/api/auth/challenge", json!({"wallet_address": wallet}), true, None).await;
+            assert_eq!(status, StatusCode::OK, "challenge {i}: {body}");
+            let text = body["challenge"].as_str().expect("a challenge").to_string();
+            let signature = bs58::encode(key.sign(text.as_bytes()).to_bytes()).into_string();
+            let app = with_test_peer(router(state.clone()), TEST_PEER);
+            let req = json!({"wallet_address": wallet, "challenge": text, "signature": signature});
+            let (status, _, body) = post(app, "/api/auth/verify", req, true, None).await;
+            assert_eq!(status, StatusCode::OK, "verify {i}: {body}");
+            tokens.push(body["token_id"].as_str().expect("a token_id").to_string());
+        }
+        assert!(!state.sessions.contains_key(&tokens[0]), "the oldest is signed out");
+        assert!(tokens[1..].iter().all(|t| state.sessions.contains_key(t)), "the newest 100 survive");
+        assert_eq!(state.sessions.len(), 100);
     }
 
     /// Served without a peer, the route cannot key the request. `challenge` has no other
@@ -1087,7 +1117,7 @@ mod tests {
     async fn challenge_counts_an_invalid_wallet_address() {
         let state = fresh_state();
         let body = json!({"wallet_address": "w"}).to_string();
-        for _ in 0..20 {
+        for _ in 0..400 {
             assert_eq!(post_raw(&state, "/api/auth/challenge", body.clone()).await, StatusCode::BAD_REQUEST);
         }
         let last = post_raw(&state, "/api/auth/challenge", body).await;
@@ -1098,7 +1128,7 @@ mod tests {
     async fn challenge_counts_an_oversized_body() {
         let state = fresh_state();
         let body = padded(&format!(r#""wallet_address":"{}""#, test_wallet()), 5120);
-        for _ in 0..20 {
+        for _ in 0..400 {
             let s = post_raw(&state, "/api/auth/challenge", body.clone()).await;
             assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE);
         }
@@ -1110,7 +1140,7 @@ mod tests {
     async fn verify_counts_an_oversized_body() {
         let state = fresh_state();
         let body = padded(r#""wallet_address":"w","challenge":"c","signature":"s""#, 5120);
-        for _ in 0..20 {
+        for _ in 0..400 {
             let s = post_raw(&state, "/api/auth/verify", body.clone()).await;
             assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE);
         }

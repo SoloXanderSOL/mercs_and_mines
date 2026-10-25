@@ -496,12 +496,12 @@ mod tests {
 
     #[tokio::test]
     async fn join_per_ip_limit() {
-        let state = with_sessions(11);
+        let state = with_sessions(31);
         let mut statuses = Vec::new();
-        for i in 0..11 {
+        for i in 0..31 {
             statuses.push(join(state.clone(), Some(&format!("w{i}"))).await.0);
         }
-        let mut expected = vec![StatusCode::CREATED; 10];
+        let mut expected = vec![StatusCode::CREATED; 30];
         expected.push(StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(statuses, expected);
     }
@@ -520,12 +520,12 @@ mod tests {
 
     #[tokio::test]
     async fn replacement_per_ip_limit() {
-        let state = with_sessions(11);
+        let state = with_sessions(31);
         let mut statuses = Vec::new();
-        for i in 0..11 {
+        for i in 0..31 {
             statuses.push(claim(state.clone(), Some(&format!("w{i}")), &Uuid::new_v4().to_string()).await.0);
         }
-        let mut expected = vec![StatusCode::NOT_FOUND; 10];
+        let mut expected = vec![StatusCode::NOT_FOUND; 30];
         expected.push(StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(statuses, expected);
     }
