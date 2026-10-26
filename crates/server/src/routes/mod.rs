@@ -8,6 +8,7 @@ pub mod admin;
 mod campaign;
 pub mod convoy_events;
 pub mod convoys;
+mod sector;
 pub mod ws_combat;
 
 use std::net::SocketAddr;
@@ -862,6 +863,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(campaign::router())
         .merge(convoys::router())
         .merge(convoy_events::router())
+        .merge(sector::router())
         .with_state(state)
         .fallback_service(ServeDir::new("app").append_index_html_on_directories(true))
 }
