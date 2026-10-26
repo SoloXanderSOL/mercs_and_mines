@@ -1,6 +1,8 @@
-// Seeker client entry point (BP-3a-1): title → MWA sign-in → join → Commander reveal → hub.
+// Seeker client entry point (BP-3a-1, portrait-first since BP-3a-1b / ODQ-58): title → MWA
+// sign-in → join → Commander reveal → hub. One upright layout; nothing is locked or blocked.
 //
 // Boot and reload rule (spec check §8):
+//   0. the working screen first, so the stage is never blank while boot waits;
 //   1. no stored session → title;
 //   2. otherwise one GET /api/auth/session (not rate-limited); a 401 → title, then sign-in;
 //   3. a stored campaign → its cached roster → reveal, with no limited request; the roster is
@@ -14,12 +16,15 @@ import { ApiError, store, counters, getSession, postJoin, getRoster } from './ap
 import { loadWallet, signIn, WalletError } from './wallet.js';
 import { renderReveal } from './reveal.js';
 
-// Booth copy, verbatim from the BP-3a-1 prompt.
+// Booth copy, verbatim from the BP-3a-1 and BP-3a-1b prompts.
 const COPY = {
   start: 'Report for duty',
   tagline: 'Expendability is a career path.',
+  bootWorking: 'Checking your credentials...',
   signinButton: 'Sign in with your Seeker',
   signinExplainer: 'One fingerprint signs you in. Your wallet will say "authorize". This only proves the Seeker is yours: nothing is spent, nothing moves.',
+  signinLna: 'Chrome may ask to let this page reach "other apps and services" on your phone. Tap Allow: that\'s how it talks to your wallet.',
+  signinWallet: "Your wallet didn't finish signing you in. Tap to try again.",
   signinExpired: 'The challenge expired while you were deciding. Tap to try again.',
   signinFailed: "The signature didn't check out. Tap to try again.",
   signinCapacity: 'Sign-in is at capacity. Tap to try again in a moment.',
@@ -33,7 +38,6 @@ const COPY = {
   revealHeading: 'Meet your Commander',
   revealOutfit: 'Your outfit',
   hubPlaceholder: 'Sector map incoming. Command is still drawing it.',
-  rotate: 'Turn your device sideways. Command only issues landscape orders.',
 };
 
 const $ = id => document.getElementById(id);
@@ -64,7 +68,9 @@ function rateText(seconds) {
 }
 
 function note(e) {
-  lastError = e instanceof ApiError ? `${e.status} ${e.kind}: ${e.message}` : `${e && e.name}: ${e && e.message}`;
+  if (e instanceof ApiError) lastError = `${e.status} ${e.kind}: ${e.message}`;
+  else if (e instanceof WalletError) lastError = `WalletError ${e.code}: ${e.message}`; // the MWA code, footer only
+  else lastError = `${e && e.name}: ${e && e.message}`;
   renderDebug();
 }
 
@@ -83,21 +89,38 @@ function handleError(e, retry) {
 }
 
 // ── title ───────────────────────────────────────────────────────────────────
-const music = new Audio('assets/music/pre_battle.mp3');
+// Nothing is fetched before the first tap (Reviewer BP-3a-1 F6): no src, no preload.
+const MUSIC_SRC = 'assets/music/pre_battle.mp3';
+const music = new Audio();
+music.preload = 'none';
 music.loop = true;
 music.volume = 0.5;
 
-async function onStart() {
-  try { await document.documentElement.requestFullscreen({ navigationUI: 'hide' }); } catch { /* rotate overlay is the fallback */ }
-  try { await screen.orientation.lock('landscape'); } catch { /* rotate overlay is the fallback */ }
-  try { await music.play(); } catch { /* audio blocked: play on without it */ }
+// The tap never waits: the music starts when it has buffered, and sign-in shows at once.
+function onStart() {
+  if (!music.src) music.src = MUSIC_SRC;
+  music.play().catch(() => { /* audio blocked or failed: play on without it */ });
   toSignIn(pendingNotice);
 }
 
 // ── sign-in ─────────────────────────────────────────────────────────────────
+// Chrome's Local Network Access prompt ("other apps and services") is resolved per site, and
+// Chrome 155 may answer under either name. The line stays unless one of them says granted.
+async function lnaGranted() {
+  for (const name of ['loopback-network', 'local-network-access']) {
+    try {
+      const status = await navigator.permissions.query({ name });
+      return status.state === 'granted';
+    } catch { /* this name is unknown here: try the next */ }
+  }
+  return false;
+}
+
 function toSignIn(notice) {
   pendingNotice = '';
   $('signin-status').textContent = notice || '';
+  $('signin-lna').hidden = false;
+  lnaGranted().then(granted => { if (granted) $('signin-lna').hidden = true; });
   show('screen-signin');
 }
 
@@ -110,12 +133,20 @@ function signInCopy(e) {
     if (e.kind === 'offline') return COPY.offline;
     return COPY.generic;
   }
-  if (e instanceof WalletError) return ''; // dismissed or dropped in the wallet: the button is the retry
+  // Not found, timed out, closed, declined (-1) or not signed (-3): one line; the code is in the footer.
+  if (e instanceof WalletError) return COPY.signinWallet;
   return COPY.offline; // the wallet library itself failed to load
 }
 
 async function onSignIn() {
   if (busy) return;
+  // Airplane mode: say so now, rather than open a wallet whose challenge can't be fetched.
+  if (navigator.onLine === false) {
+    lastError = 'navigator.onLine is false';
+    renderDebug();
+    $('signin-status').textContent = COPY.offline;
+    return;
+  }
   busy = true;
   $('btn-signin').disabled = true;
   $('signin-status').textContent = '';
@@ -196,6 +227,8 @@ function showReveal(camp, roster) {
 
 // ── boot ────────────────────────────────────────────────────────────────────
 async function boot() {
+  $('working-text').textContent = COPY.bootWorking;
+  show('screen-working'); // never a blank stage while the session check is in flight
   if (!store.session()) return show('screen-title');
   try {
     await getSession();
@@ -225,8 +258,8 @@ function fillCopy() {
   $('title-tagline').textContent = COPY.tagline;
   $('btn-signin').textContent = COPY.signinButton;
   $('signin-explainer').textContent = COPY.signinExplainer;
+  $('signin-lna').textContent = COPY.signinLna;
   $('hub-text').textContent = COPY.hubPlaceholder;
-  $('rotate-text').textContent = COPY.rotate;
 }
 
 function wire() {

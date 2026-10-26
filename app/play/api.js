@@ -64,8 +64,25 @@ export const store = {
   },
 };
 
-// Fetch counters for the ?debug=1 footer. The sector stays 0 until BP-3a-2.
+// Request counters for the ?debug=1 footer, counted per request (a retried 500 counts twice).
+// The sector stays 0 until BP-3a-2.
 export const counters = { roster: 0, sector: 0, join: 0 };
+
+// Every request gives up after this long and is shown as offline: a stalled connection (booth
+// Wi-Fi, a captive portal) must end on a screen with a button. A deadline, not a retry.
+const FETCH_DEADLINE_MS = 15000;
+
+function countRequest(path) {
+  if (path === '/api/campaign/join') counters.join += 1;
+  else if (path.endsWith('/roster')) counters.roster += 1;
+  else if (path.endsWith('/sector')) counters.sector += 1;
+}
+
+// TypeError (no network), TimeoutError (the deadline) and AbortError all mean the same to the
+// player: Command can't be reached. The name stays in the message for the debug footer.
+function offline(e) {
+  return new ApiError('offline', 0, `${e && e.name ? e.name : 'Error'}: ${e && e.message ? e.message : 'network error'}`);
+}
 
 // ── the wrapper ─────────────────────────────────────────────────────────────
 async function send(method, path, { body, auth }) {
@@ -75,13 +92,20 @@ async function send(method, path, { body, auth }) {
     const s = store.session();
     if (s && s.token_id) headers.authorization = `Bearer ${s.token_id}`;
   }
+  countRequest(path);
   let res;
+  let text;
   try {
-    res = await fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+    res = await fetch(path, {
+      method,
+      headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: AbortSignal.timeout(FETCH_DEADLINE_MS),
+    });
+    text = await res.text(); // the deadline covers the body too
   } catch (e) {
-    throw new ApiError('offline', 0, e && e.message ? e.message : 'network error');
+    throw offline(e);
   }
-  const text = await res.text().catch(() => '');
   let json = null;
   try { json = text ? JSON.parse(text) : null; } catch { /* axum rejections are plain text */ }
   if (res.ok) return { status: res.status, body: json };
@@ -127,13 +151,11 @@ export async function getSession() {
 }
 
 export async function postJoin() {
-  counters.join += 1;
   const r = await request('POST', '/api/campaign/join'); // 201 Joined or 200 AlreadyMember
   return r.body; // {campaign_id, commander_id, foreman_id, section_id, crew_id}
 }
 
 export async function getRoster(campaignId) {
-  counters.roster += 1;
   const r = await request('GET', `/api/campaign/${encodeURIComponent(campaignId)}/roster`);
   return r.body; // {campaign_id, commanders, foremen, sections, crews}
 }
