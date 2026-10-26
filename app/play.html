@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="theme-color" content="#0b0b0c">
+  <title>Mercs &amp; Mines: Seeker Demo</title>
+  <meta name="description" content="Sign in with your Seeker and meet your Commander.">
+  <link rel="icon" type="image/png" href="assets/favicon-512.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;600;700;800&family=Barlow:wght@400;500;600&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="play/play.css">
+</head>
+<body>
+  <main class="stage" id="stage">
+
+    <section id="screen-title" class="screen screen-title" hidden>
+      <img class="title-logo" src="assets/MM_title.png" alt="Mercs &amp; Mines">
+      <p class="title-tagline" id="title-tagline"></p>
+      <button class="btn btn-primary" id="btn-start" type="button"></button>
+    </section>
+
+    <section id="screen-signin" class="screen screen-signin" hidden>
+      <p class="explainer" id="signin-explainer"></p>
+      <button class="btn btn-primary" id="btn-signin" type="button"></button>
+      <p class="status" id="signin-status" role="status" aria-live="polite"></p>
+    </section>
+
+    <section id="screen-working" class="screen screen-working" hidden>
+      <div class="spinner" aria-hidden="true"></div>
+      <p class="status" id="working-text" role="status" aria-live="polite"></p>
+    </section>
+
+    <section id="screen-reveal" class="screen screen-reveal" hidden>
+      <div class="reveal-content" id="reveal-content"></div>
+      <button class="btn btn-primary btn-continue" id="btn-continue" type="button">Continue</button>
+    </section>
+
+    <section id="screen-hub" class="screen screen-hub" hidden>
+      <p class="hub-text" id="hub-text"></p>
+      <button class="btn" id="btn-back" type="button">Back to Commander</button>
+    </section>
+
+    <section id="screen-error" class="screen screen-error" hidden>
+      <p class="error-text" id="error-text" role="alert"></p>
+      <button class="btn btn-primary" id="btn-error-retry" type="button">Retry</button>
+    </section>
+
+    <footer class="debug" id="debug" hidden></footer>
+  </main>
+
+  <div class="rotate" id="rotate" role="alert">
+    <div class="rotate-icon" aria-hidden="true"></div>
+    <p id="rotate-text"></p>
+  </div>
+
+  <script type="module" src="play/main.js"></script>
+</body>
+</html>
