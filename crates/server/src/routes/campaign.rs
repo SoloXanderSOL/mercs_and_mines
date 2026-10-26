@@ -28,6 +28,7 @@ pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/campaign/join", post(post_campaign_join))
         .route("/api/campaign/:campaign_id/replacement-commander", post(post_replacement_commander))
+        .route("/api/campaign/:campaign_id/abandon", post(post_abandon_campaign))
 }
 
 /// The response body. Built here so the repository's `StarterIds` never becomes the API
@@ -58,12 +59,14 @@ const DEMO_PLAYER_CAP: i64 = 1;
 ///   - a failure **after** activation retires the campaign and deletes its sector
 ///     (`retire_campaign`), then `500`; the next join gets a new campaign;
 ///   - if the retire fails, finds the campaign no longer `Active`, or the sector delete
-///     fails, it is still `500`, journalled with the campaign and sector ids;
+///     fails, it is still `500`, journalled with the campaign and sector ids. A campaign
+///     left `Active` keeps answering the member's joins with its ids; the member recovers
+///     with `POST /api/campaign/:campaign_id/abandon`, then a new join (BP-1b);
 ///   - `503 {"error":"the demo is full"}` when the join would create a campaign beyond the
 ///     demo's live-campaign cap; a member still gets in.
 /// - **Same-wallet race:** two concurrent joins can both reach the launch. One sees
 ///   `NotPending` and answers `200`, even if the other's launch then fails and retires the
-///   campaign. The next join recovers.
+///   campaign. The next join recovers, unless that retire failed (above).
 /// - **Abuse bound:** any signed-in wallet, behind the join switch, `join_ip` 30/min and
 ///   `join_wallet` 3/min, and at most 1,000 live campaigns. It holds `JOIN_ADVISORY_KEY` for
 ///   the join transaction, then again for `begin_launch`'s short transaction. Map generation
@@ -202,6 +205,89 @@ async fn post_replacement_commander(
         ReplacementOutcome::NotMember => Err(forbidden("not a member of this campaign")),
         ReplacementOutcome::HasUsable => Err(conflict("member has a usable Commander")),
     }
+}
+
+/// The demo's "new run" (BP-1b, ODQ-56 (a); demo-only, never merged back): `200
+/// {"campaign_id"}` after retiring the caller's campaign through `retire_campaign`
+/// (`Archived`, sector deleted). The client then joins again and gets a new campaign.
+///
+/// - Order (the replacement route's): `401` → `429` per client IP → `429` per wallet →
+///   `429` per wallet per day → `404` campaign → `403` non-member (any membership row) →
+///   `409` convoy → the retire.
+/// - **No sole-member check:** the demo's join cap is 1, so a member is the sole member.
+/// - **`409 member has a convoy in transit`:** the expiry poll never cancels a timer whose
+///   sector is gone, so the abandon waits while a convoy can still land.
+/// - **`409 campaign is not active`:** the retire found it not `Active`: already abandoned,
+///   or a launch stuck `Pending` (the next join relaunches that one).
+/// - It is the recovery for a campaign stuck `Active` after a failed launch (Reviewer BP-1
+///   F1). A failed retire or sector delete is `500`, journalled with both ids.
+/// - No `JOIN_ADVISORY_KEY`: it moves `Active` → `Archived`, never out of `Pending`. Not
+///   behind the join switch, like the replacement route. Not a logged input.
+async fn post_abandon_campaign(
+    AuthSession(token): AuthSession,
+    State(state): State<Arc<AppState>>,
+    ci: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    Path(campaign_id): Path<Uuid>,
+) -> Result<Response, AppError> {
+    let ip = client_ip(ci, &headers, &state.rate_limits)?;
+    let now = Instant::now();
+    if let Err(r) = state.rate_limits.abandon_ip.check(ip, now) {
+        return Ok(too_many_requests(r));
+    }
+    if let Err(r) = state.rate_limits.abandon_wallet.check(token.wallet_address.clone(), now) {
+        return Ok(too_many_requests(r));
+    }
+    if let Err(r) = state.rate_limits.abandon_wallet_daily.check(token.wallet_address.clone(), now) {
+        return Ok(too_many_requests(r));
+    }
+
+    let wallet: Vec<u8> = bs58::decode(&token.wallet_address)
+        .into_vec()
+        .map_err(|_| unauthorized("session wallet is not valid base58"))?;
+
+    let campaign = match state.campaign_repo.get_campaign(campaign_id).await {
+        Ok(Some(c)) => c,
+        Ok(None) => return Err(not_found("campaign not found")),
+        Err(e) => {
+            return Err(internal_error(format!("post_abandon_campaign: get_campaign failed for campaign {campaign_id}: {e}")));
+        }
+    };
+    let member = match state.membership_repo.get_membership(&wallet, campaign_id).await {
+        Ok(m) => m.is_some(),
+        Err(e) => {
+            return Err(internal_error(format!("post_abandon_campaign: membership read failed for campaign {campaign_id}: {e}")));
+        }
+    };
+    if !member {
+        return Err(forbidden("not a member of this campaign"));
+    }
+    let sector_id = campaign.sector_id;
+    let in_transit = match state.convoy_repo.has_convoy_in_transit(sector_id, &wallet).await {
+        Ok(t) => t,
+        Err(e) => {
+            return Err(internal_error(format!("post_abandon_campaign: convoy read failed for campaign {campaign_id}: {e}")));
+        }
+    };
+    if in_transit {
+        return Err(conflict("member has a convoy in transit"));
+    }
+
+    let retired = match retire_campaign(state.campaign_repo.as_ref(), state.sector_repo.as_ref(), campaign_id, sector_id).await {
+        Ok(r) => r,
+        Err(RetireError::Retire(e)) => {
+            return Err(internal_error(format!(
+                "post_abandon_campaign: the retire failed: campaign {campaign_id} may still be Active, sector {sector_id} kept: {e}")));
+        }
+        Err(RetireError::DeleteSector(e)) => {
+            return Err(internal_error(format!(
+                "post_abandon_campaign: campaign {campaign_id} retired, sector {sector_id} NOT deleted (SREM sectors:all + DEL by hand): {e}")));
+        }
+    };
+    if !retired {
+        return Err(conflict("campaign is not active"));
+    }
+    Ok((StatusCode::OK, Json(json!({"campaign_id": campaign_id}))).into_response())
 }
 
 #[cfg(test)]
@@ -815,5 +901,204 @@ mod tests {
         assert_ne!(b, a.campaign_id, "B gets its own campaign");
         let b = state.campaign_repo.get_campaign(b).await.unwrap().expect("campaign");
         assert_eq!(b.state, CampaignLifecycle::Active);
+    }
+
+    // ── BP-1b: the demo's abandon ("new run") ────────────────────────────────
+
+    use crate::repository::{ConvoyDbRecord, ConvoyRepository};
+
+    async fn abandon(state: Arc<AppState>, token: Option<&str>, campaign: &str) -> (StatusCode, serde_json::Value) {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/campaign/{campaign}/abandon"));
+        if let Some(t) = token {
+            req = req.header("authorization", format!("Bearer {t}"));
+        }
+        let resp = with_test_peer(router().with_state(state), TEST_PEER)
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+    }
+
+    /// Answers the abandon's convoy read with a fixed value; nothing else is reachable.
+    struct ConvoysInTransit(bool);
+
+    #[async_trait::async_trait]
+    impl ConvoyRepository for ConvoysInTransit {
+        async fn create_convoy(&self, _: ConvoyDbRecord) -> Result<Uuid, RepositoryError> {
+            unimplemented!()
+        }
+        async fn get_convoy(&self, _: Uuid) -> Result<Option<ConvoyDbRecord>, RepositoryError> {
+            unimplemented!()
+        }
+        async fn dispatch_convoy(&self, _: ConvoyDbRecord, _: Uuid, _: &shared::InputLogEntry) -> Result<(), RepositoryError> {
+            unimplemented!()
+        }
+        async fn land_convoy(&self, _: Uuid, _: Uuid, _: &shared::InputLogEntry) -> Result<Option<ConvoyDbRecord>, RepositoryError> {
+            unimplemented!()
+        }
+        async fn has_convoy_in_transit(&self, _: Uuid, _: &[u8]) -> Result<bool, RepositoryError> {
+            Ok(self.0)
+        }
+    }
+
+    /// `WALLET` joins (which launches its campaign) on a state whose convoy read answers
+    /// `in_transit`. Returns the campaign.
+    async fn abandon_member(in_transit: bool) -> (Arc<AppState>, Uuid) {
+        let mut state = joined_state();
+        state.convoy_repo = Arc::new(ConvoysInTransit(in_transit));
+        let state = Arc::new(state);
+        let (status, body) = join(state.clone(), Some("t")).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        (state, id(&body, "campaign_id"))
+    }
+
+    async fn campaign_of(state: &AppState, campaign_id: Uuid) -> CampaignInstance {
+        state.campaign_repo.get_campaign(campaign_id).await.unwrap().expect("campaign")
+    }
+
+    #[tokio::test]
+    async fn abandon_requires_a_session() {
+        let (state, c) = abandon_member(false).await;
+        let (status, _) = abandon(state, None, &c.to_string()).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn abandon_per_ip_limit() {
+        let state = with_sessions(31);
+        let mut statuses = Vec::new();
+        for i in 0..31 {
+            statuses.push(abandon(state.clone(), Some(&format!("w{i}")), &Uuid::new_v4().to_string()).await.0);
+        }
+        let mut expected = vec![StatusCode::NOT_FOUND; 30];
+        expected.push(StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(statuses, expected);
+    }
+
+    #[tokio::test]
+    async fn abandon_per_wallet_limit() {
+        let state = Arc::new(joined_state());
+        let mut statuses = Vec::new();
+        for _ in 0..4 {
+            statuses.push(abandon(state.clone(), Some("t"), &Uuid::new_v4().to_string()).await.0);
+        }
+        let mut expected = vec![StatusCode::NOT_FOUND; 3];
+        expected.push(StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(statuses, expected, "the limit is checked before the campaign read");
+    }
+
+    #[tokio::test]
+    async fn abandon_unknown_campaign_is_404() {
+        let state = Arc::new(joined_state());
+        let (status, body) = abandon(state, Some("t"), &Uuid::new_v4().to_string()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body, json!({"error": "campaign not found"}));
+    }
+
+    #[tokio::test]
+    async fn abandon_by_a_non_member_is_403() {
+        let mut state = joined_state();
+        state.convoy_repo = Arc::new(ConvoysInTransit(false));
+        let c = active_campaign_without_wallet(&state).await;
+        let state = Arc::new(state);
+
+        let (status, body) = abandon(state.clone(), Some("t"), &c.to_string()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body, json!({"error": "not a member of this campaign"}));
+        assert_eq!(campaign_of(&state, c).await.state, CampaignLifecycle::Active, "a non-member retires nothing");
+    }
+
+    #[tokio::test]
+    async fn abandon_with_a_convoy_in_transit_is_409() {
+        let (state, c) = abandon_member(true).await;
+        let (status, body) = abandon(state.clone(), Some("t"), &c.to_string()).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body, json!({"error": "member has a convoy in transit"}));
+        let campaign = campaign_of(&state, c).await;
+        assert_eq!(campaign.state, CampaignLifecycle::Active, "still Active");
+        assert!(state.sector_repo.get_sector(campaign.sector_id).await.unwrap().is_some(), "the sector is kept");
+    }
+
+    #[tokio::test]
+    async fn abandon_twice_is_409() {
+        let (state, c) = abandon_member(false).await;
+        let (status, body) = abandon(state.clone(), Some("t"), &c.to_string()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = abandon(state, Some("t"), &c.to_string()).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body, json!({"error": "campaign is not active"}));
+    }
+
+    #[tokio::test]
+    async fn abandon_retires_deletes_the_sector_and_the_next_join_gets_a_new_campaign() {
+        let (state, c) = abandon_member(false).await;
+        let (status, body) = abandon(state.clone(), Some("t"), &c.to_string()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body, json!({"campaign_id": c}));
+        let old = campaign_of(&state, c).await;
+        assert_eq!(old.state, CampaignLifecycle::Archived, "retired");
+        assert!(state.sector_repo.get_sector(old.sector_id).await.unwrap().is_none(), "its sector is deleted");
+
+        let (status, body) = join(state.clone(), Some("t")).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let fresh = id(&body, "campaign_id");
+        assert_ne!(fresh, c, "a new campaign");
+        assert_eq!(campaign_of(&state, fresh).await.state, CampaignLifecycle::Active);
+    }
+
+    /// Reviewer BP-1 F1: an `Active` campaign with no sector (a launch that failed before
+    /// its sector write and whose retire failed) is recovered by the abandon.
+    #[tokio::test]
+    async fn abandon_recovers_a_campaign_whose_sector_is_missing() {
+        let (state, c) = abandon_member(false).await;
+        let sector_id = campaign_of(&state, c).await.sector_id;
+        state.sector_repo.delete_sector(sector_id).await.unwrap();
+
+        let (status, body) = abandon(state.clone(), Some("t"), &c.to_string()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(campaign_of(&state, c).await.state, CampaignLifecycle::Archived);
+
+        let (status, body) = join(state.clone(), Some("t")).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_ne!(id(&body, "campaign_id"), c, "a new campaign");
+    }
+
+    #[tokio::test]
+    async fn abandon_is_500_when_the_retire_fails() {
+        let mut state = joined_state();
+        state.convoy_repo = Arc::new(ConvoysInTransit(false));
+        state.campaign_repo = Arc::new(FailingRetire { inner: state.campaign_repo.clone() });
+        let state = Arc::new(state);
+        let (status, body) = join(state.clone(), Some("t")).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let c = id(&body, "campaign_id");
+
+        let (status, body) = abandon(state.clone(), Some("t"), &c.to_string()).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        let campaign = campaign_of(&state, c).await;
+        assert_eq!(campaign.state, CampaignLifecycle::Active, "still Active");
+        assert!(state.sector_repo.get_sector(campaign.sector_id).await.unwrap().is_some(), "the sector is kept");
+    }
+
+    /// A launch stuck `Pending` is not abandoned: `409`, and it stays `Pending` for the next
+    /// join to relaunch.
+    #[tokio::test]
+    async fn abandon_of_a_pending_campaign_is_409() {
+        let mut state = joined_state();
+        state.convoy_repo = Arc::new(ConvoysInTransit(false));
+        fail_first_launch(&mut state);
+        let state = Arc::new(state);
+        let (status, body) = join(state.clone(), Some("t")).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        let c = member_campaign(&state, &WALLET).await.campaign_id;
+
+        let (status, body) = abandon(state.clone(), Some("t"), &c.to_string()).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body, json!({"error": "campaign is not active"}));
+        assert_eq!(campaign_of(&state, c).await.state, CampaignLifecycle::Pending, "still Pending");
     }
 }

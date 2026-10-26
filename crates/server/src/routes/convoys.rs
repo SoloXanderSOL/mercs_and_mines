@@ -366,6 +366,9 @@ mod tests {
         async fn land_convoy(&self, _: Uuid, _: Uuid, _: &shared::InputLogEntry) -> Result<Option<ConvoyDbRecord>, RepositoryError> {
             Ok(None)
         }
+        async fn has_convoy_in_transit(&self, _: Uuid, _: &[u8]) -> Result<bool, RepositoryError> {
+            unimplemented!()
+        }
     }
 
     #[tokio::test]

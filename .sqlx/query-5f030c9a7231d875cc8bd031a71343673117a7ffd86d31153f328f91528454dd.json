@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT EXISTS (\n                   SELECT 1 FROM convoy_records\n                   WHERE sector_id = $1 AND owner_wallet = $2 AND in_transit\n                     AND arrival_time > now() - interval '5 minutes'\n               ) AS \"in_transit!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "in_transit!",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Bytea"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "5f030c9a7231d875cc8bd031a71343673117a7ffd86d31153f328f91528454dd"
+}

@@ -6655,10 +6655,15 @@ async fn assert_no_pending_campaign(pool: &sqlx::PgPool) {
 }
 
 async fn wallet_rows(pool: &sqlx::PgPool, table: &str, wallet: [u8; 32]) -> i64 {
+    try_wallet_rows(pool, table, wallet).await
+        .unwrap_or_else(|e| panic!("{table} count failed: {e}"))
+}
+
+/// `wallet_rows` without the panic, for a collect phase that must reach its cleanup.
+async fn try_wallet_rows(pool: &sqlx::PgPool, table: &str, wallet: [u8; 32]) -> Result<i64, sqlx::Error> {
     let col = if table == "player_campaign_membership" { "wallet_address" } else { "player_wallet" };
     sqlx::query_scalar(&format!("SELECT count(*) FROM {table} WHERE {col} = $1"))
         .bind(wallet.to_vec()).fetch_one(pool).await
-        .unwrap_or_else(|e| panic!("{table} count failed: {e}"))
 }
 
 async fn campaign_members(pool: &sqlx::PgPool, campaign_id: uuid::Uuid) -> i64 {
@@ -6794,6 +6799,12 @@ async fn campaign_join_repeat_returns_already_member() {
 /// BP-1 (ODQ-55 (a)) — on Postgres, with 999 live campaigns (the literal) A's join creates
 /// the 1,000th; B's join is refused and rolls back, account row included; A again is still
 /// `AlreadyMember`.
+///
+/// Order-sensitive: the zero-live guard is **global** (any leaked live campaign, from any
+/// test on any branch, voids it). Nothing between the seed and the cleanup can panic. If a
+/// run is ever killed in between, clean by hand: `DELETE FROM campaign_instances WHERE state
+/// IN ('Pending','Active','Ending') AND map_seed BETWEEN 1 AND 999 AND campaign_id NOT IN
+/// (SELECT campaign_id FROM player_campaign_membership)`.
 #[tokio::test]
 async fn pg_join_refuses_a_new_campaign_at_the_demo_cap() {
     let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
@@ -6817,29 +6828,30 @@ async fn pg_join_refuses_a_new_campaign_at_the_demo_cap() {
     let first = repo.join_campaign(&a, 1, JOIN_SEEDS).await;
     let refused = repo.join_campaign(&b, 1, JOIN_SEEDS).await;
     let again = repo.join_campaign(&a, 1, JOIN_SEEDS).await;
-    let mut b_rows = Vec::new();
+    let mut b_rows: Vec<(&str, Result<i64, sqlx::Error>)> = Vec::new();
     for t in ["player_accounts", "player_campaign_membership", "commander_records", "foreman_records", "section_records", "crew_records"] {
         let n = if t == "player_accounts" {
             sqlx::query_scalar("SELECT count(*) FROM player_accounts WHERE wallet_address = $1")
-                .bind(b.to_vec()).fetch_one(&pool).await.expect("account count failed")
+                .bind(b.to_vec()).fetch_one(&pool).await
         } else {
-            wallet_rows(&pool, t, b).await
+            try_wallet_rows(&pool, t, b).await
         };
         b_rows.push((t, n));
     }
 
-    // Clean: the seeded campaigns by id, then both wallets.
-    sqlx::query("DELETE FROM campaign_instances WHERE campaign_id = ANY($1)")
-        .bind(&seeded).execute(&pool).await.expect("seed cleanup failed");
+    // Clean: the seeded campaigns by id, then both wallets, whatever the seed delete did.
+    let seed_clean = sqlx::query("DELETE FROM campaign_instances WHERE campaign_id = ANY($1)")
+        .bind(&seeded).execute(&pool).await;
     clean_wallet_4g1(&pool, &a).await;
     clean_wallet_4g1(&pool, &b).await;
 
     // Assert.
+    seed_clean.expect("seed cleanup failed");
     assert_eq!(seeded.len(), 999);
     let ids = joined_ids(first.expect("A's join"));
     assert_eq!(refused.expect("B's join"), JoinOutcome::DemoFull);
     for (t, n) in b_rows {
-        assert_eq!(n, 0, "{t}: B wrote nothing");
+        assert_eq!(n.unwrap_or_else(|e| panic!("{t} count failed: {e}")), 0, "{t}: B wrote nothing");
     }
     assert_eq!(again.expect("A's repeat join"), JoinOutcome::AlreadyMember(ids), "AlreadyMember still passes when full");
 }
@@ -7607,4 +7619,126 @@ async fn replacement_route_end_to_end_on_postgres() {
     assert_ne!(uuid_of(&body, "commander_id"), starter);
     assert_eq!(via.as_deref(), Some("replacement"));
     assert_eq!(rows, 1);
+}
+
+/// BP-1b — end to end on Postgres: a real join, the abandon (`200`), then a rejoin gets a
+/// new campaign. The old one is `Archived`, keeps its membership, and its sector is gone.
+#[tokio::test]
+async fn abandon_route_end_to_end_on_postgres() {
+    use axum::{body::Body, http::{Request, StatusCode}};
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    let wallet = [80u8; 32];
+    clean_wallet_4g1(&pool, &wallet).await;
+    assert_no_pending_campaign(&pool).await; // the join's pick is global
+    seed_account(&pool, wallet).await;
+
+    let mut state = pg_route_state(&pool);
+    std::sync::Arc::make_mut(&mut state.config).server.join_enabled = true; // 5a-3c: joins are off by default
+    state.convoy_repo = std::sync::Arc::new(PostgresConvoyRepository::new(pool.clone()));
+    let state = std::sync::Arc::new(state);
+    let token = insert_session(&state, wallet);
+    let post = |uri: String| Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let json_of = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap_or(serde_json::Value::Null);
+    let uuid_of = |v: &serde_json::Value, key: &str| v[key].as_str().and_then(|s| uuid::Uuid::parse_str(s).ok());
+
+    // Collect.
+    let (join_status, join_body) = send(&state, post("/api/campaign/join".into())).await;
+    let old = uuid_of(&json_of(&join_body), "campaign_id");
+    let mut collected = None;
+    if let Some(c) = old {
+        let (abandon_status, abandon_body) = send(&state, post(format!("/api/campaign/{c}/abandon"))).await;
+        let old_row = PostgresCampaignRepository::new(pool.clone()).get_campaign(c).await;
+        let members: Result<i64, sqlx::Error> =
+            sqlx::query_scalar("SELECT count(*) FROM player_campaign_membership WHERE campaign_id = $1")
+                .bind(c).fetch_one(&pool).await;
+        let (rejoin_status, rejoin_body) = send(&state, post("/api/campaign/join".into())).await;
+        collected = Some((abandon_status, abandon_body, old_row, members, rejoin_status, rejoin_body));
+    }
+    let fresh = collected.as_ref().and_then(|(.., body)| uuid_of(&json_of(body), "campaign_id"));
+
+    // Clean: both campaigns' immutable campaign_started rows, then the wallet.
+    sqlx::query("ALTER TABLE input_logs DISABLE TRIGGER ALL").execute(&pool).await.ok();
+    for c in [old, fresh].into_iter().flatten() {
+        sqlx::query("DELETE FROM input_logs WHERE campaign_id = $1").bind(c).execute(&pool).await.ok();
+    }
+    sqlx::query("ALTER TABLE input_logs ENABLE TRIGGER ALL").execute(&pool).await.ok();
+    clean_wallet_4g1(&pool, &wallet).await;
+
+    // Assert.
+    assert_eq!(join_status, StatusCode::CREATED, "{join_body}");
+    let c = old.expect("the join returned a campaign id");
+    let (abandon_status, abandon_body, old_row, members, rejoin_status, rejoin_body) =
+        collected.expect("the abandon ran");
+    assert_eq!(abandon_status, StatusCode::OK, "{abandon_body}");
+    assert_eq!(json_of(&abandon_body), serde_json::json!({"campaign_id": c}));
+    let old_row = old_row.expect("get_campaign").expect("the old campaign exists");
+    assert_eq!(old_row.state, CampaignLifecycle::Archived, "the abandon archived it");
+    assert_eq!(members.expect("member count"), 1, "its membership is kept");
+    assert!(state.sector_repo.get_sector(old_row.sector_id).await.expect("get_sector").is_none(), "its sector is deleted");
+    assert_eq!(rejoin_status, StatusCode::CREATED, "{rejoin_body}");
+    assert_ne!(fresh.expect("the rejoin returned a campaign id"), c, "a new campaign");
+}
+
+/// BP-1b — the convoy in-transit read keys on the sector, the wallet and the flag, and a
+/// convoy more than five minutes overdue no longer counts. `convoy_records` has no FK
+/// parents, so the rows need no account or campaign.
+#[tokio::test]
+async fn pg_has_convoy_in_transit_reads_sector_wallet_flag_and_arrival() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    let (w, other) = ([81u8; 32], [82u8; 32]);
+    let repo = PostgresConvoyRepository::new(pool.clone());
+    let (s1, s2, s3) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let now = chrono::Utc::now();
+    let row = |sector_id: uuid::Uuid, in_transit: bool, arrival_time: chrono::DateTime<chrono::Utc>| ConvoyDbRecord {
+        convoy_id: uuid::Uuid::new_v4(),
+        sector_id,
+        owner_wallet:  w.to_vec(),
+        origin_q:      0,
+        origin_r:      0,
+        destination_q: 1,
+        destination_r: 0,
+        route:         serde_json::json!([{"q": 0, "r": 0}, {"q": 1, "r": 0}]),
+        arrival_time,
+        vehicle_class: "BehemothMegaTruck".to_string(),
+        cargo:         serde_json::json!({}),
+        in_transit,
+        created_at:    now,
+    };
+    let rows = [
+        row(s1, true, now + chrono::Duration::minutes(10)),
+        row(s2, true, now - chrono::Duration::minutes(10)),
+        row(s3, false, now + chrono::Duration::minutes(10)),
+    ];
+    let ids: Vec<uuid::Uuid> = rows.iter().map(|r| r.convoy_id).collect();
+    let mut seeded = Vec::new();
+    for r in rows {
+        seeded.push(repo.create_convoy(r).await);
+    }
+
+    // Collect.
+    let s1_w = repo.has_convoy_in_transit(s1, &w).await;
+    let s1_other = repo.has_convoy_in_transit(s1, &other).await;
+    let empty_w = repo.has_convoy_in_transit(uuid::Uuid::new_v4(), &w).await;
+    let s2_w = repo.has_convoy_in_transit(s2, &w).await;
+    let s3_w = repo.has_convoy_in_transit(s3, &w).await;
+
+    // Clean.
+    let cleaned = sqlx::query("DELETE FROM convoy_records WHERE convoy_id = ANY($1)")
+        .bind(&ids).execute(&pool).await;
+
+    // Assert.
+    cleaned.expect("convoy cleanup failed");
+    for s in seeded {
+        s.expect("create_convoy");
+    }
+    assert!(s1_w.expect("S1, W"), "in transit and due later: counts");
+    assert!(!s1_other.expect("S1, OTHER"), "another wallet's sector query: no row");
+    assert!(!empty_w.expect("empty sector, W"), "a sector with no convoys");
+    assert!(!s2_w.expect("S2, W"), "ten minutes overdue: no longer counts");
+    assert!(!s3_w.expect("S3, W"), "landed: no longer counts");
 }

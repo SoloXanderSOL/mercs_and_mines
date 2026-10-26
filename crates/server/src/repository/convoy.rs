@@ -46,6 +46,11 @@ pub trait ConvoyRepository: Send + Sync {
         campaign_id: Uuid,
         entry: &shared::InputLogEntry,
     ) -> Result<Option<ConvoyDbRecord>, RepositoryError>;
+    /// True while `owner_wallet` has a convoy in `sector_id` that is in transit and can still
+    /// land: one more than five minutes overdue no longer counts. BP-1b: the demo's abandon
+    /// refuses while this is true, because the expiry poll never cancels a timer whose sector
+    /// is gone. A convoy in a campaign whose sector was never written never lands.
+    async fn has_convoy_in_transit(&self, sector_id: Uuid, owner_wallet: &[u8]) -> Result<bool, RepositoryError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -66,6 +71,9 @@ impl ConvoyRepository for InMemoryConvoyRepository {
         unimplemented!()
     }
     async fn land_convoy(&self, _: Uuid, _: Uuid, _: &shared::InputLogEntry) -> Result<Option<ConvoyDbRecord>, RepositoryError> {
+        unimplemented!()
+    }
+    async fn has_convoy_in_transit(&self, _: Uuid, _: &[u8]) -> Result<bool, RepositoryError> {
         unimplemented!()
     }
 }
@@ -169,5 +177,20 @@ impl ConvoyRepository for PostgresConvoyRepository {
         insert_campaign_entry(&mut *tx, &campaign_id, entry).await?;
         tx.commit().await.map_err(|e| RepositoryError::Internal(e.to_string()))?;
         Ok(Some(convoy))
+    }
+
+    async fn has_convoy_in_transit(&self, sector_id: Uuid, owner_wallet: &[u8]) -> Result<bool, RepositoryError> {
+        sqlx::query_scalar!(
+            r#"SELECT EXISTS (
+                   SELECT 1 FROM convoy_records
+                   WHERE sector_id = $1 AND owner_wallet = $2 AND in_transit
+                     AND arrival_time > now() - interval '5 minutes'
+               ) AS "in_transit!""#,
+            sector_id,
+            owner_wallet
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Internal(e.to_string()))
     }
 }

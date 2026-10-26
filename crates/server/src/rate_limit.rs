@@ -23,6 +23,14 @@ pub const JOIN_PER_IP: u32 = 30;
 pub const JOIN_PER_WALLET: u32 = 3;
 pub const REPLACEMENT_PER_IP: u32 = 30;
 pub const REPLACEMENT_PER_WALLET: u32 = 3;
+pub const ABANDON_PER_IP: u32 = 30;
+pub const ABANDON_PER_WALLET: u32 = 3;
+/// The demo's abandon, per wallet per day (BP-1b, demo-only): bounds one wallet's re-roll
+/// loop and the archived campaigns it leaves (the live count is a seq scan under the join
+/// lock). A booth demoing on one wallet all day stays under it; restarting `mercs-demo`
+/// clears it.
+pub const ABANDON_PER_WALLET_DAILY: u32 = 200;
+pub const ABANDON_DAILY_WINDOW: Duration = Duration::from_secs(86_400);
 pub const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 /// Keys per limiter before a sweep; still full after the sweep → the new key is admitted
 /// uncounted (fail open, ODQ-48) and the overflow is journalled.
@@ -240,7 +248,7 @@ impl SweepThrottle {
     }
 }
 
-/// The five limiters, one set per `AppState`. Per-wallet limiters exist only for the two
+/// The eight limiters, one set per `AppState`. Per-wallet limiters exist only for the three
 /// authenticated routes (GAP-77): a sign-in body's wallet is unverified, so it is never a key.
 pub struct RateLimits {
     pub sign_in_ip: FixedWindow<ClientKey>,
@@ -248,6 +256,9 @@ pub struct RateLimits {
     pub join_wallet: FixedWindow<String>,
     pub replacement_ip: FixedWindow<ClientKey>,
     pub replacement_wallet: FixedWindow<String>,
+    pub abandon_ip: FixedWindow<ClientKey>,
+    pub abandon_wallet: FixedWindow<String>,
+    pub abandon_wallet_daily: FixedWindow<String>,
     /// Journals requests that fall into `ClientKey::Shared`: the first, then at most hourly
     /// with a count.
     pub shared_warn: RateWarn,
@@ -264,6 +275,9 @@ impl RateLimits {
             join_wallet: w("join_wallet", JOIN_PER_WALLET),
             replacement_ip: w("replacement_ip", REPLACEMENT_PER_IP),
             replacement_wallet: w("replacement_wallet", REPLACEMENT_PER_WALLET),
+            abandon_ip: w("abandon_ip", ABANDON_PER_IP),
+            abandon_wallet: w("abandon_wallet", ABANDON_PER_WALLET),
+            abandon_wallet_daily: FixedWindow::new("abandon_wallet_daily", ABANDON_PER_WALLET_DAILY, ABANDON_DAILY_WINDOW, RATE_LIMIT_MAP_CAP),
             shared_warn: RateWarn::new(),
         }
     }
@@ -279,6 +293,16 @@ impl Default for RateLimits {
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
+
+    #[test]
+    fn abandon_wallet_daily_limit_is_200() {
+        let limits = RateLimits::new();
+        let now = Instant::now();
+        for i in 0..200 {
+            assert!(limits.abandon_wallet_daily.check("w".to_string(), now).is_ok(), "request {i} is admitted");
+        }
+        assert!(limits.abandon_wallet_daily.check("w".to_string(), now).is_err(), "the 201st in a day is refused");
+    }
 
     fn peer(s: &str) -> SocketAddr {
         SocketAddr::new(s.parse().unwrap(), 1)
