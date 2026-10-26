@@ -45,14 +45,17 @@ pub(super) fn clamp_new_record(mut r: ForemanRecord) -> ForemanRecord {
 
 // ── ForemanRepository trait ──────────────────────────────────────────────────
 
-/// No production caller yet: §5a's join writes the starting Foreman and adds `foreman_repo`
-/// to `AppState`.
+/// `AppState` holds it since BP-2b-2 (the roster route reads it); the join writes the
+/// starting Foreman in its own transaction.
 #[async_trait]
 pub trait ForemanRepository: Send + Sync {
     /// Stores `foreman_grade` as given; it never recomputes or validates the Grade.
     async fn create_foreman(&self, record: ForemanRecord) -> Result<(), RepositoryError>;
     async fn get_foreman(&self, foreman_id: Uuid) -> Result<Option<ForemanRecord>, RepositoryError>;
     async fn list_foremen_by_campaign(&self, campaign_id: Uuid) -> Result<Vec<ForemanRecord>, RepositoryError>;
+    /// One member's Foremen in `campaign_id`, oldest first (`created_at`, then `foreman_id`).
+    /// The roster route's read (BP-2b-2).
+    async fn list_foremen_for_member(&self, campaign_id: Uuid, player_wallet: &[u8]) -> Result<Vec<ForemanRecord>, RepositoryError>;
 }
 
 // ── PostgresForemanRepository ────────────────────────────────────────────────
@@ -179,6 +182,42 @@ impl ForemanRepository for PostgresForemanRepository {
             updated_at:      r.updated_at,
         }).collect())
     }
+
+    async fn list_foremen_for_member(&self, campaign_id: Uuid, player_wallet: &[u8]) -> Result<Vec<ForemanRecord>, RepositoryError> {
+        let rows = sqlx::query!(
+            r#"SELECT
+                foreman_id, campaign_id, player_wallet, name, rank, xp, stress,
+                origin, faction_bias, specialization, fatal_flaw, foreman_grade,
+                is_shattered, is_kia, prng_seed_state, created_at, updated_at
+               FROM foreman_records WHERE campaign_id = $1 AND player_wallet = $2
+               ORDER BY created_at, foreman_id"#,
+            campaign_id,
+            player_wallet
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+
+        Ok(rows.into_iter().map(|r| ForemanRecord {
+            foreman_id:      r.foreman_id,
+            campaign_id:     r.campaign_id,
+            player_wallet:   r.player_wallet,
+            name:            r.name,
+            rank:            r.rank,
+            xp:              r.xp,
+            stress:          r.stress,
+            origin:          r.origin,
+            faction_bias:    r.faction_bias,
+            specialization:  r.specialization,
+            fatal_flaw:      r.fatal_flaw,
+            foreman_grade:   r.foreman_grade,
+            is_shattered:    r.is_shattered,
+            is_kia:          r.is_kia,
+            prng_seed_state: r.prng_seed_state,
+            created_at:      r.created_at,
+            updated_at:      r.updated_at,
+        }).collect())
+    }
 }
 
 // ── InMemoryForemanRepository ────────────────────────────────────────────────
@@ -218,6 +257,15 @@ impl ForemanRepository for InMemoryForemanRepository {
             .filter(|r| r.campaign_id == campaign_id)
             .map(|r| r.clone())
             .collect())
+    }
+
+    async fn list_foremen_for_member(&self, campaign_id: Uuid, player_wallet: &[u8]) -> Result<Vec<ForemanRecord>, RepositoryError> {
+        let mut rows: Vec<ForemanRecord> = self.store.iter()
+            .filter(|r| r.campaign_id == campaign_id && r.player_wallet == player_wallet)
+            .map(|r| r.clone())
+            .collect();
+        rows.sort_by_key(|r| (r.created_at, r.foreman_id));
+        Ok(rows)
     }
 }
 

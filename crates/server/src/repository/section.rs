@@ -58,6 +58,9 @@ pub trait SectionRepository: Send + Sync {
     /// The subset of `ids` that exist, belong to `player_wallet` and are in `campaign_id`.
     /// Unordered. The mission route's ownership check (7b-2): its only production call.
     async fn owned_section_ids(&self, ids: &[Uuid], player_wallet: &[u8], campaign_id: Uuid) -> Result<Vec<Uuid>, RepositoryError>;
+    /// One member's Sections in `campaign_id`, oldest first (`created_at`, then
+    /// `section_id`). The roster route's read (BP-2b-2).
+    async fn list_sections_for_member(&self, campaign_id: Uuid, player_wallet: &[u8]) -> Result<Vec<SectionRecord>, RepositoryError>;
 }
 
 // ── PostgresSectionRepository ────────────────────────────────────────────────
@@ -204,6 +207,33 @@ impl SectionRepository for PostgresSectionRepository {
         .await
         .map_err(|e| RepositoryError::Internal(e.to_string()))
     }
+
+    async fn list_sections_for_member(&self, campaign_id: Uuid, player_wallet: &[u8]) -> Result<Vec<SectionRecord>, RepositoryError> {
+        let rows = sqlx::query!(
+            r#"SELECT
+                section_id, campaign_id, player_wallet, name, headcount,
+                loadout AS "loadout: JsonValue", xp, created_at, updated_at
+               FROM section_records WHERE campaign_id = $1 AND player_wallet = $2
+               ORDER BY created_at, section_id"#,
+            campaign_id,
+            player_wallet
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+
+        Ok(rows.into_iter().map(|r| SectionRecord {
+            section_id:    r.section_id,
+            campaign_id:   r.campaign_id,
+            player_wallet: r.player_wallet,
+            name:          r.name,
+            headcount:     r.headcount,
+            loadout:       r.loadout,
+            xp:            r.xp,
+            created_at:    r.created_at,
+            updated_at:    r.updated_at,
+        }).collect())
+    }
 }
 
 // ── InMemorySectionRepository (unit-test stub) ───────────────────────────────
@@ -276,6 +306,15 @@ impl SectionRepository for InMemorySectionRepository {
             .filter(|r| ids.contains(&r.section_id) && r.player_wallet == player_wallet && r.campaign_id == campaign_id)
             .map(|r| r.section_id)
             .collect())
+    }
+
+    async fn list_sections_for_member(&self, campaign_id: Uuid, player_wallet: &[u8]) -> Result<Vec<SectionRecord>, RepositoryError> {
+        let mut rows: Vec<SectionRecord> = self.store.iter()
+            .filter(|r| r.campaign_id == campaign_id && r.player_wallet == player_wallet)
+            .map(|r| r.clone())
+            .collect();
+        rows.sort_by_key(|r| (r.created_at, r.section_id));
+        Ok(rows)
     }
 }
 

@@ -47,7 +47,8 @@ pub(super) fn clamp_new_record(mut r: CrewRecord) -> CrewRecord {
 
 // ── CrewRepository trait ─────────────────────────────────────────────────────
 
-/// No production caller yet, and no `AppState` field.
+/// `AppState` holds it since BP-2b-2 (the roster route reads it); the join writes the
+/// starting Crew in its own transaction.
 #[async_trait]
 pub trait CrewRepository: Send + Sync {
     /// The only write. Clamps morale to 0..=100 before storing.
@@ -56,6 +57,9 @@ pub trait CrewRepository: Send + Sync {
     /// Unordered (Reviewer 7a-1 F3): the first caller that shows or indexes the list adds an
     /// explicit order to both impls.
     async fn list_crews_by_campaign(&self, campaign_id: Uuid) -> Result<Vec<CrewRecord>, RepositoryError>;
+    /// One member's Crews in `campaign_id`, oldest first (`created_at`, then `crew_id`).
+    /// The roster route's read (BP-2b-2).
+    async fn list_crews_for_member(&self, campaign_id: Uuid, player_wallet: &[u8]) -> Result<Vec<CrewRecord>, RepositoryError>;
 }
 
 // ── PostgresCrewRepository ───────────────────────────────────────────────────
@@ -145,6 +149,29 @@ impl CrewRepository for PostgresCrewRepository {
             created_at:    r.created_at,
         }).collect())
     }
+
+    async fn list_crews_for_member(&self, campaign_id: Uuid, player_wallet: &[u8]) -> Result<Vec<CrewRecord>, RepositoryError> {
+        let rows = sqlx::query!(
+            r#"SELECT crew_id, campaign_id, player_wallet, headcount, xp, morale, created_at
+               FROM crew_records WHERE campaign_id = $1 AND player_wallet = $2
+               ORDER BY created_at, crew_id"#,
+            campaign_id,
+            player_wallet
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+
+        Ok(rows.into_iter().map(|r| CrewRecord {
+            crew_id:       r.crew_id,
+            campaign_id:   r.campaign_id,
+            player_wallet: r.player_wallet,
+            headcount:     r.headcount,
+            xp:            r.xp,
+            morale:        r.morale,
+            created_at:    r.created_at,
+        }).collect())
+    }
 }
 
 // ── InMemoryCrewRepository ───────────────────────────────────────────────────
@@ -189,6 +216,15 @@ impl CrewRepository for InMemoryCrewRepository {
             .filter(|r| r.campaign_id == campaign_id)
             .map(|r| r.clone())
             .collect())
+    }
+
+    async fn list_crews_for_member(&self, campaign_id: Uuid, player_wallet: &[u8]) -> Result<Vec<CrewRecord>, RepositoryError> {
+        let mut rows: Vec<CrewRecord> = self.store.iter()
+            .filter(|r| r.campaign_id == campaign_id && r.player_wallet == player_wallet)
+            .map(|r| r.clone())
+            .collect();
+        rows.sort_by_key(|r| (r.created_at, r.crew_id));
+        Ok(rows)
     }
 }
 

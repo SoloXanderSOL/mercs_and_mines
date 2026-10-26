@@ -12,7 +12,7 @@ use crate::repository::{
     CampaignJoinRepository, InMemoryCampaignJoinRepository,
     ConvoyRepository, InMemoryConvoyRepository,
     CommanderRepository, InMemoryCommanderRepository,
-    InMemoryCrewRepository, InMemoryForemanRepository,
+    CrewRepository, InMemoryCrewRepository, ForemanRepository, InMemoryForemanRepository,
     InputLogRepository, InMemoryInputLogRepository,
     MembershipRepository, InMemoryMembershipRepository,
     SectionRepository, InMemorySectionRepository,
@@ -51,9 +51,11 @@ pub struct AppState {
     pub commander_repo:  Arc<dyn CommanderRepository  + Send + Sync>,
     pub membership_repo: Arc<dyn MembershipRepository + Send + Sync>,
     pub section_repo:    Arc<dyn SectionRepository    + Send + Sync>,
+    pub foreman_repo:    Arc<dyn ForemanRepository    + Send + Sync>,
+    pub crew_repo:       Arc<dyn CrewRepository       + Send + Sync>,
     /// The join and the launch (5a-3a). In memory it shares the campaign, membership,
-    /// Commander and Section stores above (plus its own Foreman and Crew stores), so a test
-    /// that replaces any of those four fields replaces this one alongside.
+    /// Commander, Foreman, Section and Crew stores above, so a test that replaces any of
+    /// those six fields replaces this one alongside.
     pub campaign_join_repo: Arc<dyn CampaignJoinRepository>,
     pub sector_repo:    Arc<dyn SectorStateRepository>,
     pub timer_repo:      Arc<dyn TimerRepository>,
@@ -92,6 +94,8 @@ impl AppState {
             commander_repo:      commanders.clone(),
             membership_repo:     memberships.clone(),
             section_repo:        sections.clone(),
+            foreman_repo:        foremen.clone(),
+            crew_repo:           crews.clone(),
             campaign_join_repo:  Arc::new(InMemoryCampaignJoinRepository::new(
                 campaigns, memberships, commanders, foremen, sections, crews,
             )),

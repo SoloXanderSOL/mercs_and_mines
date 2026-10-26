@@ -8,6 +8,7 @@ pub mod admin;
 mod campaign;
 pub mod convoy_events;
 pub mod convoys;
+mod roster;
 mod sector;
 pub mod ws_combat;
 
@@ -875,6 +876,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(convoys::router())
         .merge(convoy_events::router())
         .merge(sector::router())
+        .merge(roster::router())
         .with_state(state)
         .fallback_service(ServeDir::new("app").append_index_html_on_directories(true))
 }

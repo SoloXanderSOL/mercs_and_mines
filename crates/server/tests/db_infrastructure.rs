@@ -4071,7 +4071,7 @@ fn default_state() -> mercs_server::state::AppState {
 }
 
 /// A Postgres route test starts here, so the join and the routes read one set of stores
-/// (code `CLAUDE.md` §5's trap): the four join-read repositories and `campaign_join_repo`
+/// (code `CLAUDE.md` §5's trap): the six join-read repositories and `campaign_join_repo`
 /// swap together, plus the input log. Everything else stays in memory.
 fn pg_route_state(pool: &sqlx::PgPool) -> mercs_server::state::AppState {
     use std::sync::Arc;
@@ -4080,6 +4080,8 @@ fn pg_route_state(pool: &sqlx::PgPool) -> mercs_server::state::AppState {
     state.membership_repo = Arc::new(PostgresMembershipRepository::new(pool.clone()));
     state.commander_repo = Arc::new(PostgresCommanderRepository::new(pool.clone()));
     state.section_repo = Arc::new(PostgresSectionRepository::new(pool.clone()));
+    state.foreman_repo = Arc::new(PostgresForemanRepository::new(pool.clone()));
+    state.crew_repo = Arc::new(PostgresCrewRepository::new(pool.clone()));
     state.campaign_join_repo = Arc::new(PostgresCampaignJoinRepository::new(pool.clone()));
     state.input_log_repo = Arc::new(PostgresInputLogRepository::new(pool.clone()));
     state
@@ -4182,6 +4184,99 @@ async fn sector_route_end_to_end_on_postgres() {
     let row = row.expect("get_membership").expect("the membership exists");
     let (q, r) = (row.gateway_hex_q.expect("the launch assigned q"), row.gateway_hex_r.expect("the launch assigned r"));
     assert_eq!(json_of(&body)["gateway"], serde_json::json!({"q": q, "r": r}));
+}
+
+/// BP-2b-2 — end to end on Postgres: a real join writes the caller's starters and a launch
+/// runs as in the sector test. Then a second member and their Commander are added (after the
+/// launch: on `dev` a launch refuses a campaign with two members), so the route's answer
+/// passes through the Postgres wallet filter. The oracle is a campaign-wide read here.
+#[tokio::test]
+async fn roster_route_end_to_end_on_postgres() {
+    use axum::{body::Body, http::{Request, StatusCode}};
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    let wallet = [89u8; 32];
+    let other = [90u8; 32];
+    clean_wallet_4g1(&pool, &wallet).await;
+    clean_wallet_4g1(&pool, &other).await;
+    assert_no_pending_campaign(&pool).await; // the join's pick is global
+    seed_account(&pool, wallet).await;
+    seed_account(&pool, other).await;
+
+    let mut state = pg_route_state(&pool);
+    std::sync::Arc::make_mut(&mut state.config).server.join_enabled = true; // 5a-3c: joins are off by default
+    let state = std::sync::Arc::new(state);
+    let token = insert_session(&state, wallet);
+    let request = |method: &str, uri: String| Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let json_of = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap_or(serde_json::Value::Null);
+
+    // Collect.
+    let (join_status, join_body) = send(&state, request("POST", "/api/campaign/join".into())).await;
+    let campaign_id = json_of(&join_body)["campaign_id"].as_str().and_then(|s| uuid::Uuid::parse_str(s).ok());
+    let mut collected = None;
+    if let Some(c) = campaign_id {
+        let launch = initialize_campaign(
+            c,
+            &*state.campaign_join_repo,
+            state.membership_repo.as_ref(),
+            state.sector_repo.as_ref(),
+            state.input_log_repo.as_ref(),
+        )
+        .await;
+        let launched = matches!(launch, Ok(()) | Err(mercs_server::campaign_init::InitError::NotPending));
+        let added = PostgresMembershipRepository::new(pool.clone()).add_member(&other, c, None, None).await;
+        let theirs = mercs_server::commander_gen::generate_commander(other.to_vec(), c, 90);
+        let theirs_id = theirs.commander_id;
+        let created = PostgresCommanderRepository::new(pool.clone()).create_commander(theirs).await;
+        let (status, body) = send(&state, request("GET", format!("/api/campaign/{c}/roster"))).await;
+        let rows = (
+            PostgresCommanderRepository::new(pool.clone()).list_commanders_by_campaign(c).await,
+            PostgresForemanRepository::new(pool.clone()).list_foremen_by_campaign(c).await,
+            PostgresSectionRepository::new(pool.clone()).list_sections_by_campaign(c).await,
+            PostgresCrewRepository::new(pool.clone()).list_crews_by_campaign(c).await,
+        );
+        collected = Some((launched, added, created, theirs_id, status, body, rows));
+    }
+
+    // Clean: the immutable campaign_started row the launch wrote, then both wallets.
+    sqlx::query("ALTER TABLE input_logs DISABLE TRIGGER ALL").execute(&pool).await.ok();
+    if let Some(c) = campaign_id {
+        sqlx::query("DELETE FROM input_logs WHERE campaign_id = $1").bind(c).execute(&pool).await.ok();
+    }
+    let enabled = sqlx::query("ALTER TABLE input_logs ENABLE TRIGGER ALL").execute(&pool).await;
+    clean_wallet_4g1(&pool, &wallet).await;
+    clean_wallet_4g1(&pool, &other).await;
+
+    // Assert.
+    enabled.expect("input_logs triggers re-enabled");
+    assert_eq!(join_status, StatusCode::CREATED, "{join_body}");
+    let (launched, added, created, theirs_id, status, body, rows) = collected.expect("the join returned a campaign id");
+    assert!(launched, "the campaign launched (Ok or NotPending)");
+    added.expect("the second member joined after the launch");
+    created.expect("the second member's Commander");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let body = json_of(&body);
+    let ids = |list: &str, key: &str| -> Vec<String> {
+        body[list].as_array().expect("a list").iter().map(|v| v[key].as_str().expect("an id").to_string()).collect()
+    };
+    let (commanders, foremen, sections, crews) = rows;
+    let commanders = commanders.expect("list Commanders");
+    assert_eq!(commanders.len(), 2, "control: the campaign holds both members' Commanders");
+    let mine: Vec<String> = commanders.iter().filter(|r| r.player_wallet == wallet).map(|r| r.commander_id.to_string()).collect();
+    assert_eq!(mine.len(), 1, "the join wrote one starter Commander");
+    assert_eq!(ids("commanders", "commander_id"), mine);
+    assert!(!body.to_string().contains(&theirs_id.to_string()), "the second member's Commander leaked");
+    let foremen: Vec<String> = foremen.expect("list Foremen").iter().map(|r| r.foreman_id.to_string()).collect();
+    let sections: Vec<String> = sections.expect("list Sections").iter().map(|r| r.section_id.to_string()).collect();
+    let crews: Vec<String> = crews.expect("list Crews").iter().map(|r| r.crew_id.to_string()).collect();
+    assert_eq!((foremen.len(), sections.len(), crews.len()), (1, 1, 1), "the join wrote one starter of each");
+    assert_eq!(ids("foremen", "foreman_id"), foremen);
+    assert_eq!(ids("sections", "section_id"), sections);
+    assert_eq!(ids("crews", "crew_id"), crews);
 }
 
 /// Sends `req` through a fresh router over `state`; returns the status and the body text.
@@ -4474,6 +4569,9 @@ impl CommanderRepository for ShatterOnStart {
     }
     async fn list_commanders_by_campaign(&self, campaign_id: uuid::Uuid) -> Result<Vec<CommanderRecord>, mercs_server::repository::RepositoryError> {
         self.inner.list_commanders_by_campaign(campaign_id).await
+    }
+    async fn list_commanders_for_member(&self, campaign_id: uuid::Uuid, player_wallet: &[u8]) -> Result<Vec<CommanderRecord>, mercs_server::repository::RepositoryError> {
+        self.inner.list_commanders_for_member(campaign_id, player_wallet).await
     }
     async fn delete_commanders_by_campaign(&self, campaign_id: uuid::Uuid) -> Result<u64, mercs_server::repository::RepositoryError> {
         self.inner.delete_commanders_by_campaign(campaign_id).await

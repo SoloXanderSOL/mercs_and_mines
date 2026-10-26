@@ -230,6 +230,9 @@ pub trait CommanderRepository: Send + Sync {
     async fn set_kia(&self, commander_id: Uuid) -> Result<(), RepositoryError>;
     async fn list_commanders_by_campaign(&self, campaign_id: Uuid) -> Result<Vec<CommanderRecord>, RepositoryError>;
     async fn delete_commanders_by_campaign(&self, campaign_id: Uuid) -> Result<u64, RepositoryError>;
+    /// One member's Commanders in `campaign_id`, KIA and Shattered included, oldest first
+    /// (`created_at`, then `commander_id`). The roster route's read (BP-2b-2).
+    async fn list_commanders_for_member(&self, campaign_id: Uuid, player_wallet: &[u8]) -> Result<Vec<CommanderRecord>, RepositoryError>;
 
     /// Records an `active` deployment and its Sections. In one transaction it first aborts
     /// every `active` deployment older than `STALE_DEPLOYMENT_AFTER` that is this
@@ -585,6 +588,43 @@ impl CommanderRepository for PostgresCommanderRepository {
         }).collect())
     }
 
+    async fn list_commanders_for_member(&self, campaign_id: Uuid, player_wallet: &[u8]) -> Result<Vec<CommanderRecord>, RepositoryError> {
+        let rows = sqlx::query!(
+            r#"SELECT
+                commander_id, campaign_id, player_wallet, name, rank, xp, stress,
+                origin, faction_bias, specialization, fatal_flaw, veteran_trait,
+                is_shattered, is_kia, prng_seed_state, commander_grade, created_at, updated_at
+               FROM commander_records WHERE campaign_id = $1 AND player_wallet = $2
+               ORDER BY created_at, commander_id"#,
+            campaign_id,
+            player_wallet
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+
+        Ok(rows.into_iter().map(|r| CommanderRecord {
+            commander_id:    r.commander_id,
+            campaign_id:     r.campaign_id,
+            player_wallet:   r.player_wallet,
+            name:            r.name,
+            rank:            r.rank,
+            xp:              r.xp,
+            stress:          r.stress,
+            origin:          r.origin,
+            faction_bias:    r.faction_bias,
+            specialization:  r.specialization,
+            fatal_flaw:      r.fatal_flaw,
+            veteran_trait:   r.veteran_trait,
+            is_shattered:    r.is_shattered,
+            is_kia:          r.is_kia,
+            prng_seed_state: r.prng_seed_state,
+            commander_grade: r.commander_grade,
+            created_at:      r.created_at,
+            updated_at:      r.updated_at,
+        }).collect())
+    }
+
     async fn delete_commanders_by_campaign(&self, campaign_id: Uuid) -> Result<u64, RepositoryError> {
         let result = sqlx::query!(
             "DELETE FROM commander_records WHERE campaign_id = $1",
@@ -878,6 +918,15 @@ impl CommanderRepository for InMemoryCommanderRepository {
             .filter(|r| r.campaign_id == campaign_id)
             .map(|r| r.clone())
             .collect())
+    }
+
+    async fn list_commanders_for_member(&self, campaign_id: Uuid, player_wallet: &[u8]) -> Result<Vec<CommanderRecord>, RepositoryError> {
+        let mut rows: Vec<CommanderRecord> = self.store.iter()
+            .filter(|r| r.campaign_id == campaign_id && r.player_wallet == player_wallet)
+            .map(|r| r.clone())
+            .collect();
+        rows.sort_by_key(|r| (r.created_at, r.commander_id));
+        Ok(rows)
     }
 
     async fn delete_commanders_by_campaign(&self, campaign_id: Uuid) -> Result<u64, RepositoryError> {

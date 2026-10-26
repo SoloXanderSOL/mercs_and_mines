@@ -41,6 +41,10 @@ pub const RATE_LIMIT_MAP_CAP: usize = 100_000;
 pub const SECTOR_READ_PER_IP: u32 = 30;
 pub const SECTOR_READ_PER_WALLET: u32 = 10;
 
+/// The roster read route (ODQ-57, keeper): a small body, so a looser per-address limit.
+pub const ROSTER_READ_PER_IP: u32 = 120;
+pub const ROSTER_READ_PER_WALLET: u32 = 10;
+
 /// What a request is counted against. IPv4 whole; IPv6 by its /64 (`V6Net` holds the top
 /// 64 bits), so one host can't mint fresh buckets from its own prefix. `Shared` is the one
 /// bucket for a loopback peer that sent no usable `X-Real-IP`.
@@ -260,6 +264,9 @@ pub struct RateLimits {
     /// The sector read route (ODQ-57): per address and per wallet.
     pub sector_ip: FixedWindow<ClientKey>,
     pub sector_wallet: FixedWindow<String>,
+    /// The roster read route (ODQ-57): per address and per wallet.
+    pub roster_ip: FixedWindow<ClientKey>,
+    pub roster_wallet: FixedWindow<String>,
     pub join_ip: FixedWindow<ClientKey>,
     pub join_wallet: FixedWindow<String>,
     pub replacement_ip: FixedWindow<ClientKey>,
@@ -281,6 +288,8 @@ impl RateLimits {
             sign_in_ip: w("sign_in_ip", SIGN_IN_PER_IP),
             sector_ip: w("sector_ip", SECTOR_READ_PER_IP),
             sector_wallet: w("sector_wallet", SECTOR_READ_PER_WALLET),
+            roster_ip: w("roster_ip", ROSTER_READ_PER_IP),
+            roster_wallet: w("roster_wallet", ROSTER_READ_PER_WALLET),
             join_ip: w("join_ip", JOIN_PER_IP),
             join_wallet: w("join_wallet", JOIN_PER_WALLET),
             replacement_ip: w("replacement_ip", REPLACEMENT_PER_IP),
