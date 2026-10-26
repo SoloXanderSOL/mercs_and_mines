@@ -1,8 +1,11 @@
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::{
-    extract::{Path, State},
+    extract::{ConnectInfo, Path, State},
+    http::HeaderMap,
     response::{IntoResponse, Response},
     routing::get,
     Json, Router,
@@ -15,7 +18,9 @@ use crate::map_gen::{HexTerrain, MagmaVeinNode};
 use crate::repository::CampaignLifecycle;
 use crate::state::AppState;
 
-use super::{conflict, forbidden, internal_error, not_found, unauthorized, AppError};
+use super::{
+    client_ip, conflict, forbidden, internal_error, not_found, too_many_requests, unauthorized, AppError,
+};
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new().route("/api/campaign/:campaign_id/sector", get(get_campaign_sector))
@@ -41,19 +46,31 @@ pub struct GatewayHex {
 }
 
 /// A member's sector map, `GET /api/campaign/:campaign_id/sector` (BP-2a, keeper). Order:
-/// `401` (no session) → `404` (unknown campaign) → `403` (not a member; any membership
-/// row) → `409` (not `Active` or `Ending`, as the events socket) → the sector read. A
-/// missing sector or a failed read is `500`.
+/// `401` (no session) → `429` per address (`sector_ip`) → `429` per wallet (`sector_wallet`)
+/// → `404` (unknown campaign) → `403` (not a member; any membership row) → `409` (not
+/// `Active` or `Ending`, as the events socket) → the sector read. A missing sector is `409`
+/// if the campaign has left `Active`/`Ending` since the state check (a retire raced the
+/// read, Reviewer BP-2a F2), otherwise `500`, as is a failed read.
 /// - **Pre-fog:** Phase 1 stubs fog of war as full visibility, so every terrain hex and
 ///   every vein is returned. Phase 2's per-player vision filters inside this projection.
 /// - `gateway` is `null` until the launch has assigned it, or if it never did.
-/// - Read-only, not behind the join switch, and not rate-limited: one call costs ~0.9 ms
-///   in release (measured at the BP-2a spec check).
+/// - Read-only and not behind the join switch. Rate-limited (ODQ-57): the body is ~86 KB
+///   uncompressed, and on the demo any wallet can become a member.
 async fn get_campaign_sector(
     AuthSession(token): AuthSession,
     State(state): State<Arc<AppState>>,
+    ci: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
     Path(campaign_id): Path<Uuid>,
 ) -> Result<Response, AppError> {
+    let ip = client_ip(ci, &headers, &state.rate_limits)?;
+    let now = Instant::now();
+    if let Err(r) = state.rate_limits.sector_ip.check(ip, now) {
+        return Ok(too_many_requests(r));
+    }
+    if let Err(r) = state.rate_limits.sector_wallet.check(token.wallet_address.clone(), now) {
+        return Ok(too_many_requests(r));
+    }
     let wallet: Vec<u8> = bs58::decode(&token.wallet_address)
         .into_vec()
         .map_err(|_| unauthorized("session wallet is not valid base58"))?;
@@ -82,6 +99,21 @@ async fn get_campaign_sector(
     let sector = match state.sector_repo.get_sector(sector_id).await {
         Ok(Some(s)) => s,
         Ok(None) => {
+            // Reviewer BP-2a F2: a retire (an abandon, or a failed launch's) may have landed
+            // since the state check, deleting the sector; then this is a `409`, not a fault.
+            let reread = match state.campaign_repo.get_campaign(campaign_id).await {
+                Ok(c) => c,
+                Err(e) => {
+                    return Err(internal_error(format!("get_campaign_sector: re-read of campaign {campaign_id} failed after sector {sector_id} was missing: {e}")));
+                }
+            };
+            let still_admitted = match &reread {
+                Some(c) => matches!(c.state, CampaignLifecycle::Active | CampaignLifecycle::Ending),
+                None => true,
+            };
+            if !still_admitted {
+                return Err(conflict("campaign is not active"));
+            }
             return Err(internal_error(format!("get_campaign_sector: sector {sector_id} of campaign {campaign_id} is missing")));
         }
         Err(e) => {
@@ -105,6 +137,8 @@ mod tests {
     use crate::config::Config;
     use crate::map_gen::generate_sector_map;
     use crate::repository::{CampaignInstance, HexOccupant, NewCampaignInstance, OccupationStatus, SectorState, WalletAddress};
+    use crate::repository::{CampaignRepository, RepositoryError, SectorId, SectorStateRepository};
+    use crate::routes::{with_test_peer, TEST_PEER};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use http_body_util::BodyExt;
@@ -113,8 +147,8 @@ mod tests {
     const WALLET: [u8; 32] = [83u8; 32];
     const OTHER: [u8; 32] = [84u8; 32];
 
-    /// A signed-in session `"t"` for `WALLET`.
-    fn signed_in() -> Arc<AppState> {
+    /// A signed-in session `"t"` for `WALLET`, not yet shared, so a test can swap a store.
+    fn session_state() -> AppState {
         let state = AppState::new(Arc::new(Config::default()));
         let wallet = bs58::encode(WALLET).into_string();
         let now = chrono::Utc::now().timestamp();
@@ -125,7 +159,11 @@ mod tests {
             issued_at: now,
             expires_at: now + 600,
         });
-        Arc::new(state)
+        state
+    }
+
+    fn signed_in() -> Arc<AppState> {
+        Arc::new(session_state())
     }
 
     async fn get(state: &Arc<AppState>, token: Option<&str>, campaign: Uuid) -> (StatusCode, serde_json::Value) {
@@ -133,10 +171,27 @@ mod tests {
         if let Some(t) = token {
             req = req.header("authorization", format!("Bearer {t}"));
         }
-        let resp = router().with_state(Arc::clone(state)).oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+        let resp = with_test_peer(router().with_state(Arc::clone(state)), TEST_PEER).oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
         let status = resp.status();
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+    }
+
+    /// `signed_in()` plus sessions `"w0"`…`"w{n-1}"` for wallets `[100 + i; 32]`.
+    fn with_sessions(n: u8) -> Arc<AppState> {
+        let state = session_state();
+        for i in 0..n {
+            let wallet = bs58::encode([100 + i; 32]).into_string();
+            let now = chrono::Utc::now().timestamp();
+            state.sessions.insert(format!("w{i}"), shared::SessionToken {
+                token_id: format!("w{i}"),
+                account_id: wallet.clone(),
+                wallet_address: wallet,
+                issued_at: now,
+                expires_at: now + 600,
+            });
+        }
+        Arc::new(state)
     }
 
     /// A campaign in `lifecycle` with `wallet` as its member at `gateway`. `Pending` is left as
@@ -308,5 +363,77 @@ mod tests {
         let c = campaign_with(&state, WALLET, CampaignLifecycle::Active, Some((3, -5))).await;
         let (status, _) = get(&state, Some("t"), c.campaign_id).await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// Reviewer BP-2a F2: archives the campaign as if a retire landed between the route's
+    /// state check and its sector read, then reports the sector missing.
+    struct RetiresOnRead {
+        campaigns: Arc<dyn CampaignRepository + Send + Sync>,
+        campaign_id: Uuid,
+    }
+
+    #[async_trait::async_trait]
+    impl SectorStateRepository for RetiresOnRead {
+        async fn get_sector(&self, _: SectorId) -> Result<Option<SectorState>, RepositoryError> {
+            self.campaigns.update_sector_state(self.campaign_id, CampaignLifecycle::Archived).await?;
+            Ok(None)
+        }
+        async fn upsert_sector(&self, _: SectorState) -> Result<(), RepositoryError> {
+            unimplemented!()
+        }
+        async fn list_sectors(&self) -> Result<Vec<SectorState>, RepositoryError> {
+            unimplemented!()
+        }
+        async fn get_player_presence(&self, _: SectorId) -> Result<Vec<WalletAddress>, RepositoryError> {
+            unimplemented!()
+        }
+        async fn set_player_presence(&self, _: SectorId, _: &[WalletAddress]) -> Result<(), RepositoryError> {
+            unimplemented!()
+        }
+        async fn add_hex_occupant(&self, _: SectorId, _: i32, _: i32, _: HexOccupant) -> Result<(), RepositoryError> {
+            unimplemented!()
+        }
+        async fn remove_hex_occupant(&self, _: SectorId, _: i32, _: i32, _: Uuid) -> Result<(), RepositoryError> {
+            unimplemented!()
+        }
+        async fn delete_sector(&self, _: SectorId) -> Result<(), RepositoryError> {
+            unimplemented!()
+        }
+    }
+
+    #[tokio::test]
+    async fn sector_per_ip_limit() {
+        let state = with_sessions(31);
+        let mut statuses = Vec::new();
+        for i in 0..31 {
+            statuses.push(get(&state, Some(&format!("w{i}")), Uuid::new_v4()).await.0);
+        }
+        let mut expected = vec![StatusCode::NOT_FOUND; 30];
+        expected.push(StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(statuses, expected);
+    }
+
+    #[tokio::test]
+    async fn sector_per_wallet_limit() {
+        let state = signed_in();
+        let mut statuses = Vec::new();
+        for _ in 0..11 {
+            statuses.push(get(&state, Some("t"), Uuid::new_v4()).await.0);
+        }
+        let mut expected = vec![StatusCode::NOT_FOUND; 10];
+        expected.push(StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(statuses, expected, "the limit is checked before the campaign read");
+    }
+
+    /// The player's own abandon archives the campaign after the state check: `409`, not `500`.
+    #[tokio::test]
+    async fn sector_abandoned_mid_read_is_409() {
+        let mut state = session_state();
+        let c = campaign_with(&state, WALLET, CampaignLifecycle::Active, Some((3, -5))).await;
+        state.sector_repo = Arc::new(RetiresOnRead { campaigns: Arc::clone(&state.campaign_repo), campaign_id: c.campaign_id });
+        let state = Arc::new(state);
+        let (status, body) = get(&state, Some("t"), c.campaign_id).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"], "campaign is not active");
     }
 }

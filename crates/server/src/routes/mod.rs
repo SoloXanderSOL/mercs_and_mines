@@ -584,10 +584,21 @@ async fn post_mission_resolve(
     log_rank_up(rec.commander_id, eff.old_rank, eff.new_rank);
 
     // The death is a Commander effect, not sim output, so it sits beside `report` (§4e R4).
+    // The totals and deltas come from the row `resolve_deployment` locked (BP-2b-1), so a
+    // write between the route's own read and the lock can't skew them.
     Ok(Json(json!({
         "session_id": session_id.to_string(),
         "report":     report_value,
-        "commander":  {"kia": eff.is_kia, "glorious": eff.glorious},
+        "commander":  {
+            "kia":           eff.is_kia,
+            "glorious":      eff.glorious,
+            "stress":        eff.stress,
+            "xp":            eff.xp,
+            "old_rank":      eff.old_rank,
+            "new_rank":      eff.new_rank,
+            "stress_change": eff.stress - eff.old_stress,
+            "xp_gained":     eff.xp - eff.old_xp,
+        },
     })))
 }
 

@@ -51,8 +51,8 @@ pub(crate) fn log_rank_up(commander_id: Uuid, from: i16, to: i16) {
     }
 }
 
-/// The values `resolve_deployment` committed: the locked row's rank before the write,
-/// the rank, stress and XP it wrote, and whether the mission killed the Commander
+/// The values `resolve_deployment` committed: the locked row's rank, stress and XP before
+/// the write, the rank, stress and XP it wrote, and whether the mission killed the Commander
 /// (a `Wipeout`, §4e) and the death was Glorious (its card is foil).
 #[derive(Debug, Clone, Copy)]
 pub struct AppliedEffects {
@@ -60,6 +60,8 @@ pub struct AppliedEffects {
     pub new_rank: i16,
     pub stress:   i16,
     pub xp:       i32,
+    pub old_stress: i16,
+    pub old_xp:   i32,
     pub is_kia:   bool,
     pub glorious: bool,
 }
@@ -75,6 +77,7 @@ fn locked_row_effects(
     outcome: &OutcomeType,
     cfg: &SimConfig,
 ) -> AppliedEffects {
+    let (old_stress, old_xp) = (stress, xp);
     let stress = stress_after_casualties(stress_after_deployment(stress_to_level(stress), cfg), kia, cfg);
     let xp = xp + crate::commander_gen::xp_award(tier, outcome);
     AppliedEffects {
@@ -82,6 +85,8 @@ fn locked_row_effects(
         new_rank: crate::commander_gen::rank_for_xp(xp),
         stress:   i16::from(stress),
         xp,
+        old_stress,
+        old_xp,
         is_kia:   false,
         glorious: false,
     }

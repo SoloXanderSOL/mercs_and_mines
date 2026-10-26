@@ -36,6 +36,11 @@ pub const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 /// uncounted (fail open, ODQ-48) and the overflow is journalled.
 pub const RATE_LIMIT_MAP_CAP: usize = 100_000;
 
+/// The sector read route (ODQ-57, keeper). Wallets are free to mint, so the per-address
+/// limit is the real bound on its ~86 KB body.
+pub const SECTOR_READ_PER_IP: u32 = 30;
+pub const SECTOR_READ_PER_WALLET: u32 = 10;
+
 /// What a request is counted against. IPv4 whole; IPv6 by its /64 (`V6Net` holds the top
 /// 64 bits), so one host can't mint fresh buckets from its own prefix. `Shared` is the one
 /// bucket for a loopback peer that sent no usable `X-Real-IP`.
@@ -252,6 +257,9 @@ impl SweepThrottle {
 /// authenticated routes (GAP-77): a sign-in body's wallet is unverified, so it is never a key.
 pub struct RateLimits {
     pub sign_in_ip: FixedWindow<ClientKey>,
+    /// The sector read route (ODQ-57): per address and per wallet.
+    pub sector_ip: FixedWindow<ClientKey>,
+    pub sector_wallet: FixedWindow<String>,
     pub join_ip: FixedWindow<ClientKey>,
     pub join_wallet: FixedWindow<String>,
     pub replacement_ip: FixedWindow<ClientKey>,
@@ -271,6 +279,8 @@ impl RateLimits {
         }
         Self {
             sign_in_ip: w("sign_in_ip", SIGN_IN_PER_IP),
+            sector_ip: w("sector_ip", SECTOR_READ_PER_IP),
+            sector_wallet: w("sector_wallet", SECTOR_READ_PER_WALLET),
             join_ip: w("join_ip", JOIN_PER_IP),
             join_wallet: w("join_wallet", JOIN_PER_WALLET),
             replacement_ip: w("replacement_ip", REPLACEMENT_PER_IP),

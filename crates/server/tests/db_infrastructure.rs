@@ -4666,6 +4666,8 @@ async fn mission_resolve_end_to_end_writes_effects() {
     let died = matches!(outcome, OutcomeType::Wipeout);
     assert_eq!(resp["commander"]["kia"].as_bool(), Some(died), "commander.kia must equal outcome == Wipeout");
     assert!(resp["commander"]["glorious"].is_boolean());
+    // BP-2b-1: the block's totals and deltas, asserted after the cleanup below.
+    let block = resp["commander"].clone();
     assert_eq!(after.is_kia, died);
     let cards: i64 = sqlx::query_scalar("SELECT count(*) FROM card_mint_pending WHERE player_wallet = $1")
         .bind(&wallet[..])
@@ -4693,6 +4695,17 @@ async fn mission_resolve_end_to_end_writes_effects() {
     sqlx::query("DELETE FROM session_configs WHERE session_id = $1").bind(sid).execute(&pool).await.ok();
     sqlx::query("ALTER TABLE session_configs ENABLE TRIGGER ALL").execute(&pool).await.ok();
     clean_wallet_4g1(&pool, &wallet).await;
+
+    // BP-2b-1: the commander block carries the totals and the deltas, computed from the
+    // row `resolve_deployment` locked (here equal to `record`, read before the mission).
+    let keys: std::collections::BTreeSet<&str> = block.as_object().expect("commander is an object").keys().map(String::as_str).collect();
+    assert_eq!(keys, ["glorious", "kia", "new_rank", "old_rank", "stress", "stress_change", "xp", "xp_gained"].into_iter().collect());
+    assert_eq!(block["stress"], serde_json::json!(after.stress));
+    assert_eq!(block["xp"], serde_json::json!(after.xp));
+    assert_eq!(block["old_rank"], serde_json::json!(record.rank));
+    assert_eq!(block["new_rank"], serde_json::json!(after.rank));
+    assert_eq!(block["stress_change"], serde_json::json!(after.stress - record.stress));
+    assert_eq!(block["xp_gained"], serde_json::json!(after.xp - record.xp));
 }
 
 // ── INF-5: GAP-57, the boot migrator ─────────────────────────────────────────
