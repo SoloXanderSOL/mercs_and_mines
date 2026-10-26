@@ -36,6 +36,40 @@ pub struct PendingChallenge {
     pub expires_at: i64,
 }
 
+/// Per-campaign launch locks (BP-1c, demo-only). See `AppState::launch_locks`.
+#[derive(Default)]
+pub struct LaunchLocks(DashMap<Uuid, Arc<tokio::sync::Mutex<()>>>);
+
+impl LaunchLocks {
+    /// Waits for the campaign's lock, creating it on first use. The `entry` guard is dropped
+    /// before the `.await` (never hold a shard lock across an await).
+    pub async fn lock(&self, campaign_id: Uuid) -> LaunchGuard<'_> {
+        let mutex = self.0.entry(campaign_id).or_default().clone();
+        let guard = mutex.lock_owned().await;
+        LaunchGuard { locks: self, campaign_id, guard: Some(guard) }
+    }
+
+    /// In-flight launches (tests assert it drains to 0).
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+/// Holds a campaign's launch lock. On drop it releases the lock, then removes the map entry
+/// if nobody else holds or awaits it (`strong_count == 1`: only the map's own `Arc`).
+pub struct LaunchGuard<'a> {
+    locks: &'a LaunchLocks,
+    campaign_id: Uuid,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl Drop for LaunchGuard<'_> {
+    fn drop(&mut self) {
+        self.guard.take();
+        self.locks.0.remove_if(&self.campaign_id, |_, m| Arc::strong_count(m) == 1);
+    }
+}
+
 pub struct AppState {
     pub session_repo:    Arc<dyn SessionStateRepository + Send + Sync>,
     pub input_log_repo:  Arc<dyn InputLogRepository + Send + Sync>,
@@ -71,6 +105,11 @@ pub struct AppState {
     pub redis: Option<redis::aio::ConnectionManager>,
     /// The sign-in, join and replacement rate limits (INF-6c-1). Fresh per `AppState`.
     pub rate_limits: RateLimits,
+    /// Per-campaign launch locks (BP-1c, demo-only): a demo join holds its campaign's lock
+    /// across the launch and the sectorless repair, so a repair never retires a campaign
+    /// whose launch is still writing its sector. In-process: a restart empties it, which is
+    /// right, because a restart also ends every launch.
+    pub launch_locks: LaunchLocks,
 }
 
 impl AppState {
@@ -107,6 +146,7 @@ impl AppState {
             pool:               None,
             redis:              None,
             rate_limits:        RateLimits::new(),
+            launch_locks:       LaunchLocks::default(),
         }
     }
 }

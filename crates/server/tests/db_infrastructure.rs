@@ -717,6 +717,52 @@ async fn redis_delete_sector_removes_key_and_set_member() {
     again.expect("a second delete is Ok");
 }
 
+/// BP-1c: `sector_exists` (one `EXISTS` on the hex state key, the demo join's sectorless
+/// repair) follows the sector through an upsert and a delete, and says nothing about any
+/// other sector.
+#[tokio::test]
+async fn redis_sector_exists_tracks_upsert_and_delete() {
+    use redis::AsyncCommands;
+    let url = match std::env::var("TEST_REDIS_URL").ok() {
+        Some(u) => u,
+        None => {
+            eprintln!("TEST_REDIS_URL not set — skipping redis_sector_exists_tracks_upsert_and_delete");
+            return;
+        }
+    };
+    let client = redis::Client::open(url).expect("Invalid TEST_REDIS_URL");
+    let mgr = redis::aio::ConnectionManager::new(client).await.expect("Failed to connect to Redis");
+    let repo = RedisSectorStateRepository::new(mgr.clone());
+    let mut conn = mgr.clone();
+
+    // Collect.
+    let sector_id = uuid::Uuid::new_v4();
+    let before = repo.sector_exists(sector_id).await.expect("sector_exists before");
+    repo.upsert_sector(SectorState {
+        sector_id,
+        campaign_id: uuid::Uuid::new_v4(),
+        occupation_status: OccupationStatus::Neutral,
+        owner: None,
+        deployed_unit_count: 0,
+        terrain: std::collections::HashMap::new(),
+        magma_veins: vec![],
+        hex_occupancy: std::collections::HashMap::new(),
+    }).await.expect("upsert_sector failed");
+    let after_upsert = repo.sector_exists(sector_id).await.expect("sector_exists after the upsert");
+    let other = repo.sector_exists(uuid::Uuid::new_v4()).await.expect("sector_exists of another id");
+    repo.delete_sector(sector_id).await.expect("delete_sector failed");
+    let after_delete = repo.sector_exists(sector_id).await.expect("sector_exists after the delete");
+
+    // Clean (a no-op when the delete worked), then assert.
+    conn.del::<_, ()>(format!("sector:{}:hex_state", sector_id)).await.ok();
+    conn.srem::<_, _, ()>("sectors:all", sector_id.to_string()).await.ok();
+
+    assert!(!before, "nothing written yet");
+    assert!(after_upsert, "the upsert wrote the hex state");
+    assert!(!other, "another id stays absent");
+    assert!(!after_delete, "the delete removed the hex state");
+}
+
 /// BP-1: on Postgres, `retire_if_active` archives only an `Active` campaign; `Pending`,
 /// `Ending` and a missing id are `false` and unchanged. Fixture campaigns no wallet reaches.
 #[tokio::test]
@@ -4184,6 +4230,94 @@ async fn sector_route_end_to_end_on_postgres() {
     let row = row.expect("get_membership").expect("the membership exists");
     let (q, r) = (row.gateway_hex_q.expect("the launch assigned q"), row.gateway_hex_r.expect("the launch assigned r"));
     assert_eq!(json_of(&body)["gateway"], serde_json::json!({"q": q, "r": r}));
+}
+
+/// BP-1c — the sectorless repair on Postgres: a joined, launched campaign loses its sector
+/// (class (a), a process killed mid-launch). The next join retires it (`retire_if_active`'s
+/// real `UPDATE`) and answers `500`; the join after that skips the `Archived` campaign
+/// (`live_membership`) and creates and launches a new one. The sector store is
+/// `pg_route_state`'s in-memory one.
+#[tokio::test]
+async fn pg_join_repairs_an_active_campaign_with_no_sector() {
+    use axum::{body::Body, http::{Request, StatusCode}};
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    let wallet = [94u8; 32];
+    clean_wallet_4g1(&pool, &wallet).await;
+    assert_no_pending_campaign(&pool).await; // the join's pick is global
+    seed_account(&pool, wallet).await;
+
+    let mut state = pg_route_state(&pool);
+    std::sync::Arc::make_mut(&mut state.config).server.join_enabled = true; // 5a-3c: joins are off by default
+    let state = std::sync::Arc::new(state);
+    let token = insert_session(&state, wallet);
+    let join_request = || Request::builder()
+        .method("POST")
+        .uri("/api/campaign/join")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let json_of = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap_or(serde_json::Value::Null);
+    let campaign_of = |body: &str| json_of(body)["campaign_id"].as_str().and_then(|s| uuid::Uuid::parse_str(s).ok());
+    let campaigns = PostgresCampaignRepository::new(pool.clone());
+
+    // Collect.
+    let (first_status, first_body) = send(&state, join_request()).await;
+    let first = campaign_of(&first_body);
+    let mut collected = None;
+    if let Some(c1) = first {
+        let before = campaigns.get_campaign(c1).await;
+        let deleted = match &before {
+            Ok(Some(c)) => state.sector_repo.delete_sector(c.sector_id).await.map(|_| c.sector_id),
+            _ => Err(mercs_server::repository::RepositoryError::Internal("no campaign row".into())),
+        };
+        let (repair_status, repair_body) = send(&state, join_request()).await;
+        let after = campaigns.get_campaign(c1).await;
+        let (fresh_status, fresh_body) = send(&state, join_request()).await;
+        let fresh = campaign_of(&fresh_body);
+        let fresh_row = match fresh {
+            Some(c2) => campaigns.get_campaign(c2).await.ok().flatten(),
+            None => None,
+        };
+        let fresh_sector = match &fresh_row {
+            Some(c) => state.sector_repo.sector_exists(c.sector_id).await.ok(),
+            None => None,
+        };
+        let old_sector = match &deleted {
+            Ok(s) => state.sector_repo.sector_exists(*s).await.ok(),
+            Err(_) => None,
+        };
+        collected = Some((before, deleted, repair_status, repair_body, after, fresh_status, fresh_body, fresh, fresh_row, fresh_sector, old_sector));
+    }
+
+    // Clean: the immutable campaign_started rows both launches wrote, then the wallet (its
+    // campaigns are collected through the membership rows, Archived included).
+    let fresh_id = collected.as_ref().and_then(|c| c.7);
+    sqlx::query("ALTER TABLE input_logs DISABLE TRIGGER ALL").execute(&pool).await.ok();
+    for c in [first, fresh_id].into_iter().flatten() {
+        sqlx::query("DELETE FROM input_logs WHERE campaign_id = $1").bind(c).execute(&pool).await.ok();
+    }
+    let enabled = sqlx::query("ALTER TABLE input_logs ENABLE TRIGGER ALL").execute(&pool).await;
+    clean_wallet_4g1(&pool, &wallet).await;
+
+    // Assert.
+    enabled.expect("input_logs triggers re-enabled");
+    assert_eq!(first_status, StatusCode::CREATED, "{first_body}");
+    let (before, deleted, repair_status, repair_body, after, fresh_status, fresh_body, fresh, fresh_row, fresh_sector, old_sector) =
+        collected.expect("the first join returned a campaign id");
+    let before = before.expect("get_campaign").expect("the first campaign");
+    assert_eq!(before.state, CampaignLifecycle::Active, "the join launched it");
+    deleted.expect("the sector delete (the kill being modelled)");
+    assert_eq!(repair_status, StatusCode::INTERNAL_SERVER_ERROR, "{repair_body}");
+    let after = after.expect("get_campaign").expect("the first campaign");
+    assert_eq!(after.state, CampaignLifecycle::Archived, "the sectorless campaign was retired");
+    assert_eq!(old_sector, Some(false), "no sector left behind");
+    assert_eq!(fresh_status, StatusCode::CREATED, "{fresh_body}");
+    let fresh = fresh.expect("the retry returned a campaign id");
+    assert_ne!(fresh, before.campaign_id, "the retry gets a new campaign");
+    let fresh_row = fresh_row.expect("the new campaign's row");
+    assert_eq!(fresh_row.state, CampaignLifecycle::Active, "the new campaign launched");
+    assert_eq!(fresh_sector, Some(true), "with a sector");
+    assert_eq!(state.launch_locks.len(), 0, "no launch lock left behind");
 }
 
 /// BP-2b-2 — end to end on Postgres: a real join writes the caller's starters and a launch

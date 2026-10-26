@@ -399,6 +399,9 @@ mod tests {
         async fn delete_sector(&self, _: SectorId) -> Result<(), RepositoryError> {
             unimplemented!()
         }
+        async fn sector_exists(&self, _: SectorId) -> Result<bool, RepositoryError> {
+            unimplemented!()
+        }
     }
 
     #[tokio::test]

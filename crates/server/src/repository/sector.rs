@@ -55,6 +55,9 @@ pub trait SectorStateRepository: Send + Sync {
     /// Removes the sector, its player presence and its `sectors:all` entry (BP-1).
     /// Idempotent: a missing sector is `Ok(())`.
     async fn delete_sector(&self, sector_id: SectorId) -> Result<(), RepositoryError>;
+    /// Whether the sector's hex state exists (BP-1c, demo-only): the demo join's sectorless
+    /// repair. Never loads the ~86 KB state.
+    async fn sector_exists(&self, sector_id: SectorId) -> Result<bool, RepositoryError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -130,6 +133,10 @@ impl SectorStateRepository for InMemorySectorStateRepository {
         self.sectors.remove(&sector_id);
         self.presence.remove(&sector_id);
         Ok(())
+    }
+
+    async fn sector_exists(&self, sector_id: SectorId) -> Result<bool, RepositoryError> {
+        Ok(self.sectors.contains_key(&sector_id))
     }
 }
 
@@ -259,6 +266,14 @@ impl SectorStateRepository for RedisSectorStateRepository {
             .await
             .map_err(|e| RepositoryError::Internal(e.to_string()))
     }
+
+    async fn sector_exists(&self, sector_id: SectorId) -> Result<bool, RepositoryError> {
+        use redis::AsyncCommands;
+        let mut conn = self.conn.clone();
+        conn.exists::<_, bool>(Self::hex_state_key(sector_id))
+            .await
+            .map_err(|e| RepositoryError::Internal(e.to_string()))
+    }
 }
 
 #[cfg(test)]
@@ -291,5 +306,21 @@ mod tests {
         assert!(repo.get_sector(id).await.unwrap().is_none(), "the sector is gone");
         assert!(repo.get_player_presence(id).await.unwrap().is_empty(), "the presence is gone");
         repo.delete_sector(id).await.expect("a second delete is Ok");
+    }
+
+    /// BP-1c: `sector_exists` follows the hex state through an upsert and a delete, and says
+    /// nothing about any other sector.
+    #[tokio::test]
+    async fn in_memory_sector_exists_tracks_upsert_and_delete() {
+        let repo = InMemorySectorStateRepository::new();
+        let (id, other) = (Uuid::new_v4(), Uuid::new_v4());
+        assert!(!repo.sector_exists(id).await.unwrap(), "nothing written yet");
+
+        repo.upsert_sector(sector(id)).await.unwrap();
+        assert!(repo.sector_exists(id).await.unwrap(), "the upsert wrote it");
+        assert!(!repo.sector_exists(other).await.unwrap(), "another id stays absent");
+
+        repo.delete_sector(id).await.unwrap();
+        assert!(!repo.sector_exists(id).await.unwrap(), "the delete removed it");
     }
 }

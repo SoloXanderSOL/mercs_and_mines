@@ -67,6 +67,14 @@ const DEMO_PLAYER_CAP: i64 = 1;
 /// - **Same-wallet race:** two concurrent joins can both reach the launch. One sees
 ///   `NotPending` and answers `200`, even if the other's launch then fails and retires the
 ///   campaign. The next join recovers, unless that retire failed (above).
+/// - **Cancel-safe (BP-1c, Reviewer BP-3a-1b F1):** the join and the launch run in a spawned
+///   task the route awaits, so a client that goes away mid-launch no longer leaves an
+///   `Active` campaign without a sector. A join that finds its campaign `Active` with no
+///   sector (a process killed mid-launch, or a campaign stuck before BP-1c) retires it and
+///   answers `500`; the client's retry gets a new campaign. Each campaign's launch and
+///   repair run under its `launch_locks` entry, so a repair never retires a launch still in
+///   flight. An `Ending` campaign is never repaired (`retire_if_active` matches `Active`
+///   only; the demo never reaches `Ending`).
 /// - **Abuse bound:** any signed-in wallet, behind the join switch, `join_ip` 30/min and
 ///   `join_wallet` 3/min, and at most 1,000 live campaigns. It holds `JOIN_ADVISORY_KEY` for
 ///   the join transaction, then again for `begin_launch`'s short transaction. Map generation
@@ -106,6 +114,20 @@ async fn post_campaign_join(
         foreman:   generate_seed(),
         map:       generate_seed() as i64,
     };
+    // BP-1c: the work runs in its own task. Dropping the `JoinHandle` (the client went away,
+    // hyper dropped this future) detaches the task; it never cancels it. The route never
+    // calls `abort()`, so the only `JoinError` is a panic.
+    let task_state = state.clone();
+    let handle = tokio::spawn(async move { join_and_launch(task_state, wallet, seeds).await });
+    match handle.await {
+        Ok(result) => result,
+        Err(e) => Err(internal_error(format!("demo join task failed for wallet {}: {e}", session.wallet_address))),
+    }
+}
+
+/// The demo join's work (BP-1c): join, launch, and repair a sectorless `Active` campaign.
+/// It runs inside the task `post_campaign_join` spawns, so it always runs to the end.
+async fn join_and_launch(state: Arc<AppState>, wallet: Vec<u8>, seeds: JoinSeeds) -> Result<Response, AppError> {
     let outcome = state
         .campaign_join_repo
         .join_campaign(&wallet, DEMO_PLAYER_CAP, seeds)
@@ -118,9 +140,12 @@ async fn post_campaign_join(
         JoinOutcome::DemoFull => return Err(service_unavailable("the demo is full")),
     };
     let c = ids.campaign_id;
+    // One launch or repair per campaign at a time (BP-1c).
+    let _launch = state.launch_locks.lock(c).await;
     match initialize_campaign(c, &*state.campaign_join_repo, state.membership_repo.as_ref(),
                               state.sector_repo.as_ref(), state.input_log_repo.as_ref()).await {
-        Ok(()) | Err(InitError::NotPending) => {}
+        Ok(()) => {}
+        Err(InitError::NotPending) => repair_if_sectorless(&state, c).await?,
         Err(InitError::AfterActivation { sector_id, cause }) => {
             return Err(match retire_campaign(state.campaign_repo.as_ref(), state.sector_repo.as_ref(), c, sector_id).await {
                 Ok(true) => internal_error(format!(
@@ -137,6 +162,35 @@ async fn post_campaign_join(
             "demo launch failed before activation: campaign {c} stays Pending: {e:?}"))),
     }
     Ok((status, Json(starter_ids_body(&ids))).into_response())
+}
+
+/// The sectorless repair (BP-1c): a campaign left `Active` with no sector state is retired,
+/// its sector deleted, and the join answers `500`; the client's retry gets a new campaign.
+/// The caller holds the campaign's launch lock. Healthy (sector present) and non-`Active`
+/// campaigns pass through. One Postgres read and one Redis `EXISTS`; never `get_sector`.
+async fn repair_if_sectorless(state: &AppState, c: Uuid) -> Result<(), AppError> {
+    let campaign = state.campaign_repo.get_campaign(c).await
+        .map_err(|e| internal_error(format!("demo join repair: reading campaign {c} failed: {e}")))?
+        .ok_or_else(|| internal_error(format!("demo join repair: campaign {c} not found")))?;
+    if campaign.state != CampaignLifecycle::Active {
+        return Ok(());
+    }
+    let sector_id = campaign.sector_id;
+    let exists = state.sector_repo.sector_exists(sector_id).await
+        .map_err(|e| internal_error(format!("demo join repair: sector check for campaign {c} failed: {e}")))?;
+    if exists {
+        return Ok(());
+    }
+    Err(match retire_campaign(state.campaign_repo.as_ref(), state.sector_repo.as_ref(), c, sector_id).await {
+        Ok(true) => internal_error(format!(
+            "demo join repaired: campaign {c} had no sector {sector_id}, retired")),
+        Ok(false) => internal_error(format!(
+            "demo join repair: campaign {c} had no sector {sector_id} and was no longer Active")),
+        Err(RetireError::Retire(e)) => internal_error(format!(
+            "demo join repair: retire failed, campaign {c} stuck Active, sector {sector_id} missing: {e}")),
+        Err(RetireError::DeleteSector(e)) => internal_error(format!(
+            "demo join repair: campaign {c} retired, sector {sector_id} delete failed: {e}")),
+    })
 }
 
 // TODO(phase-2-§10j): alpha-only replacement; removed when the Phase 2 Bootcamp hire ships (ODQ-33).
@@ -1100,5 +1154,216 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
         assert_eq!(body, json!({"error": "campaign is not active"}));
         assert_eq!(campaign_of(&state, c).await.state, CampaignLifecycle::Pending, "still Pending");
+    }
+
+    // ── BP-1c: a cancel-safe demo join ───────────────────────────────────────
+
+    use crate::repository::{
+        HexOccupant, InMemorySectorStateRepository, SectorId, SectorState, SectorStateRepository, WalletAddress,
+    };
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+    use tokio::sync::Notify;
+
+    /// The BP-1c pause seam, a test double around an in-memory sector store. While
+    /// `pause_next` is set, the next `upsert_sector` signals `parked` and waits for `release`
+    /// before writing: a launch held after `begin_launch` committed and before its sector
+    /// exists. It also counts the `sector_exists` and `get_sector` calls.
+    struct PausedSector {
+        inner: Arc<InMemorySectorStateRepository>,
+        pause_next: AtomicBool,
+        parked: Notify,
+        release: Notify,
+        exists_calls: AtomicUsize,
+        get_calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl SectorStateRepository for PausedSector {
+        async fn get_sector(&self, s: SectorId) -> Result<Option<SectorState>, RepositoryError> {
+            self.get_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.get_sector(s).await
+        }
+        async fn upsert_sector(&self, state: SectorState) -> Result<(), RepositoryError> {
+            if self.pause_next.swap(false, Ordering::SeqCst) {
+                self.parked.notify_one();
+                self.release.notified().await;
+            }
+            self.inner.upsert_sector(state).await
+        }
+        async fn list_sectors(&self) -> Result<Vec<SectorState>, RepositoryError> {
+            self.inner.list_sectors().await
+        }
+        async fn get_player_presence(&self, s: SectorId) -> Result<Vec<WalletAddress>, RepositoryError> {
+            self.inner.get_player_presence(s).await
+        }
+        async fn set_player_presence(&self, s: SectorId, p: &[WalletAddress]) -> Result<(), RepositoryError> {
+            self.inner.set_player_presence(s, p).await
+        }
+        async fn add_hex_occupant(&self, s: SectorId, q: i32, r: i32, e: HexOccupant) -> Result<(), RepositoryError> {
+            self.inner.add_hex_occupant(s, q, r, e).await
+        }
+        async fn remove_hex_occupant(&self, s: SectorId, q: i32, r: i32, u: Uuid) -> Result<(), RepositoryError> {
+            self.inner.remove_hex_occupant(s, q, r, u).await
+        }
+        async fn delete_sector(&self, s: SectorId) -> Result<(), RepositoryError> {
+            self.inner.delete_sector(s).await
+        }
+        async fn sector_exists(&self, s: SectorId) -> Result<bool, RepositoryError> {
+            self.exists_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.sector_exists(s).await
+        }
+    }
+
+    /// A joined state with session `"t"` for `wallet`, whose sector store is a `PausedSector`
+    /// (parking the first sector write when `pause` is set). `sector_repo` is not a join-read
+    /// field, so the join's own stores are untouched.
+    fn paused_state(wallet: [u8; 32], pause: bool) -> (Arc<AppState>, Arc<PausedSector>) {
+        let mut config = Config::default();
+        config.server.join_enabled = true;
+        let mut state = AppState::new(Arc::new(config));
+        let w = bs58::encode(wallet).into_string();
+        let now = chrono::Utc::now().timestamp();
+        state.sessions.insert("t".into(), shared::SessionToken {
+            token_id: "t".into(),
+            account_id: w.clone(),
+            wallet_address: w,
+            issued_at: now,
+            expires_at: now + 600,
+        });
+        let paused = Arc::new(PausedSector {
+            inner: Arc::new(InMemorySectorStateRepository::new()),
+            pause_next: AtomicBool::new(pause),
+            parked: Notify::new(),
+            release: Notify::new(),
+            exists_calls: AtomicUsize::new(0),
+            get_calls: AtomicUsize::new(0),
+        });
+        state.sector_repo = paused.clone();
+        (Arc::new(state), paused)
+    }
+
+    /// Polls `check` every 10 ms for up to 2 s: a detached launch finishes in the background.
+    async fn eventually<F, Fut>(mut check: F) -> bool
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        for _ in 0..200 {
+            if check().await {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    /// The request is dropped while its launch is parked between `begin_launch`'s commit and
+    /// the sector write (the client went away mid-launch). The launch still finishes: the
+    /// sector and the gateway are written and the campaign's lock is released.
+    #[tokio::test]
+    async fn join_launch_survives_a_dropped_request() {
+        let wallet = [91u8; 32];
+        let (state, sector) = paused_state(wallet, true);
+
+        tokio::select! {
+            r = join(state.clone(), Some("t")) => panic!("the join answered while its launch was parked: {r:?}"),
+            _ = sector.parked.notified() => {}
+        }
+        let campaign = member_campaign(&state, &wallet).await;
+        assert_eq!(campaign.state, CampaignLifecycle::Active, "begin_launch committed");
+        assert!(!sector.inner.sector_exists(campaign.sector_id).await.unwrap(), "no sector yet");
+
+        sector.release.notify_one();
+        let (st, sc) = (state.clone(), sector.clone());
+        let (campaign_id, sector_id) = (campaign.campaign_id, campaign.sector_id);
+        let finished = eventually(move || {
+            let (st, sc) = (st.clone(), sc.clone());
+            async move {
+                let gateway = st.membership_repo.get_membership(&wallet, campaign_id).await.unwrap()
+                    .and_then(|m| m.gateway_hex_q)
+                    .is_some();
+                sc.inner.sector_exists(sector_id).await.unwrap() && gateway && st.launch_locks.len() == 0
+            }
+        })
+        .await;
+        assert!(finished, "the detached launch wrote the sector and the gateway, then released its lock");
+    }
+
+    /// Class (a): a campaign `Active` with no sector (a process killed mid-launch). The next
+    /// join retires it and answers the generic `500`; the join after that gets a new campaign.
+    #[tokio::test]
+    async fn join_repairs_an_active_campaign_with_no_sector() {
+        let wallet = [92u8; 32];
+        let (state, sector) = paused_state(wallet, false);
+        let (status, body) = join(state.clone(), Some("t")).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let first = member_campaign(&state, &wallet).await;
+        sector.inner.delete_sector(first.sector_id).await.unwrap();
+
+        let (status, body) = join(state.clone(), Some("t")).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert_eq!(body["error"], "internal error", "the generic 500 body: {body}");
+        let retired = state.campaign_repo.get_campaign(first.campaign_id).await.unwrap().expect("campaign");
+        assert_eq!(retired.state, CampaignLifecycle::Archived, "the sectorless campaign was retired");
+        assert!(!sector.inner.sector_exists(first.sector_id).await.unwrap(), "no sector left behind");
+
+        let (status, body) = join(state.clone(), Some("t")).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let fresh = id(&body, "campaign_id");
+        assert_ne!(fresh, first.campaign_id, "the retry gets a new campaign");
+        let campaign = state.campaign_repo.get_campaign(fresh).await.unwrap().expect("campaign");
+        assert_eq!(campaign.state, CampaignLifecycle::Active, "launched");
+        assert!(sector.inner.sector_exists(campaign.sector_id).await.unwrap(), "with a sector");
+        assert_eq!(state.launch_locks.len(), 0, "no launch lock left behind");
+    }
+
+    /// A's launch is parked before its sector write; B (the same wallet: a double tap, or a
+    /// retry after the client's deadline) finds the campaign `Active` with no sector. B must
+    /// wait on the campaign's launch lock, not retire a campaign whose sector is on its way.
+    #[tokio::test]
+    async fn join_repair_waits_for_an_inflight_launch() {
+        let wallet = [93u8; 32];
+        let (state, sector) = paused_state(wallet, true);
+        let a = tokio::spawn(join(state.clone(), Some("t")));
+        sector.parked.notified().await;
+        let campaign = member_campaign(&state, &wallet).await;
+
+        let mut b = tokio::spawn(join(state.clone(), Some("t")));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut b).await.is_err(),
+            "B answered while A's launch was still writing the sector"
+        );
+
+        sector.release.notify_one();
+        let (status_a, body_a) = a.await.unwrap();
+        let (status_b, body_b) = b.await.unwrap();
+        assert_eq!(status_a, StatusCode::CREATED, "{body_a}");
+        assert_eq!(status_b, StatusCode::OK, "{body_b}");
+        assert_eq!(id(&body_b, "campaign_id"), campaign.campaign_id, "B joined A's campaign");
+        let after = state.campaign_repo.get_campaign(campaign.campaign_id).await.unwrap().expect("campaign");
+        assert_eq!(after.state, CampaignLifecycle::Active, "not retired");
+        assert!(sector.inner.sector_exists(campaign.sector_id).await.unwrap(), "A's sector stands");
+        assert_eq!(state.launch_locks.len(), 0, "no launch lock left behind");
+    }
+
+    /// A repeat join of a healthy campaign is `200` with the same ids and retires nothing;
+    /// the repair costs one `EXISTS` and never loads the ~86 KB sector.
+    #[tokio::test]
+    async fn join_with_a_live_sector_does_not_retire() {
+        let wallet = [91u8; 32];
+        let (state, sector) = paused_state(wallet, false);
+        let (status, first) = join(state.clone(), Some("t")).await;
+        assert_eq!(status, StatusCode::CREATED, "{first}");
+        let (status, again) = join(state.clone(), Some("t")).await;
+        assert_eq!(status, StatusCode::OK, "{again}");
+        assert_eq!(again, first, "the same starter set");
+
+        let campaign = member_campaign(&state, &wallet).await;
+        assert_eq!(campaign.state, CampaignLifecycle::Active, "not retired");
+        assert!(sector.inner.sector_exists(campaign.sector_id).await.unwrap(), "the sector stands");
+        assert_eq!(sector.get_calls.load(Ordering::SeqCst), 0, "the repair never loads the sector");
+        assert_eq!(sector.exists_calls.load(Ordering::SeqCst), 1, "one EXISTS, on the repeat join only");
+        assert_eq!(state.launch_locks.len(), 0, "no launch lock left behind");
     }
 }
