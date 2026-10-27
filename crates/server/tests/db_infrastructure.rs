@@ -2053,7 +2053,8 @@ async fn mission_resolve_rejects_empty_squad() {
         .header("authorization", format!("Bearer {token}"))
         .body(Body::from(body.to_string()))
         .unwrap();
-    let resp = mercs_server::routes::router(Arc::clone(&state)).oneshot(req).await.unwrap();
+    let app = mercs_server::routes::with_test_peer(mercs_server::routes::router(Arc::clone(&state)), mercs_server::routes::TEST_PEER);
+    let resp = app.oneshot(req).await.unwrap();
     assert_eq!(
         resp.status(), StatusCode::BAD_REQUEST,
         "a zero-unit deployment must be refused before it rolls"
@@ -4106,6 +4107,7 @@ async fn post_mission(app: axum::Router, token: Option<&str>, body: &serde_json:
     if let Some(t) = token {
         req = req.header("authorization", format!("Bearer {t}"));
     }
+    let app = mercs_server::routes::with_test_peer(app, mercs_server::routes::TEST_PEER);
     let resp = app.oneshot(req.body(Body::from(body.to_string())).unwrap()).await.unwrap();
     let status = resp.status();
     let bytes = resp.into_body().collect().await.unwrap().to_bytes().to_vec();
@@ -4559,6 +4561,107 @@ async fn auth_verify_refuses_a_challenge_issued_to_another_wallet() {
     let (status, body) = verify_with(&state, &key_b, &text, &text).await;
     assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
     assert!(state.sessions.is_empty(), "a refused verify issues no session");
+}
+
+// ── BP-3b-1: the mission route's limits (in-memory; wallets 230–240, sessions only) ──
+
+/// `n` copies of the test unit, an unknown Commander and one unknown Section: past the
+/// body checks such a request answers 404 (Commander not found), so it never deploys.
+fn mission_body_with_units(n: usize) -> serde_json::Value {
+    let units: Vec<serde_json::Value> = (0..n).map(|_| mission_unit_json()).collect();
+    serde_json::json!({
+        "squad": { "units": units },
+        "mission_id": "GUARD_DUTY",
+        "commander_id": uuid::Uuid::new_v4(),
+        "section_ids": [uuid::Uuid::new_v4()],
+    })
+}
+
+/// A one-unit body exactly `len` bytes long (the unit's name is padded).
+fn mission_body_of_len(len: usize) -> serde_json::Value {
+    let mut body = mission_body_with_units(1);
+    let base = body.to_string().len() - "Grunt".len();
+    body["squad"]["units"][0]["name"] = serde_json::json!("x".repeat(len - base));
+    assert_eq!(body.to_string().len(), len, "the padded body has the length asked for");
+    body
+}
+
+/// Six missions a minute per wallet (a literal); the seventh is 429 whatever its body.
+#[tokio::test]
+async fn mission_resolve_per_wallet_limit() {
+    let state = default_state();
+    let token = insert_session(&state, [230u8; 32]);
+    let state = std::sync::Arc::new(state);
+    let mut statuses = Vec::new();
+    for _ in 0..7 {
+        let app = mercs_server::routes::router(std::sync::Arc::clone(&state));
+        statuses.push(post_mission(app, Some(&token), &mission_body_with_units(1)).await.0);
+    }
+    let mut expected = vec![axum::http::StatusCode::NOT_FOUND; 6];
+    expected.push(axum::http::StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(statuses, expected);
+}
+
+/// Sixty a minute per address (a literal): ten wallets spend six each, and an eleventh,
+/// fresh wallet is refused by the address limit.
+#[tokio::test]
+async fn mission_resolve_per_ip_limit() {
+    let state = default_state();
+    let tokens: Vec<String> = (0..11u8).map(|i| insert_session(&state, [230 + i; 32])).collect();
+    let state = std::sync::Arc::new(state);
+    let mut statuses = Vec::new();
+    for i in 0..61usize {
+        let app = mercs_server::routes::router(std::sync::Arc::clone(&state));
+        statuses.push(post_mission(app, Some(&tokens[i / 6]), &mission_body_with_units(1)).await.0);
+    }
+    let mut expected = vec![axum::http::StatusCode::NOT_FOUND; 60];
+    expected.push(axum::http::StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(statuses, expected);
+}
+
+/// 64 KiB of body (65,536 bytes, a literal) is read; one byte more is axum's 413.
+#[tokio::test]
+async fn mission_resolve_body_over_the_cap_is_413() {
+    let state = default_state();
+    let token = insert_session(&state, [230u8; 32]);
+    let state = std::sync::Arc::new(state);
+    let app = mercs_server::routes::router(std::sync::Arc::clone(&state));
+    let (at_cap, _) = post_mission(app, Some(&token), &mission_body_of_len(65_536)).await;
+    assert_eq!(at_cap, axum::http::StatusCode::NOT_FOUND, "a body at the cap is read");
+    let app = mercs_server::routes::router(std::sync::Arc::clone(&state));
+    let (over, _) = post_mission(app, Some(&token), &mission_body_of_len(65_537)).await;
+    assert_eq!(over, axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+/// Canon: 8 units per Section. One Section carries 8 (past the check: 404), not 9 (400).
+#[tokio::test]
+async fn mission_resolve_rejects_more_units_than_its_sections_hold() {
+    let state = default_state();
+    let token = insert_session(&state, [230u8; 32]);
+    let state = std::sync::Arc::new(state);
+    let app = mercs_server::routes::router(std::sync::Arc::clone(&state));
+    let (eight, _) = post_mission(app, Some(&token), &mission_body_with_units(8)).await;
+    assert_eq!(eight, axum::http::StatusCode::NOT_FOUND, "8 units for 1 Section pass the cap");
+    let app = mercs_server::routes::router(std::sync::Arc::clone(&state));
+    let (nine, body) = post_mission(app, Some(&token), &mission_body_with_units(9)).await;
+    assert_eq!(nine, axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(error_message(&body), "A mission carries at most 8 units per Section");
+}
+
+/// The limits come before the body: with the wallet's six spent, an oversized body is
+/// 429, not 413, so an over-cap body is counted like any other.
+#[tokio::test]
+async fn mission_resolve_counts_before_reading_the_body() {
+    let state = default_state();
+    let token = insert_session(&state, [230u8; 32]);
+    let state = std::sync::Arc::new(state);
+    for _ in 0..6 {
+        let app = mercs_server::routes::router(std::sync::Arc::clone(&state));
+        post_mission(app, Some(&token), &mission_body_with_units(1)).await;
+    }
+    let app = mercs_server::routes::router(std::sync::Arc::clone(&state));
+    let (status, _) = post_mission(app, Some(&token), &mission_body_of_len(65_537)).await;
+    assert_eq!(status, axum::http::StatusCode::TOO_MANY_REQUESTS);
 }
 
 #[tokio::test]
