@@ -28,6 +28,7 @@ is already built. Do not guess — read it. The status block at the top of that 
 is the ground truth.
 
 As of 2026-10-27 (`dev` frozen since 2026-10-25 for the Breakpoint demo):
+On `breakpoint`, the current state, test count and next wallet are in the shared doc's Standing Brief, not here; this file's §1 describes `dev`.
 
 - **Section 1 (Database Layer):** 1a (Postgres) and 1b (Redis) complete. **1c-3 (the
   GAP-34 fix) built at `bb49b3c`:** `session_start` (header + full request + timestamp)
