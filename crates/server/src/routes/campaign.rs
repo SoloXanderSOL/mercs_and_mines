@@ -16,7 +16,7 @@ use sim_engine::rng::generate_seed;
 
 use crate::auth::AuthSession;
 use crate::campaign_init::{initialize_campaign, retire_campaign, InitError, RetireError};
-use crate::repository::{CampaignLifecycle, JoinOutcome, JoinSeeds, ReplacementOutcome, StarterIds};
+use crate::repository::{CampaignLifecycle, JoinOutcome, JoinSeeds, ReplacementOutcome, SectorState, StarterIds};
 use crate::state::AppState;
 
 use super::{
@@ -193,6 +193,70 @@ async fn repair_if_sectorless(state: &AppState, c: Uuid) -> Result<(), AppError>
     })
 }
 
+/// The sector route's repair (BP-1d, demo-only; Reviewer BP-3a-2 F1). Called once, from
+/// `routes/sector.rs`'s missing-sector arm; `dev`'s route keeps its `500`. A campaign left
+/// `Active` with no sector state (Redis lost its keys: the demo's Redis persists by RDB
+/// snapshot only) is retired, its sector deleted, and the route answers `409 campaign is not
+/// active`, so the client's `409` → re-join-once path starts a new campaign.
+/// - **Spawned**, as the demo join: a client that goes away while this waits detaches the
+///   task, never cancels it, so the launch lock entry is always released and a retire always
+///   reaches its sector delete. The only `JoinError` is a panic.
+/// - **Locked** (see `repair_missing_sector_locked`). Only the miss path locks; the hot
+///   read never does.
+pub(super) async fn repair_missing_sector(state: Arc<AppState>, campaign_id: Uuid, sector_id: Uuid)
+    -> Result<SectorState, AppError>
+{
+    let task = tokio::spawn(repair_missing_sector_locked(state, campaign_id, sector_id));
+    match task.await {
+        Ok(result) => result,
+        Err(e) => Err(internal_error(format!("sector repair task failed for campaign {campaign_id}: {e}"))),
+    }
+}
+
+/// The repair's work, under the campaign's `launch_locks` entry, taken first and never while
+/// a transaction or `JOIN_ADVISORY_KEY` is held (the join's order). Both reads are repeated
+/// under the lock, campaign first:
+/// - no longer `Active` → `409` (an abandon or a join repair retired it: Reviewer BP-2a F2);
+/// - `Ending`, or the row gone → `500`, as before (`retire_if_active` retires only `Active`,
+///   and the demo can't reach `Ending` before its 90-day `ends_at`);
+/// - the sector now present (a launch finished while this waited) → served. Its `gateway`
+///   comes from the membership read before the wait, so it may be `null`: the launch writes
+///   the sector before the gateways. The demo client never sends that race;
+/// - still missing → retired (one `warn!` per retire, so each Redis-loss repair is in the
+///   journal) → `409`.
+///
+/// A convoy in transit does not refuse the repair: its sector is already gone, so its timer
+/// already polls a missing sector (demo runbook: clear that timer by hand).
+async fn repair_missing_sector_locked(state: Arc<AppState>, campaign_id: Uuid, sector_id: Uuid)
+    -> Result<SectorState, AppError>
+{
+    let _launch = state.launch_locks.lock(campaign_id).await;
+    let campaign = state.campaign_repo.get_campaign(campaign_id).await
+        .map_err(|e| internal_error(format!("sector repair: re-reading campaign {campaign_id} failed: {e}")))?;
+    match campaign.map(|c| c.state) {
+        Some(CampaignLifecycle::Active) => {}
+        Some(CampaignLifecycle::Ending) | None => return Err(internal_error(format!(
+            "get_campaign_sector: sector {sector_id} of campaign {campaign_id} is missing"))),
+        Some(_) => return Err(conflict("campaign is not active")),
+    }
+    let found = state.sector_repo.get_sector(sector_id).await
+        .map_err(|e| internal_error(format!("sector repair: re-reading sector {sector_id} of campaign {campaign_id} failed: {e}")))?;
+    if let Some(sector) = found {
+        return Ok(sector);
+    }
+    match retire_campaign(state.campaign_repo.as_ref(), state.sector_repo.as_ref(), campaign_id, sector_id).await {
+        Ok(true) => {
+            tracing::warn!(%campaign_id, %sector_id, "sector repair: campaign had no sector, retired");
+            Err(conflict("campaign is not active"))
+        }
+        Ok(false) => Err(conflict("campaign is not active")),
+        Err(RetireError::Retire(e)) => Err(internal_error(format!(
+            "sector repair: retire failed, campaign {campaign_id} stuck Active, sector {sector_id} missing: {e}"))),
+        Err(RetireError::DeleteSector(e)) => Err(internal_error(format!(
+            "sector repair: campaign {campaign_id} retired, sector {sector_id} delete failed: {e}"))),
+    }
+}
+
 // TODO(phase-2-§10j): alpha-only replacement; removed when the Phase 2 Bootcamp hire ships (ODQ-33).
 /// The alpha replacement (5a-4, ODQ-33; ODQ-46 since 5a-5): `201` with a new Rank 1 Commander
 /// for a member with no usable Commander (every one KIA or Shattered).
@@ -277,6 +341,9 @@ async fn post_replacement_commander(
 ///   F1). A failed retire or sector delete is `500`, journalled with both ids.
 /// - No `JOIN_ADVISORY_KEY`: it moves `Active` → `Archived`, never out of `Pending`. Not
 ///   behind the join switch, like the replacement route. Not a logged input.
+/// - **Under the launch lock (BP-1d, Reviewer BP-1c F2):** the retire waits for an
+///   in-flight launch of the same campaign, so it never leaves an orphan sector; an abandon
+///   that meets a launch still running retires the launched campaign (`200`).
 async fn post_abandon_campaign(
     AuthSession(token): AuthSession,
     State(state): State<Arc<AppState>>,
@@ -327,7 +394,22 @@ async fn post_abandon_campaign(
         return Err(conflict("member has a convoy in transit"));
     }
 
-    let retired = match retire_campaign(state.campaign_repo.as_ref(), state.sector_repo.as_ref(), campaign_id, sector_id).await {
+    // BP-1d (Reviewer BP-1c F2): the retire runs under the campaign's launch lock, so an
+    // abandon during an in-flight launch waits for the sector write and then deletes it (no
+    // orphan key), and in its own task, so a client that goes away can neither split the
+    // retire from the sector delete nor leave the lock entry behind.
+    let task_state = state.clone();
+    let task = tokio::spawn(async move {
+        let _launch = task_state.launch_locks.lock(campaign_id).await;
+        retire_campaign(task_state.campaign_repo.as_ref(), task_state.sector_repo.as_ref(), campaign_id, sector_id).await
+    });
+    let retire = match task.await {
+        Ok(r) => r,
+        Err(e) => {
+            return Err(internal_error(format!("post_abandon_campaign: the retire task failed for campaign {campaign_id}: {e}")));
+        }
+    };
+    let retired = match retire {
         Ok(r) => r,
         Err(RetireError::Retire(e)) => {
             return Err(internal_error(format!(
@@ -1168,7 +1250,7 @@ mod tests {
     /// The BP-1c pause seam, a test double around an in-memory sector store. While
     /// `pause_next` is set, the next `upsert_sector` signals `parked` and waits for `release`
     /// before writing: a launch held after `begin_launch` committed and before its sector
-    /// exists. It also counts the `sector_exists` and `get_sector` calls.
+    /// exists. It also counts the `sector_exists`, `get_sector` and `delete_sector` calls.
     struct PausedSector {
         inner: Arc<InMemorySectorStateRepository>,
         pause_next: AtomicBool,
@@ -1176,6 +1258,7 @@ mod tests {
         release: Notify,
         exists_calls: AtomicUsize,
         get_calls: AtomicUsize,
+        delete_calls: AtomicUsize,
     }
 
     #[async_trait::async_trait]
@@ -1207,6 +1290,7 @@ mod tests {
             self.inner.remove_hex_occupant(s, q, r, u).await
         }
         async fn delete_sector(&self, s: SectorId) -> Result<(), RepositoryError> {
+            self.delete_calls.fetch_add(1, Ordering::SeqCst);
             self.inner.delete_sector(s).await
         }
         async fn sector_exists(&self, s: SectorId) -> Result<bool, RepositoryError> {
@@ -1217,7 +1301,8 @@ mod tests {
 
     /// A joined state with session `"t"` for `wallet`, whose sector store is a `PausedSector`
     /// (parking the first sector write when `pause` is set). `sector_repo` is not a join-read
-    /// field, so the join's own stores are untouched.
+    /// field, so the join's own stores are untouched. The convoy read answers "none in transit"
+    /// (BP-1d's abandon tests; the in-memory convoy store is `unimplemented!()`).
     fn paused_state(wallet: [u8; 32], pause: bool) -> (Arc<AppState>, Arc<PausedSector>) {
         let mut config = Config::default();
         config.server.join_enabled = true;
@@ -1238,8 +1323,10 @@ mod tests {
             release: Notify::new(),
             exists_calls: AtomicUsize::new(0),
             get_calls: AtomicUsize::new(0),
+            delete_calls: AtomicUsize::new(0),
         });
         state.sector_repo = paused.clone();
+        state.convoy_repo = Arc::new(ConvoysInTransit(false));
         (Arc::new(state), paused)
     }
 
@@ -1365,5 +1452,197 @@ mod tests {
         assert_eq!(sector.get_calls.load(Ordering::SeqCst), 0, "the repair never loads the sector");
         assert_eq!(sector.exists_calls.load(Ordering::SeqCst), 1, "one EXISTS, on the repeat join only");
         assert_eq!(state.launch_locks.len(), 0, "no launch lock left behind");
+    }
+
+    // ── BP-1d: the sector route's repair and the abandon lock ────────────────
+
+    /// `GET /api/campaign/:campaign_id/sector` on `state`, through the sector route's router.
+    async fn sector_get(state: Arc<AppState>, token: Option<&str>, campaign: Uuid) -> (StatusCode, serde_json::Value) {
+        let mut req = Request::builder().method("GET").uri(format!("/api/campaign/{campaign}/sector"));
+        if let Some(t) = token {
+            req = req.header("authorization", format!("Bearer {t}"));
+        }
+        let resp = with_test_peer(crate::routes::sector::router().with_state(state), TEST_PEER)
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+    }
+
+    /// A launch is parked before its sector write, holding the lock; a GET misses the sector
+    /// and must wait for the launch, then serve the map it wrote, not retire the campaign.
+    #[tokio::test]
+    async fn sector_waits_for_an_inflight_launch() {
+        let wallet = [95u8; 32];
+        let (state, sector) = paused_state(wallet, true);
+        let a = tokio::spawn(join(state.clone(), Some("t")));
+        sector.parked.notified().await;
+        let campaign = member_campaign(&state, &wallet).await;
+
+        let mut g = tokio::spawn(sector_get(state.clone(), Some("t"), campaign.campaign_id));
+        let sc = sector.clone();
+        assert!(
+            eventually(move || {
+                let sc = sc.clone();
+                async move { sc.get_calls.load(Ordering::SeqCst) == 1 }
+            })
+            .await,
+            "the GET read the sector once"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut g).await.is_err(),
+            "the GET answered while the launch was still writing the sector"
+        );
+
+        sector.release.notify_one();
+        let (status_a, body_a) = a.await.unwrap();
+        assert_eq!(status_a, StatusCode::CREATED, "{body_a}");
+        let (status, body) = g.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["campaign_id"], campaign.campaign_id.to_string());
+        assert!(!body["terrain"].as_object().expect("terrain is an object").is_empty(), "the launch's map");
+        let after = state.campaign_repo.get_campaign(campaign.campaign_id).await.unwrap().expect("campaign");
+        assert_eq!(after.state, CampaignLifecycle::Active, "not retired");
+        assert!(sector.inner.sector_exists(campaign.sector_id).await.unwrap(), "the sector stands");
+        assert_eq!(sector.delete_calls.load(Ordering::SeqCst), 0, "nothing deleted");
+        assert_eq!(sector.get_calls.load(Ordering::SeqCst), 2, "the first read and the locked re-read");
+        assert_eq!(state.launch_locks.len(), 0, "no launch lock left behind");
+    }
+
+    /// The sector is gone and someone else (an abandon or a join repair) holds the lock and
+    /// retires the campaign; the waiting GET answers `409` and neither reads the sector again
+    /// nor deletes it a second time.
+    #[tokio::test]
+    async fn sector_repair_waits_for_a_retire_and_does_not_repeat_it() {
+        let wallet = [96u8; 32];
+        let (state, sector) = paused_state(wallet, false);
+        let (status, body) = join(state.clone(), Some("t")).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let campaign = member_campaign(&state, &wallet).await;
+        let (c, s) = (campaign.campaign_id, campaign.sector_id);
+        sector.inner.delete_sector(s).await.unwrap();
+
+        let guard = state.launch_locks.lock(c).await;
+        let mut g = tokio::spawn(sector_get(state.clone(), Some("t"), c));
+        let sc = sector.clone();
+        assert!(
+            eventually(move || {
+                let sc = sc.clone();
+                async move { sc.get_calls.load(Ordering::SeqCst) == 1 }
+            })
+            .await,
+            "the GET read the sector once"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut g).await.is_err(),
+            "the GET answered while another holder had the campaign's lock"
+        );
+        let retired = crate::campaign_init::retire_campaign(state.campaign_repo.as_ref(), state.sector_repo.as_ref(), c, s)
+            .await
+            .expect("retire_campaign");
+        assert!(retired, "the holder's retire");
+        assert_eq!(sector.delete_calls.load(Ordering::SeqCst), 1, "the holder's delete");
+        drop(guard);
+
+        let (status, body) = g.await.unwrap();
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"], "campaign is not active");
+        assert_eq!(sector.delete_calls.load(Ordering::SeqCst), 1, "no second delete");
+        assert_eq!(sector.get_calls.load(Ordering::SeqCst), 1, "the repair stopped at the campaign state");
+        assert_eq!(campaign_of(&state, c).await.state, CampaignLifecycle::Archived);
+        assert_eq!(state.launch_locks.len(), 0, "no launch lock left behind");
+    }
+
+    /// An abandon during an in-flight launch waits for the sector write, then retires the
+    /// launched campaign and deletes its sector: no orphan key (Reviewer BP-1c F2).
+    #[tokio::test]
+    async fn abandon_waits_for_an_inflight_launch() {
+        let wallet = [97u8; 32];
+        let (state, sector) = paused_state(wallet, true);
+        let a = tokio::spawn(join(state.clone(), Some("t")));
+        sector.parked.notified().await;
+        let campaign = member_campaign(&state, &wallet).await;
+
+        let (st, cs) = (state.clone(), campaign.campaign_id.to_string());
+        let mut b = tokio::spawn(async move { abandon(st, Some("t"), &cs).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut b).await.is_err(),
+            "the abandon answered while the launch was still writing the sector"
+        );
+
+        sector.release.notify_one();
+        let (status_a, body_a) = a.await.unwrap();
+        assert_eq!(status_a, StatusCode::CREATED, "{body_a}");
+        let (status, body) = b.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body, serde_json::json!({"campaign_id": campaign.campaign_id}));
+        assert_eq!(campaign_of(&state, campaign.campaign_id).await.state, CampaignLifecycle::Archived);
+        assert!(!sector.inner.sector_exists(campaign.sector_id).await.unwrap(), "no orphan sector");
+        assert_eq!(sector.delete_calls.load(Ordering::SeqCst), 1, "the abandon's delete");
+        assert_eq!(state.launch_locks.len(), 0, "no launch lock left behind");
+    }
+
+    /// The GET is dropped while its repair waits on the lock (the client went away). The
+    /// repair still runs once the lock frees: the campaign is retired and the lock released.
+    #[tokio::test]
+    async fn sector_repair_survives_a_dropped_request() {
+        let wallet = [98u8; 32];
+        let (state, sector) = paused_state(wallet, false);
+        let (status, body) = join(state.clone(), Some("t")).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let campaign = member_campaign(&state, &wallet).await;
+        let c = campaign.campaign_id;
+        sector.inner.delete_sector(campaign.sector_id).await.unwrap();
+
+        let guard = state.launch_locks.lock(c).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), sector_get(state.clone(), Some("t"), c)).await.is_err(),
+            "the GET answered while the lock was held"
+        );
+        drop(guard);
+
+        let st = state.clone();
+        let finished = eventually(move || {
+            let st = st.clone();
+            async move {
+                let archived = st.campaign_repo.get_campaign(c).await.unwrap().map(|x| x.state) == Some(CampaignLifecycle::Archived);
+                archived && st.launch_locks.len() == 0
+            }
+        })
+        .await;
+        assert!(finished, "the detached repair retired the campaign and released its lock");
+    }
+
+    /// The abandon is dropped while it waits on the lock. Its detached task still retires
+    /// the campaign and deletes the sector once the lock frees.
+    #[tokio::test]
+    async fn abandon_survives_a_dropped_request() {
+        let wallet = [99u8; 32];
+        let (state, sector) = paused_state(wallet, false);
+        let (status, body) = join(state.clone(), Some("t")).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let campaign = member_campaign(&state, &wallet).await;
+        let (c, s) = (campaign.campaign_id, campaign.sector_id);
+        let cs = c.to_string();
+
+        let guard = state.launch_locks.lock(c).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), abandon(state.clone(), Some("t"), &cs)).await.is_err(),
+            "the abandon answered while the lock was held"
+        );
+        drop(guard);
+
+        let (st, sc) = (state.clone(), sector.clone());
+        let finished = eventually(move || {
+            let (st, sc) = (st.clone(), sc.clone());
+            async move {
+                let archived = st.campaign_repo.get_campaign(c).await.unwrap().map(|x| x.state) == Some(CampaignLifecycle::Archived);
+                archived && !sc.inner.sector_exists(s).await.unwrap() && st.launch_locks.len() == 0
+            }
+        })
+        .await;
+        assert!(finished, "the detached abandon retired the campaign, deleted the sector and released its lock");
     }
 }

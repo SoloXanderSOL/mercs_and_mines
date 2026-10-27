@@ -48,9 +48,10 @@ pub struct GatewayHex {
 /// A member's sector map, `GET /api/campaign/:campaign_id/sector` (BP-2a, keeper). Order:
 /// `401` (no session) → `429` per address (`sector_ip`) → `429` per wallet (`sector_wallet`)
 /// → `404` (unknown campaign) → `403` (not a member; any membership row) → `409` (not
-/// `Active` or `Ending`, as the events socket) → the sector read. A missing sector is `409`
-/// if the campaign has left `Active`/`Ending` since the state check (a retire raced the
-/// read, Reviewer BP-2a F2), otherwise `500`, as is a failed read.
+/// `Active` or `Ending`, as the events socket) → the sector read. A missing sector goes to
+/// the demo's `repair_missing_sector` (BP-1d, demo-only, in `routes/campaign.rs`): `409` once
+/// the campaign is no longer `Active` (retired there, or by a raced retire), the sector if a
+/// launch wrote it meanwhile, `500` for `Ending`. A failed read is `500`.
 /// - **Pre-fog:** Phase 1 stubs fog of war as full visibility, so every terrain hex and
 ///   every vein is returned. Phase 2's per-player vision filters inside this projection.
 /// - `gateway` is `null` until the launch has assigned it, or if it never did.
@@ -98,24 +99,7 @@ async fn get_campaign_sector(
     let sector_id = campaign.sector_id;
     let sector = match state.sector_repo.get_sector(sector_id).await {
         Ok(Some(s)) => s,
-        Ok(None) => {
-            // Reviewer BP-2a F2: a retire (an abandon, or a failed launch's) may have landed
-            // since the state check, deleting the sector; then this is a `409`, not a fault.
-            let reread = match state.campaign_repo.get_campaign(campaign_id).await {
-                Ok(c) => c,
-                Err(e) => {
-                    return Err(internal_error(format!("get_campaign_sector: re-read of campaign {campaign_id} failed after sector {sector_id} was missing: {e}")));
-                }
-            };
-            let still_admitted = match &reread {
-                Some(c) => matches!(c.state, CampaignLifecycle::Active | CampaignLifecycle::Ending),
-                None => true,
-            };
-            if !still_admitted {
-                return Err(conflict("campaign is not active"));
-            }
-            return Err(internal_error(format!("get_campaign_sector: sector {sector_id} of campaign {campaign_id} is missing")));
-        }
+        Ok(None) => super::campaign::repair_missing_sector(Arc::clone(&state), campaign_id, sector_id).await?,
         Err(e) => {
             return Err(internal_error(format!("get_campaign_sector: get_sector failed for sector {sector_id} of campaign {campaign_id}: {e}")));
         }
@@ -356,13 +340,31 @@ mod tests {
         assert!(!text.contains(&other_array), "OTHER's address (byte array) leaked");
     }
 
-    /// An admitted campaign whose sector was never stored.
+    /// BP-1d: an `Active` campaign whose sector is missing (Redis lost it) is retired by the
+    /// demo repair, and the route answers `409`, so the client re-joins.
     #[tokio::test]
-    async fn sector_missing_from_the_store_is_500() {
+    async fn sector_missing_on_an_active_campaign_is_retired_409() {
         let state = signed_in();
         let c = campaign_with(&state, WALLET, CampaignLifecycle::Active, Some((3, -5))).await;
-        let (status, _) = get(&state, Some("t"), c.campaign_id).await;
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let (status, body) = get(&state, Some("t"), c.campaign_id).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"], "campaign is not active");
+        let after = state.campaign_repo.get_campaign(c.campaign_id).await.unwrap().expect("campaign");
+        assert_eq!(after.state, CampaignLifecycle::Archived, "the sectorless campaign was retired");
+        assert_eq!(state.launch_locks.len(), 0, "no launch lock left behind");
+    }
+
+    /// BP-1d: `retire_if_active` never retires `Ending`, so the repair keeps today's `500`.
+    #[tokio::test]
+    async fn sector_missing_on_an_ending_campaign_stays_500() {
+        let state = signed_in();
+        let c = campaign_with(&state, WALLET, CampaignLifecycle::Ending, None).await;
+        let (status, body) = get(&state, Some("t"), c.campaign_id).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert_eq!(body["error"], "internal error");
+        let after = state.campaign_repo.get_campaign(c.campaign_id).await.unwrap().expect("campaign");
+        assert_eq!(after.state, CampaignLifecycle::Ending, "not retired");
+        assert_eq!(state.launch_locks.len(), 0, "no launch lock left behind");
     }
 
     /// Reviewer BP-2a F2: archives the campaign as if a retire landed between the route's
