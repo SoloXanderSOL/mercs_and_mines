@@ -64,12 +64,6 @@ pub const CHECKOUT_CONFIRM_PER_WALLET: u32 = 30;
 pub const CHECKOUT_CHECKS_PER_WINDOW: u32 = 4;
 pub const CHECKOUT_CHECK_WINDOW: Duration = Duration::from_secs(10);
 
-/// The mission route (BP-3b-1, keeper). Every accepted call writes permanent rows, one of
-/// them the whole request in the immutable `input_logs`, and wallets are free, so the
-/// per-address limit bounds a script and the per-wallet limit bounds a player.
-pub const MISSION_PER_IP: u32 = 60;
-pub const MISSION_PER_WALLET: u32 = 6;
-
 /// What a request is counted against. IPv4 whole; IPv6 by its /64 (`V6Net` holds the top
 /// 64 bits), so one host can't mint fresh buckets from its own prefix. `Shared` is the one
 /// bucket for a loopback peer that sent no usable `X-Real-IP`.
@@ -307,9 +301,6 @@ pub struct RateLimits {
     pub checkout_checks: FixedWindow<()>,
     /// Journals refusals at the chain-check ceiling: the first, then at most hourly.
     pub checkout_checks_warn: RateWarn,
-    /// The mission route (BP-3b-1): per address and per wallet.
-    pub mission_ip: FixedWindow<ClientKey>,
-    pub mission_wallet: FixedWindow<String>,
     pub join_ip: FixedWindow<ClientKey>,
     pub join_wallet: FixedWindow<String>,
     pub replacement_ip: FixedWindow<ClientKey>,
@@ -343,8 +334,6 @@ impl RateLimits {
             checkout_confirm_wallet: w("checkout_confirm_wallet", CHECKOUT_CONFIRM_PER_WALLET),
             checkout_checks: FixedWindow::new("checkout_checks", CHECKOUT_CHECKS_PER_WINDOW, CHECKOUT_CHECK_WINDOW, RATE_LIMIT_MAP_CAP),
             checkout_checks_warn: RateWarn::new(),
-            mission_ip: w("mission_ip", MISSION_PER_IP),
-            mission_wallet: w("mission_wallet", MISSION_PER_WALLET),
             join_ip: w("join_ip", JOIN_PER_IP),
             join_wallet: w("join_wallet", JOIN_PER_WALLET),
             replacement_ip: w("replacement_ip", REPLACEMENT_PER_IP),
