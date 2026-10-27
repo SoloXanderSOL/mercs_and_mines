@@ -74,18 +74,21 @@ fn u32_with_warn(get: impl Fn(&str) -> Option<String>, key: &str, default: u32, 
 
 /// The env key for the mainnet RPC URL (BP-4). Its value carries a provider key.
 pub(crate) const SOLANA_MAINNET_RPC_URL_KEY: &str = "SOLANA_MAINNET_RPC_URL";
+/// The env key for the devnet RPC URL the checkout confirms against (BP-5). A keyed value
+/// is a secret, as the mainnet one is.
+pub(crate) const SOLANA_DEVNET_RPC_URL_KEY: &str = "SOLANA_DEVNET_RPC_URL";
 
 /// Reads an RPC URL that may carry a provider key. Unset or empty → `None`, silently. Set
 /// but not an `http`/`https` URL → `None`, with a warning that names the key and never the
 /// value (unlike `parse_or_warn`, which journals the raw value).
-fn rpc_url_or_warn(get: impl Fn(&str) -> Option<String>, key: &str) -> Option<RpcUrl> {
+fn rpc_url_or_warn(get: impl Fn(&str) -> Option<String>, key: &str, feature: &str) -> Option<RpcUrl> {
     let raw = get(key)?;
     if raw.is_empty() {
         return None;
     }
     let url = RpcUrl::parse(&raw);
     if url.is_none() {
-        tracing::warn!("{key} is set but is not a usable http(s) URL; genesis lookups are off");
+        tracing::warn!("{key} is set but is not a usable http(s) URL; {feature} is off");
     }
     url
 }
@@ -124,6 +127,9 @@ pub struct ServerConfig {
     /// provider key: `RpcUrl`'s `Debug` redacts it. `None` (unset, empty or unusable)
     /// turns the lookup off.
     pub solana_mainnet_rpc_url: Option<RpcUrl>,
+    /// The devnet Solana JSON-RPC URL the checkout confirms payments against (BP-5).
+    /// `None` (unset, empty or unusable) turns checkout off.
+    pub solana_devnet_rpc_url: Option<RpcUrl>,
 }
 
 impl Default for ServerConfig {
@@ -136,6 +142,7 @@ impl Default for ServerConfig {
             default_max_ticks:          50,
             join_enabled:               false,
             solana_mainnet_rpc_url:     None,
+            solana_devnet_rpc_url:      None,
         }
     }
 }
@@ -155,7 +162,8 @@ impl ServerConfig {
             combat_session_stale_secs:  parse_or_warn(&get, "COMBAT_SESSION_STALE_SECS", 300),
             default_max_ticks:          parse_or_warn(&get, "DEFAULT_MAX_TICKS",         50),
             join_enabled:               parse_or_warn(&get, "MERCS_JOIN_ENABLED",        false),
-            solana_mainnet_rpc_url:     rpc_url_or_warn(&get, SOLANA_MAINNET_RPC_URL_KEY),
+            solana_mainnet_rpc_url:     rpc_url_or_warn(&get, SOLANA_MAINNET_RPC_URL_KEY, "the Genesis Token lookup"),
+            solana_devnet_rpc_url:      rpc_url_or_warn(&get, SOLANA_DEVNET_RPC_URL_KEY, "checkout"),
         }
     }
 }
@@ -397,6 +405,15 @@ mod tests {
         let shown = format!("{cfg:?}");
         assert!(!shown.contains("SECRETKEY") && !shown.contains("rpc.example"), "Debug leaked the URL: {shown}");
         assert!(shown.contains("RpcUrl(<redacted>)"), "Debug still lists the field: {shown}");
+    }
+
+    /// BP-5 — the devnet RPC URL reads like the mainnet one, into its own field.
+    #[test]
+    fn solana_devnet_rpc_url_reads_into_its_own_field() {
+        let cfg = ServerConfig::from_lookup(lookup(&[("SOLANA_DEVNET_RPC_URL", "https://api.devnet.solana.com")]));
+        assert!(cfg.solana_devnet_rpc_url.is_some() && cfg.solana_mainnet_rpc_url.is_none());
+        assert!(ServerConfig::default().solana_devnet_rpc_url.is_none(), "Default → None");
+        assert!(ServerConfig::from_lookup(lookup(&[("SOLANA_DEVNET_RPC_URL", "not a url")])).solana_devnet_rpc_url.is_none());
     }
 
     /// INF-6b — an unspecified (all-interfaces) bind warns, naming the address.

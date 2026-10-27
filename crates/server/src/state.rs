@@ -100,6 +100,11 @@ pub struct AppState {
     /// The Genesis Token lookup client (BP-4). `None` when no RPC URL is configured (tests,
     /// CI, production), and `GET /api/genesis` then answers `503`.
     pub genesis: Option<Arc<crate::genesis::GenesisRpc>>,
+    /// The checkout rail (BP-5). `None` when no devnet RPC URL is configured (tests, CI,
+    /// production), and the checkout routes then answer `503`.
+    pub checkout_rail: Option<Arc<dyn crate::payment::PaymentRail>>,
+    /// The checkout intents and receipts (BP-5): in memory, bounded.
+    pub checkout: crate::checkout_store::CheckoutStore,
     /// Postgres connection pool. None only in unit-test contexts that use in-memory repos.
     /// Production startup panics if DATABASE_URL is unset; pool is always Some in prod.
     pub pool: Option<sqlx::PgPool>,
@@ -146,6 +151,8 @@ impl AppState {
             convoy_repo:         Arc::new(InMemoryConvoyRepository),
             convoy_event_senders: DashMap::new(),
             genesis:            crate::genesis::from_config(config.server.solana_mainnet_rpc_url.as_ref()),
+            checkout_rail:      crate::demo_checkout::rail(config.server.solana_devnet_rpc_url.as_ref()),
+            checkout:           crate::checkout_store::CheckoutStore::default(),
             config,
             pool:               None,
             redis:              None,

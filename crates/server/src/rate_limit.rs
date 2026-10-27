@@ -52,6 +52,18 @@ pub const GENESIS_PER_IP: u32 = 20;
 pub const GENESIS_PER_WALLET: u32 = 3;
 pub const GENESIS_ALL_PER_MINUTE: u32 = 120;
 
+/// The checkout (BP-5, keeper). A chain check spends up to three calls on the devnet RPC,
+/// whose public endpoint allows 10 calls per method per ~10 s from the droplet's one
+/// address and counts refused calls. So `CHECKOUT_CHECKS_PER_WINDOW` per
+/// `CHECKOUT_CHECK_WINDOW` (one bucket for everyone) is the bound, and two windows back
+/// to back stay under 10 lookups. Over it the confirm answers `503` with `Retry-After`.
+pub const CHECKOUT_INTENT_PER_IP: u32 = 30;
+pub const CHECKOUT_INTENT_PER_WALLET: u32 = 5;
+pub const CHECKOUT_CONFIRM_PER_IP: u32 = 120;
+pub const CHECKOUT_CONFIRM_PER_WALLET: u32 = 30;
+pub const CHECKOUT_CHECKS_PER_WINDOW: u32 = 4;
+pub const CHECKOUT_CHECK_WINDOW: Duration = Duration::from_secs(10);
+
 /// What a request is counted against. IPv4 whole; IPv6 by its /64 (`V6Net` holds the top
 /// 64 bits), so one host can't mint fresh buckets from its own prefix. `Shared` is the one
 /// bucket for a loopback peer that sent no usable `X-Real-IP`.
@@ -280,6 +292,15 @@ pub struct RateLimits {
     pub genesis_all: FixedWindow<()>,
     /// Journals refusals at the global ceiling: the first, then at most hourly with a count.
     pub genesis_all_warn: RateWarn,
+    /// The checkout (BP-5): starts and confirms per address and per wallet, and one global
+    /// ceiling on chain checks.
+    pub checkout_intent_ip: FixedWindow<ClientKey>,
+    pub checkout_intent_wallet: FixedWindow<String>,
+    pub checkout_confirm_ip: FixedWindow<ClientKey>,
+    pub checkout_confirm_wallet: FixedWindow<String>,
+    pub checkout_checks: FixedWindow<()>,
+    /// Journals refusals at the chain-check ceiling: the first, then at most hourly.
+    pub checkout_checks_warn: RateWarn,
     pub join_ip: FixedWindow<ClientKey>,
     pub join_wallet: FixedWindow<String>,
     pub replacement_ip: FixedWindow<ClientKey>,
@@ -307,6 +328,12 @@ impl RateLimits {
             genesis_wallet: w("genesis_wallet", GENESIS_PER_WALLET),
             genesis_all: w("genesis_all", GENESIS_ALL_PER_MINUTE),
             genesis_all_warn: RateWarn::new(),
+            checkout_intent_ip: w("checkout_intent_ip", CHECKOUT_INTENT_PER_IP),
+            checkout_intent_wallet: w("checkout_intent_wallet", CHECKOUT_INTENT_PER_WALLET),
+            checkout_confirm_ip: w("checkout_confirm_ip", CHECKOUT_CONFIRM_PER_IP),
+            checkout_confirm_wallet: w("checkout_confirm_wallet", CHECKOUT_CONFIRM_PER_WALLET),
+            checkout_checks: FixedWindow::new("checkout_checks", CHECKOUT_CHECKS_PER_WINDOW, CHECKOUT_CHECK_WINDOW, RATE_LIMIT_MAP_CAP),
+            checkout_checks_warn: RateWarn::new(),
             join_ip: w("join_ip", JOIN_PER_IP),
             join_wallet: w("join_wallet", JOIN_PER_WALLET),
             replacement_ip: w("replacement_ip", REPLACEMENT_PER_IP),
