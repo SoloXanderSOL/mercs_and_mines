@@ -1,18 +1,16 @@
 //! The Seeker Genesis Token (SGT) lookup (BP-4, keeper). Read-only, mainnet, hand-rolled
-//! JSON-RPC over `reqwest` (ODQ-52 (a)). The recipe is Solana Mobile's
+//! JSON-RPC over `crate::json_rpc` (ODQ-52 (a)). The recipe is Solana Mobile's
 //! `@solana-mobile/skr-genesis-token@1.0.1`: list the owner's Token-2022 accounts, drop the
 //! zero balances, fetch the mints, and accept a mint whose `MetadataPointer` (type 18) and
 //! `TokenGroupMember` (type 23) both name the SGT group. It gates nothing (ODQ-53 (a)).
-//!
-//! The RPC URL carries a provider key, so it never reaches a log: `RpcUrl`'s `Debug` redacts
-//! it, and every `reqwest::Error` goes through `rpc_error_text`, which strips the URL.
 
-use std::error::Error as _;
 use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine as _;
 use serde_json::{json, Value};
+
+use crate::json_rpc::{JsonRpc, RpcUrl, RPC_CONNECT_TIMEOUT, RPC_TIMEOUT};
 
 /// The Token-2022 program, owner of every SGT mint and token account.
 pub const TOKEN_2022_PROGRAM: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
@@ -21,11 +19,6 @@ pub const SGT_GROUP: &str = "GT22s89nU4iWFkNXj1Bw6uYhJJWDRPpShHt4Bk8f99Te";
 /// Mints checked per lookup: one `getMultipleAccounts` call. A wallet with more non-zero
 /// Token-2022 mints is checked on the first 100 in string order.
 pub const MAX_MINTS: usize = 100;
-/// The largest RPC response body read; a larger one fails the lookup.
-pub const MAX_RPC_BODY: usize = 1024 * 1024;
-pub const RPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
-/// Per call, send plus body.
-pub const RPC_TIMEOUT: Duration = Duration::from_secs(3);
 
 const EXT_METADATA_POINTER: u16 = 18;
 const EXT_GROUP_MEMBER: u16 = 23;
@@ -33,46 +26,9 @@ const EXT_GROUP_MEMBER: u16 = 23;
 const ACCOUNT_TYPE_AT: usize = 165;
 const TLV_START: usize = 166;
 
-/// A JSON-RPC endpoint URL that may carry a provider key. `Debug` never prints it.
-#[derive(Clone)]
-pub struct RpcUrl(reqwest::Url);
-
-impl RpcUrl {
-    /// An `http` or `https` URL; anything else is `None`.
-    pub fn parse(raw: &str) -> Option<Self> {
-        let url = reqwest::Url::parse(raw).ok()?;
-        if matches!(url.scheme(), "http" | "https") {
-            Some(Self(url))
-        } else {
-            None
-        }
-    }
-}
-
-impl std::fmt::Debug for RpcUrl {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("RpcUrl(<redacted>)")
-    }
-}
-
-/// A `reqwest::Error` as text, URL stripped, followed by its source chain (the cause: a
-/// timeout, a refused connection). Never format a `reqwest::Error` any other way.
-pub fn rpc_error_text(e: reqwest::Error) -> String {
-    let e = e.without_url();
-    let mut text = e.to_string();
-    let mut cause = e.source();
-    while let Some(c) = cause {
-        text.push_str(": ");
-        text.push_str(&c.to_string());
-        cause = c.source();
-    }
-    text
-}
-
-/// The lookup client: one connection pool, no redirects, no proxy.
+/// The lookup client.
 pub struct GenesisRpc {
-    client: reqwest::Client,
-    url: RpcUrl,
+    rpc: JsonRpc,
 }
 
 /// The client `AppState` holds. `None` when no URL is configured, or when the client fails
@@ -93,14 +49,7 @@ pub fn from_config(url: Option<&RpcUrl>) -> Option<Arc<GenesisRpc>> {
 
 impl GenesisRpc {
     pub fn new(url: RpcUrl, connect_timeout: Duration, timeout: Duration) -> Result<Self, String> {
-        let client = reqwest::Client::builder()
-            .connect_timeout(connect_timeout)
-            .timeout(timeout)
-            .redirect(reqwest::redirect::Policy::none())
-            .no_proxy()
-            .build()
-            .map_err(rpc_error_text)?;
-        Ok(Self { client, url })
+        Ok(Self { rpc: JsonRpc::new(url, connect_timeout, timeout)? })
     }
 
     /// The SGT lookup for `owner` (base58). `Ok(None)`: no SGT. `Ok(Some(mint))`: the
@@ -109,6 +58,7 @@ impl GenesisRpc {
     /// A mint that can't be read is "not an SGT", never an error.
     pub async fn lookup(&self, owner: &str) -> Result<Option<String>, String> {
         let accounts = self
+            .rpc
             .call(
                 "getTokenAccountsByOwner",
                 json!([owner, {"programId": TOKEN_2022_PROGRAM}, {"commitment": "confirmed", "encoding": "jsonParsed"}]),
@@ -119,6 +69,7 @@ impl GenesisRpc {
             return Ok(None);
         }
         let infos = self
+            .rpc
             .call("getMultipleAccounts", json!([&mints, {"commitment": "confirmed", "encoding": "base64"}]))
             .await?;
         let values = infos["value"].as_array().ok_or("getMultipleAccounts: result.value is not an array")?;
@@ -129,42 +80,20 @@ impl GenesisRpc {
             mints.iter().zip(values).filter(|(_, account)| is_sgt_account(account)).map(|(mint, _)| mint).collect();
         Ok(sgts.into_iter().min().cloned())
     }
-
-    /// One JSON-RPC call; returns its `result`. The body is read up to `MAX_RPC_BODY`.
-    async fn call(&self, method: &str, params: Value) -> Result<Value, String> {
-        let request = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
-        let mut resp = self
-            .client
-            .post(self.url.0.clone())
-            .json(&request)
-            .send()
-            .await
-            .and_then(reqwest::Response::error_for_status)
-            .map_err(|e| format!("{method}: {}", rpc_error_text(e)))?;
-        let mut body = Vec::new();
-        while let Some(chunk) = resp.chunk().await.map_err(|e| format!("{method}: {}", rpc_error_text(e)))? {
-            if body.len() + chunk.len() > MAX_RPC_BODY {
-                return Err(format!("{method}: response body over {MAX_RPC_BODY} bytes"));
-            }
-            body.extend_from_slice(&chunk);
-        }
-        let reply: Value = serde_json::from_slice(&body).map_err(|e| format!("{method}: body is not JSON ({e})"))?;
-        if let Some(error) = reply.get("error").filter(|e| !e.is_null()) {
-            return Err(format!("{method}: JSON-RPC error {error}"));
-        }
-        reply.get("result").cloned().ok_or_else(|| format!("{method}: reply has no result"))
-    }
 }
 
 /// The distinct mints of the non-zero accounts in a `getTokenAccountsByOwner` result, in
-/// string order, at most `MAX_MINTS`. An element without a mint or an amount is an error.
+/// string order, at most `MAX_MINTS`. An element whose mint or amount can't be read (the
+/// RPC falls back to base64 for an account it can't parse) is "not held", never an error
+/// (Reviewer BP-4 F3), the mirror of the mint side's "unreadable = not an SGT".
 fn held_mints(result: &Value) -> Result<Vec<String>, String> {
     let list = result["value"].as_array().ok_or("getTokenAccountsByOwner: result.value is not an array")?;
     let mut mints = std::collections::BTreeSet::new();
     for account in list {
         let info = &account["account"]["data"]["parsed"]["info"];
-        let mint = info["mint"].as_str().ok_or("getTokenAccountsByOwner: an account has no mint")?;
-        let amount = info["tokenAmount"]["amount"].as_str().ok_or("getTokenAccountsByOwner: an account has no amount")?;
+        let (Some(mint), Some(amount)) = (info["mint"].as_str(), info["tokenAmount"]["amount"].as_str()) else {
+            continue;
+        };
         if amount != "0" {
             mints.insert(mint.to_string());
         }
@@ -262,7 +191,8 @@ pub(crate) mod fixtures {
 #[cfg(test)]
 mod tests {
     use super::fixtures::{mint, naming, sgt, sgt_group, sgt_like, OTHER_GROUP};
-    use super::{is_sgt_mint, GenesisRpc, RpcUrl, RPC_CONNECT_TIMEOUT, RPC_TIMEOUT, TOKEN_2022_PROGRAM};
+    use super::{held_mints, is_sgt_mint, TOKEN_2022_PROGRAM};
+    use serde_json::json;
 
     #[test]
     fn sgt_mint_with_the_real_layout_is_an_sgt() {
@@ -305,9 +235,18 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn genesis_rpc_client_builds() {
-        let url = RpcUrl::parse("https://rpc.example/?api-key=SECRETKEY").expect("an https URL parses");
-        assert!(GenesisRpc::new(url, RPC_CONNECT_TIMEOUT, RPC_TIMEOUT).is_ok());
+    /// Reviewer BP-4 F3: an element the RPC returned as base64 (no `parsed.info`) is skipped,
+    /// and the parsed element beside it still counts.
+    #[test]
+    fn genesis_unparsed_account_is_not_held() {
+        let result = json!({"value": [
+            {"pubkey": "AccountRaw", "account": {"owner": TOKEN_2022_PROGRAM, "data": ["AAAA", "base64"]}},
+            {"pubkey": "AccountParsed", "account": {"owner": TOKEN_2022_PROGRAM, "data": {
+                "program": "spl-token-2022",
+                "parsed": {"type": "account", "info": {"mint": "MintSgtOne", "tokenAmount": {"amount": "1"}}},
+            }}},
+        ]});
+        assert_eq!(held_mints(&result), Ok(vec!["MintSgtOne".to_string()]));
+        assert!(held_mints(&json!({"value": "nope"})).is_err(), "a value that isn't a list is still an error");
     }
 }

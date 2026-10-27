@@ -5,7 +5,7 @@
 // See .env.example for the full variable list and commentary.
 
 use sim_engine::config::SimConfig;
-use crate::genesis::RpcUrl;
+use crate::json_rpc::RpcUrl;
 
 // ── Helper readers ────────────────────────────────────────────────────────────
 

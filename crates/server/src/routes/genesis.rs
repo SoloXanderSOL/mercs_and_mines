@@ -73,7 +73,8 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::genesis::fixtures::{mint, sgt};
-    use crate::genesis::{GenesisRpc, RpcUrl, TOKEN_2022_PROGRAM};
+    use crate::genesis::{GenesisRpc, TOKEN_2022_PROGRAM};
+    use crate::json_rpc::RpcUrl;
     use crate::routes::{serve_on_loopback, with_test_peer, TEST_PEER};
     use axum::body::Body;
     use axum::http::{header, Request, StatusCode};
