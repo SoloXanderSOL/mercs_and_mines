@@ -616,6 +616,17 @@ begins.
   Flaw trigger, loot) is ever seeded from a stored or displayed generator seed:** each roll
   takes a fresh seed when it happens (`generate_seed()`), as the mission route does.
 
+* **Story content never enters this repo (ODQ-60, 2026-10-27):** the engine is public and the
+  story is private. For any Story Event not marked `public: true` in the Wiki's
+  `Story_Events_Catalogue`, its prose, choice text, consequences, flag writes, chain edges
+  and trigger conditions (and any Victory Condition source keyed to one event) never appear
+  here: not in code, comments, test names, fixtures, docs, this file or **commit messages**.
+  Real content lives in the private `mercs_and_mines_content` repo. Refer to events by ID
+  only (`EVT-019`); tests use invented `EVT-TEST-*` events. The client receives only the
+  current card's prose and its visible choice labels. Every Story Event brick greps code and
+  `git log` for its events' titles and one distinctive phrase each, and expects 0. World lore
+  (faction and setting descriptions, `app/lore.html`) is public by design and not covered.
+
 ---
 
 ## 5. WSL EXECUTION ENVIRONMENT
