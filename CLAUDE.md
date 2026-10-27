@@ -27,7 +27,7 @@ Before writing any code, read the Phase 1 Alpha Foundation document to understan
 is already built. Do not guess — read it. The status block at the top of that document
 is the ground truth.
 
-As of 2026-10-18:
+As of 2026-10-27 (`dev` frozen since 2026-10-25 for the Breakpoint demo):
 
 - **Section 1 (Database Layer):** 1a (Postgres) and 1b (Redis) complete. **1c-3 (the
   GAP-34 fix) built at `bb49b3c`:** `session_start` (header + full request + timestamp)
@@ -405,14 +405,16 @@ As of 2026-10-18:
   open can park its handler in `socket.send().await` (memory bounded at 64 events). Live
   socket tests serve through `routes::serve_on_loopback` (`cfg(test)`) and connect with
   the dev-dependencies `tokio-tungstenite` 0.24 + `futures-util` 0.3. No R7, no migration,
-  no `.sqlx/` change. **Unpushed.**
+  no `.sqlx/` change. **Pushed and deployed 2026-10-25.**
 
 **461/461 tests green (1 `shared` + 231 `mercs_server` lib + 2 `aar_determinism` + 156
-`db_infrastructure` + 71 `sim_engine`; single-threaded, verified at `53d4c72` on rustc
+`db_infrastructure` + 71 `sim_engine`; single-threaded, verified at `dbbcd84` on rustc
 1.99.1). Workspace version `0.3.0`. `.sqlx/` holds 77 files; the latest migration is
-`0032_usable_replacement_and_card_provenance`. `main` = `a374602` (INF-6c-2b-2, deployed
-2026-10-23); `dev` is ahead with INF-6d, unpushed.
-Next: the Breakpoint freeze; no §5b until 2026-11-18.** Any brick that changes what `resolve_mission` produces for
+`0032_usable_replacement_and_card_provenance`. `main` = `dev` = `dbbcd84` (INF-6d, deployed
+2026-10-25; joins ON in production since that day).
+Next: the Breakpoint freeze; no §5b until 2026-11-18. Demo work runs on the `breakpoint`
+branch (`Wiki/GDD/Breakpoint_Demo_Plan.md`) and comes back here as reviewed keeper bricks
+after the freeze.** Any brick that changes what `resolve_mission` produces for
 a given seed bumps the workspace version in the same brick. 4b-1 reused `sim-engine`'s `OutcomeType` rather than
 defining a new enum, and writes **no input-log entry** — the rank-up entry was removed
 from scope. **ODQ-22 and ODQ-23 were ruled 2026-09-03 — engagement and mission outcomes
@@ -607,6 +609,12 @@ begins.
   the first production caller then checks that `.prev` knows the variant. Deserialising is
   the guarantee; replay equality across a version bump is not. Current examples: `CombatResolveRequest` and
   everything inside it, including the sim `Commander`.
+
+* **Generator seeds are provenance, never secrets (Reviewer BP-2b-2 F3, 2026-10-26):** a
+  record's `prng_seed_state` is a `u32` and the generators are public, so the seed can be
+  recovered offline from what the record shows. **No later roll (mission, stress, Fatal
+  Flaw trigger, loot) is ever seeded from a stored or displayed generator seed:** each roll
+  takes a fresh seed when it happens (`generate_seed()`), as the mission route does.
 
 ---
 
