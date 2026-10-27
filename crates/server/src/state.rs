@@ -97,6 +97,9 @@ pub struct AppState {
     /// Sender map for convoy event WebSocket notifications, keyed by campaign_id.
     pub convoy_event_senders: DashMap<Uuid, mpsc::Sender<ConvoyEvent>>,
     pub config: Arc<Config>,
+    /// The Genesis Token lookup client (BP-4). `None` when no RPC URL is configured (tests,
+    /// CI, production), and `GET /api/genesis` then answers `503`.
+    pub genesis: Option<Arc<crate::genesis::GenesisRpc>>,
     /// Postgres connection pool. None only in unit-test contexts that use in-memory repos.
     /// Production startup panics if DATABASE_URL is unset; pool is always Some in prod.
     pub pool: Option<sqlx::PgPool>,
@@ -142,6 +145,7 @@ impl AppState {
             timer_repo:          Arc::new(InMemoryTimerRepository::new()),
             convoy_repo:         Arc::new(InMemoryConvoyRepository),
             convoy_event_senders: DashMap::new(),
+            genesis:            crate::genesis::from_config(config.server.solana_mainnet_rpc_url.as_ref()),
             config,
             pool:               None,
             redis:              None,

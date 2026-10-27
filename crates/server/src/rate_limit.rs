@@ -45,6 +45,13 @@ pub const SECTOR_READ_PER_WALLET: u32 = 10;
 pub const ROSTER_READ_PER_IP: u32 = 120;
 pub const ROSTER_READ_PER_WALLET: u32 = 10;
 
+/// The Genesis Token lookup (BP-4, keeper). A lookup spends up to two calls on the
+/// provider key and wallets are free, so `GENESIS_ALL_PER_MINUTE` (one key for everyone)
+/// is the bound on the key's quota: over it the route answers `503`.
+pub const GENESIS_PER_IP: u32 = 20;
+pub const GENESIS_PER_WALLET: u32 = 3;
+pub const GENESIS_ALL_PER_MINUTE: u32 = 120;
+
 /// What a request is counted against. IPv4 whole; IPv6 by its /64 (`V6Net` holds the top
 /// 64 bits), so one host can't mint fresh buckets from its own prefix. `Shared` is the one
 /// bucket for a loopback peer that sent no usable `X-Real-IP`.
@@ -267,6 +274,12 @@ pub struct RateLimits {
     /// The roster read route (ODQ-57): per address and per wallet.
     pub roster_ip: FixedWindow<ClientKey>,
     pub roster_wallet: FixedWindow<String>,
+    /// The Genesis Token lookup (BP-4): per address, per wallet, and one global ceiling.
+    pub genesis_ip: FixedWindow<ClientKey>,
+    pub genesis_wallet: FixedWindow<String>,
+    pub genesis_all: FixedWindow<()>,
+    /// Journals refusals at the global ceiling: the first, then at most hourly with a count.
+    pub genesis_all_warn: RateWarn,
     pub join_ip: FixedWindow<ClientKey>,
     pub join_wallet: FixedWindow<String>,
     pub replacement_ip: FixedWindow<ClientKey>,
@@ -290,6 +303,10 @@ impl RateLimits {
             sector_wallet: w("sector_wallet", SECTOR_READ_PER_WALLET),
             roster_ip: w("roster_ip", ROSTER_READ_PER_IP),
             roster_wallet: w("roster_wallet", ROSTER_READ_PER_WALLET),
+            genesis_ip: w("genesis_ip", GENESIS_PER_IP),
+            genesis_wallet: w("genesis_wallet", GENESIS_PER_WALLET),
+            genesis_all: w("genesis_all", GENESIS_ALL_PER_MINUTE),
+            genesis_all_warn: RateWarn::new(),
             join_ip: w("join_ip", JOIN_PER_IP),
             join_wallet: w("join_wallet", JOIN_PER_WALLET),
             replacement_ip: w("replacement_ip", REPLACEMENT_PER_IP),

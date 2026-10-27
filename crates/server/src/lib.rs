@@ -3,6 +3,7 @@ pub mod commander_gen;
 pub mod config;
 pub mod field_leader_gen;
 pub mod foreman_gen;
+pub mod genesis;
 pub mod advisor_gen;
 pub mod augmentee_gen;
 pub mod api_types;

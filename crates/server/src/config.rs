@@ -5,6 +5,7 @@
 // See .env.example for the full variable list and commentary.
 
 use sim_engine::config::SimConfig;
+use crate::genesis::RpcUrl;
 
 // ── Helper readers ────────────────────────────────────────────────────────────
 
@@ -71,6 +72,24 @@ fn u32_with_warn(get: impl Fn(&str) -> Option<String>, key: &str, default: u32, 
     }
 }
 
+/// The env key for the mainnet RPC URL (BP-4). Its value carries a provider key.
+pub(crate) const SOLANA_MAINNET_RPC_URL_KEY: &str = "SOLANA_MAINNET_RPC_URL";
+
+/// Reads an RPC URL that may carry a provider key. Unset or empty → `None`, silently. Set
+/// but not an `http`/`https` URL → `None`, with a warning that names the key and never the
+/// value (unlike `parse_or_warn`, which journals the raw value).
+fn rpc_url_or_warn(get: impl Fn(&str) -> Option<String>, key: &str) -> Option<RpcUrl> {
+    let raw = get(key)?;
+    if raw.is_empty() {
+        return None;
+    }
+    let url = RpcUrl::parse(&raw);
+    if url.is_none() {
+        tracing::warn!("{key} is set but is not a usable http(s) URL; genesis lookups are off");
+    }
+    url
+}
+
 // ── Server config ─────────────────────────────────────────────────────────────
 
 /// Fallback bind address when SERVER_BIND_ADDR is unset. LOOPBACK ON PURPOSE.
@@ -101,6 +120,10 @@ pub struct ServerConfig {
     pub default_max_ticks: usize,
     /// The join switch, from `MERCS_JOIN_ENABLED` (exactly `true` opens joins). Off by default until INF-6's rate limit is live.
     pub join_enabled: bool,
+    /// The mainnet Solana JSON-RPC URL for the Genesis Token lookup (BP-4). It carries a
+    /// provider key: `RpcUrl`'s `Debug` redacts it. `None` (unset, empty or unusable)
+    /// turns the lookup off.
+    pub solana_mainnet_rpc_url: Option<RpcUrl>,
 }
 
 impl Default for ServerConfig {
@@ -112,6 +135,7 @@ impl Default for ServerConfig {
             combat_session_stale_secs:  300,
             default_max_ticks:          50,
             join_enabled:               false,
+            solana_mainnet_rpc_url:     None,
         }
     }
 }
@@ -131,6 +155,7 @@ impl ServerConfig {
             combat_session_stale_secs:  parse_or_warn(&get, "COMBAT_SESSION_STALE_SECS", 300),
             default_max_ticks:          parse_or_warn(&get, "DEFAULT_MAX_TICKS",         50),
             join_enabled:               parse_or_warn(&get, "MERCS_JOIN_ENABLED",        false),
+            solana_mainnet_rpc_url:     rpc_url_or_warn(&get, SOLANA_MAINNET_RPC_URL_KEY),
         }
     }
 }
@@ -354,6 +379,24 @@ mod tests {
     #[test]
     fn server_config_from_lookup_reads_the_join_switch() {
         assert_eq!(ServerConfig::from_lookup(lookup(&[("MERCS_JOIN_ENABLED", "true")])).join_enabled, true);
+    }
+
+    /// BP-4 — the RPC URL: unset, empty or unusable → `None`, an http(s) URL → `Some`, and
+    /// the config's `Debug` never shows the URL or its key.
+    #[test]
+    fn solana_rpc_url_reads_and_never_prints() {
+        let key = "SOLANA_MAINNET_RPC_URL";
+        let read = |pairs: &[(&str, &str)]| ServerConfig::from_lookup(lookup(pairs)).solana_mainnet_rpc_url;
+        assert!(read(&[]).is_none(), "unset → None");
+        for bad in ["", "not a url", "ftp://rpc.example/?api-key=SECRETKEY"] {
+            assert!(read(&[(key, bad)]).is_none(), "{bad:?} must read as None");
+        }
+        assert!(ServerConfig::default().solana_mainnet_rpc_url.is_none(), "Default → None");
+        let cfg = ServerConfig::from_lookup(lookup(&[(key, "https://rpc.example/?api-key=SECRETKEY")]));
+        assert!(cfg.solana_mainnet_rpc_url.is_some(), "an https URL → Some");
+        let shown = format!("{cfg:?}");
+        assert!(!shown.contains("SECRETKEY") && !shown.contains("rpc.example"), "Debug leaked the URL: {shown}");
+        assert!(shown.contains("RpcUrl(<redacted>)"), "Debug still lists the field: {shown}");
     }
 
     /// INF-6b — an unspecified (all-interfaces) bind warns, naming the address.

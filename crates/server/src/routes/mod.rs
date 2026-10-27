@@ -8,6 +8,7 @@ pub mod admin;
 mod campaign;
 pub mod convoy_events;
 pub mod convoys;
+mod genesis;
 mod roster;
 mod sector;
 pub mod ws_combat;
@@ -94,6 +95,12 @@ fn forbidden(msg: impl Into<String>) -> AppError {
 /// A `503` with the house JSON body. The helper journals nothing; a caller that refuses under load journals through its own `RateWarn`.
 fn service_unavailable(msg: impl Into<String>) -> AppError {
     (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": msg.into()})))
+}
+
+/// A `502` with the house JSON body: an upstream (the Solana RPC) failed. Not a `500`, so
+/// not `internal_error`; the caller journals the cause.
+fn bad_gateway(msg: impl Into<String>) -> AppError {
+    (StatusCode::BAD_GATEWAY, Json(json!({"error": msg.into()})))
 }
 
 /// A throttled request (INF-6c-1): the fixed JSON body plus `Retry-After` in whole seconds.
@@ -877,6 +884,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(convoy_events::router())
         .merge(sector::router())
         .merge(roster::router())
+        .merge(genesis::router())
         .with_state(state)
         .fallback_service(ServeDir::new("app").append_index_html_on_directories(true))
 }
