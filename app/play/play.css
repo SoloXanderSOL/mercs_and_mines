@@ -28,6 +28,7 @@ html, body {
   color: var(--text);
   font-family: var(--body);
   overflow: hidden;
+  overscroll-behavior: none;
   -webkit-tap-highlight-color: transparent;
 }
 
@@ -80,7 +81,7 @@ body { display: flex; align-items: center; justify-content: center; }
 .btn:disabled { opacity: 0.45; cursor: default; }
 .btn:focus-visible { outline: 0.6cqw solid var(--text); outline-offset: 0.8cqw; }
 
-.status, .explainer, .error-text, .hub-text {
+.status, .explainer, .error-text {
   max-width: 88cqw;
   margin: 0;
   font-size: 4.6cqw;
@@ -200,6 +201,95 @@ body { display: flex; align-items: center; justify-content: center; }
 
 .btn-continue { flex: none; }
 
+/* ── hub: the sector map (BP-3a-2) ──────────────────────────────────────── */
+/* A 10cqw title bar, the map, a 16cqw button bar. The map canvas owns its touches. */
+.screen-hub { padding: 0; gap: 0; justify-content: flex-start; }
+
+.hub-top {
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: 10cqw;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.hub-title {
+  margin: 0;
+  font-family: var(--display);
+  font-weight: 800;
+  font-size: 5.5cqw;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+.hub-map {
+  position: absolute;
+  top: 10cqw; left: 0;
+  width: 100%;
+  height: calc(100% - 26cqw);
+  display: block;
+  touch-action: none;
+}
+
+.hub-bottom {
+  position: absolute;
+  bottom: 0; left: 0; right: 0;
+  height: 16cqw;
+  display: flex;
+  align-items: center;
+  gap: 2cqw;
+  padding: 0 3cqw;
+}
+
+.btn-bar {
+  flex: 1;
+  width: auto;
+  max-width: none;
+  min-height: 11cqw;
+  padding: 0 2cqw;
+  font-size: 4.4cqw;
+}
+
+.legend {
+  position: absolute;
+  left: 3cqw; right: 3cqw;
+  bottom: 17cqw;
+  max-height: calc(100% - 30cqw);
+  overflow-y: auto;
+  padding: 3cqw;
+  background: rgba(11, 11, 12, 0.94);
+  border: 0.4cqw solid var(--panel-edge);
+  border-radius: 2cqw;
+  text-align: left;
+}
+
+.legend[hidden] { display: none; }
+
+.legend-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1.6cqw 3cqw;
+  font-size: 3.8cqw;
+}
+
+.legend-item { display: flex; align-items: center; gap: 2cqw; min-width: 0; }
+.legend-wide { grid-column: 1 / -1; }
+
+.swatch {
+  flex: none;
+  width: 4cqw;
+  height: 4cqw;
+  border: 0.5cqw solid transparent;
+}
+
+.swatch-hex { border-radius: 0.8cqw; }
+.swatch-dot { border-radius: 50%; }
+
 /* ── debug footer (?debug=1) ────────────────────────────────────────────── */
 .debug {
   position: absolute; left: 0; right: 0; bottom: 0;
@@ -207,5 +297,6 @@ body { display: flex; align-items: center; justify-content: center; }
   font-family: var(--mono); font-size: 3cqw;
   color: #7fd17f; background: rgba(0, 0, 0, 0.75);
   overflow-wrap: anywhere; z-index: 5;
+  pointer-events: none; /* never swallows a tap on the hub's bottom bar */
 }
 .debug[hidden] { display: none; }

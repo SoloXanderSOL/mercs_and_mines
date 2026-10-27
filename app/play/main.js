@@ -1,22 +1,25 @@
 // Seeker client entry point (BP-3a-1, portrait-first since BP-3a-1b / ODQ-58): title → MWA
-// sign-in → join → Commander reveal → hub. One upright layout; nothing is locked or blocked.
+// sign-in → join → Commander reveal → hub (the sector map since BP-3a-2). One upright layout;
+// nothing is locked or blocked.
 //
 // Boot and reload rule (spec check §8):
-//   0. the working screen first, so the stage is never blank while boot waits;
 //   1. no stored session → title;
+//   1a. otherwise the working screen, so the stage is never blank while boot waits;
 //   2. otherwise one GET /api/auth/session (not rate-limited); a 401 → title, then sign-in;
 //   3. a stored campaign → its cached roster → reveal, with no limited request; the roster is
 //      fetched once only if its cache is missing;
 //   4. no stored campaign → one join, then one roster fetch.
-// A roster 409 (or 404/403: the stored campaign is stale) clears the campaign and joins once
-// more; a second one in a row is the error screen. Nothing runs on a timer and nothing retries
-// by itself: every retry is a tap.
+// A roster or sector 409 (or 404/403: the stored campaign is stale) clears the campaign and
+// joins once more; a second one in a row is the error screen. A sector 500 offers a retry of
+// the sector only, never a re-join. The sector is fetched once per campaign and cached for the
+// tab. Nothing runs on a timer and nothing retries by itself: every retry is a tap.
 
-import { ApiError, store, counters, getSession, postJoin, getRoster } from './api.js';
+import { ApiError, store, counters, getSession, postJoin, getRoster, getSector } from './api.js';
 import { loadWallet, signIn, WalletError } from './wallet.js';
 import { renderReveal } from './reveal.js';
+import { HexMap, PALETTE, TERRAIN_ORDER, OVERLAY } from './hexmap.js';
 
-// Booth copy, verbatim from the BP-3a-1 and BP-3a-1b prompts.
+// Booth copy, verbatim from the BP-3a-1, BP-3a-1b and BP-3a-2 prompts.
 const COPY = {
   start: 'Report for duty',
   tagline: 'Expendability is a career path.',
@@ -37,7 +40,20 @@ const COPY = {
   generic: 'Something went wrong on our side. Tap to retry.',
   revealHeading: 'Meet your Commander',
   revealOutfit: 'Your outfit',
-  hubPlaceholder: 'Sector map incoming. Command is still drawing it.',
+  hubTitle: 'Your Sector',
+  hubBack: 'Back',
+  hubRecentre: 'Recentre',
+  hubLegend: 'Legend',
+  legendVein: 'Magma vein (bigger is richer)',
+  legendAnchor: 'Tectonic anchor',
+  legendGateway: 'Your gateway',
+  // Canon terrain names (Terrain_and_Environmental_Hazards §1), keyed by `HexTerrain`.
+  terrain: {
+    AshenPlains: 'Ashen Plains', ScorchedDesert: 'Scorched Desert', RuinedCity: 'Ruined City',
+    CityState: 'City-State', GunOutpost: 'G.U.N. Outpost', MagmaFlow: 'Magma Flow',
+    CooledMagma: 'Cooled Magma', VolcanicCaldera: 'Volcanic Caldera', Mountain: 'Mountain',
+    Ravine: 'Ravine', ToxicZone: 'Toxic Zone',
+  },
 };
 
 const $ = id => document.getElementById(id);
@@ -50,6 +66,9 @@ let errorRetry = null;      // what the error screen's button runs
 let lastRoster = null;      // the last roster, kept in memory too (Reviewer BP-2b-2 F2)
 let mwaState = 'loading';
 let lastError = '';
+let map = null;             // the sector map, kept while the campaign stays the same
+let mapCampaign = null;     // the campaign `map` belongs to
+let mapDrawMs = null;       // parsed response → the first drawImage, for the debug footer
 
 // ── screens ─────────────────────────────────────────────────────────────────
 function show(id) {
@@ -225,11 +244,90 @@ function showReveal(camp, roster) {
   show('screen-reveal');
 }
 
+// ── hub: the sector map (BP-3a-2) ───────────────────────────────────────────
+// From the reveal's Continue. The same campaign's map is kept and only re-measured; a cached
+// body draws with no fetch; otherwise one fetch.
+async function enterHub() {
+  const camp = store.campaign();
+  if (!camp) return enterCampaign(0);
+  if (map && mapCampaign === camp.campaign_id) {
+    show('screen-hub');
+    map.resize();
+    return;
+  }
+  const cached = store.sector(camp.campaign_id);
+  if (cached) return showMap(camp, cached, performance.now());
+  return loadSector(camp, 0);
+}
+
+async function loadSector(camp, conflicts) {
+  $('working-text').textContent = '';
+  show('screen-working');
+  let sector;
+  try {
+    sector = await getSector(camp.campaign_id);
+  } catch (e) {
+    if (e instanceof ApiError && (e.kind === 'conflict' || e.kind === 'notfound' || e.kind === 'forbidden')) {
+      note(e);
+      store.clearCampaign(); // the stored campaign is over or gone: the roster's rule
+      lastRoster = null;
+      if (conflicts >= 1) return showError(COPY.generic, () => enterCampaign(0));
+      return doJoin(conflicts + 1);
+    }
+    // A 500 (after the one retry), offline, 429 or 401: the button retries the sector only.
+    return handleError(e, () => loadSector(camp, conflicts));
+  }
+  const t0 = performance.now();
+  showMap(camp, sector, t0);
+  store.setSector(camp.campaign_id, sector); // after the draw, so the timing is the draw's
+}
+
+// The hub must be visible first: the canvas needs its layout size for the first draw.
+function showMap(camp, sector, t0) {
+  show('screen-hub');
+  if (map) map.destroy();
+  map = new HexMap($('hub-map'), sector);
+  mapCampaign = camp.campaign_id;
+  mapDrawMs = Math.round(performance.now() - t0);
+  if (map.unknownTerrain.size) lastError = `unknown terrain: ${[...map.unknownTerrain].join(', ')}`;
+  renderDebug();
+}
+
+function toggleLegend() {
+  const legend = $('legend');
+  legend.hidden = !legend.hidden;
+  $('btn-legend').setAttribute('aria-expanded', String(!legend.hidden));
+}
+
+// The legend: Wiki's palette swatches with the canon names, then the overlay marks.
+function buildLegend() {
+  const list = $('legend-list');
+  // kind: 'fill' (a filled square or dot) or 'ring' (an outline only)
+  const row = (shape, kind, colour, text, wide) => {
+    const li = document.createElement('li');
+    li.className = wide ? 'legend-item legend-wide' : 'legend-item';
+    const swatch = document.createElement('span');
+    swatch.className = `swatch swatch-${shape}`;
+    if (kind === 'fill') swatch.style.background = colour;
+    else swatch.style.borderColor = colour;
+    const label = document.createElement('span');
+    label.textContent = text;
+    li.append(swatch, label);
+    return li;
+  };
+  for (const t of TERRAIN_ORDER) list.append(row('hex', 'fill', PALETTE[t], COPY.terrain[t], false));
+  list.append(
+    row('dot', 'fill', OVERLAY.vein, COPY.legendVein, true),
+    row('dot', 'ring', OVERLAY.anchor, COPY.legendAnchor, true),
+    row('hex', 'ring', OVERLAY.gateway, COPY.legendGateway, true),
+  );
+}
+
 // ── boot ────────────────────────────────────────────────────────────────────
 async function boot() {
+  if (!store.session()) return show('screen-title');
   $('working-text').textContent = COPY.bootWorking;
   show('screen-working'); // never a blank stage while the session check is in flight
-  if (!store.session()) return show('screen-title');
   try {
     await getSession();
   } catch (e) {
@@ -249,6 +347,7 @@ function renderDebug() {
   if (!DEBUG) return;
   $('debug').textContent =
     `mwa ${mwaState} · roster fetches ${counters.roster} · sector fetches ${counters.sector} · joins ${counters.join}`
+    + (mapDrawMs !== null ? ` · map draw ${mapDrawMs} ms` : '')
     + (lastError ? ` · last error: ${lastError}` : '');
 }
 
@@ -259,23 +358,31 @@ function fillCopy() {
   $('btn-signin').textContent = COPY.signinButton;
   $('signin-explainer').textContent = COPY.signinExplainer;
   $('signin-lna').textContent = COPY.signinLna;
-  $('hub-text').textContent = COPY.hubPlaceholder;
+  $('hub-title').textContent = COPY.hubTitle;
+  $('btn-back').textContent = COPY.hubBack;
+  $('btn-recentre').textContent = COPY.hubRecentre;
+  $('btn-legend').textContent = COPY.hubLegend;
 }
 
 function wire() {
   $('btn-start').addEventListener('click', onStart);
   $('btn-signin').addEventListener('click', onSignIn);
   $('btn-error-retry').addEventListener('click', () => { const r = errorRetry; errorRetry = null; if (r) r(); });
-  $('btn-continue').addEventListener('click', () => show('screen-hub'));
+  $('btn-continue').addEventListener('click', enterHub);
   $('btn-back').addEventListener('click', () => {
     const camp = store.campaign();
-    if (camp && lastRoster) return showReveal(camp, lastRoster);
+    if (camp && lastRoster) return showReveal(camp, lastRoster); // the map instance is kept
     return enterCampaign(0);
   });
+  $('btn-recentre').addEventListener('click', () => { if (map) map.home(); });
+  $('btn-legend').addEventListener('click', toggleLegend);
+  // The toolbar showing or hiding, or a turn of the phone, resizes the stage.
+  window.addEventListener('resize', () => { if (map && !$('screen-hub').hidden) map.resize(); });
   if (DEBUG) $('debug').hidden = false;
 }
 
 fillCopy();
+buildLegend();
 wire();
 loadWallet().then(
   () => { mwaState = 'ok'; renderDebug(); },

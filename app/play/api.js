@@ -45,6 +45,7 @@ function removeKey(key) {
 const SESSION = 'mm.session';
 const CAMPAIGN = 'mm.campaign';
 const rosterKey = id => `mm.roster.${id}`;
+const sectorKey = id => `mm.sector.${id}`; // ~87 KB; sessionStorage allows ~5 MB per origin
 
 export const store = {
   session: () => readKey(SESSION),                       // {token_id, expires_at}
@@ -53,9 +54,14 @@ export const store = {
   setCampaign: c => writeKey(CAMPAIGN, { campaign_id: c.campaign_id, commander_id: c.commander_id }),
   roster: id => readKey(rosterKey(id)),
   setRoster: (id, body) => writeKey(rosterKey(id), body),
+  sector: id => readKey(sectorKey(id)),                  // the sector route's body (BP-3a-2)
+  setSector: (id, body) => writeKey(sectorKey(id), body),
   clearCampaign() {
     const c = readKey(CAMPAIGN);
-    if (c && c.campaign_id) removeKey(rosterKey(c.campaign_id));
+    if (c && c.campaign_id) {
+      removeKey(rosterKey(c.campaign_id));
+      removeKey(sectorKey(c.campaign_id));
+    }
     removeKey(CAMPAIGN);
   },
   clearAll() {
@@ -65,7 +71,6 @@ export const store = {
 };
 
 // Request counters for the ?debug=1 footer, counted per request (a retried 500 counts twice).
-// The sector stays 0 until BP-3a-2.
 export const counters = { roster: 0, sector: 0, join: 0 };
 
 // Every request gives up after this long and is shown as offline: a stalled connection (booth
@@ -158,4 +163,9 @@ export async function postJoin() {
 export async function getRoster(campaignId) {
   const r = await request('GET', `/api/campaign/${encodeURIComponent(campaignId)}/roster`);
   return r.body; // {campaign_id, commanders, foremen, sections, crews}
+}
+
+export async function getSector(campaignId) {
+  const r = await request('GET', `/api/campaign/${encodeURIComponent(campaignId)}/sector`);
+  return r.body; // {campaign_id, sector_id, terrain, magma_veins, gateway (or null)}
 }

@@ -39,8 +39,16 @@
     </section>
 
     <section id="screen-hub" class="screen screen-hub" hidden>
-      <p class="hub-text" id="hub-text"></p>
-      <button class="btn" id="btn-back" type="button">Back to Commander</button>
+      <header class="hub-top"><h1 class="hub-title" id="hub-title"></h1></header>
+      <canvas class="hub-map" id="hub-map"></canvas>
+      <div class="legend" id="legend" hidden>
+        <ul class="legend-list" id="legend-list"></ul>
+      </div>
+      <nav class="hub-bottom">
+        <button class="btn btn-bar" id="btn-back" type="button"></button>
+        <button class="btn btn-bar" id="btn-recentre" type="button"></button>
+        <button class="btn btn-bar" id="btn-legend" type="button" aria-expanded="false"></button>
+      </nav>
     </section>
 
     <section id="screen-error" class="screen screen-error" hidden>
