@@ -387,8 +387,19 @@ fn deploy_refusal(rec: &crate::repository::CommanderRecord) -> Option<AppError> 
     None
 }
 
+/// Body cap for the mission route (BP-3b-1), layered per route. The client still sends
+/// whole units until GAP-36 builds the squad from records, and every accepted body is
+/// logged forever; axum's 2 MiB default let one call log 1.9 MB. 64 KiB holds a Rank 2
+/// Commander's full force (4 Sections, 32 units, about 21 KB) with room to spare.
+pub const MISSION_BODY_LIMIT: usize = 64 * 1024;
+/// Canon: a Section is at most 8 units (Casualties_Reinforcements_and_Veterancy). A mission
+/// carries at most this many units for each Section it sends.
+pub const MAX_UNITS_PER_SECTION: usize = 8;
+
 /// Mission ↔ Commander wiring (brick 4g-1, Phase_1_Section_4 §4g; Sections since 7b-2).
-/// Check order: 401 (extractor) → 400 (body; then `section_ids` empty or duplicate) →
+/// Check order: 401 (extractor) → 429 per address, then per wallet (BP-3b-1) → axum's body
+/// rejection, counted (413 over `MISSION_BODY_LIMIT`; 400, 415, 422) → 400 (body; then
+/// `section_ids` empty or duplicate; more units than the Sections hold) →
 /// 404 (Commander unknown or not yours) → 409 (the Commander's campaign is not Active,
 /// S3, 5a-3b) → 422 (more Sections than the rank's command cap,
 /// GAP-50) → 404 (a Section unknown, not yours or not in the Commander's campaign; one
@@ -400,8 +411,22 @@ fn deploy_refusal(rec: &crate::repository::CommanderRecord) -> Option<AppError> 
 async fn post_mission_resolve(
     AuthSession(session): AuthSession,
     State(state): State<Arc<AppState>>,
-    Json(body): Json<MissionResolveBody>,
-) -> Result<impl IntoResponse, AppError> {
+    ci: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    body: Result<Json<MissionResolveBody>, JsonRejection>,
+) -> Result<Response, AppError> {
+    let ip = client_ip(ci, &headers, &state.rate_limits)?;
+    let now_i = Instant::now();
+    if let Err(r) = state.rate_limits.mission_ip.check(ip, now_i) {
+        return Ok(too_many_requests(r));
+    }
+    if let Err(r) = state.rate_limits.mission_wallet.check(session.wallet_address.clone(), now_i) {
+        return Ok(too_many_requests(r));
+    }
+    let Json(body) = match body {
+        Ok(j) => j,
+        Err(rej) => return Ok(rej.into_response()),
+    };
     let MissionResolveBody { request: req, section_ids } = body;
     // 400 — body shape. Refused fields are never silently ignored.
     if req.squad.commander.is_some() {
@@ -422,6 +447,9 @@ async fn post_mission_resolve(
     let distinct: std::collections::HashSet<Uuid> = section_ids.iter().copied().collect();
     if distinct.len() != section_ids.len() {
         return Err(bad_request("section_ids must not repeat a Section"));
+    }
+    if req.squad.units.len() > section_ids.len() * MAX_UNITS_PER_SECTION {
+        return Err(bad_request(format!("A mission carries at most {MAX_UNITS_PER_SECTION} units per Section")));
     }
 
     // 404 — an unknown Commander and someone else's get the same body, so the route
@@ -608,7 +636,8 @@ async fn post_mission_resolve(
             "stress_change": eff.stress - eff.old_stress,
             "xp_gained":     eff.xp - eff.old_xp,
         },
-    })))
+    }))
+    .into_response())
 }
 
 async fn post_combat_resolve(
@@ -871,7 +900,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/auth/challenge",            post(post_auth_challenge).layer(DefaultBodyLimit::max(AUTH_BODY_LIMIT)))
         .route("/api/auth/verify",               post(post_auth_verify).layer(DefaultBodyLimit::max(AUTH_BODY_LIMIT)))
         .route("/api/auth/session",              get(get_auth_session))
-        .route("/api/mission/resolve",           post(post_mission_resolve))
+        .route("/api/mission/resolve",           post(post_mission_resolve).layer(DefaultBodyLimit::max(MISSION_BODY_LIMIT)))
         .route("/api/combat/resolve",            post(post_combat_resolve))
         .route("/api/combat/pack-assault",       post(post_pack_assault))
         .route("/api/combat/stream/start",       post(post_combat_stream_start))
