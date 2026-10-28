@@ -4562,7 +4562,7 @@ async fn auth_verify_refuses_a_challenge_issued_to_another_wallet() {
     assert!(state.sessions.is_empty(), "a refused verify issues no session");
 }
 
-// ── BP-3b-1: the mission route's limits (in-memory; wallets 230–240, sessions only) ──
+// ── BP-3b-1: the mission route's limits (in-memory; wallets 230–250, sessions only) ──
 
 /// `n` copies of the test unit, an unknown Commander and one unknown Section: past the
 /// body checks such a request answers 404 (Commander not found), so it never deploys.
@@ -4601,34 +4601,35 @@ async fn mission_resolve_per_wallet_limit() {
     assert_eq!(statuses, expected);
 }
 
-/// Sixty a minute per address (a literal): ten wallets spend six each, and an eleventh,
-/// fresh wallet is refused by the address limit.
+/// A hundred a minute per address (a literal; BP-3c-1's demo value): twenty wallets spend
+/// five each, and a twenty-first, fresh wallet is refused by the address limit.
 #[tokio::test]
 async fn mission_resolve_per_ip_limit() {
     let state = default_state();
-    let tokens: Vec<String> = (0..11u8).map(|i| insert_session(&state, [230 + i; 32])).collect();
+    let tokens: Vec<String> = (0..21u8).map(|i| insert_session(&state, [230 + i; 32])).collect();
     let state = std::sync::Arc::new(state);
     let mut statuses = Vec::new();
-    for i in 0..61usize {
+    for i in 0..101usize {
         let app = mercs_server::routes::router(std::sync::Arc::clone(&state));
-        statuses.push(post_mission(app, Some(&tokens[i / 6]), &mission_body_with_units(1)).await.0);
+        statuses.push(post_mission(app, Some(&tokens[i / 5]), &mission_body_with_units(1)).await.0);
     }
-    let mut expected = vec![axum::http::StatusCode::NOT_FOUND; 60];
+    let mut expected = vec![axum::http::StatusCode::NOT_FOUND; 100];
     expected.push(axum::http::StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(statuses, expected);
 }
 
-/// 64 KiB of body (65,536 bytes, a literal) is read; one byte more is axum's 413.
+/// 16 KiB of body (16,384 bytes, a literal; BP-3c-1's demo cap) is read; one byte more
+/// is axum's 413.
 #[tokio::test]
 async fn mission_resolve_body_over_the_cap_is_413() {
     let state = default_state();
     let token = insert_session(&state, [230u8; 32]);
     let state = std::sync::Arc::new(state);
     let app = mercs_server::routes::router(std::sync::Arc::clone(&state));
-    let (at_cap, _) = post_mission(app, Some(&token), &mission_body_of_len(65_536)).await;
+    let (at_cap, _) = post_mission(app, Some(&token), &mission_body_of_len(16_384)).await;
     assert_eq!(at_cap, axum::http::StatusCode::NOT_FOUND, "a body at the cap is read");
     let app = mercs_server::routes::router(std::sync::Arc::clone(&state));
-    let (over, _) = post_mission(app, Some(&token), &mission_body_of_len(65_537)).await;
+    let (over, _) = post_mission(app, Some(&token), &mission_body_of_len(16_385)).await;
     assert_eq!(over, axum::http::StatusCode::PAYLOAD_TOO_LARGE);
 }
 
@@ -4659,7 +4660,7 @@ async fn mission_resolve_counts_before_reading_the_body() {
         post_mission(app, Some(&token), &mission_body_with_units(1)).await;
     }
     let app = mercs_server::routes::router(std::sync::Arc::clone(&state));
-    let (status, _) = post_mission(app, Some(&token), &mission_body_of_len(65_537)).await;
+    let (status, _) = post_mission(app, Some(&token), &mission_body_of_len(16_385)).await;
     assert_eq!(status, axum::http::StatusCode::TOO_MANY_REQUESTS);
 }
 

@@ -88,7 +88,7 @@ mod tests {
     use std::time::Duration;
     use tower::ServiceExt;
 
-    /// In-memory sessions only (no DB): bytes 221–227 sit above every byte in use.
+    /// In-memory sessions only (no DB): bytes 221–231, private to each test's state.
     const HOLDER: [u8; 32] = [221u8; 32];
     /// The mock's client: both timeouts. The slow mock waits 1,000 ms.
     const TEST_TIMEOUT: Duration = Duration::from_millis(250);
@@ -257,19 +257,19 @@ mod tests {
         assert_eq!(body, json!({"error": "genesis lookup unavailable"}));
     }
 
-    /// Seven wallets in turn, so no wallet passes 3 and the 21st request meets the address
-    /// limit. No URL: the first 20 answer `503`.
+    /// Eleven wallets in turn, so no wallet passes 3 and the 31st request meets the address
+    /// limit (BP-3c-1's demo value). No URL: the first 30 answer `503`.
     #[tokio::test]
     async fn genesis_per_ip_limit() {
         let state = state_with(None).await;
-        for i in 0..7u8 {
+        for i in 0..11u8 {
             sign_in(&state, &format!("w{i}"), [221 + i; 32]);
         }
         let mut statuses = Vec::new();
-        for i in 0..21u8 {
-            statuses.push(get(&state, Some(&format!("w{}", i % 7))).await.0);
+        for i in 0..31u8 {
+            statuses.push(get(&state, Some(&format!("w{}", i % 11))).await.0);
         }
-        let mut expected = vec![StatusCode::SERVICE_UNAVAILABLE; 20];
+        let mut expected = vec![StatusCode::SERVICE_UNAVAILABLE; 30];
         expected.push(StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(statuses, expected);
     }

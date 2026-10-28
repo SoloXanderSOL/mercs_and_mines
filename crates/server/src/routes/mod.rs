@@ -392,7 +392,9 @@ fn deploy_refusal(rec: &crate::repository::CommanderRecord) -> Option<AppError> 
 /// whole units until GAP-36 builds the squad from records, and every accepted body is
 /// logged forever; axum's 2 MiB default let one call log 1.9 MB. 64 KiB holds a Rank 2
 /// Commander's full force (4 Sections, 32 units, about 21 KB) with room to spare.
-pub const MISSION_BODY_LIMIT: usize = 64 * 1024;
+/// On `breakpoint` (BP-3c-1, demo-only): 16 KiB. A demo Commander holds one Section
+/// (8 units, about 5 KB), and the smaller cap pays for the raised `MISSION_PER_IP`.
+pub const MISSION_BODY_LIMIT: usize = 16 * 1024;
 
 /// The largest body `combat/resolve` and `stream/start` accept (BP-1e-1). An honest request
 /// is under 1 KB, and one at every bound is about 2.2 KB.

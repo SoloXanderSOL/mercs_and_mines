@@ -48,7 +48,9 @@ pub const ROSTER_READ_PER_WALLET: u32 = 10;
 /// The Genesis Token lookup (BP-4, keeper). A lookup spends up to two calls on the
 /// provider key and wallets are free, so `GENESIS_ALL_PER_MINUTE` (one key for everyone)
 /// is the bound on the key's quota: over it the route answers `503`.
-pub const GENESIS_PER_IP: u32 = 20;
+/// On `breakpoint` (BP-3c-1, ODQ-61 (c), demo-only): 30, for 25 phones behind one venue
+/// address, one lookup each per sign-in. `GENESIS_ALL_PER_MINUTE` is unchanged.
+pub const GENESIS_PER_IP: u32 = 30;
 pub const GENESIS_PER_WALLET: u32 = 3;
 pub const GENESIS_ALL_PER_MINUTE: u32 = 120;
 
@@ -67,7 +69,10 @@ pub const CHECKOUT_CHECK_WINDOW: Duration = Duration::from_secs(10);
 /// The mission route (BP-3b-1, keeper). Every accepted call writes permanent rows, one of
 /// them the whole request in the immutable `input_logs`, and wallets are free, so the
 /// per-address limit bounds a script and the per-wallet limit bounds a player.
-pub const MISSION_PER_IP: u32 = 60;
+/// On `breakpoint` (BP-3c-1, ODQ-61 (c), demo-only): 100, for 25 phones behind one venue
+/// address at about four missions a minute each. `MISSION_BODY_LIMIT` drops to 16 KiB
+/// beside it, so one address's logged bytes stay below what 64 KiB cost at 60.
+pub const MISSION_PER_IP: u32 = 100;
 pub const MISSION_PER_WALLET: u32 = 6;
 
 /// The combat routes (BP-1e-1, keeper, GAP-87). `combat/resolve` and the AAR take no session,
