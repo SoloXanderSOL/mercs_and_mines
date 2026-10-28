@@ -290,6 +290,180 @@ body { display: flex; align-items: center; justify-content: center; }
 .swatch-hex { border-radius: 0.8cqw; }
 .swatch-dot { border-radius: 50%; }
 
+/* ── battle loop (BP-3b-2) ──────────────────────────────────────────────── */
+/* Missions, briefing, the presentation, the AAR and the end of the run. The stage is always
+   9:16 (177.8cqw tall), so every block below is budgeted in cqw against that height. */
+.btn-bar-primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+
+.screen-missions, .screen-briefing, .screen-battle, .screen-aar {
+  justify-content: flex-start;
+  gap: 3cqw;
+  padding: 5cqw 5cqw 6cqw;
+}
+
+.screen-heading {
+  margin: 0;
+  font-family: var(--display);
+  font-weight: 800;
+  font-size: 7cqw;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+.still {
+  flex: none;
+  width: 100%;
+  height: 46cqw;
+  object-fit: cover;
+  border-radius: 2cqw;
+  border: 0.4cqw solid var(--panel-edge);
+  background: var(--panel);
+}
+.still-short { height: 24cqw; }
+.still-wipeout { filter: grayscale(1) brightness(0.5); }
+
+/* mission list */
+.missions-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 3cqw;
+}
+
+.mission-row {
+  width: 100%;
+  display: grid;
+  gap: 1.2cqw;
+  text-align: left;
+  font: inherit;
+  color: var(--text);
+  background: var(--panel);
+  border: 0.4cqw solid var(--panel-edge);
+  border-radius: 2cqw;
+  padding: 3.5cqw 4cqw;
+  cursor: pointer;
+}
+.mission-row:focus-visible { outline: 0.6cqw solid var(--text); outline-offset: 0.6cqw; }
+.mission-name { font-family: var(--display); font-weight: 800; font-size: 6.2cqw; text-transform: uppercase; letter-spacing: 0.03em; }
+.mission-diff { display: flex; align-items: baseline; gap: 2.5cqw; }
+.mission-diff-label { font-family: var(--mono); font-size: 3.4cqw; text-transform: uppercase; color: var(--muted); }
+.mission-pips { font-size: 3.6cqw; letter-spacing: 0.08em; color: var(--accent); }
+.mission-meta { font-size: 3.9cqw; color: var(--muted); }
+
+/* briefing */
+.briefing-text { margin: 0; font-size: 4.4cqw; line-height: 1.4; font-style: italic; }
+.briefing-line { margin: 0; font-size: 4.4cqw; color: var(--muted); }
+.briefing-actions {
+  margin-top: auto;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2.5cqw;
+}
+.debug-toggle { display: flex; align-items: center; gap: 2cqw; font-family: var(--mono); font-size: 3.6cqw; color: #7fd17f; }
+.debug-toggle input { width: 5cqw; height: 5cqw; }
+
+/* the presentation: each line fades in, then counts up */
+.score-lines {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 1.4cqw;
+}
+.score-row, .battle-reveal {
+  opacity: 0;
+  transform: translateY(1.5cqw);
+  transition: opacity 0.25s ease-out, transform 0.25s ease-out;
+}
+.score-row.shown, .battle-reveal.shown { opacity: 1; transform: none; }
+@media (prefers-reduced-motion: reduce) {
+  .score-row, .battle-reveal { transition: none; transform: none; }
+}
+.score-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 1.2cqw 3cqw;
+  background: var(--panel);
+  border-radius: 1.2cqw;
+  font-size: 4.4cqw;
+}
+.score-label { color: var(--muted); }
+.score-value { font-family: var(--mono); font-size: 4.6cqw; }
+.battle-reveal { margin: 0; }
+.battle-chance, .battle-roll { font-family: var(--display); font-weight: 700; font-size: 6cqw; }
+.battle-outcome { font-family: var(--display); font-weight: 800; font-size: 8cqw; text-transform: uppercase; letter-spacing: 0.04em; min-height: 9cqw; }
+#btn-skip { margin-top: auto; }
+
+.outcome-Success { color: var(--accent); }
+.outcome-Defeat { color: var(--text); }
+.outcome-Wipeout { color: var(--danger); }
+
+/* the after-action report */
+.screen-aar { gap: 1.8cqw; padding-top: 4cqw; }
+.aar-outcome { margin: 0; font-family: var(--display); font-weight: 800; font-size: 6.4cqw; text-transform: uppercase; letter-spacing: 0.04em; }
+.panel-heading { margin: 0 0 1.4cqw; font-family: var(--display); font-weight: 700; font-size: 4.4cqw; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+.aar-panel {
+  width: 100%;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  text-align: left;
+}
+.aar-units {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6cqw;
+}
+.unit-row {
+  display: grid;
+  grid-template-columns: 6cqw 24cqw 1fr;
+  align-items: center;
+  gap: 2cqw;
+  padding: 0.6cqw 2.4cqw;
+  background: var(--panel);
+  border-radius: 1cqw;
+  font-size: 3.9cqw;
+}
+.unit-glyph { font-size: 4.2cqw; }
+.unit-status { color: var(--muted); }
+.unit-wounded .unit-status { color: var(--accent); }
+.unit-kia .unit-status { color: var(--danger); }
+.aar-row { width: 100%; display: grid; grid-template-columns: 1fr 1fr; gap: 2.5cqw; text-align: left; }
+.aar-box { background: var(--panel); border: 0.4cqw solid var(--panel-edge); border-radius: 1.5cqw; padding: 2.4cqw 3cqw; min-width: 0; }
+.pay-line { margin: 0; font-size: 3.8cqw; line-height: 1.35; overflow-wrap: anywhere; }
+.pay-none { color: var(--muted); }
+.aar-commander { display: flex; flex-direction: column; gap: 0.8cqw; font-size: 3.8cqw; }
+.aar-commander-name { font-family: var(--display); font-weight: 800; font-size: 4.6cqw; overflow-wrap: anywhere; }
+.aar-rankup { color: var(--accent); }
+
+/* the end of the run */
+.screen-end { gap: 3cqw; }
+.end-title { margin: 0; font-family: var(--display); font-weight: 800; font-size: 10cqw; text-transform: uppercase; letter-spacing: 0.05em; color: var(--danger); }
+.end-name { margin: 0; font-family: var(--display); font-weight: 800; font-size: 7.5cqw; }
+.end-grade { margin: 0; font-family: var(--display); font-weight: 700; font-size: 5cqw; letter-spacing: 0.08em; text-transform: uppercase; color: var(--accent); }
+.end-flaw { margin: 0; font-family: var(--mono); font-size: 4cqw; color: var(--muted); }
+.end-body { margin: 0; max-width: 84cqw; font-size: 4.6cqw; line-height: 1.45; }
+.end-glorious { margin: 0; font-style: italic; font-size: 4.4cqw; color: var(--accent); }
+.end-glorious[hidden] { display: none; }
+
 /* ── debug footer (?debug=1) ────────────────────────────────────────────── */
 .debug {
   position: absolute; left: 0; right: 0; bottom: 0;

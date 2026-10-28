@@ -46,6 +46,8 @@ const SESSION = 'mm.session';
 const CAMPAIGN = 'mm.campaign';
 const rosterKey = id => `mm.roster.${id}`;
 const sectorKey = id => `mm.sector.${id}`; // ~87 KB; sessionStorage allows ~5 MB per origin
+const MISSIONS = 'mm.missions'; // GET /api/missions, static: once per tab (BP-3b-2)
+const UNITS = 'mm.units';       // GET /api/units, static: once per tab
 
 export const store = {
   session: () => readKey(SESSION),                       // {token_id, expires_at}
@@ -56,6 +58,10 @@ export const store = {
   setRoster: (id, body) => writeKey(rosterKey(id), body),
   sector: id => readKey(sectorKey(id)),                  // the sector route's body (BP-3a-2)
   setSector: (id, body) => writeKey(sectorKey(id), body),
+  missions: () => readKey(MISSIONS),
+  setMissions: body => writeKey(MISSIONS, body),
+  units: () => readKey(UNITS),
+  setUnits: body => writeKey(UNITS, body),
   clearCampaign() {
     const c = readKey(CAMPAIGN);
     if (c && c.campaign_id) {
@@ -71,7 +77,8 @@ export const store = {
 };
 
 // Request counters for the ?debug=1 footer, counted per request (a retried 500 counts twice).
-export const counters = { roster: 0, sector: 0, join: 0 };
+// `mission` is counted by the Deploy tap (battle.js), once per POST.
+export const counters = { roster: 0, sector: 0, join: 0, missions: 0, units: 0, mission: 0 };
 
 // Every request gives up after this long and is shown as offline: a stalled connection (booth
 // Wi-Fi, a captive portal) must end on a screen with a button. A deadline, not a retry.
@@ -81,6 +88,8 @@ function countRequest(path) {
   if (path === '/api/campaign/join') counters.join += 1;
   else if (path.endsWith('/roster')) counters.roster += 1;
   else if (path.endsWith('/sector')) counters.sector += 1;
+  else if (path === '/api/missions') counters.missions += 1;
+  else if (path === '/api/units') counters.units += 1;
 }
 
 // TypeError (no network), TimeoutError (the deadline) and AbortError all mean the same to the
@@ -168,4 +177,33 @@ export async function getRoster(campaignId) {
 export async function getSector(campaignId) {
   const r = await request('GET', `/api/campaign/${encodeURIComponent(campaignId)}/sector`);
   return r.body; // {campaign_id, sector_id, terrain, magma_veins, gateway (or null)}
+}
+
+// The two static lists (BP-3b-2), fetched once per tab and kept in sessionStorage.
+export async function getMissions() {
+  const cached = store.missions();
+  if (cached) return cached;
+  const r = await request('GET', '/api/missions');
+  store.setMissions(r.body); // {GUARD_DUTY: MissionDefinition, …}
+  return r.body;
+}
+
+export async function getUnits() {
+  const cached = store.units();
+  if (cached) return cached;
+  const r = await request('GET', '/api/units');
+  store.setUnits(r.body); // {KEY: UnitDefinition, …}
+  return r.body;
+}
+
+// Never retried: a 500 may come after the input is logged, so a retry would deploy again.
+export async function postMission(body) {
+  const r = await request('POST', '/api/mission/resolve', { body, retry500: false });
+  return r.body; // {session_id, report, commander: {kia, glorious, stress, xp, old_rank, new_rank, stress_change, xp_gained}}
+}
+
+// "New run": retire this campaign so the next join starts a fresh one. Never retried.
+export async function postAbandon(campaignId) {
+  const r = await request('POST', `/api/campaign/${encodeURIComponent(campaignId)}/abandon`, { retry500: false });
+  return r.body; // {campaign_id}
 }

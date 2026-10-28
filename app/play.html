@@ -46,9 +46,65 @@
       </div>
       <nav class="hub-bottom">
         <button class="btn btn-bar" id="btn-back" type="button"></button>
+        <button class="btn btn-bar btn-bar-primary" id="btn-missions" type="button"></button>
         <button class="btn btn-bar" id="btn-recentre" type="button"></button>
         <button class="btn btn-bar" id="btn-legend" type="button" aria-expanded="false"></button>
       </nav>
+    </section>
+
+    <section id="screen-missions" class="screen screen-missions" hidden>
+      <h1 class="screen-heading" id="missions-title"></h1>
+      <ul class="missions-list" id="missions-list"></ul>
+      <button class="btn" id="btn-missions-back" type="button"></button>
+    </section>
+
+    <section id="screen-briefing" class="screen screen-briefing" hidden>
+      <img class="still" id="briefing-still" alt="">
+      <h1 class="screen-heading" id="briefing-name"></h1>
+      <p class="briefing-text" id="briefing-text"></p>
+      <p class="briefing-line" id="briefing-squad"></p>
+      <p class="briefing-line" id="briefing-commander"></p>
+      <div class="briefing-actions" id="briefing-actions">
+        <button class="btn btn-primary" id="btn-deploy" type="button"></button>
+        <button class="btn" id="btn-briefing-back" type="button"></button>
+      </div>
+    </section>
+
+    <section id="screen-battle" class="screen screen-battle" hidden>
+      <img class="still" id="battle-still" alt="">
+      <ul class="score-lines" id="battle-lines"></ul>
+      <p class="battle-reveal battle-chance" id="battle-chance"></p>
+      <p class="battle-reveal battle-roll" id="battle-roll"></p>
+      <p class="battle-reveal battle-outcome" id="battle-outcome"></p>
+      <button class="btn" id="btn-skip" type="button"></button>
+    </section>
+
+    <section id="screen-aar" class="screen screen-aar" hidden>
+      <img class="still still-short" id="aar-still" alt="">
+      <h1 class="screen-heading" id="aar-title"></h1>
+      <p class="aar-outcome" id="aar-outcome"></p>
+      <div class="aar-panel">
+        <h2 class="panel-heading" id="aar-units-heading"></h2>
+        <ul class="aar-units" id="aar-units"></ul>
+      </div>
+      <div class="aar-row">
+        <div class="aar-box">
+          <h2 class="panel-heading" id="aar-pay-heading"></h2>
+          <div id="aar-pay"></div>
+        </div>
+        <div class="aar-box aar-commander" id="aar-commander"></div>
+      </div>
+      <button class="btn btn-primary" id="btn-aar-continue" type="button"></button>
+    </section>
+
+    <section id="screen-end" class="screen screen-end" hidden>
+      <h1 class="end-title" id="end-title"></h1>
+      <p class="end-name" id="end-name"></p>
+      <p class="end-grade" id="end-grade"></p>
+      <p class="end-flaw" id="end-flaw"></p>
+      <p class="end-body" id="end-body"></p>
+      <p class="end-glorious" id="end-glorious" hidden></p>
+      <button class="btn btn-primary" id="btn-new-run" type="button"></button>
     </section>
 
     <section id="screen-error" class="screen screen-error" hidden>

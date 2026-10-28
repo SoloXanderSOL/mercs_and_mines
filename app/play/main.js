@@ -18,8 +18,10 @@ import { ApiError, store, counters, getSession, postJoin, getRoster, getSector }
 import { loadWallet, signIn, WalletError } from './wallet.js';
 import { renderReveal } from './reveal.js';
 import { HexMap, PALETTE, TERRAIN_ORDER, OVERLAY } from './hexmap.js';
+import { createBattle } from './battle.js';
 
-// Booth copy, verbatim from the BP-3a-1, BP-3a-1b and BP-3a-2 prompts.
+// Booth copy, verbatim from the BP-3a-1, BP-3a-1b, BP-3a-2 and BP-3b-2 prompts (the battle's own
+// copy lives in battle.js).
 const COPY = {
   start: 'Report for duty',
   tagline: 'Expendability is a career path.',
@@ -44,6 +46,8 @@ const COPY = {
   hubBack: 'Back',
   hubRecentre: 'Recentre',
   hubLegend: 'Legend',
+  hubMissions: 'Missions',
+  hubLoading: 'Surveying your sector...',
   legendVein: 'Magma vein (bigger is richer)',
   legendAnchor: 'Tectonic anchor',
   legendGateway: 'Your gateway',
@@ -57,7 +61,8 @@ const COPY = {
 };
 
 const $ = id => document.getElementById(id);
-const SCREENS = ['screen-title', 'screen-signin', 'screen-working', 'screen-reveal', 'screen-hub', 'screen-error'];
+const SCREENS = ['screen-title', 'screen-signin', 'screen-working', 'screen-reveal', 'screen-hub', 'screen-error',
+  'screen-missions', 'screen-briefing', 'screen-battle', 'screen-aar', 'screen-end'];
 const DEBUG = new URLSearchParams(location.search).get('debug') === '1';
 
 let busy = false;           // one wallet or server flow at a time
@@ -69,6 +74,8 @@ let lastError = '';
 let map = null;             // the sector map, kept while the campaign stays the same
 let mapCampaign = null;     // the campaign `map` belongs to
 let mapDrawMs = null;       // parsed response → the first drawImage, for the debug footer
+let debugExtra = '';        // the last mission's `stress=… xp=…`, for the debug footer
+let battle = null;          // battle.js (BP-3b-2), created at the bottom
 
 // ── screens ─────────────────────────────────────────────────────────────────
 function show(id) {
@@ -233,8 +240,21 @@ async function loadRoster(camp, conflicts) {
   return showReveal(camp, roster);
 }
 
+// The reveal never shows a dead Commander: a KIA or Shattered stored id gives way to the first
+// usable one in the roster (a re-join answers with the starter, alive or not), and with none
+// usable the run is over.
+const isUsable = c => !c.is_kia && !c.is_shattered;
+
 function showReveal(camp, roster) {
   lastRoster = roster;
+  const commanders = roster.commanders || [];
+  const stored = commanders.find(c => c.commander_id === camp.commander_id);
+  if (stored && !isUsable(stored)) {
+    const next = commanders.find(isUsable);
+    if (!next) return battle.showEndOfRun(stored.commander_id);
+    camp = { campaign_id: camp.campaign_id, commander_id: next.commander_id };
+    store.setCampaign(camp);
+  }
   const ok = renderReveal($('reveal-content'), roster, camp.commander_id,
     { heading: COPY.revealHeading, outfit: COPY.revealOutfit });
   if (!ok) {
@@ -261,7 +281,7 @@ async function enterHub() {
 }
 
 async function loadSector(camp, conflicts) {
-  $('working-text').textContent = '';
+  $('working-text').textContent = COPY.hubLoading;
   show('screen-working');
   let sector;
   try {
@@ -347,7 +367,9 @@ function renderDebug() {
   if (!DEBUG) return;
   $('debug').textContent =
     `mwa ${mwaState} · roster fetches ${counters.roster} · sector fetches ${counters.sector} · joins ${counters.join}`
+    + ` · missions ${counters.missions} · units ${counters.units} · mission posts ${counters.mission}`
     + (mapDrawMs !== null ? ` · map draw ${mapDrawMs} ms` : '')
+    + (debugExtra ? ` · ${debugExtra}` : '')
     + (lastError ? ` · last error: ${lastError}` : '');
 }
 
@@ -362,6 +384,7 @@ function fillCopy() {
   $('btn-back').textContent = COPY.hubBack;
   $('btn-recentre').textContent = COPY.hubRecentre;
   $('btn-legend').textContent = COPY.hubLegend;
+  $('btn-missions').textContent = COPY.hubMissions;
 }
 
 function wire() {
@@ -376,14 +399,53 @@ function wire() {
   });
   $('btn-recentre').addEventListener('click', () => { if (map) map.home(); });
   $('btn-legend').addEventListener('click', toggleLegend);
+  $('btn-missions').addEventListener('click', () => battle.openMissions());
   // The toolbar showing or hiding, or a turn of the phone, resizes the stage.
   window.addEventListener('resize', () => { if (map && !$('screen-hub').hidden) map.resize(); });
   if (DEBUG) $('debug').hidden = false;
 }
 
+// ── battle (BP-3b-2) ────────────────────────────────────────────────────────
+function dropMap() {
+  if (map) map.destroy();
+  map = null;
+  mapCampaign = null;
+}
+
+// After a lost mission: one roster fetch, which lands on the reveal with the server's numbers.
+function reloadRoster() {
+  const camp = store.campaign();
+  if (!camp) return enterCampaign(0);
+  return loadRoster(camp, 0);
+}
+
+// The stored campaign is over or not this wallet's: the roster's rule (clear, re-join once).
+function staleCampaign() {
+  store.clearCampaign();
+  lastRoster = null;
+  dropMap();
+  return doJoin(1);
+}
+
+// New run: the old campaign is retired, so a fresh join starts the next one.
+function startFresh() {
+  store.clearCampaign();
+  lastRoster = null;
+  debugExtra = '';
+  dropMap();
+  return doJoin(0);
+}
+
 fillCopy();
 buildLegend();
 wire();
+battle = createBattle({
+  $, DEBUG, music, show, showError, handleError, note, enterHub, enterCampaign,
+  reloadRoster, staleCampaign, startFresh,
+  genericText: COPY.generic,
+  getRoster: () => lastRoster,
+  setDebugExtra: text => { debugExtra = text; renderDebug(); },
+});
 loadWallet().then(
   () => { mwaState = 'ok'; renderDebug(); },
   e => { mwaState = `failed: ${e && e.message}`; renderDebug(); },
