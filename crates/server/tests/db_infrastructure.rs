@@ -3641,7 +3641,7 @@ async fn advisor_records_cascade_with_their_campaign() {
     clean_wallet_4g1(&pool, &wallet).await;
 }
 
-/// Local copy of the AAR test's fixture (seed_override 42, max_ticks 25).
+/// Local copy of the AAR test's fixture (max_ticks 25, no seed).
 fn alpha_vs_scout_payload() -> serde_json::Value {
     serde_json::json!({
         "section": {
@@ -3678,7 +3678,6 @@ fn alpha_vs_scout_payload() -> serde_json::Value {
                 "accuracy": 0
             }]
         },
-        "seed_override": 42,
         "max_ticks": 25,
         "combat_initiation_type": "SPOTTED"
     })
@@ -3703,7 +3702,7 @@ async fn combat_route_logs_to_postgres_and_integrity_detects_tamper() {
 
     let mut state = mercs_server::state::AppState::new(Arc::new(mercs_server::config::Config::default()));
     state.input_log_repo = Arc::new(PostgresInputLogRepository::new(pool.clone()));
-    let app = mercs_server::routes::router(Arc::new(state));
+    let app = mercs_server::routes::with_test_peer(mercs_server::routes::router(Arc::new(state)), mercs_server::routes::TEST_PEER);
 
     async fn body_json(resp: axum::response::Response) -> serde_json::Value {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
@@ -3731,7 +3730,7 @@ async fn combat_route_logs_to_postgres_and_integrity_detects_tamper() {
     assert_eq!(entries.len(), 1, "the route must log exactly one entry (session_start)");
     assert_eq!(entries[0].event_type, "session_start");
     assert_eq!((entries[0].tick, entries[0].seq), (0, 0));
-    assert_eq!(entries[0].payload["request"]["seed_override"], 42);
+    assert_eq!(entries[0].payload["request"]["seed_override"], serde_json::Value::Null);
     assert!(entries[0].payload["timestamp"].is_string(), "session_start must carry the timestamp");
 
     // Step 3: the AAR replays the logged input to the same report.
@@ -4920,7 +4919,7 @@ async fn combat_resolve_still_succeeds_when_its_log_write_fails() {
     use tower::ServiceExt;
     let mut state = default_state();
     state.input_log_repo = std::sync::Arc::new(FailingInputLog { inner: state.input_log_repo.clone(), fail_writes: true });
-    let app = mercs_server::routes::router(std::sync::Arc::new(state));
+    let app = mercs_server::routes::with_test_peer(mercs_server::routes::router(std::sync::Arc::new(state)), mercs_server::routes::TEST_PEER);
     let req = Request::builder()
         .method("POST")
         .uri("/api/combat/resolve")

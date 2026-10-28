@@ -1,7 +1,8 @@
 // HTTP route handlers for all API endpoints.
 // Seed handling (Director ruling): the server is the authority on time and entropy.
-//   seed_override Some(n) → passed through for deterministic replay.
-//   seed_override None    → generated from OS entropy via rng::generate_seed().
+//   The combat, stream and mission routes refuse seed_override (400); ore-run still
+//   honours it. Otherwise the seed comes from OS entropy via rng::generate_seed(),
+//   and the AAR replays the logged seed.
 // Timestamp is always generated server-side via chrono::Utc::now(); never accepted from client.
 
 pub mod admin;
@@ -37,7 +38,7 @@ use sim_engine::{
     missions::missions,
     ore_run::run_ore_run,
     resolver::{
-        apply_commander_buffs, resolve_combat, resolve_mission, resolve_pack_assault,
+        apply_commander_buffs, resolve_combat, resolve_mission,
     },
     rng::generate_seed,
     scenario::Approach,
@@ -47,7 +48,7 @@ use sim_engine::{
 
 use crate::auth::AuthSession;
 use crate::api_types::{
-    convoy_vehicle_from_class, CombatResolveRequest, MissionResolveBody, PackAssaultRequest,
+    convoy_vehicle_from_class, validate_combat_request, CombatResolveRequest, MissionResolveBody,
 };
 use crate::commander_gen::mission_tier;
 use crate::state::AppState;
@@ -186,7 +187,7 @@ fn session_start_entry(request: Value, timestamp: &str) -> shared::InputLogEntry
 }
 
 /// Writes a session's header and its `session_start` entry to the input log.
-/// Policy by caller: combat / pack assault / WS: fire-and-forget — a failure is logged
+/// Policy by caller: combat / WS: fire-and-forget — a failure is logged
 /// and the caller's response is unchanged. The mission route does not call this; it uses
 /// the fallible `InputLogRepository::start_session` before the roll (§4g item 9).
 /// Without a header the entry could be neither hashed nor replayed, so a failed header
@@ -392,6 +393,10 @@ fn deploy_refusal(rec: &crate::repository::CommanderRecord) -> Option<AppError> 
 /// logged forever; axum's 2 MiB default let one call log 1.9 MB. 64 KiB holds a Rank 2
 /// Commander's full force (4 Sections, 32 units, about 21 KB) with room to spare.
 pub const MISSION_BODY_LIMIT: usize = 64 * 1024;
+
+/// The largest body `combat/resolve` and `stream/start` accept (BP-1e-1). An honest request
+/// is under 1 KB, and one at every bound is about 2.2 KB.
+pub const COMBAT_BODY_LIMIT: usize = 8 * 1024;
 /// Canon: a Section is at most 8 units (Casualties_Reinforcements_and_Veterancy). A mission
 /// carries at most this many units for each Section it sends.
 pub const MAX_UNITS_PER_SECTION: usize = 8;
@@ -640,16 +645,36 @@ async fn post_mission_resolve(
     .into_response())
 }
 
+/// `POST /api/combat/resolve`: the sandbox combat route, kept as the fight the AAR replays
+/// (ODQ-64). It takes no session, so it is limited per address. Order (BP-1e-1): 500
+/// without a peer → 429 `combat_ip` → axum's body rejection, counted (413 over
+/// `COMBAT_BODY_LIMIT`; 400, 415, 422) → 400 `seed_override` → 400 out of bounds → resolve,
+/// log, 200.
 async fn post_combat_resolve(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<CombatResolveRequest>,
-) -> Result<impl IntoResponse, AppError> {
+    ci: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    body: Result<Json<CombatResolveRequest>, JsonRejection>,
+) -> Result<Response, AppError> {
+    let ip = client_ip(ci, &headers, &state.rate_limits)?;
+    if let Err(r) = state.rate_limits.combat_ip.check(ip, Instant::now()) {
+        return Ok(too_many_requests(r));
+    }
+    let Json(req) = match body {
+        Ok(j) => j,
+        Err(rej) => return Ok(rej.into_response()),
+    };
+    if req.seed_override.is_some() {
+        return Err(bad_request("seed_override is not accepted on this route"));
+    }
+    validate_combat_request(&req, state.config.server.default_max_ticks).map_err(bad_request)?;
+
     // Serialize before combat_initiation_type is consumed by unwrap_or. A failure refuses
     // the request before anything is logged, so the log never holds a null request.
     let req_payload = serde_json::to_value(&req)
         .map_err(|e| internal_error(format!("request serialization failed: {e}")))?;
 
-    let seed = req.seed_override.unwrap_or_else(generate_seed);
+    let seed = generate_seed();
     let timestamp = Utc::now().to_rfc3339();
     let initiation = req.combat_initiation_type.unwrap_or(CombatInitiationType::Spotted);
     let max_ticks = req.max_ticks.unwrap_or(state.config.server.default_max_ticks) as u32;
@@ -693,70 +718,50 @@ async fn post_combat_resolve(
     Ok(Json(serde_json::json!({
         "session_id": session_id.to_string(),
         "report":     report_value,
-    })))
-}
-
-async fn post_pack_assault(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<PackAssaultRequest>,
-) -> Result<impl IntoResponse, AppError> {
-    // Serialize before combat_initiation_type is moved into resolve_pack_assault. A failure
-    // refuses the request before anything is logged.
-    let req_payload = serde_json::to_value(&req)
-        .map_err(|e| internal_error(format!("request serialization failed: {e}")))?;
-
-    let seed = req.seed_override.unwrap_or_else(generate_seed);
-    let timestamp = Utc::now().to_rfc3339();
-    let max_ticks = req.max_ticks.unwrap_or(state.config.server.default_max_ticks) as u32;
-    let defending = req
-        .defending_convoy_vehicles
-        .unwrap_or_default()
-        .iter()
-        .map(convoy_vehicle_from_class)
-        .collect();
-
-    let report = resolve_pack_assault(
-        &req.section,
-        &req.pack,
-        &timestamp,
-        req.combat_initiation_type,
-        defending,
-        max_ticks,
-        Some(seed),
-        &state.config.sim,
-    );
-
-    let session_id = Uuid::new_v4();
-    let config = shared::SessionConfig {
-        session_id: session_id.to_string(),
-        build_version: env!("CARGO_PKG_VERSION").to_string(),
-        seed: seed as u64,
-        sector_id: Uuid::nil(),
-        campaign_id: Uuid::nil(),
-        sector_tier: "Contested".into(),
-        ruleset: "standard_v1".into(),
-    };
-    log_session_start(state.input_log_repo.as_ref(), &config, session_id, req_payload, &timestamp).await;
-
-    Ok(Json(report))
+    }))
+    .into_response())
 }
 
 // ── Streaming combat session (requires auth) ───────────────────────────────
 
+/// `POST /api/combat/stream/start`. Order (BP-1e-1): 401 → 500 without a peer → 429
+/// `stream_ip` → 429 `stream_wallet` → axum's body rejection, counted (413 over
+/// `COMBAT_BODY_LIMIT`; 400, 415, 422) → 400 `seed_override` → 400 out of bounds → save, 200.
+/// The socket checks the saved request again before it upgrades.
 async fn post_combat_stream_start(
-    AuthSession(_session): AuthSession,
+    AuthSession(session): AuthSession,
     State(state): State<Arc<AppState>>,
-    Json(req): Json<CombatResolveRequest>,
-) -> impl IntoResponse {
+    ci: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    body: Result<Json<CombatResolveRequest>, JsonRejection>,
+) -> Result<Response, AppError> {
+    let ip = client_ip(ci, &headers, &state.rate_limits)?;
+    let now_i = Instant::now();
+    if let Err(r) = state.rate_limits.stream_ip.check(ip, now_i) {
+        return Ok(too_many_requests(r));
+    }
+    if let Err(r) = state.rate_limits.stream_wallet.check(session.wallet_address.clone(), now_i) {
+        return Ok(too_many_requests(r));
+    }
+    let Json(req) = match body {
+        Ok(j) => j,
+        Err(rej) => return Ok(rej.into_response()),
+    };
+    if req.seed_override.is_some() {
+        return Err(bad_request("seed_override is not accepted on this route"));
+    }
+    validate_combat_request(&req, state.config.server.default_max_ticks).map_err(bad_request)?;
     let id = Uuid::new_v4();
-    let session = CombatSession {
+    let saved = CombatSession {
         params: req,
         created_at: Utc::now(),
     };
-    if let Err(e) = state.session_repo.save_session(id, session).await {
-        return internal_error(format!("[session] failed to save combat session {id}: {e}")).into_response();
-    }
-    Json(json!({"session_id": id.to_string()})).into_response()
+    state
+        .session_repo
+        .save_session(id, saved)
+        .await
+        .map_err(|e| internal_error(format!("[session] failed to save combat session {id}: {e}")))?;
+    Ok(Json(json!({"session_id": id.to_string()})).into_response())
 }
 
 // ── Session integrity anchor ───────────────────────────────────────────────
@@ -790,10 +795,20 @@ async fn get_session_integrity(
 
 // ── After-Action Report (deterministic replay) ────────────────────────────
 
+/// `GET /api/combat/aar/:session_id`: replays a logged `combat/resolve` fight. It takes no
+/// session, so it is limited per address, and it refuses a logged request outside today's
+/// bounds rather than run it (BP-1e-1). Order: 500 without a peer → 429 `aar_ip` → 400 bad
+/// id → 404 → 400 not a combat request → 400 out of bounds → replay, 200.
 async fn get_combat_aar(
     State(state): State<Arc<AppState>>,
+    ci: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
     Path(raw_id): Path<String>,
-) -> Result<impl IntoResponse, AppError> {
+) -> Result<Response, AppError> {
+    let ip = client_ip(ci, &headers, &state.rate_limits)?;
+    if let Err(r) = state.rate_limits.aar_ip.check(ip, Instant::now()) {
+        return Ok(too_many_requests(r));
+    }
     let session_id = Uuid::parse_str(&raw_id)
         .map_err(|_| bad_request("session_id must be a valid UUID"))?;
 
@@ -820,6 +835,9 @@ async fn get_combat_aar(
         .as_str()
         .ok_or_else(|| internal_error("session_start payload missing timestamp"))?
         .to_string();
+    if let Err(msg) = validate_combat_request(&request, state.config.server.default_max_ticks) {
+        return Err(bad_request(format!("logged request is out of bounds: {msg}")));
+    }
 
     // Rebuild the resolver inputs exactly as post_combat_resolve built them.
     // The stored seed is forced: this is the determinism guarantee.
@@ -856,7 +874,8 @@ async fn get_combat_aar(
         "build_version": config.build_version,
         "replayed_at":   Utc::now().to_rfc3339(),
         "report":        report_value,
-    })))
+    }))
+    .into_response())
 }
 
 // ── Ore Run (hackathon demo) ───────────────────────────────────────────────
@@ -901,9 +920,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/auth/verify",               post(post_auth_verify).layer(DefaultBodyLimit::max(AUTH_BODY_LIMIT)))
         .route("/api/auth/session",              get(get_auth_session))
         .route("/api/mission/resolve",           post(post_mission_resolve).layer(DefaultBodyLimit::max(MISSION_BODY_LIMIT)))
-        .route("/api/combat/resolve",            post(post_combat_resolve))
-        .route("/api/combat/pack-assault",       post(post_pack_assault))
-        .route("/api/combat/stream/start",       post(post_combat_stream_start))
+        .route("/api/combat/resolve",            post(post_combat_resolve).layer(DefaultBodyLimit::max(COMBAT_BODY_LIMIT)))
+        .route("/api/combat/stream/start",       post(post_combat_stream_start).layer(DefaultBodyLimit::max(COMBAT_BODY_LIMIT)))
         .route("/api/combat/stream/:session_id", get(ws_combat::ws_stream_handler))
         .route("/api/combat/aar/:session_id",    get(get_combat_aar))
         .route("/api/ore-run/start",             post(post_ore_run_start))

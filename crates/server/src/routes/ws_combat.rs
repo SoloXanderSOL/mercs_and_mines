@@ -22,7 +22,7 @@ use sim_engine::{
 };
 
 use crate::{
-    api_types::{convoy_vehicle_from_class, CombatResolveRequest},
+    api_types::{convoy_vehicle_from_class, validate_combat_request, CombatResolveRequest},
     repository::InputLogRepository,
     state::AppState,
 };
@@ -49,6 +49,12 @@ pub async fn ws_stream_handler(
         > chrono::Duration::seconds(stale_secs as i64)
     {
         return StatusCode::GONE.into_response();
+    }
+
+    // A session saved by an older binary was never checked, so the socket checks it again
+    // before the upgrade (BP-1e-1). The refusal is a plain HTTP 400.
+    if let Err(msg) = validate_combat_request(&session.params, state.config.server.default_max_ticks) {
+        return super::bad_request(msg).into_response();
     }
 
     // Serialize the logged request before the upgrade: a failure refuses the request with
@@ -225,7 +231,7 @@ mod tests {
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >;
 
-    /// A live combat socket: a saved session, ticks every second, up to 1000 ticks.
+    /// A live combat socket: a saved session, ticks every second, up to 100 ticks.
     async fn combat_client() -> Client {
         let mut config = Config::default();
         config.sim.tick_stream_delay_ms = 1000;
@@ -261,7 +267,7 @@ mod tests {
         let params = CombatResolveRequest {
             section,
             vehicle,
-            max_ticks: Some(1000),
+            max_ticks: Some(100),
             seed_override: Some(42),
             combat_initiation_type: None,
             defending_convoy_vehicles: None,
@@ -292,6 +298,215 @@ mod tests {
         let tick: CombatTickEvent = serde_json::from_str(&text).expect("tick json");
         assert!(!tick.combat_ended, "precondition: the fixture's combat must outlast tick 1");
         tick.tick_index
+    }
+
+    // ── BP-1e-1: the combat routes' bounds and limits (in-memory; wallets 241–242, sessions only) ──
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt;
+    use serde_json::{json, Value};
+    use tower::ServiceExt;
+
+    fn fresh() -> Arc<AppState> {
+        Arc::new(AppState::new(Arc::new(Config::default())))
+    }
+
+    fn sign_in(state: &AppState, token: &str, wallet: [u8; 32]) {
+        let wallet = bs58::encode(wallet).into_string();
+        let now = Utc::now().timestamp();
+        state.sessions.insert(token.into(), shared::SessionToken {
+            token_id: token.into(),
+            account_id: wallet.clone(),
+            wallet_address: wallet,
+            issued_at: now,
+            expires_at: now + 600,
+        });
+    }
+
+    /// The AAR test's fixture (`tests/aar_determinism.rs`), without a seed. In every bound.
+    fn alpha() -> Value {
+        json!({
+            "section": {
+                "id": "alpha", "name": "Alpha Section", "max_strength": 5, "current_strength": 5,
+                "individual_hp": 10, "accuracy": 60, "evasion": 20,
+                "weapon": { "name": "Laser Carbine", "ap": 4, "base_damage": 8, "tag": "Laser", "accuracy": 0 },
+                "armor_at": 3, "armor_tag": "LightArmor"
+            },
+            "vehicle": {
+                "id": "scout-1", "name": "Armored Scout", "hp": 40, "max_hp": 40, "at": 6,
+                "armor_tag": "HeavyArmor", "evasion": 10,
+                "weapons": [{ "name": "Scout Cannon", "ap": 6, "base_damage": 12, "tag": "Slug", "accuracy": 0 }]
+            },
+            "max_ticks": 25,
+            "combat_initiation_type": "SPOTTED"
+        })
+    }
+
+    /// Out-of-bounds variants of `alpha()`, each cheap to run (the negatives run them), with
+    /// a word the refusal must name.
+    fn out_of_bounds() -> Vec<(Value, &'static str)> {
+        let mut strength = alpha();
+        strength["section"]["max_strength"] = json!(9);
+        strength["section"]["current_strength"] = json!(9);
+        let mut ticks = alpha();
+        ticks["max_ticks"] = json!(101);
+        let mut weapons = alpha();
+        let w = weapons["vehicle"]["weapons"][0].clone();
+        weapons["vehicle"]["weapons"] = json!([w.clone(), w.clone(), w.clone(), w.clone(), w]);
+        let mut hp = alpha();
+        hp["vehicle"]["hp"] = json!(41);
+        vec![(strength, "max_strength"), (ticks, "max_ticks"), (weapons, "weapons"), (hp, "hp")]
+    }
+
+    /// One request from `TEST_PEER`. `body: None` sends a POST with no content type (axum's
+    /// `415`, which the limiters count).
+    async fn send(state: &Arc<AppState>, method: &str, uri: &str, token: Option<&str>, body: Option<&Value>) -> (StatusCode, Value) {
+        let app = super::super::with_test_peer(super::super::router(state.clone()), super::super::TEST_PEER);
+        let mut req = Request::builder().method(method).uri(uri);
+        if let Some(t) = token {
+            req = req.header("authorization", format!("Bearer {t}"));
+        }
+        let req = match body {
+            Some(b) => req.header("content-type", "application/json").body(Body::from(b.to_string())),
+            None => req.body(Body::from("{}")),
+        }
+        .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+
+    /// ODQ-64 (b): pack-assault is retired. An unrouted POST falls through to the static
+    /// files, which answer `405`.
+    #[tokio::test]
+    async fn pack_assault_is_retired() {
+        let state = fresh();
+        let (status, body) = send(&state, "POST", "/api/combat/pack-assault", None, Some(&json!({}))).await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{body}");
+    }
+
+    #[tokio::test]
+    async fn combat_resolve_refuses_out_of_bound_values() {
+        let state = fresh();
+        let mut cases = out_of_bounds();
+        let mut seeded = alpha();
+        seeded["seed_override"] = json!(42);
+        cases.push((seeded, "seed_override"));
+        for (body, word) in &cases {
+            let (status, resp) = send(&state, "POST", "/api/combat/resolve", None, Some(body)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{word}: {resp}");
+            assert!(resp["error"].as_str().unwrap_or("").contains(word), "{word}: {resp}");
+        }
+        let (status, resp) = send(&state, "POST", "/api/combat/resolve", None, Some(&alpha())).await;
+        assert_eq!(status, StatusCode::OK, "the in-bounds fixture resolves: {resp}");
+    }
+
+    #[tokio::test]
+    async fn combat_resolve_counts_before_reading_the_body() {
+        let state = fresh();
+        for i in 0..crate::rate_limit::COMBAT_PER_IP {
+            let (status, _) = send(&state, "POST", "/api/combat/resolve", None, None).await;
+            assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "request {i}");
+        }
+        let (status, _) = send(&state, "POST", "/api/combat/resolve", None, Some(&alpha())).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// Writes a logged combat session the way `combat/resolve` does, bypassing its checks.
+    async fn log_row(state: &Arc<AppState>, request: Value) -> Uuid {
+        let sid = Uuid::new_v4();
+        let cfg = shared::SessionConfig {
+            session_id: sid.to_string(),
+            build_version: "test".into(),
+            seed: 7,
+            sector_id: Uuid::nil(),
+            campaign_id: Uuid::nil(),
+            sector_tier: "Contested".into(),
+            ruleset: "standard_v1".into(),
+        };
+        let entry = super::super::session_start_entry(request, "2026-10-28T00:00:00+00:00");
+        state.input_log_repo.start_session(&cfg, &entry).await.expect("start_session");
+        sid
+    }
+
+    #[tokio::test]
+    async fn aar_refuses_an_out_of_bound_logged_request() {
+        let state = fresh();
+        let (strength, _) = out_of_bounds().remove(0);
+        let bad = log_row(&state, strength).await;
+        let (status, body) = send(&state, "GET", &format!("/api/combat/aar/{bad}"), None, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let msg = body["error"].as_str().unwrap_or("");
+        assert!(msg.starts_with("logged request is out of bounds") && msg.contains("max_strength"), "{body}");
+        let good = log_row(&state, alpha()).await;
+        let (status, body) = send(&state, "GET", &format!("/api/combat/aar/{good}"), None, None).await;
+        assert_eq!(status, StatusCode::OK, "an in-bounds row replays: {body}");
+    }
+
+    #[tokio::test]
+    async fn aar_counts_per_address() {
+        let state = fresh();
+        for i in 0..crate::rate_limit::AAR_PER_IP {
+            let (status, _) = send(&state, "GET", "/api/combat/aar/x", None, None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "request {i}");
+        }
+        let (status, _) = send(&state, "GET", "/api/combat/aar/x", None, None).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn stream_start_refuses_out_of_bound_values() {
+        let state = fresh();
+        sign_in(&state, "t", [241u8; 32]);
+        let mut cases = out_of_bounds();
+        cases.swap(0, 1); // max_ticks first
+        cases.truncate(3);
+        let mut seeded = alpha();
+        seeded["seed_override"] = json!(42);
+        cases.push((seeded, "seed_override"));
+        for (body, word) in &cases {
+            let (status, resp) = send(&state, "POST", "/api/combat/stream/start", Some("t"), Some(body)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{word}: {resp}");
+            assert!(resp["error"].as_str().unwrap_or("").contains(word), "{word}: {resp}");
+        }
+        let (status, resp) = send(&state, "POST", "/api/combat/stream/start", Some("t"), Some(&alpha())).await;
+        assert_eq!(status, StatusCode::OK, "the in-bounds fixture is saved: {resp}");
+    }
+
+    #[tokio::test]
+    async fn stream_start_counts_before_reading_the_body() {
+        let state = fresh();
+        sign_in(&state, "t", [242u8; 32]);
+        for i in 0..crate::rate_limit::STREAM_PER_WALLET {
+            let (status, _) = send(&state, "POST", "/api/combat/stream/start", Some("t"), None).await;
+            assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "request {i}");
+        }
+        let (status, _) = send(&state, "POST", "/api/combat/stream/start", Some("t"), Some(&alpha())).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// A session an older binary saved without the checks: the socket refuses it before the
+    /// upgrade, with a plain HTTP 400.
+    #[tokio::test]
+    async fn combat_socket_refuses_an_out_of_bound_session() {
+        let mut config = Config::default();
+        config.sim.tick_stream_delay_ms = 1000;
+        let state = Arc::new(AppState::new(Arc::new(config)));
+        let (strength, _) = out_of_bounds().remove(0);
+        let params: CombatResolveRequest = serde_json::from_value(strength).expect("params");
+        let id = Uuid::new_v4();
+        state
+            .session_repo
+            .save_session(id, CombatSession { params, created_at: Utc::now() })
+            .await
+            .expect("save_session");
+        let addr = super::super::serve_on_loopback(super::super::router(state)).await;
+        match tokio_tungstenite::connect_async(format!("ws://{addr}/api/combat/stream/{id}")).await {
+            Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => assert_eq!(resp.status(), 400),
+            other => panic!("expected an HTTP 400 before the upgrade, got {:?}", other.map(|_| ())),
+        }
     }
 
     #[tokio::test]

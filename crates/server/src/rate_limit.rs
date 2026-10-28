@@ -70,6 +70,14 @@ pub const CHECKOUT_CHECK_WINDOW: Duration = Duration::from_secs(10);
 pub const MISSION_PER_IP: u32 = 60;
 pub const MISSION_PER_WALLET: u32 = 6;
 
+/// The combat routes (BP-1e-1, keeper, GAP-87). `combat/resolve` and the AAR take no session,
+/// so they are limited per address only; `stream/start` is signed in, so per wallet too.
+/// Each per-address value sits under nginx's 30 a minute.
+pub const COMBAT_PER_IP: u32 = 20;
+pub const AAR_PER_IP: u32 = 20;
+pub const STREAM_PER_IP: u32 = 20;
+pub const STREAM_PER_WALLET: u32 = 6;
+
 /// What a request is counted against. IPv4 whole; IPv6 by its /64 (`V6Net` holds the top
 /// 64 bits), so one host can't mint fresh buckets from its own prefix. `Shared` is the one
 /// bucket for a loopback peer that sent no usable `X-Real-IP`.
@@ -310,6 +318,12 @@ pub struct RateLimits {
     /// The mission route (BP-3b-1): per address and per wallet.
     pub mission_ip: FixedWindow<ClientKey>,
     pub mission_wallet: FixedWindow<String>,
+    /// The combat routes (BP-1e-1): resolve and the AAR per address; the stream per address
+    /// and per wallet.
+    pub combat_ip: FixedWindow<ClientKey>,
+    pub aar_ip: FixedWindow<ClientKey>,
+    pub stream_ip: FixedWindow<ClientKey>,
+    pub stream_wallet: FixedWindow<String>,
     pub join_ip: FixedWindow<ClientKey>,
     pub join_wallet: FixedWindow<String>,
     pub replacement_ip: FixedWindow<ClientKey>,
@@ -345,6 +359,10 @@ impl RateLimits {
             checkout_checks_warn: RateWarn::new(),
             mission_ip: w("mission_ip", MISSION_PER_IP),
             mission_wallet: w("mission_wallet", MISSION_PER_WALLET),
+            combat_ip: w("combat_ip", COMBAT_PER_IP),
+            aar_ip: w("aar_ip", AAR_PER_IP),
+            stream_ip: w("stream_ip", STREAM_PER_IP),
+            stream_wallet: w("stream_wallet", STREAM_PER_WALLET),
             join_ip: w("join_ip", JOIN_PER_IP),
             join_wallet: w("join_wallet", JOIN_PER_WALLET),
             replacement_ip: w("replacement_ip", REPLACEMENT_PER_IP),

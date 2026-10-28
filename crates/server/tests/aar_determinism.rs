@@ -2,7 +2,7 @@ use std::sync::Arc;
 use axum::body::Body;
 use http_body_util::BodyExt;
 use tower::util::ServiceExt;
-use mercs_server::{config::Config, routes::router, state::AppState};
+use mercs_server::{config::Config, routes::{router, with_test_peer, TEST_PEER}, state::AppState};
 
 fn alpha_vs_scout_payload() -> serde_json::Value {
     serde_json::json!({
@@ -40,7 +40,6 @@ fn alpha_vs_scout_payload() -> serde_json::Value {
                 "accuracy": 0
             }]
         },
-        "seed_override": 42,
         "max_ticks": 25,
         "combat_initiation_type": "SPOTTED"
     })
@@ -50,7 +49,7 @@ fn alpha_vs_scout_payload() -> serde_json::Value {
 async fn aar_replays_deterministically() {
     let config = Arc::new(Config::default());
     let state = Arc::new(AppState::new(config));
-    let app = router(state);
+    let app = with_test_peer(router(state), TEST_PEER);
 
     // ── Step 1: resolve combat, get session_id ─────────────────────────
     let resolve_resp = app
@@ -145,7 +144,7 @@ async fn aar_replays_commander_buffed_combat() {
     payload["commander"] = serde_json::to_value(&commander).unwrap();
 
     let state = Arc::new(AppState::new(Arc::new(Config::default())));
-    let app = router(state);
+    let app = with_test_peer(router(state), TEST_PEER);
 
     let resolve_resp = app
         .clone()
