@@ -8153,3 +8153,268 @@ async fn pg_has_convoy_in_transit_reads_sector_wallet_flag_and_arrival() {
     assert!(!s2_w.expect("S2, W"), "ten minutes overdue: no longer counts");
     assert!(!s3_w.expect("S3, W"), "landed: no longer counts");
 }
+
+// ── BP-3c-1b-1: the demo reaper (demo-only, ODQ-67 (b)) ─────────────────────
+// Wallets 100–105. Literal times, no sleeps: T0 = 2026-01-01T00:00:00Z, cutoff T0 + 15 min.
+// Each test asserts on its own campaign only: a sweep can see other `Active` rows.
+
+use mercs_server::demo_reaper::{reap_once, reap_once_with_seam, PostgresReaperStore, ReaperStore, ReaperWarns};
+
+fn reap_at(rfc3339: &str) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::parse_from_rfc3339(rfc3339).unwrap().with_timezone(&chrono::Utc)
+}
+
+fn reap_t0() -> chrono::DateTime<chrono::Utc> {
+    reap_at("2026-01-01T00:00:00Z")
+}
+
+fn reap_cutoff() -> chrono::DateTime<chrono::Utc> {
+    reap_t0() + chrono::Duration::minutes(15)
+}
+
+/// An `Active` campaign for `wallet` (pre-cleaned) with one Commander, and its sector in
+/// `state`'s in-memory sector store. Returns (campaign, sector, commander).
+async fn reap_seed(
+    pool: &sqlx::PgPool,
+    state: &mercs_server::state::AppState,
+    wallet: [u8; 32],
+) -> (uuid::Uuid, uuid::Uuid, uuid::Uuid) {
+    let (c, ids) = seed_active_member(pool, wallet, 0x3C1B, 1).await;
+    let sector_id = PostgresCampaignRepository::new(pool.clone())
+        .get_campaign(c).await.expect("get_campaign").expect("the campaign exists").sector_id;
+    state.sector_repo.upsert_sector(SectorState {
+        sector_id,
+        campaign_id:         c,
+        occupation_status:   OccupationStatus::Neutral,
+        owner:               None,
+        deployed_unit_count: 0,
+        terrain:             std::collections::HashMap::new(),
+        magma_veins:         vec![],
+        hex_occupancy:       std::collections::HashMap::new(),
+    }).await.expect("upsert_sector");
+    (c, sector_id, ids[0])
+}
+
+/// One deployment for `commander` at `started_at`, then aborted, so a later start is not busy.
+async fn reap_deployment(pool: &sqlx::PgPool, commander: uuid::Uuid, started_at: chrono::DateTime<chrono::Utc>) {
+    let repo = PostgresCommanderRepository::new(pool.clone());
+    let d = new_deployment_4g1(commander, started_at);
+    assert!(matches!(repo.start_deployment(&d).await.expect("start_deployment"), DeploymentStart::Started));
+    repo.abort_deployment(d.deployment_id).await.expect("abort_deployment");
+}
+
+async fn reap_state_of(pool: &sqlx::PgPool, c: uuid::Uuid) -> Option<CampaignLifecycle> {
+    PostgresCampaignRepository::new(pool.clone()).get_campaign(c).await.ok().flatten().map(|r| r.state)
+}
+
+/// BP-3c-1b-1 D1 — a campaign whose latest mission started before the cutoff is archived and
+/// its sector deleted.
+#[tokio::test]
+async fn reaper_retires_a_campaign_idle_since_its_last_mission() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    let wallet = [100u8; 32];
+    let state = default_state();
+    let (c, s, k) = reap_seed(&pool, &state, wallet).await;
+    reap_deployment(&pool, k, reap_t0()).await;
+    let store = PostgresReaperStore::new(pool.clone());
+
+    // Collect.
+    let listed = store.list_idle_campaigns(reap_cutoff(), 10_000).await;
+    let reaped = reap_once(&state, &store, reap_cutoff(), &mut ReaperWarns::new()).await;
+    let after = reap_state_of(&pool, c).await;
+    let sector = state.sector_repo.sector_exists(s).await;
+
+    // Clean.
+    clean_wallet_4g1(&pool, &wallet).await;
+
+    // Assert.
+    assert!(listed.expect("list_idle_campaigns").contains(&(c, s)), "listed as idle");
+    assert!(reaped >= 1, "the sweep retired it");
+    assert_eq!(after, Some(CampaignLifecycle::Archived));
+    assert!(!sector.expect("sector_exists"), "its sector is deleted");
+    assert_eq!(state.launch_locks.len(), 0, "no launch lock left behind");
+}
+
+/// BP-3c-1b-1 D2 — a mission started after the cutoff keeps the campaign: not listed, not
+/// retired, sector kept.
+#[tokio::test]
+async fn reaper_keeps_a_campaign_with_a_recent_mission() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    let wallet = [101u8; 32];
+    let state = default_state();
+    let (c, s, k) = reap_seed(&pool, &state, wallet).await;
+    reap_deployment(&pool, k, reap_t0() + chrono::Duration::minutes(20)).await;
+    let store = PostgresReaperStore::new(pool.clone());
+
+    // Collect.
+    let listed = store.list_idle_campaigns(reap_cutoff(), 10_000).await;
+    let retired = store.retire_if_idle(c, reap_cutoff()).await;
+    reap_once(&state, &store, reap_cutoff(), &mut ReaperWarns::new()).await;
+    let after = reap_state_of(&pool, c).await;
+    let sector = state.sector_repo.sector_exists(s).await;
+
+    // Clean.
+    clean_wallet_4g1(&pool, &wallet).await;
+
+    // Assert.
+    assert!(!listed.expect("list_idle_campaigns").contains(&(c, s)), "not listed");
+    assert!(!retired.expect("retire_if_idle"), "not retired");
+    assert_eq!(after, Some(CampaignLifecycle::Active));
+    assert!(sector.expect("sector_exists"), "its sector is kept");
+}
+
+/// BP-3c-1b-1 D3 — with no mission at all, the launch time decides.
+#[tokio::test]
+async fn reaper_falls_back_to_the_launch_time() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    let wallet = [102u8; 32];
+    let state = default_state();
+    let (c, s, _) = reap_seed(&pool, &state, wallet).await;
+    let store = PostgresReaperStore::new(pool.clone());
+
+    // Collect.
+    let before_launch = store.retire_if_idle(c, reap_at("2000-01-01T00:00:00Z")).await;
+    let listed = store.list_idle_campaigns(reap_at("2100-01-01T00:00:00Z"), 10_000).await;
+    let after_launch = store.retire_if_idle(c, reap_at("2100-01-01T00:00:00Z")).await;
+    let after = reap_state_of(&pool, c).await;
+
+    // Clean.
+    clean_wallet_4g1(&pool, &wallet).await;
+
+    // Assert.
+    assert!(!before_launch.expect("retire_if_idle 2000"), "launched after 2000: not idle");
+    assert!(listed.expect("list_idle_campaigns").contains(&(c, s)), "listed at 2100");
+    assert!(after_launch.expect("retire_if_idle 2100"), "launched before 2100: retired");
+    assert_eq!(after, Some(CampaignLifecycle::Archived));
+}
+
+/// BP-3c-1b-1 D4 — `Pending`, `Ending` and `Archived` campaigns are never listed or retired.
+#[tokio::test]
+async fn reaper_touches_only_active_campaigns() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    let wallet = [103u8; 32];
+    clean_wallet_4g1(&pool, &wallet).await;
+    let repo = PostgresCampaignRepository::new(pool.clone());
+    let ends_at = chrono::Utc::now() + chrono::Duration::days(90);
+    let pending = seed_account_and_campaign(&pool, wallet, 0x3C1B).await;
+    let ending = seed_account_and_campaign(&pool, wallet, 0x3C1B).await;
+    assert!(repo.activate_campaign(ending, ends_at, serde_json::json!({})).await.expect("activate"));
+    repo.update_sector_state(ending, CampaignLifecycle::Ending).await.expect("update_sector_state");
+    let archived = seed_account_and_campaign(&pool, wallet, 0x3C1B).await;
+    assert!(repo.activate_campaign(archived, ends_at, serde_json::json!({})).await.expect("activate"));
+    assert!(repo.retire_if_active(archived).await.expect("retire_if_active"));
+    let store = PostgresReaperStore::new(pool.clone());
+    let late = reap_at("2100-01-01T00:00:00Z");
+
+    // Collect.
+    let listed = store.list_idle_campaigns(late, 10_000).await;
+    let mut retired = Vec::new();
+    let mut states = Vec::new();
+    for c in [pending, ending, archived] {
+        retired.push(store.retire_if_idle(c, late).await);
+        states.push(reap_state_of(&pool, c).await);
+    }
+
+    // Clean.
+    clean_wallet_4g1(&pool, &wallet).await;
+
+    // Assert.
+    let listed: Vec<uuid::Uuid> = listed.expect("list_idle_campaigns").into_iter().map(|(c, _)| c).collect();
+    for c in [pending, ending, archived] {
+        assert!(!listed.contains(&c), "{c} is not Active: never listed");
+    }
+    for r in retired {
+        assert!(!r.expect("retire_if_idle"), "never retired");
+    }
+    assert_eq!(states, vec![
+        Some(CampaignLifecycle::Pending),
+        Some(CampaignLifecycle::Ending),
+        Some(CampaignLifecycle::Archived),
+    ]);
+}
+
+/// BP-3c-1b-1 D5 — the race: a mission whose deployment commits after the reaper's select
+/// and before its retire keeps the campaign, because the idle test sits inside the `UPDATE`.
+#[tokio::test]
+async fn reaper_retire_sees_a_deployment_committed_after_its_select() {
+    use std::time::Duration;
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    let wallet = [104u8; 32];
+    let state = std::sync::Arc::new(default_state());
+    let (c, s, k) = reap_seed(&pool, &state, wallet).await;
+    reap_deployment(&pool, k, reap_t0()).await;
+    let store = std::sync::Arc::new(PostgresReaperStore::new(pool.clone()));
+    let (hook, mut parked, gate) = join_pause_hook();
+
+    // Collect.
+    let (st, sr) = (std::sync::Arc::clone(&state), std::sync::Arc::clone(&store));
+    let reaper = tokio::spawn(async move {
+        reap_once_with_seam(&st, sr.as_ref(), reap_cutoff(), &mut ReaperWarns::new(), Some(&hook)).await
+    });
+    let parked_ok = tokio::time::timeout(Duration::from_secs(10), parked.recv()).await;
+    let started = PostgresCommanderRepository::new(pool.clone())
+        .start_deployment(&new_deployment_4g1(k, reap_t0() + chrono::Duration::minutes(20))).await;
+    gate.send(true).expect("open the gate");
+    let reaped = reaper.await;
+    let after = reap_state_of(&pool, c).await;
+    let sector = state.sector_repo.sector_exists(s).await;
+
+    // Clean.
+    clean_wallet_4g1(&pool, &wallet).await;
+
+    // Assert.
+    parked_ok.expect("the reaper never parked").expect("the reaper never parked");
+    assert!(matches!(started.expect("start_deployment"), DeploymentStart::Started));
+    reaped.expect("the reaper task");
+    assert_eq!(after, Some(CampaignLifecycle::Active), "the deployment committed first: kept");
+    assert!(sector.expect("sector_exists"), "its sector is kept");
+    assert_eq!(state.launch_locks.len(), 0, "no launch lock left behind");
+}
+
+/// BP-3c-1b-1 D6 — a convoy in transit on the campaign's sector keeps an idle campaign, as it
+/// blocks the abandon; once it has landed the campaign is retired.
+#[tokio::test]
+async fn reaper_keeps_a_campaign_with_a_convoy_in_transit() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    let wallet = [105u8; 32];
+    let state = default_state();
+    let (c, s, k) = reap_seed(&pool, &state, wallet).await;
+    reap_deployment(&pool, k, reap_t0()).await;
+    let now = chrono::Utc::now();
+    let convoy_id = uuid::Uuid::new_v4();
+    PostgresConvoyRepository::new(pool.clone()).create_convoy(ConvoyDbRecord {
+        convoy_id,
+        sector_id:     s,
+        owner_wallet:  wallet.to_vec(),
+        origin_q:      0,
+        origin_r:      0,
+        destination_q: 1,
+        destination_r: 0,
+        route:         serde_json::json!([{"q": 0, "r": 0}, {"q": 1, "r": 0}]),
+        arrival_time:  now + chrono::Duration::minutes(10),
+        vehicle_class: "BehemothMegaTruck".to_string(),
+        cargo:         serde_json::json!({}),
+        in_transit:    true,
+        created_at:    now,
+    }).await.expect("create_convoy");
+    let store = PostgresReaperStore::new(pool.clone());
+
+    // Collect.
+    let listed = store.list_idle_campaigns(reap_cutoff(), 10_000).await;
+    let in_transit = store.retire_if_idle(c, reap_cutoff()).await;
+    let landed = sqlx::query("UPDATE convoy_records SET in_transit = false WHERE convoy_id = $1")
+        .bind(convoy_id).execute(&pool).await;
+    let after_landing = store.retire_if_idle(c, reap_cutoff()).await;
+
+    // Clean.
+    let cleaned = sqlx::query("DELETE FROM convoy_records WHERE convoy_id = $1")
+        .bind(convoy_id).execute(&pool).await;
+    clean_wallet_4g1(&pool, &wallet).await;
+
+    // Assert.
+    cleaned.expect("convoy cleanup failed");
+    landed.expect("land the convoy");
+    assert!(!listed.expect("list_idle_campaigns").contains(&(c, s)), "a convoy in transit: not listed");
+    assert!(!in_transit.expect("retire_if_idle"), "a convoy in transit: kept");
+    assert!(after_landing.expect("retire_if_idle"), "landed: retired");
+}

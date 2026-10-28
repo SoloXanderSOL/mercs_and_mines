@@ -9,6 +9,7 @@ pub mod payment;
 pub mod solana_pay;
 pub mod checkout_store;
 pub mod demo_checkout;
+pub mod demo_reaper;
 pub mod advisor_gen;
 pub mod augmentee_gen;
 pub mod api_types;

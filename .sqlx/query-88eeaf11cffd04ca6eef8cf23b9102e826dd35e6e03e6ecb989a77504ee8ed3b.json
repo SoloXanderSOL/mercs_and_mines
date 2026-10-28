@@ -1,0 +1,43 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE campaign_instances c SET state = $1, updated_at = now()\n               WHERE c.campaign_id = $2 AND c.state = $3\n                 AND (COALESCE((SELECT max(d.started_at) FROM deployment_records d\n                                JOIN commander_records cr ON cr.commander_id = d.commander_id\n                                WHERE cr.campaign_id = c.campaign_id), c.started_at) < $4)\n                 AND NOT EXISTS (SELECT 1 FROM convoy_records v\n                                 WHERE v.sector_id = c.sector_id AND v.in_transit\n                                   AND v.arrival_time > now() - interval '5 minutes')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        {
+          "Custom": {
+            "name": "sector_state",
+            "kind": {
+              "Enum": [
+                "Pending",
+                "Active",
+                "Ending",
+                "Ended",
+                "Archived"
+              ]
+            }
+          }
+        },
+        "Uuid",
+        {
+          "Custom": {
+            "name": "sector_state",
+            "kind": {
+              "Enum": [
+                "Pending",
+                "Active",
+                "Ending",
+                "Ended",
+                "Archived"
+              ]
+            }
+          }
+        },
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "88eeaf11cffd04ca6eef8cf23b9102e826dd35e6e03e6ecb989a77504ee8ed3b"
+}

@@ -75,6 +75,9 @@ async fn main() {
     state.convoy_repo     = Arc::new(PostgresConvoyRepository::new(pool.clone()));
     state.session_repo    = Arc::new(RedisSessionStateRepository::new(redis_mgr.clone(), config.server.combat_session_stale_secs));
     state.input_log_repo  = Arc::new(PostgresInputLogRepository::new(pool.clone()));
+    // BP-3c-1b-1 (demo-only): the demo reaper's store (ODQ-67 (b)).
+    let reaper_store: Arc<dyn mercs_server::demo_reaper::ReaperStore> =
+        Arc::new(mercs_server::demo_reaper::PostgresReaperStore::new(pool.clone()));
     state.pool  = Some(pool);
     state.redis = Some(redis_mgr);
     let state = Arc::new(state);
@@ -101,6 +104,15 @@ async fn main() {
         Duration::from_secs(5),
         Duration::from_secs(60),
         move || mercs_server::auth::run_auth_sweep_task(Arc::clone(&sweep_state)),
+    ));
+
+    // BP-3c-1b-1 (demo-only): archives demo campaigns idle for 15 minutes (ODQ-67 (b)).
+    let reaper_state = Arc::clone(&state);
+    tokio::spawn(supervise(
+        "demo_reaper",
+        Duration::from_secs(5),
+        Duration::from_secs(60),
+        move || mercs_server::demo_reaper::run_demo_reaper_task(Arc::clone(&reaper_state), Arc::clone(&reaper_store)),
     ));
 
     let app = mercs_server::routes::router(state);

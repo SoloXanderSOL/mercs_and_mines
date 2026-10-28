@@ -1,0 +1,43 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT c.campaign_id AS \"campaign_id!\", c.sector_id AS \"sector_id!\"\n               FROM campaign_instances c\n               LEFT JOIN (SELECT cr.campaign_id, max(d.started_at) AS last_start\n                          FROM deployment_records d\n                          JOIN commander_records cr ON cr.commander_id = d.commander_id\n                          GROUP BY cr.campaign_id) m ON m.campaign_id = c.campaign_id\n               WHERE c.state = $1\n                 AND (COALESCE(m.last_start, c.started_at) < $2)\n                 AND NOT EXISTS (SELECT 1 FROM convoy_records v\n                                 WHERE v.sector_id = c.sector_id AND v.in_transit\n                                   AND v.arrival_time > now() - interval '5 minutes')\n               ORDER BY COALESCE(m.last_start, c.started_at)\n               LIMIT $3",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "campaign_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "sector_id!",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        {
+          "Custom": {
+            "name": "sector_state",
+            "kind": {
+              "Enum": [
+                "Pending",
+                "Active",
+                "Ending",
+                "Ended",
+                "Archived"
+              ]
+            }
+          }
+        },
+        "Timestamptz",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "57cf85323c991db7e02c363e8255efc6131e31ec1bc83d680659b717fca2da93"
+}
