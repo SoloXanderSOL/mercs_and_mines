@@ -1,8 +1,8 @@
 // HTTP route handlers for all API endpoints.
 // Seed handling (Director ruling): the server is the authority on time and entropy.
-//   The combat, stream and mission routes refuse seed_override (400); ore-run still
-//   honours it. Otherwise the seed comes from OS entropy via rng::generate_seed(),
-//   and the AAR replays the logged seed.
+//   Every route that takes seed_override refuses it (400): combat, stream, mission and
+//   ore-run. The seed comes from OS entropy via rng::generate_seed(), and the AAR
+//   replays the logged seed.
 // Timestamp is always generated server-side via chrono::Utc::now(); never accepted from client.
 
 pub mod admin;
@@ -397,6 +397,9 @@ pub const MISSION_BODY_LIMIT: usize = 64 * 1024;
 /// The largest body `combat/resolve` and `stream/start` accept (BP-1e-1). An honest request
 /// is under 1 KB, and one at every bound is about 2.2 KB.
 pub const COMBAT_BODY_LIMIT: usize = 8 * 1024;
+
+/// The largest body `ore-run/start` accepts (BP-1e-2). The button's body is at most 31 bytes.
+pub const ORE_BODY_LIMIT: usize = 1024;
 /// Canon: a Section is at most 8 units (Casualties_Reinforcements_and_Veterancy). A mission
 /// carries at most this many units for each Section it sends.
 pub const MAX_UNITS_PER_SECTION: usize = 8;
@@ -883,20 +886,40 @@ async fn get_combat_aar(
 #[derive(Debug, Deserialize)]
 struct OreRunRequest {
     approach: Approach,
-    seed_override: Option<u32>,
+    /// Refused: the server picks the seed. `null` reads as `None` and is accepted.
+    #[serde(default)]
+    seed_override: Option<Value>,
 }
 
+/// `POST /api/ore-run/start`: the Ore Run button on `game.html`. It takes no session, so it
+/// is limited per address. Order (BP-1e-2): 500 without a peer → 429 `ore_ip` → axum's body
+/// rejection, counted (413 over `ORE_BODY_LIMIT`; 400, 415, 422) → 400 `seed_override` →
+/// run, 200.
 async fn post_ore_run_start(
-    State(_state): State<Arc<AppState>>,
-    Json(req): Json<OreRunRequest>,
-) -> Result<impl IntoResponse, AppError> {
+    State(state): State<Arc<AppState>>,
+    ci: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    body: Result<Json<OreRunRequest>, JsonRejection>,
+) -> Result<Response, AppError> {
+    let ip = client_ip(ci, &headers, &state.rate_limits)?;
+    if let Err(r) = state.rate_limits.ore_ip.check(ip, Instant::now()) {
+        return Ok(too_many_requests(r));
+    }
+    let Json(req) = match body {
+        Ok(j) => j,
+        Err(rej) => return Ok(rej.into_response()),
+    };
+    let OreRunRequest { approach, seed_override } = req;
+    if seed_override.is_some() {
+        return Err(bad_request("seed_override is not accepted on this route"));
+    }
     // TODO Phase 1: assign session_id and persist session config via save_session_config
     // before ore-run outcomes are attached to campaign resource events. The seed is
     // currently returned to the client but not anchored server-side — any run wired
     // into campaign state without this fix will be un-auditable.
-    let seed = req.seed_override.unwrap_or_else(generate_seed);
+    let seed = generate_seed();
     let timestamp = Utc::now().to_rfc3339();
-    let (result, ticks) = run_ore_run(req.approach, seed, &timestamp);
+    let (result, ticks) = run_ore_run(approach, seed, &timestamp);
     let result_value = serde_json::to_value(&result)
         .map_err(|e| internal_error(format!("ore-run result serialization failed: {e}")))?;
     let ticks_value = serde_json::to_value(&ticks)
@@ -905,7 +928,8 @@ async fn post_ore_run_start(
         "result": result_value,
         "ticks":  ticks_value,
         "seed":   seed,
-    })))
+    }))
+    .into_response())
 }
 
 // ── Router ─────────────────────────────────────────────────────────────────
@@ -924,7 +948,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/combat/stream/start",       post(post_combat_stream_start).layer(DefaultBodyLimit::max(COMBAT_BODY_LIMIT)))
         .route("/api/combat/stream/:session_id", get(ws_combat::ws_stream_handler))
         .route("/api/combat/aar/:session_id",    get(get_combat_aar))
-        .route("/api/ore-run/start",             post(post_ore_run_start))
+        .route("/api/ore-run/start",             post(post_ore_run_start).layer(DefaultBodyLimit::max(ORE_BODY_LIMIT)))
         .route("/api/session/:id/integrity",     get(get_session_integrity))
         .merge(admin::router())
         .merge(campaign::router())

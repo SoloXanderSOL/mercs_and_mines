@@ -1,9 +1,11 @@
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 use axum::{
     Router,
     routing::post,
-    extract::{Path, State},
-    http::StatusCode,
+    extract::{rejection::JsonRejection, ConnectInfo, DefaultBodyLimit, Path, State},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -12,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::auth::AuthSession;
-use crate::map_gen::hex_axial_distance;
+use crate::map_gen::{hex_axial_distance, MAP_RADIUS_HEXES};
 use crate::repository::{
     CampaignLifecycle, ConvoyDbRecord, DeploymentTimer, HexOccupant, TimerType, WalletAddress,
 };
@@ -28,18 +30,58 @@ pub struct DispatchConvoyRequest {
     pub cargo:         serde_json::Value,
 }
 
-pub fn router() -> Router<Arc<AppState>> {
-    Router::new()
-        .route("/api/campaign/:campaign_id/convoy/dispatch", post(dispatch_convoy))
+/// The largest dispatch body (BP-1e-2). An honest one is about 130 bytes.
+pub const CONVOY_BODY_LIMIT: usize = 4096;
+/// The largest `cargo`, serialised. It is logged, stored and sent on the owner's events
+/// socket, so it is bounded on its own.
+pub const CONVOY_CARGO_MAX_BYTES: usize = 1024;
+/// The longest `vehicle_class`, in bytes. It is logged, stored and shown on the sector map.
+pub const MAX_VEHICLE_CLASS_BYTES: usize = 64;
+
+/// Whether an axial hex is on the sector map: its cube distance from the centre is within
+/// `MAP_RADIUS_HEXES`. Computed in `i64`, so any client value is safe; `hex_axial_distance`
+/// subtracts raw `i32`s and runs only once both hexes pass.
+fn on_the_map(q: i32, r: i32) -> bool {
+    let (q, r) = (q as i64, r as i64);
+    let dist = (q.abs() + r.abs() + (q + r).abs()) / 2;
+    dist <= MAP_RADIUS_HEXES as i64
 }
 
+pub fn router() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/api/campaign/:campaign_id/convoy/dispatch", post(dispatch_convoy).layer(DefaultBodyLimit::max(CONVOY_BODY_LIMIT)))
+}
+
+/// `POST /api/campaign/:campaign_id/convoy/dispatch`. Order (BP-1e-2): 401 → 400 path →
+/// 500 without a peer → 429 `convoy_ip` → 429 `convoy_wallet` → axum's body rejection,
+/// counted (413 over `CONVOY_BODY_LIMIT`; 400, 415, 422) → 401 wallet → 400 shape
+/// (`vehicle_class`, `cargo`, a hex off the map, zero distance) → 404 campaign → 403 member →
+/// 409 not Active → 409 sector state missing (GAP-85; 500 on a read error) → 400 impassable
+/// → timer, write, marker → 201.
 async fn dispatch_convoy(
     AuthSession(token): AuthSession,
     State(state): State<Arc<AppState>>,
     Path(campaign_id): Path<Uuid>,
-    Json(req): Json<DispatchConvoyRequest>,
+    ci: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    body: Result<Json<DispatchConvoyRequest>, JsonRejection>,
 ) -> Response {
     // TODO(phase-2): validate He3 balance before dispatch
+    let ip = match super::client_ip(ci, &headers, &state.rate_limits) {
+        Ok(k) => k,
+        Err(e) => return e.into_response(),
+    };
+    let now_i = Instant::now();
+    if let Err(r) = state.rate_limits.convoy_ip.check(ip, now_i) {
+        return super::too_many_requests(r);
+    }
+    if let Err(r) = state.rate_limits.convoy_wallet.check(token.wallet_address.clone(), now_i) {
+        return super::too_many_requests(r);
+    }
+    let Json(req) = match body {
+        Ok(j) => j,
+        Err(rej) => return rej.into_response(),
+    };
 
     // Decode wallet: base58 string → Vec<u8> for DB storage, [u8; 32] for timer
     let owner_wallet: Vec<u8> = match bs58::decode(&token.wallet_address).into_vec() {
@@ -50,6 +92,24 @@ async fn dispatch_convoy(
         Ok(b) => b,
         Err(_) => return super::unauthorized("session wallet is not a 32-byte key").into_response(),
     };
+
+    // 400 — the body's shape (BP-1e-2). Each check is a pure function of the request, so the
+    // answer never depends on the campaign, and a malformed body costs no read.
+    if req.vehicle_class.len() > MAX_VEHICLE_CLASS_BYTES {
+        return super::bad_request(format!("vehicle_class is longer than {MAX_VEHICLE_CLASS_BYTES} bytes")).into_response();
+    }
+    let cargo_bytes = serde_json::to_vec(&req.cargo).map(|v| v.len()).unwrap_or(usize::MAX);
+    if cargo_bytes > CONVOY_CARGO_MAX_BYTES {
+        return super::bad_request(format!("cargo is larger than {CONVOY_CARGO_MAX_BYTES} bytes")).into_response();
+    }
+    if !on_the_map(req.origin_q, req.origin_r) || !on_the_map(req.destination_q, req.destination_r) {
+        return super::bad_request("hex is off the map").into_response();
+    }
+    // A zero-distance timer fires at once and could race the dispatch commit into the
+    // phantom path, so it is refused before any write (GAP-44, W3).
+    if (req.origin_q, req.origin_r) == (req.destination_q, req.destination_r) {
+        return super::bad_request("origin and destination are the same hex").into_response();
+    }
 
     // Look up campaign → derive sector_id
     let campaign = match state.campaign_repo.get_campaign(campaign_id).await {
@@ -77,14 +137,18 @@ async fn dispatch_convoy(
 
     // Terrain modifier — destination hex only (Phase 1 simplification)
     // TODO(phase-2): use full route waypoints for terrain modifier
-    // A sector read error falls back to modifier 1.0, as before; it is logged, not refused.
+    // GAP-85: the sector must be readable. A plain-terrain default would skip the impassable
+    // check and give a wrong travel time, so a read error is a 500 and a missing sector a 409.
     let sector = match state.sector_repo.get_sector(sector_id).await {
         Ok(s) => s,
         Err(e) => {
-            tracing::warn!("dispatch_convoy: get_sector failed for campaign {campaign_id} (sector {sector_id}); using terrain modifier 1.0: {e:?}");
-            None
+            return super::internal_error(format!("dispatch_convoy: get_sector failed for campaign {campaign_id} (sector {sector_id}): {e:?}")).into_response();
         }
     };
+    if sector.is_none() {
+        tracing::warn!(%campaign_id, %sector_id, "dispatch_convoy: sector state missing; refusing the dispatch");
+        return super::conflict("campaign sector state is unavailable").into_response();
+    }
     let terrain_modifier = sector
         .and_then(|s| s.terrain.get(&format!("{},{}", req.destination_q, req.destination_r)).cloned())
         .map(|t| t.travel_time_modifier())
@@ -93,11 +157,6 @@ async fn dispatch_convoy(
     // TODO(phase-1): reject route if destination hex is impassable
     if terrain_modifier == f64::INFINITY {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "destination hex is impassable"}))).into_response();
-    }
-    // A zero-distance timer fires at once and could race the dispatch commit into the
-    // phantom path, so it is refused before any write (GAP-44, W3).
-    if (req.origin_q, req.origin_r) == (req.destination_q, req.destination_r) {
-        return super::bad_request("origin and destination are the same hex").into_response();
     }
 
     // Compute arrival time
@@ -238,6 +297,17 @@ mod tests {
         assert!(activated, "the fixture campaign must activate");
         state.membership_repo.add_member(&[5u8; 32], campaign_id, None, None).await.expect("add_member");
         sign_in(&state, "t", [5u8; 32]);
+        // GAP-85: dispatch refuses a campaign whose sector state is missing.
+        state.sector_repo.upsert_sector(SectorState {
+            sector_id,
+            campaign_id,
+            occupation_status: OccupationStatus::Neutral,
+            owner: None,
+            deployed_unit_count: 0,
+            terrain: Default::default(),
+            magma_veins: vec![],
+            hex_occupancy: Default::default(),
+        }).await.expect("in-memory upsert_sector");
         (state, campaign_id, sector_id)
     }
 
@@ -246,14 +316,23 @@ mod tests {
             "origin_q": 0, "origin_r": 0, "destination_q": to.0, "destination_r": to.1,
             "vehicle_class": "BehemothMegaTruck", "cargo": {}
         });
+        post_dispatch(state, token, campaign_id, Some(&body)).await
+    }
+
+    /// One dispatch POST from `TEST_PEER`. `body: None` sends no content type (axum's `415`,
+    /// which the limiters count).
+    async fn post_dispatch(state: Arc<AppState>, token: &str, campaign_id: Uuid, body: Option<&serde_json::Value>) -> (StatusCode, Vec<u8>) {
         let req = Request::builder()
             .method("POST")
             .uri(format!("/api/campaign/{campaign_id}/convoy/dispatch"))
-            .header("content-type", "application/json")
-            .header("authorization", format!("Bearer {token}"))
-            .body(Body::from(serde_json::to_vec(&body).unwrap()))
-            .unwrap();
-        let resp = router().with_state(state).oneshot(req).await.unwrap();
+            .header("authorization", format!("Bearer {token}"));
+        let req = match body {
+            Some(b) => req.header("content-type", "application/json").body(Body::from(serde_json::to_vec(b).unwrap())),
+            None => req.body(Body::from("{}")),
+        }
+        .unwrap();
+        let app = super::super::with_test_peer(router().with_state(state), super::super::TEST_PEER);
+        let resp = app.oneshot(req).await.unwrap();
         let status = resp.status();
         (status, resp.into_body().collect().await.unwrap().to_bytes().to_vec())
     }
@@ -325,6 +404,107 @@ mod tests {
             .unwrap_or_else(|| panic!("error_id is not a UUID: {v}"));
         assert_eq!(v, serde_json::json!({"error": "internal error", "error_id": id}));
         assert!(!v.to_string().contains("get_campaign"), "the message leaked: {v}");
+    }
+
+    // ── BP-1e-2: dispatch's limits, shape checks and GAP-85 (in-memory) ──
+
+    /// `dispatch_state()` with the convoy write failing (`NoConvoyRows`) and its own timers.
+    /// A body that passes every check therefore ends in `500` at the write, after its timer,
+    /// so the tests read `500` + one timer as "accepted", and a refusal leaves no timer.
+    async fn guarded_state() -> (Arc<AppState>, Arc<crate::repository::InMemoryTimerRepository>, Uuid, Uuid) {
+        let (mut state, campaign_id, sector_id) = dispatch_state().await;
+        state.convoy_repo = Arc::new(NoConvoyRows);
+        let timers = Arc::new(crate::repository::InMemoryTimerRepository::new());
+        state.timer_repo = timers.clone();
+        (Arc::new(state), timers, campaign_id, sector_id)
+    }
+
+    fn dispatch_body(to: (i32, i32), vehicle_class: &str, cargo: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "origin_q": 0, "origin_r": 0, "destination_q": to.0, "destination_r": to.1,
+            "vehicle_class": vehicle_class, "cargo": cargo
+        })
+    }
+
+    fn error_of(body: &[u8]) -> String {
+        let v: serde_json::Value = serde_json::from_slice(body).unwrap_or(serde_json::Value::Null);
+        v["error"].as_str().unwrap_or("").to_string()
+    }
+
+    #[tokio::test]
+    async fn dispatch_counts_before_reading_the_body() {
+        let (state, timers, campaign_id, _) = guarded_state().await;
+        for i in 0..crate::rate_limit::CONVOY_PER_WALLET {
+            let (status, _) = post_dispatch(state.clone(), "t", campaign_id, None).await;
+            assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "request {i}");
+        }
+        let body = dispatch_body((1, 0), "BehemothMegaTruck", serde_json::json!({}));
+        let (status, _) = post_dispatch(state, "t", campaign_id, Some(&body)).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(timers.0.is_empty(), "a refused dispatch schedules nothing");
+    }
+
+    #[tokio::test]
+    async fn dispatch_refuses_oversized_cargo() {
+        let (state, timers, campaign_id, _) = guarded_state().await;
+        let over = serde_json::json!({ "x": "a".repeat(1017) });
+        assert_eq!(serde_json::to_vec(&over).unwrap().len(), CONVOY_CARGO_MAX_BYTES + 1);
+        let (status, body) = post_dispatch(state.clone(), "t", campaign_id, Some(&dispatch_body((1, 0), "Hauler", over))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{}", String::from_utf8_lossy(&body));
+        assert!(error_of(&body).contains("cargo"), "{}", String::from_utf8_lossy(&body));
+        assert!(timers.0.is_empty(), "a refused dispatch schedules nothing");
+        let edge = serde_json::json!({ "x": "a".repeat(1016) });
+        let (status, _) = post_dispatch(state, "t", campaign_id, Some(&dispatch_body((1, 0), "Hauler", edge))).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "a cargo of exactly the limit passes every check");
+        assert_eq!(timers.0.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn dispatch_refuses_a_long_vehicle_class() {
+        let (state, timers, campaign_id, _) = guarded_state().await;
+        let long = "x".repeat(MAX_VEHICLE_CLASS_BYTES + 1);
+        let (status, body) = post_dispatch(state.clone(), "t", campaign_id, Some(&dispatch_body((1, 0), &long, serde_json::json!({})))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{}", String::from_utf8_lossy(&body));
+        assert!(error_of(&body).contains("vehicle_class"), "{}", String::from_utf8_lossy(&body));
+        assert!(timers.0.is_empty(), "a refused dispatch schedules nothing");
+        let edge = "x".repeat(MAX_VEHICLE_CLASS_BYTES);
+        let (status, _) = post_dispatch(state, "t", campaign_id, Some(&dispatch_body((1, 0), &edge, serde_json::json!({})))).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "a vehicle_class of exactly the limit passes every check");
+        assert_eq!(timers.0.len(), 1);
+    }
+
+    /// Off-map hexes are refused before `hex_axial_distance`, whose raw `i32` subtraction
+    /// would overflow on extreme values. The first case is cheap and on the axis. Six
+    /// dispatches in all: `CONVOY_PER_WALLET`.
+    #[tokio::test]
+    async fn dispatch_refuses_a_hex_off_the_map() {
+        let (state, timers, campaign_id, _) = guarded_state().await;
+        let r = MAP_RADIUS_HEXES as i32;
+        for to in [(r + 1, 0), (r, 1), (i32::MAX, 0), (i32::MIN, i32::MIN)] {
+            let (status, body) = post_dispatch(state.clone(), "t", campaign_id, Some(&dispatch_body(to, "Hauler", serde_json::json!({})))).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{to:?}: {}", String::from_utf8_lossy(&body));
+            assert_eq!(error_of(&body), "hex is off the map", "{to:?}");
+        }
+        let mut origin_off = dispatch_body((1, 0), "Hauler", serde_json::json!({}));
+        origin_off["origin_q"] = serde_json::json!(i32::MIN);
+        let (status, _) = post_dispatch(state.clone(), "t", campaign_id, Some(&origin_off)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "an origin off the map is refused too");
+        assert!(timers.0.is_empty(), "a refused dispatch schedules nothing");
+        let (status, _) = post_dispatch(state, "t", campaign_id, Some(&dispatch_body((r, 0), "Hauler", serde_json::json!({})))).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "the map's edge passes every check");
+        assert_eq!(timers.0.len(), 1);
+    }
+
+    /// GAP-85: a campaign whose sector state is missing refuses the dispatch with `409`,
+    /// never a plain-terrain default.
+    #[tokio::test]
+    async fn dispatch_refuses_a_missing_sector() {
+        let (state, timers, campaign_id, sector_id) = guarded_state().await;
+        state.sector_repo.delete_sector(sector_id).await.expect("delete_sector");
+        let (status, body) = post_dispatch(state, "t", campaign_id, Some(&dispatch_body((1, 0), "Hauler", serde_json::json!({})))).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(error_of(&body), "campaign sector state is unavailable");
+        assert!(timers.0.is_empty(), "a refused dispatch schedules nothing");
     }
 
     #[tokio::test]

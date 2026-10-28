@@ -2391,7 +2391,7 @@ async fn convoy_dispatch_creates_db_record_and_timer() {
     state.sector_repo.upsert_sector(sector_state).await.expect("upsert_sector failed");
 
     // Fire POST /api/campaign/:id/convoy/dispatch
-    let app = mercs_server::routes::router(Arc::clone(&state));
+    let app = mercs_server::routes::with_test_peer(mercs_server::routes::router(Arc::clone(&state)), mercs_server::routes::TEST_PEER);
     let body = serde_json::json!({
         "origin_q": 3, "origin_r": -2,
         "destination_q": 5, "destination_r": 3,
@@ -3748,7 +3748,7 @@ async fn combat_route_logs_to_postgres_and_integrity_detects_tamper() {
     sqlx::query("ALTER TABLE input_logs DISABLE TRIGGER ALL")
         .execute(&pool).await.expect("disable triggers failed");
     let tamper = sqlx::query(
-        "UPDATE input_logs SET payload = jsonb_set(payload, '{request,seed_override}', '43') WHERE session_id = $1",
+        "UPDATE input_logs SET payload = jsonb_set(payload, '{request,max_ticks}', '24') WHERE session_id = $1",
     )
     .bind(sid)
     .execute(&pool)
@@ -5400,7 +5400,7 @@ async fn dispatch_via_route(f: &ConvoyFixture) -> uuid::Uuid {
         .header("authorization", format!("Bearer {}", f.token_id))
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap();
-    let resp = mercs_server::routes::router(std::sync::Arc::clone(&f.state)).oneshot(req).await.unwrap();
+    let resp = mercs_server::routes::with_test_peer(mercs_server::routes::router(std::sync::Arc::clone(&f.state)), mercs_server::routes::TEST_PEER).oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED, "dispatch must return 201");
     let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();

@@ -78,6 +78,14 @@ pub const AAR_PER_IP: u32 = 20;
 pub const STREAM_PER_IP: u32 = 20;
 pub const STREAM_PER_WALLET: u32 = 6;
 
+/// The Ore Run and convoy dispatch (BP-1e-2, keeper, GAP-87). The Ore Run takes no session,
+/// so it is limited per address only; an honest player presses it about 12 times a minute
+/// at most. Dispatch is signed in, so per address and per wallet. Each per-address value
+/// sits at or under nginx's 30 a minute.
+pub const ORE_PER_IP: u32 = 20;
+pub const CONVOY_PER_IP: u32 = 30;
+pub const CONVOY_PER_WALLET: u32 = 6;
+
 /// What a request is counted against. IPv4 whole; IPv6 by its /64 (`V6Net` holds the top
 /// 64 bits), so one host can't mint fresh buckets from its own prefix. `Shared` is the one
 /// bucket for a loopback peer that sent no usable `X-Real-IP`.
@@ -324,6 +332,11 @@ pub struct RateLimits {
     pub aar_ip: FixedWindow<ClientKey>,
     pub stream_ip: FixedWindow<ClientKey>,
     pub stream_wallet: FixedWindow<String>,
+    /// The Ore Run (BP-1e-2): per address.
+    pub ore_ip: FixedWindow<ClientKey>,
+    /// Convoy dispatch (BP-1e-2): per address and per wallet.
+    pub convoy_ip: FixedWindow<ClientKey>,
+    pub convoy_wallet: FixedWindow<String>,
     pub join_ip: FixedWindow<ClientKey>,
     pub join_wallet: FixedWindow<String>,
     pub replacement_ip: FixedWindow<ClientKey>,
@@ -363,6 +376,9 @@ impl RateLimits {
             aar_ip: w("aar_ip", AAR_PER_IP),
             stream_ip: w("stream_ip", STREAM_PER_IP),
             stream_wallet: w("stream_wallet", STREAM_PER_WALLET),
+            ore_ip: w("ore_ip", ORE_PER_IP),
+            convoy_ip: w("convoy_ip", CONVOY_PER_IP),
+            convoy_wallet: w("convoy_wallet", CONVOY_PER_WALLET),
             join_ip: w("join_ip", JOIN_PER_IP),
             join_wallet: w("join_wallet", JOIN_PER_WALLET),
             replacement_ip: w("replacement_ip", REPLACEMENT_PER_IP),

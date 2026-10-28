@@ -509,6 +509,39 @@ mod tests {
         }
     }
 
+    // ── BP-1e-2: the Ore Run (no session) ──
+
+    /// The four bodies `game.html`'s Ore Run buttons send (`app.js:169`): each runs.
+    #[tokio::test]
+    async fn ore_run_accepts_the_game_html_bodies() {
+        let state = fresh();
+        for approach in ["AggressiveCharge", "TerrainManeuver", "MaintainRange", "EscapeRearguard"] {
+            let (status, body) = send(&state, "POST", "/api/ore-run/start", None, Some(&json!({ "approach": approach }))).await;
+            assert_eq!(status, StatusCode::OK, "{approach}: {body}");
+            assert!(body["seed"].is_u64(), "{approach}: the server picks the seed: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn ore_run_refuses_seed_override() {
+        let state = fresh();
+        let req = json!({"approach": "AggressiveCharge", "seed_override": 7});
+        let (status, body) = send(&state, "POST", "/api/ore-run/start", None, Some(&req)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body["error"].as_str().unwrap_or("").contains("seed_override"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn ore_run_counts_before_reading_the_body() {
+        let state = fresh();
+        for i in 0..crate::rate_limit::ORE_PER_IP {
+            let (status, _) = send(&state, "POST", "/api/ore-run/start", None, None).await;
+            assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "request {i}");
+        }
+        let (status, _) = send(&state, "POST", "/api/ore-run/start", None, Some(&json!({"approach": "AggressiveCharge"}))).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    }
+
     #[tokio::test]
     async fn combat_ws_over_cap_frame_ends_the_session() {
         let mut ws = combat_client().await;

@@ -5,9 +5,23 @@
 // See .env.example for the full variable list and commentary.
 
 use sim_engine::config::SimConfig;
+use crate::api_types::COMBAT_MAX_TICKS;
 use crate::json_rpc::RpcUrl;
 
 // ── Helper readers ────────────────────────────────────────────────────────────
+
+/// Reads `DEFAULT_MAX_TICKS` as `parse_or_warn` does, then falls back to 50, with a
+/// warning, above `COMBAT_MAX_TICKS`. Every combat route refuses an effective tick count
+/// over the cap, so a larger default would refuse every request that omits `max_ticks`
+/// (Reviewer BP-1e-1 F1).
+fn max_ticks_or_warn(get: impl Fn(&str) -> Option<String>) -> usize {
+    let v = parse_or_warn(&get, "DEFAULT_MAX_TICKS", 50);
+    if v > COMBAT_MAX_TICKS {
+        tracing::warn!("DEFAULT_MAX_TICKS is {v}, above the combat cap {COMBAT_MAX_TICKS}; using 50");
+        return 50;
+    }
+    v
+}
 
 /// Reads `key` as a `T`. Unset → `default`, silently. Set but unparseable (`str::parse`
 /// does not trim) → `default`, with a warning naming the key and the raw value. A value
@@ -160,7 +174,7 @@ impl ServerConfig {
             session_duration_secs:      parse_or_warn(&get, "SESSION_DURATION_SECS",     7200),
             challenge_expiry_secs:      parse_or_warn(&get, "CHALLENGE_EXPIRY_SECS",     60),
             combat_session_stale_secs:  parse_or_warn(&get, "COMBAT_SESSION_STALE_SECS", 300),
-            default_max_ticks:          parse_or_warn(&get, "DEFAULT_MAX_TICKS",         50),
+            default_max_ticks:          max_ticks_or_warn(&get),
             join_enabled:               parse_or_warn(&get, "MERCS_JOIN_ENABLED",        false),
             solana_mainnet_rpc_url:     rpc_url_or_warn(&get, SOLANA_MAINNET_RPC_URL_KEY, "the Genesis Token lookup"),
             solana_devnet_rpc_url:      rpc_url_or_warn(&get, SOLANA_DEVNET_RPC_URL_KEY, "checkout"),
@@ -311,6 +325,16 @@ mod tests {
         check::<i32>(10, ("-7", -7), &common);
         check::<i64>(10, ("-7", -7), &common);
         check::<f64>(1.5, ("2.25", 2.25), &common);
+    }
+
+    /// Reviewer BP-1e-1 F1: a default above the combat cap would refuse every request that
+    /// omits `max_ticks`, so it falls back to 50.
+    #[test]
+    fn default_max_ticks_above_the_combat_cap_falls_back() {
+        let read = |pairs: &[(&str, &str)]| ServerConfig::from_lookup(lookup(pairs)).default_max_ticks;
+        assert_eq!(read(&[]), 50);
+        assert_eq!(read(&[("DEFAULT_MAX_TICKS", "100")]), 100);
+        assert_eq!(read(&[("DEFAULT_MAX_TICKS", "101")]), 50);
     }
 
     /// 5a-3c — the join switch is closed unless something opens it.
