@@ -8418,3 +8418,63 @@ async fn reaper_keeps_a_campaign_with_a_convoy_in_transit() {
     assert!(!in_transit.expect("retire_if_idle"), "a convoy in transit: kept");
     assert!(after_landing.expect("retire_if_idle"), "landed: retired");
 }
+
+// ── BP-3c-1b-2: the per-address live-campaign cap (demo-only, ODQ-68 (c′)) ──────
+// Wallets 106–108, every request from `TEST_PEER` (one address).
+
+/// BP-3c-1b-2 D1 — at the cap a join is refused before any write; once one of the address's
+/// campaigns is archived, the Postgres live read drops it and the next join is admitted.
+#[tokio::test]
+async fn address_cap_refuses_then_admits_after_an_archive() {
+    use axum::{body::Body, http::{Request, StatusCode}};
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    let wallets = [[106u8; 32], [107u8; 32], [108u8; 32]];
+    for w in &wallets {
+        clean_wallet_4g1(&pool, w).await;
+    }
+    assert_no_pending_campaign(&pool).await; // the join's pick is global
+
+    let mut state = pg_route_state(&pool);
+    std::sync::Arc::make_mut(&mut state.config).server.join_enabled = true; // 5a-3c: joins are off by default
+    state.address_campaigns = mercs_server::demo_address_cap::AddressCampaigns::new(2);
+    state.live_campaigns = std::sync::Arc::new(mercs_server::demo_address_cap::PostgresLiveCampaigns::new(pool.clone()));
+    let state = std::sync::Arc::new(state);
+    let tokens: Vec<String> = wallets.iter().map(|w| insert_session(&state, *w)).collect();
+    let join = |t: &str| Request::builder()
+        .method("POST")
+        .uri("/api/campaign/join")
+        .header("authorization", format!("Bearer {t}"))
+        .body(Body::empty())
+        .unwrap();
+
+    // Collect.
+    let (s106, b106) = send(&state, join(&tokens[0])).await;
+    let (s107, b107) = send(&state, join(&tokens[1])).await;
+    let (refused, refused_body) = send(&state, join(&tokens[2])).await;
+    let refused_members = try_wallet_rows(&pool, "player_campaign_membership", wallets[2]).await;
+    let campaign_of = |b: &str| serde_json::from_str::<serde_json::Value>(b).ok()
+        .and_then(|v| v["campaign_id"].as_str().and_then(|s| uuid::Uuid::parse_str(s).ok()));
+    let retired = match campaign_of(&b106) {
+        Some(c) => PostgresCampaignRepository::new(pool.clone()).retire_if_active(c).await.ok(),
+        None => None,
+    };
+    let (admitted, admitted_body) = send(&state, join(&tokens[2])).await;
+
+    // Clean: the immutable campaign_started rows the launches wrote (BP-1), then the wallets.
+    let launched: Vec<uuid::Uuid> = [&b106, &b107, &admitted_body].into_iter().filter_map(|b| campaign_of(b)).collect();
+    sqlx::query("ALTER TABLE input_logs DISABLE TRIGGER ALL").execute(&pool).await.ok();
+    sqlx::query("DELETE FROM input_logs WHERE campaign_id = ANY($1)").bind(&launched).execute(&pool).await.ok();
+    sqlx::query("ALTER TABLE input_logs ENABLE TRIGGER ALL").execute(&pool).await.ok();
+    for w in &wallets {
+        clean_wallet_4g1(&pool, w).await;
+    }
+
+    // Assert.
+    assert_eq!(s106, StatusCode::CREATED, "{b106}");
+    assert_eq!(s107, StatusCode::CREATED, "{b107}");
+    assert_eq!(refused, StatusCode::SERVICE_UNAVAILABLE, "{refused_body}");
+    assert_eq!(refused_body, r#"{"error":"the demo is full"}"#);
+    assert_eq!(refused_members.expect("membership count"), 0, "a refused join writes no membership");
+    assert_eq!(retired, Some(true), "c106 retired");
+    assert_eq!(admitted, StatusCode::CREATED, "{admitted_body}");
+}

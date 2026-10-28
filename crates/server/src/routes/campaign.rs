@@ -17,6 +17,7 @@ use sim_engine::rng::generate_seed;
 use crate::auth::AuthSession;
 use crate::campaign_init::{initialize_campaign, retire_campaign, InitError, RetireError};
 use crate::repository::{CampaignLifecycle, JoinOutcome, JoinSeeds, ReplacementOutcome, SectorState, StarterIds};
+use crate::rate_limit::ClientKey;
 use crate::state::AppState;
 
 use super::{
@@ -118,7 +119,7 @@ async fn post_campaign_join(
     // hyper dropped this future) detaches the task; it never cancels it. The route never
     // calls `abort()`, so the only `JoinError` is a panic.
     let task_state = state.clone();
-    let handle = tokio::spawn(async move { join_and_launch(task_state, wallet, seeds).await });
+    let handle = tokio::spawn(async move { join_and_launch(task_state, wallet, seeds, ip).await });
     match handle.await {
         Ok(result) => result,
         Err(e) => Err(internal_error(format!("demo join task failed for wallet {}: {e}", session.wallet_address))),
@@ -127,7 +128,19 @@ async fn post_campaign_join(
 
 /// The demo join's work (BP-1c): join, launch, and repair a sectorless `Active` campaign.
 /// It runs inside the task `post_campaign_join` spawns, so it always runs to the end.
-async fn join_and_launch(state: Arc<AppState>, wallet: Vec<u8>, seeds: JoinSeeds) -> Result<Response, AppError> {
+async fn join_and_launch(state: Arc<AppState>, wallet: Vec<u8>, seeds: JoinSeeds, ip: ClientKey) -> Result<Response, AppError> {
+    // BP-3c-1b-2 (demo-only, ODQ-68 (c')): at most `DEMO_ADDRESS_LIVE_CAP` live campaigns per
+    // address. Checked before the join, so at the cap a re-join is refused too. The permit
+    // holds the slot until the join's outcome is known.
+    let permit = state.address_campaigns.reserve(ip, state.live_campaigns.as_ref()).await
+        .map_err(|e| internal_error(format!("demo address cap: the live-campaign read failed: {e}")))?;
+    let Some(permit) = permit else {
+        if let Some(n) = state.address_campaigns.refused_warn.hit(Instant::now()) {
+            tracing::warn!(key = ?ip, refused = n, cap = state.address_campaigns.cap(),
+                "demo address cap: join refused, the address holds its cap of live campaigns");
+        }
+        return Err(service_unavailable("the demo is full"));
+    };
     let outcome = state
         .campaign_join_repo
         .join_campaign(&wallet, DEMO_PLAYER_CAP, seeds)
@@ -135,8 +148,14 @@ async fn join_and_launch(state: Arc<AppState>, wallet: Vec<u8>, seeds: JoinSeeds
         .map_err(|e| internal_error(format!("campaign join failed: {e}")))?;
 
     let (status, ids) = match outcome {
-        JoinOutcome::Joined(ids) => (StatusCode::CREATED, ids),
-        JoinOutcome::AlreadyMember(ids) => (StatusCode::OK, ids),
+        JoinOutcome::Joined(ids) => {
+            permit.commit(ids.campaign_id);
+            (StatusCode::CREATED, ids)
+        }
+        JoinOutcome::AlreadyMember(ids) => {
+            drop(permit);
+            (StatusCode::OK, ids)
+        }
         JoinOutcome::DemoFull => return Err(service_unavailable("the demo is full")),
     };
     let c = ids.campaign_id;
@@ -1644,5 +1663,110 @@ mod tests {
         })
         .await;
         assert!(finished, "the detached abandon retired the campaign, deleted the sector and released its lock");
+    }
+
+    // ── BP-3c-1b-2: the per-address live-campaign cap (demo-only, ODQ-68 (c′)) ──
+    // In-memory wallets 251–253; every request comes from `TEST_PEER`, one address.
+
+    use crate::demo_address_cap::AddressCampaigns;
+
+    /// `joined_state` with the address cap at `cap`, no convoy in transit, and sessions
+    /// `"a251"`…`"a253"`.
+    fn capped_state(cap: usize) -> AppState {
+        let mut state = joined_state();
+        state.address_campaigns = AddressCampaigns::new(cap);
+        state.convoy_repo = Arc::new(ConvoysInTransit(false));
+        for b in 251u8..=253 {
+            add_session(&state, [b; 32], &format!("a{b}"));
+        }
+        state
+    }
+
+    /// BP-3c-1b-2 R1 — past the cap the join is the demo-full `503`, before any write.
+    #[tokio::test]
+    async fn join_is_503_past_the_address_cap() {
+        let state = Arc::new(capped_state(2));
+        let (s1, b1) = join(state.clone(), Some("a251")).await;
+        let (s2, b2) = join(state.clone(), Some("a252")).await;
+        let (s3, b3) = join(state.clone(), Some("a253")).await;
+        assert_eq!(s1, StatusCode::CREATED, "{b1}");
+        assert_eq!(s2, StatusCode::CREATED, "{b2}");
+        assert_eq!(s3, StatusCode::SERVICE_UNAVAILABLE, "{b3}");
+        assert_eq!(b3, json!({"error": "the demo is full"}));
+        let rows = state.membership_repo.list_campaigns_by_player(&[253u8; 32]).await.unwrap();
+        assert!(rows.is_empty(), "a refused join writes no membership");
+    }
+
+    /// BP-3c-1b-2 R2 — an abandoned campaign stops counting at the next join at the cap.
+    #[tokio::test]
+    async fn an_abandoned_campaign_frees_an_address_slot() {
+        let state = Arc::new(capped_state(2));
+        let (s1, b1) = join(state.clone(), Some("a251")).await;
+        let (s2, b2) = join(state.clone(), Some("a252")).await;
+        assert_eq!(s1, StatusCode::CREATED, "{b1}");
+        assert_eq!(s2, StatusCode::CREATED, "{b2}");
+        let c = id(&b1, "campaign_id");
+        let (s, b) = abandon(state.clone(), Some("a251"), &c.to_string()).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let (s3, b3) = join(state.clone(), Some("a253")).await;
+        assert_eq!(s3, StatusCode::CREATED, "{b3}");
+    }
+
+    /// Parks the first `join_campaign` until released; every later call goes straight through.
+    struct ParkFirstJoin {
+        inner: Arc<dyn CampaignJoinRepository>,
+        calls: AtomicUsize,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl CampaignJoinRepository for ParkFirstJoin {
+        async fn join_campaign(&self, wallet: &[u8], cap: i64, seeds: JoinSeeds) -> Result<JoinOutcome, RepositoryError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            self.inner.join_campaign(wallet, cap, seeds).await
+        }
+        async fn begin_launch(
+            &self,
+            campaign_id: Uuid,
+            max_members: usize,
+            ends_at: DateTime<Utc>,
+            victory_tickers: serde_json::Value,
+        ) -> Result<LaunchStart, RepositoryError> {
+            self.inner.begin_launch(campaign_id, max_members, ends_at, victory_tickers).await
+        }
+        async fn claim_replacement(&self, campaign_id: Uuid, wallet: &[u8], seed: u32) -> Result<ReplacementOutcome, RepositoryError> {
+            self.inner.claim_replacement(campaign_id, wallet, seed).await
+        }
+    }
+
+    /// BP-3c-1b-2 R3 — a join still inside the join holds its slot: at cap 1, a second join
+    /// from the same address meanwhile is refused.
+    #[tokio::test]
+    async fn an_inflight_join_holds_its_address_slot() {
+        let mut state = capped_state(1);
+        let (entered, release) = (Arc::new(tokio::sync::Notify::new()), Arc::new(tokio::sync::Notify::new()));
+        state.campaign_join_repo = Arc::new(ParkFirstJoin {
+            inner: state.campaign_join_repo.clone(),
+            calls: AtomicUsize::new(0),
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        let state = Arc::new(state);
+        let wait = std::time::Duration::from_secs(5);
+
+        let first = tokio::spawn(join(state.clone(), Some("a251")));
+        tokio::time::timeout(wait, entered.notified()).await.expect("the first join reached the join");
+        let second = tokio::time::timeout(wait, join(state.clone(), Some("a252"))).await;
+        release.notify_one();
+        let (s1, b1) = tokio::time::timeout(wait, first).await.expect("the first join finished").expect("no panic");
+
+        let (s2, b2) = second.expect("the second join answered");
+        assert_eq!(s2, StatusCode::SERVICE_UNAVAILABLE, "{b2}");
+        assert_eq!(b2, json!({"error": "the demo is full"}));
+        assert_eq!(s1, StatusCode::CREATED, "{b1}");
     }
 }

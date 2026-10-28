@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT campaign_id AS \"campaign_id!\" FROM campaign_instances\n               WHERE campaign_id = ANY($1) AND state IN ('Pending','Active','Ending')",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "campaign_id!",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "fe487a160b8928f2776a2ef09101efc8349f7e12de0bff7b271ec6a50698a83a"
+}

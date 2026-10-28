@@ -118,6 +118,11 @@ pub struct AppState {
     /// whose launch is still writing its sector. In-process: a restart empties it, which is
     /// right, because a restart also ends every launch.
     pub launch_locks: LaunchLocks,
+    /// The per-address live-campaign cap (BP-3c-1b-2, demo-only, ODQ-68 (c')).
+    pub address_campaigns: crate::demo_address_cap::AddressCampaigns,
+    /// The cap's liveness read. In memory it reads the same store as `campaign_repo`;
+    /// `main.rs` sets the Postgres one. A Postgres route test that reaches the cap sets it too.
+    pub live_campaigns: Arc<dyn crate::demo_address_cap::LiveCampaigns>,
 }
 
 impl AppState {
@@ -143,6 +148,7 @@ impl AppState {
             section_repo:        sections.clone(),
             foreman_repo:        foremen.clone(),
             crew_repo:           crews.clone(),
+            live_campaigns:      Arc::new(crate::demo_address_cap::InMemoryLiveCampaigns::new(campaigns.clone())),
             campaign_join_repo:  Arc::new(InMemoryCampaignJoinRepository::new(
                 campaigns, memberships, commanders, foremen, sections, crews,
             )),
@@ -158,6 +164,7 @@ impl AppState {
             redis:              None,
             rate_limits:        RateLimits::new(),
             launch_locks:       LaunchLocks::default(),
+            address_campaigns:  crate::demo_address_cap::AddressCampaigns::new(crate::demo_address_cap::DEMO_ADDRESS_LIVE_CAP),
         }
     }
 }

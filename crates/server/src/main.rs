@@ -78,6 +78,8 @@ async fn main() {
     // BP-3c-1b-1 (demo-only): the demo reaper's store (ODQ-67 (b)).
     let reaper_store: Arc<dyn mercs_server::demo_reaper::ReaperStore> =
         Arc::new(mercs_server::demo_reaper::PostgresReaperStore::new(pool.clone()));
+    // BP-3c-1b-2 (demo-only): the address cap's liveness read (ODQ-68 (c')).
+    state.live_campaigns  = Arc::new(mercs_server::demo_address_cap::PostgresLiveCampaigns::new(pool.clone()));
     state.pool  = Some(pool);
     state.redis = Some(redis_mgr);
     let state = Arc::new(state);
