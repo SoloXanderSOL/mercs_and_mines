@@ -18,7 +18,7 @@ const ATA_PROGRAM = 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL';
 const CLUSTER_RE = /^[a-z]+(-[a-z]+)?$/; // the cluster names a host below: nothing else passes
 const POLL_MS = 3000;
 const WINDOW_MS = 30000;
-const NOT_SIGNED = [-1, -3, -4]; // MWA: authorization failed, not signed, not submitted
+const NOT_SIGNED = [-1, -3]; // MWA: authorization failed, not signed: nothing went out
 
 const nextPoll = ms => new Promise(r => setTimeout(r, ms)); // the checkout poll's only timer
 
@@ -165,7 +165,8 @@ export function createCheckout(deps) {
   const cont = clearRef => [COPY.checkoutContinue, () => leave(clearRef)];
   const tryAgain = [COPY.checkoutRetry, () => start(attempt)];
 
-  const working = line => render({ line, spinner: true });
+  // The invoice and wallet steps can be left (Not now): the generation bumps, so a late answer does nothing.
+  const working = (line, leavable = false) => render({ line, spinner: true, secondary: leavable ? notNow : null });
   const offerScreen = () => render({ body: COPY.checkoutOfferBody, primary: [COPY.checkoutPay, pay], secondary: notNow });
   const walkthrough = () => render({ title: COPY.walkthroughTitle, body: COPY.walkthroughBody, primary: cont(false) });
   const noFunds = () => render({ line: COPY.checkoutNoFunds, body: COPY.walkthroughBody, primary: cont(false) });
@@ -189,7 +190,8 @@ export function createCheckout(deps) {
   function failed(e) {
     deps.note(e);
     if (e instanceof WalletError) {
-      return retryable(e.code === 'ERROR_SESSION_CLOSED' ? COPY.checkoutSessionClosed : COPY.checkoutRefused);
+      const unknown = e.code === 'ERROR_SESSION_CLOSED' || e.code === -4; // it may have paid: the retry checks first
+      return retryable(unknown ? COPY.checkoutSessionClosed : COPY.checkoutRefused);
     }
     if (e instanceof ApiError) {
       if (e.kind === 'unauth') { gen += 1; return deps.handleError(e, null); }
@@ -202,11 +204,10 @@ export function createCheckout(deps) {
     return retryable(COPY.checkoutNetwork); // the web3 module or the test network failed
   }
 
-  function checkFailed() {
-    const stored = store.checkoutRef();
+  function checkFailed(reference = store.checkoutRef()?.reference) {
     render({
       body: COPY.checkoutCheckFailed,
-      primary: stored ? [COPY.checkoutCheckAgain, () => start(g => poll(g, stored.reference))] : tryAgain,
+      primary: reference ? [COPY.checkoutCheckAgain, () => start(g => poll(g, reference))] : tryAgain,
       secondary: cont(false),
     });
   }
@@ -220,7 +221,8 @@ export function createCheckout(deps) {
       });
     }
     if (body.status === 'mismatch') return render({ body: COPY.checkoutMismatch, primary: cont(true) });
-    return poll(g, body.reference);
+    if (body.status === 'pending') return poll(g, body.reference);
+    return checkFailed(body.reference); // a status this client doesn't know: never a re-GET by itself
   }
 
   // The first GET at once, then every 3 s (longer when a 503 says so) for at most 30 s.
@@ -262,7 +264,7 @@ export function createCheckout(deps) {
 
   // Pay and Try again.
   async function attempt(g) {
-    working(COPY.checkoutWorking);
+    working(COPY.checkoutWorking, true);
     const session = store.session();
     const wallet = (session && session.wallet_address) || null;
 
@@ -284,9 +286,10 @@ export function createCheckout(deps) {
     const body = await postCheckoutIntent();
     if (!alive(g)) return;
     if (!CLUSTER_RE.test(String(body.cluster))) return unavailable();
-    store.setCheckoutRef({ reference: body.reference, wallet });
     const w3 = await loadWeb3();
     const conn = new w3.Connection(`https://api.${body.cluster}.solana.com`, 'confirmed');
+    if (!alive(g)) return;
+    store.setCheckoutRef({ reference: body.reference, wallet }); // after the module loads: a failure there stored nothing
     const unsent = () => store.clearCheckoutRef();
 
     if (wallet) { // (i) before the wallet opens: a wallet that can't pay never sees the payment
@@ -302,13 +305,14 @@ export function createCheckout(deps) {
       if (!tx) { unsent(); return noFunds(); }
     }
 
-    working(COPY.checkoutWallet);
+    working(COPY.checkoutWallet, true);
     let stop = null;   // why prepare declined
     let handed = false;
     let signature;
     try {
       signature = await payWithWallet(body.cluster, async address => {
         // (ii) the account the wallet offers, simulated again on a fresh blockhash
+        if (!alive(g)) return null; // Not now was tapped while the wallet opened
         if (wallet && address !== wallet) { stop = 'wrongWallet'; return null; }
         let tx;
         try {
@@ -319,6 +323,7 @@ export function createCheckout(deps) {
           return null;
         }
         if (!tx) { stop = 'noFunds'; return null; }
+        if (!alive(g)) return null;
         handed = true;
         return tx;
       });

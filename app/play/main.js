@@ -419,7 +419,7 @@ async function boot() {
   show('screen-working'); // never a blank stage while the session check is in flight
   try {
     const live = await getSession();
-    store.setSession({ ...store.session(), wallet_address: live && live.wallet_address }); // the checkout's payer
+    store.setSession({ ...store.session(), wallet_address: live?.wallet_address || store.session()?.wallet_address }); // the checkout's payer
   } catch (e) {
     note(e);
     if (e instanceof ApiError && e.kind === 'unauth') {
