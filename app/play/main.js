@@ -14,7 +14,7 @@
 // the sector only, never a re-join. The sector is fetched once per campaign and cached for the
 // tab. Nothing runs on a timer and nothing retries by itself: every retry is a tap.
 
-import { ApiError, store, counters, getSession, postJoin, getRoster, getSector, getGenesis } from './api.js';
+import { ApiError, store, counters, getSession, postJoin, getRoster, getSector, getGenesis, getVersion } from './api.js';
 import { loadWallet, signIn, WalletError } from './wallet.js';
 import { createCheckout } from './checkout.js';
 import { renderReveal } from './reveal.js';
@@ -93,6 +93,8 @@ let debugExtra = '';        // the last mission's `stress=… xp=…`, for the d
 let battle = null;          // battle.js (BP-3b-2), created at the bottom
 let checkout = null;        // checkout.js (BP-3c-2b), created at the bottom
 let paySignature = '';      // the last payment's signature, for the debug footer only
+let debugBuild = '';        // the server's build_sha (first 7), for the debug footer only
+let debugCache = '';        // the play worker's cache name(s), for the debug footer only
 let closedNote = false;     // the stored campaign was closed (409): the next reveal says so once
 
 // ── screens ─────────────────────────────────────────────────────────────────
@@ -456,7 +458,7 @@ async function boot() {
 function renderDebug() {
   if (!DEBUG) return;
   $('debug').textContent =
-    `mwa ${mwaState} · roster fetches ${counters.roster} · sector fetches ${counters.sector} · joins ${counters.join}`
+    `build ${debugBuild || '?'} · cache ${debugCache || 'none'} · mwa ${mwaState} · roster fetches ${counters.roster} · sector fetches ${counters.sector} · joins ${counters.join}`
     + ` · missions ${counters.missions} · units ${counters.units} · mission posts ${counters.mission}`
     + (mapDrawMs !== null ? ` · map draw ${mapDrawMs} ms` : '')
     + (debugExtra ? ` · ${debugExtra}` : '')
@@ -498,7 +500,11 @@ function wire() {
   window.addEventListener('resize', () => { if (map && !$('screen-hub').hidden) map.resize(); });
   $('btn-mute').addEventListener('click', () => { store.setMuted(!store.muted()); applyMute(); });
   applyMute(); // at load: a reload keeps the tab's mute
-  if (DEBUG) $('debug').hidden = false;
+  if (DEBUG) {
+    $('debug').hidden = false;
+    getVersion().then(v => { debugBuild = String((v && v.build_sha) || '').slice(0, 7); renderDebug(); }, () => {});
+    if ('caches' in window) caches.keys().then(keys => { debugCache = keys.filter(k => k.startsWith('mm-play-')).join(', '); renderDebug(); }, () => {});
+  }
 }
 
 // ── battle (BP-3b-2) ────────────────────────────────────────────────────────
@@ -557,3 +563,5 @@ loadWallet().then(
   e => { mwaState = `failed: ${e && e.message}`; renderDebug(); },
 );
 boot();
+// The play worker (BP-3c-4): a root file, so its scope can cover /play.html. The game runs without it.
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('/play-sw.js', { scope: '/play' }).catch(() => {});

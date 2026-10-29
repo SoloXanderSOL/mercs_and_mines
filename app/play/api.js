@@ -220,6 +220,13 @@ export async function getGenesis() {
   return r.body;
 }
 
+// The server's build, for the ?debug=1 footer only (BP-3c-4). Unauthenticated and never retried;
+// the play worker never intercepts it, so the answer always comes from the server.
+export async function getVersion() {
+  const r = await request('GET', '/api/version', { auth: false, retry500: false });
+  return r.body; // {build_sha, version}
+}
+
 // The checkout (BP-5's routes, BP-3c-2b's client). The POST takes no body and is safe to repeat:
 // the server hands back the wallet's unpaid intent. The GET says where a payment stands.
 export async function postCheckoutIntent() {
