@@ -16,6 +16,7 @@
 import { postChallenge, postVerify } from './api.js';
 import { base58 } from './wallet.js';
 import { setWalkthroughWhen } from './checkout.js';
+import { mountCard } from './demo_card.js';
 
 const WAY_KEY = 'mm.way_in';
 const THROWAWAY_KEY = 'mm.throwaway.key';
@@ -170,4 +171,5 @@ export function mountWaysIn({ $, onSignIn }) {
   });
 
   setWalkthroughWhen(() => wayIn() !== 'seeker');
+  mountCard();
 }
