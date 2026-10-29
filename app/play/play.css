@@ -481,6 +481,14 @@ body { display: flex; align-items: center; justify-content: center; }
 .end-glorious { margin: 0; font-style: italic; font-size: 4.4cqw; color: var(--accent); }
 .end-glorious[hidden] { display: none; }
 
+/* ── checkout (BP-3c-2b): one screen, every state ───────────────────────── */
+.screen-checkout { gap: 4cqw; }
+.checkout-title { margin: 0; font-family: var(--display); font-weight: 800; font-size: 7.5cqw; line-height: 1.15; }
+.checkout-line { margin: 0; max-width: 88cqw; font-size: 4.8cqw; line-height: 1.4; color: var(--accent); }
+.checkout-body { margin: 0; max-width: 84cqw; font-size: 4.6cqw; line-height: 1.45; color: var(--muted); }
+.checkout-actions { width: 100%; display: flex; flex-direction: column; align-items: center; gap: 2.5cqw; }
+.checkout-line[hidden], .checkout-body[hidden] { display: none; }
+
 /* ── debug footer (?debug=1) ────────────────────────────────────────────── */
 .debug {
   position: absolute; left: 0; right: 0; bottom: 0;

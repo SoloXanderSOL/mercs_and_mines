@@ -434,6 +434,10 @@ export function createBattle(deps) {
     if (result.commander.kia || (d && d.commander.is_shattered)) {
       return showEndOfRun(d ? d.commander.commander_id : store.campaign()?.commander_id);
     }
+    const camp = store.campaign();
+    if (camp && !store.offered(camp.campaign_id)) { // the checkout, once per campaign (BP-3c-2b)
+      return deps.offerCheckout(() => { music(MUSIC.hub); deps.enterHub(); });
+    }
     music(MUSIC.hub);
     deps.enterHub();
   }
@@ -458,8 +462,14 @@ export function createBattle(deps) {
     deps.show('screen-end');
   }
 
-  // New run: retire this campaign, then join a fresh one (its reveal follows the join).
-  async function newRun() {
+  // New run: the checkout first (BP-3c-2b), then retire this campaign and join a fresh one (its
+  // reveal follows the join).
+  function newRun() {
+    if (busy) return;
+    deps.offerCheckout(abandonAndRejoin);
+  }
+
+  async function abandonAndRejoin() {
     if (busy) return;
     const camp = store.campaign();
     if (!camp) return deps.startFresh();
@@ -472,7 +482,7 @@ export function createBattle(deps) {
     } catch (e) {
       busy = false;
       if (!(e instanceof ApiError && e.kind === 'conflict' && e.message === 'campaign is not active')) {
-        return deps.handleError(e, newRun);
+        return deps.handleError(e, abandonAndRejoin);
       }
     }
     busy = false;

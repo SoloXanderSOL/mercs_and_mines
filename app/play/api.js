@@ -10,7 +10,7 @@ export class ApiError extends Error {
     this.name = 'ApiError';
     this.kind = kind;             // offline | rate | unauth | bad | forbidden | notfound | conflict | unavailable | server | other
     this.status = status;         // 0 when the request never reached the server
-    this.retryAfter = retryAfter; // whole seconds, on a 429
+    this.retryAfter = retryAfter; // whole seconds, on a 429 (60 if absent) or a 503 that sends one
   }
 }
 
@@ -49,10 +49,14 @@ const sectorKey = id => `mm.sector.${id}`; // ~87 KB; sessionStorage allows ~5 M
 const MISSIONS = 'mm.missions'; // GET /api/missions, static: once per tab (BP-3b-2)
 const UNITS = 'mm.units';       // GET /api/units, static: once per tab
 const genesisKey = w => `mm.genesis.${w}`; // {holds} from a 200 only, per wallet (BP-3c-2)
+const CHECKOUT_REF = 'mm.checkout.ref'; // {reference, wallet}: this tab's unfinished checkout (BP-3c-2b)
+const offeredKey = id => `mm.checkout.offered.${id}`; // the checkout was offered after this campaign's AAR
 
 export const store = {
   session: () => readKey(SESSION),                       // {token_id, expires_at}
-  setSession: t => writeKey(SESSION, { token_id: t.token_id, expires_at: t.expires_at }),
+  setSession: t => writeKey(SESSION, {
+    token_id: t.token_id, expires_at: t.expires_at, ...(t.wallet_address ? { wallet_address: t.wallet_address } : {}),
+  }),
   campaign: () => readKey(CAMPAIGN),                     // {campaign_id, commander_id}
   setCampaign: c => writeKey(CAMPAIGN, { campaign_id: c.campaign_id, commander_id: c.commander_id }),
   roster: id => readKey(rosterKey(id)),
@@ -65,6 +69,12 @@ export const store = {
   setUnits: body => writeKey(UNITS, body),
   genesis: wallet => readKey(genesisKey(wallet)),
   setGenesis: (wallet, answer) => writeKey(genesisKey(wallet), answer),
+  // The checkout's two keys live outside clearAll(): a 401 and a re-sign-in keep them.
+  checkoutRef: () => readKey(CHECKOUT_REF),
+  setCheckoutRef: r => writeKey(CHECKOUT_REF, { reference: r.reference, wallet: r.wallet }),
+  clearCheckoutRef: () => removeKey(CHECKOUT_REF),
+  offered: id => readKey(offeredKey(id)) === true,
+  setOffered: id => writeKey(offeredKey(id), true),
   clearCampaign() {
     const c = readKey(CAMPAIGN);
     if (c && c.campaign_id) {
@@ -130,9 +140,9 @@ async function send(method, path, { body, auth }) {
   const message = (json && typeof json.error === 'string') ? json.error : text;
   const kind = KIND_BY_STATUS[res.status] || 'other';
   let retryAfter = null;
-  if (res.status === 429) {
+  if (res.status === 429 || res.status === 503) {
     const n = parseInt(res.headers.get('Retry-After') || '', 10);
-    retryAfter = Number.isFinite(n) && n > 0 ? n : 60;
+    retryAfter = Number.isFinite(n) && n > 0 ? n : (res.status === 429 ? 60 : null);
   }
   throw new ApiError(kind, res.status, message, retryAfter);
 }
@@ -204,6 +214,18 @@ export async function getUnits() {
 export async function getGenesis() {
   const r = await request('GET', '/api/genesis');
   return r.body;
+}
+
+// The checkout (BP-5's routes, BP-3c-2b's client). The POST takes no body and is safe to repeat:
+// the server hands back the wallet's unpaid intent. The GET says where a payment stands.
+export async function postCheckoutIntent() {
+  const r = await request('POST', '/api/checkout/intent');
+  return r.body; // {reference, amount, decimals, recipient, mint, cluster, expires_in_secs, status}
+}
+
+export async function getCheckoutIntent(reference) {
+  const r = await request('GET', `/api/checkout/intent/${encodeURIComponent(reference)}`);
+  return r.body; // the same, with status pending | confirmed | mismatch
 }
 
 // Never retried: a 500 may come after the input is logged, so a retry would deploy again.

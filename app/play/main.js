@@ -16,6 +16,7 @@
 
 import { ApiError, store, counters, getSession, postJoin, getRoster, getSector, getGenesis } from './api.js';
 import { loadWallet, signIn, WalletError } from './wallet.js';
+import { createCheckout } from './checkout.js';
 import { renderReveal } from './reveal.js';
 import { HexMap, PALETTE, TERRAIN_ORDER, OVERLAY } from './hexmap.js';
 import { createBattle } from './battle.js';
@@ -73,7 +74,7 @@ const COPY = {
 
 const $ = id => document.getElementById(id);
 const SCREENS = ['screen-title', 'screen-signin', 'screen-working', 'screen-reveal', 'screen-hub', 'screen-error',
-  'screen-missions', 'screen-briefing', 'screen-battle', 'screen-aar', 'screen-end', 'screen-genesis'];
+  'screen-missions', 'screen-briefing', 'screen-battle', 'screen-aar', 'screen-end', 'screen-genesis', 'screen-checkout'];
 const DEBUG = new URLSearchParams(location.search).get('debug') === '1';
 
 let busy = false;           // one wallet or server flow at a time
@@ -87,6 +88,8 @@ let mapCampaign = null;     // the campaign `map` belongs to
 let mapDrawMs = null;       // parsed response → the first drawImage, for the debug footer
 let debugExtra = '';        // the last mission's `stress=… xp=…`, for the debug footer
 let battle = null;          // battle.js (BP-3b-2), created at the bottom
+let checkout = null;        // checkout.js (BP-3c-2b), created at the bottom
+let paySignature = '';      // the last payment's signature, for the debug footer only
 
 // ── screens ─────────────────────────────────────────────────────────────────
 function show(id) {
@@ -234,7 +237,11 @@ async function showGenesis(wallet, genesisNote) {
     note(e);
     return renderGenesis(false, COPY.genesisUnknownTitle, COPY.genesisUnknownBody);
   }
-  const holds = Boolean(answer && answer.holds_genesis_token === true);
+  if (typeof answer?.holds_genesis_token !== 'boolean') { // a 200 we can't read: never cached
+    note(new Error('genesis answer without a boolean holds_genesis_token'));
+    return renderGenesis(false, COPY.genesisUnknownTitle, COPY.genesisUnknownBody);
+  }
+  const holds = answer.holds_genesis_token;
   if (wallet) store.setGenesis(wallet, { holds });
   return renderGenesisAnswer(holds);
 }
@@ -411,7 +418,8 @@ async function boot() {
   $('working-text').textContent = COPY.bootWorking;
   show('screen-working'); // never a blank stage while the session check is in flight
   try {
-    await getSession();
+    const live = await getSession();
+    store.setSession({ ...store.session(), wallet_address: live && live.wallet_address }); // the checkout's payer
   } catch (e) {
     note(e);
     if (e instanceof ApiError && e.kind === 'unauth') {
@@ -432,6 +440,7 @@ function renderDebug() {
     + ` · missions ${counters.missions} · units ${counters.units} · mission posts ${counters.mission}`
     + (mapDrawMs !== null ? ` · map draw ${mapDrawMs} ms` : '')
     + (debugExtra ? ` · ${debugExtra}` : '')
+    + (paySignature ? ` · payment ${paySignature}` : '')
     + (lastError ? ` · last error: ${lastError}` : '');
 }
 
@@ -508,9 +517,16 @@ wire();
 battle = createBattle({
   $, DEBUG, music, show, showError, handleError, note, enterHub, enterCampaign,
   reloadRoster, staleCampaign, startFresh,
+  offerCheckout: then => checkout.offer(then),
   genericText: COPY.generic,
   getRoster: () => lastRoster,
   setDebugExtra: text => { debugExtra = text; renderDebug(); },
+});
+checkout = createCheckout({
+  $, show, handleError, note, rateText,
+  offlineText: COPY.offline,
+  genericText: COPY.generic,
+  setSignature: sig => { paySignature = sig; renderDebug(); },
 });
 loadWallet().then(
   () => { mwaState = 'ok'; renderDebug(); },

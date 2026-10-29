@@ -114,6 +114,17 @@
       <button class="btn btn-primary" id="btn-new-run" type="button"></button>
     </section>
 
+    <section id="screen-checkout" class="screen screen-checkout" hidden>
+      <h1 class="checkout-title" id="checkout-title"></h1>
+      <div class="spinner" id="checkout-spinner" aria-hidden="true" hidden></div>
+      <p class="checkout-line" id="checkout-line" role="status" aria-live="polite" hidden></p>
+      <p class="checkout-body" id="checkout-body" hidden></p>
+      <div class="checkout-actions">
+        <button class="btn btn-primary" id="btn-checkout-primary" type="button" hidden></button>
+        <button class="btn" id="btn-checkout-secondary" type="button" hidden></button>
+      </div>
+    </section>
+
     <section id="screen-error" class="screen screen-error" hidden>
       <p class="error-text" id="error-text" role="alert"></p>
       <button class="btn btn-primary" id="btn-error-retry" type="button">Retry</button>

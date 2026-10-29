@@ -2,7 +2,7 @@
 // Seeker (Raw/DEVICE_SPIKE_RESULT.md): one `transact` that authorises, fetches a challenge for
 // the authorised address, and signs it with `signMessages`. Seed Vault Wallet returns the bare
 // 64-byte signature; other wallets return message + signature, so the last 64 bytes are taken
-// either way.
+// either way. The checkout (BP-3c-2b) pays through the same wallet on the test network.
 
 import { postChallenge, postVerify, ApiError } from './api.js';
 
@@ -15,6 +15,7 @@ const IDENTITY = { name: 'Mercs & Mines', uri: location.origin, icon: 'assets/fa
 // The only persistent (cross-tab) storage in the client: the wallet's own authorisation, so a
 // later sign-in skips the wallet's Connect sheet (spike Q1f). The server session stays per tab.
 const AUTH_KEY = 'mm.mwa.auth_token';
+const authKey = cluster => `${AUTH_KEY}.${cluster}`; // another chain's authorisation, kept apart
 const MWA_AUTHORIZATION_FAILED = -1; // protocol error code for a stale or revoked auth_token
 
 export class WalletError extends Error {
@@ -25,20 +26,20 @@ export class WalletError extends Error {
   }
 }
 
-function readSaved() {
+function readSaved(key = AUTH_KEY) {
   try {
-    const raw = localStorage.getItem(AUTH_KEY);
+    const raw = localStorage.getItem(key);
     const v = raw ? JSON.parse(raw) : null;
     return v && typeof v.auth_token === 'string' ? v : null;
   } catch { return null; }
 }
 
-function writeSaved(authToken, address) {
-  try { localStorage.setItem(AUTH_KEY, JSON.stringify({ auth_token: authToken, address })); } catch { /* not kept */ }
+function writeSaved(authToken, address, key = AUTH_KEY) {
+  try { localStorage.setItem(key, JSON.stringify({ auth_token: authToken, address })); } catch { /* not kept */ }
 }
 
-function clearSaved() {
-  try { localStorage.removeItem(AUTH_KEY); } catch { /* nothing to clear */ }
+function clearSaved(key = AUTH_KEY) {
+  try { localStorage.removeItem(key); } catch { /* nothing to clear */ }
 }
 
 // ── encoding ────────────────────────────────────────────────────────────────
@@ -108,4 +109,39 @@ export async function signIn() {
     throw new WalletError(e);
   }
   return postVerify(signed.address, signed.challenge, signed.signature);
+}
+
+// ── payment (BP-3c-2b) ──────────────────────────────────────────────────────
+// The web3 module the checkout builds with: the same pinned import as at load, so no new fetch.
+export function loadWeb3() {
+  return loadWallet().then(() => import(WEB3_URL));
+}
+
+// Call only from a tap. One wallet session on `cluster`'s chain: authorise, then
+// `prepare(address)` resolves with the payment for that account, or null to stop before anything
+// is signed. Resolves with the signature (base58), or null. Throws ApiError or WalletError as
+// signIn does. The authorisation is saved under the cluster's own key.
+export async function payWithWallet(cluster, prepare) {
+  const { transact } = await loadWallet();
+  const key = authKey(cluster);
+  const saved = readSaved(key);
+  try {
+    return await transact(async wallet => {
+      const auth = await wallet.authorize({
+        chain: `solana:${cluster}`,
+        identity: IDENTITY,
+        ...(saved ? { auth_token: saved.auth_token } : {}),
+      });
+      const addr = addressOf(auth.accounts[0]);
+      writeSaved(auth.auth_token, addr.b58, key);
+      const tx = await prepare(addr.b58);
+      if (!tx) return null;
+      const [signature] = await wallet.signAndSendTransactions({ transactions: [tx] });
+      return signature;
+    });
+  } catch (e) {
+    if (e instanceof ApiError) throw e;
+    if (saved && e && e.code === MWA_AUTHORIZATION_FAILED) clearSaved(key);
+    throw new WalletError(e);
+  }
 }
