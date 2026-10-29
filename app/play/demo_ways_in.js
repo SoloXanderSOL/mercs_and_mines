@@ -10,9 +10,12 @@
 // Kept in sessionStorage (this tab only, never the cross-tab store): the way in (mm.way_in) and the
 // throwaway's private JWK (mm.throwaway.key). store.clearAll() never touches either, so a 401
 // keeps the key and the next sign-in is the same wallet (the join answers AlreadyMember).
+//
+// The checkout (BP-3c-2b) is real on the Seeker way in only: the other two get its walkthrough.
 
 import { postChallenge, postVerify } from './api.js';
 import { base58 } from './wallet.js';
+import { setWalkthroughWhen } from './checkout.js';
 
 const WAY_KEY = 'mm.way_in';
 const THROWAWAY_KEY = 'mm.throwaway.key';
@@ -121,7 +124,8 @@ function element(tag, className, text) {
 // Relabels the Seeker button and the explainer, and adds the other two ways after it. Call it
 // after main.js has filled its copy and before it wires its own handlers, so the way is
 // recorded before the Seeker button's sign-in starts. `btn-signin` is disabled while any
-// sign-in runs; no way is recorded then.
+// sign-in runs (main.js), and the other two follow it; all three are disabled while the
+// throwaway key is prepared, so no other sign-in can start then (Reviewer BP-3c-2 F1/F2).
 export function mountWaysIn({ $, onSignIn }) {
   const seeker = $('btn-signin');
   seeker.textContent = COPY.waySeeker;
@@ -137,8 +141,10 @@ export function mountWaysIn({ $, onSignIn }) {
   const throwawayNote = element('p', 'explainer way-note', COPY.wayThrowawayNote);
   seeker.after(wallet, walletNote, throwaway, throwawayNote);
 
-  let preparing = false;
-  const idle = () => !seeker.disabled && !preparing;
+  const setWaysDisabled = on => { for (const b of [seeker, wallet, throwaway]) b.disabled = on; };
+  new MutationObserver(() => { wallet.disabled = seeker.disabled; throwaway.disabled = seeker.disabled; })
+    .observe(seeker, { attributes: true, attributeFilter: ['disabled'] });
+  const idle = () => !seeker.disabled;
 
   seeker.addEventListener('click', () => { if (idle()) writeTab(WAY_KEY, 'seeker'); });
   wallet.addEventListener('click', () => {
@@ -148,9 +154,9 @@ export function mountWaysIn({ $, onSignIn }) {
   });
   throwaway.addEventListener('click', async () => {
     if (!idle()) return;
-    preparing = true;
+    setWaysDisabled(true); // a disabled button fires no click: no other sign-in starts now
     const key = await throwawayKey();
-    preparing = false;
+    setWaysDisabled(false);
     if (!key) {
       $('signin-status').textContent = COPY.throwawayUnsupported;
       throwaway.hidden = true;
@@ -162,4 +168,6 @@ export function mountWaysIn({ $, onSignIn }) {
       genesisNote: { title: COPY.genesisThrowawayTitle, body: COPY.genesisThrowawayBody },
     });
   });
+
+  setWalkthroughWhen(() => wayIn() !== 'seeker');
 }
