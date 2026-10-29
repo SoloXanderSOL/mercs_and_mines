@@ -151,9 +151,9 @@ export function createCheckout(deps) {
   }
 
   // Continue and Not now: the offer counts as made for this campaign once the player leaves.
-  function leave(clearRef) {
+  function leave(ref) {
     gen += 1;
-    if (clearRef) store.clearCheckoutRef();
+    if (ref) store.clearCheckoutRef(ref);
     const camp = store.campaign();
     if (camp) store.setOffered(camp.campaign_id);
     const next = then;
@@ -162,7 +162,7 @@ export function createCheckout(deps) {
   }
 
   const notNow = [COPY.checkoutNotNow, () => leave(false)];
-  const cont = clearRef => [COPY.checkoutContinue, () => leave(clearRef)];
+  const cont = ref => [COPY.checkoutContinue, () => leave(ref)];
   const tryAgain = [COPY.checkoutRetry, () => start(attempt)];
 
   // The invoice and wallet steps can be left (Not now): the generation bumps, so a late answer does nothing.
@@ -217,10 +217,10 @@ export function createCheckout(deps) {
       return render({
         title: COPY.checkoutPaidTitle,
         body: fill(COPY.checkoutPaidBody, { amount: amountText(body.amount, body.decimals) }),
-        primary: cont(true),
+        primary: cont(body.reference),
       });
     }
-    if (body.status === 'mismatch') return render({ body: COPY.checkoutMismatch, primary: cont(true) });
+    if (body.status === 'mismatch') return render({ body: COPY.checkoutMismatch, primary: cont(body.reference) });
     if (body.status === 'pending') return poll(g, body.reference);
     return checkFailed(body.reference); // a status this client doesn't know: never a re-GET by itself
   }
@@ -248,7 +248,7 @@ export function createCheckout(deps) {
       } catch (e) {
         if (!alive(g)) return;
         if (e instanceof ApiError && e.kind === 'notfound') {
-          return render({ body: COPY.checkoutLost, primary: cont(true) }); // never a fresh POST here
+          return render({ body: COPY.checkoutLost, primary: cont(reference) }); // never a fresh POST here
         }
         if (e instanceof ApiError && e.kind === 'unavailable' && e.retryAfter) {
           delay = Math.max(POLL_MS, e.retryAfter * 1000);
@@ -276,7 +276,7 @@ export function createCheckout(deps) {
         body = await getCheckoutIntent(stored.reference);
       } catch (e) {
         if (!(e instanceof ApiError && e.kind === 'notfound')) throw e;
-        store.clearCheckoutRef(); // expired, a restart, or not this wallet's
+        store.clearCheckoutRef(stored.reference); // expired, a restart, or not this wallet's
       }
       if (!alive(g)) return;
       if (body) return settle(g, body);
@@ -289,8 +289,6 @@ export function createCheckout(deps) {
     const w3 = await loadWeb3();
     const conn = new w3.Connection(`https://api.${body.cluster}.solana.com`, 'confirmed');
     if (!alive(g)) return;
-    store.setCheckoutRef({ reference: body.reference, wallet }); // after the module loads: a failure there stored nothing
-    const unsent = () => store.clearCheckoutRef();
 
     if (wallet) { // (i) before the wallet opens: a wallet that can't pay never sees the payment
       let tx;
@@ -298,11 +296,10 @@ export function createCheckout(deps) {
         tx = await simulated(w3, conn, body, wallet);
       } catch (e) {
         deps.note(e);
-        unsent();
         return alive(g) && retryable(COPY.checkoutNetwork);
       }
       if (!alive(g)) return;
-      if (!tx) { unsent(); return noFunds(); }
+      if (!tx) return noFunds();
     }
 
     working(COPY.checkoutWallet, true);
@@ -324,15 +321,15 @@ export function createCheckout(deps) {
         }
         if (!tx) { stop = 'noFunds'; return null; }
         if (!alive(g)) return null;
+        store.setCheckoutRef({ reference: body.reference, wallet }); // stored at the handover: nothing before it went out
         handed = true;
         return tx;
       });
     } catch (e) {
-      if (!handed || (e instanceof WalletError && NOT_SIGNED.includes(e.code))) unsent(); // nothing went out
+      if (handed && e instanceof WalletError && NOT_SIGNED.includes(e.code)) store.clearCheckoutRef(body.reference);
       throw e;
     }
     if (!signature) {
-      unsent();
       if (!alive(g)) return;
       if (stop === 'wrongWallet') return retryable(COPY.checkoutWrongWallet);
       if (stop === 'network') return retryable(COPY.checkoutNetwork);

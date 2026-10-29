@@ -489,6 +489,16 @@ body { display: flex; align-items: center; justify-content: center; }
 .checkout-actions { width: 100%; display: flex; flex-direction: column; align-items: center; gap: 2.5cqw; }
 .checkout-line[hidden], .checkout-body[hidden] { display: none; }
 
+/* ── mute (BP-3c-3): one button above every screen ──────────────────────── */
+.mute-btn {
+  position: absolute; top: 1cqw; right: 1.5cqw; z-index: 6; /* inside the hub's 10 cqw header, clear of the map */
+  width: 8cqw; height: 8cqw; padding: 0;
+  font-size: 4.5cqw; line-height: 1; cursor: pointer;
+  color: var(--text); background: rgba(0, 0, 0, 0.45); border: 0.4cqw solid var(--panel-edge); border-radius: 50%;
+}
+.reveal-note { margin: 0; max-width: 88cqw; font-size: 4.2cqw; line-height: 1.4; color: var(--accent); }
+.reveal-note[hidden] { display: none; }
+
 /* ── debug footer (?debug=1) ────────────────────────────────────────────── */
 .debug {
   position: absolute; left: 0; right: 0; bottom: 0;

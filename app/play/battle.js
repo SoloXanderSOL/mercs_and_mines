@@ -46,6 +46,7 @@ const COPY = {
   battleChance: 'Chance of success: {n}%',
   battleRoll: 'Rolled {n}',
   battleSkip: 'Skip',
+  battleContinue: 'Continue',
   outcome: { Success: 'Mission accomplished', Defeat: 'Mission failed', Wipeout: 'No survivors' },
   aarTitle: 'After-action report',
   aarUnits: '1st Section',
@@ -90,6 +91,10 @@ function el(tag, className, text) {
   return node;
 }
 
+// What runs between the first non-death AAR and the checkout offer. By default, nothing.
+let beforeOffer = (ctx, next) => next();
+export function setBeforeOffer(fn) { beforeOffer = fn; }
+
 // `deps` is main.js's side of the client: screens, the error screen, the roster it keeps,
 // the one Audio element, and the flows the battle hands back to (hub, reveal, join).
 export function createBattle(deps) {
@@ -103,9 +108,10 @@ export function createBattle(deps) {
   let run = 0;               // the presentation in progress; Skip and a new run bump it
   let oneRookie = null;      // the debug checkbox, created only under DEBUG
 
-  function music(src) {
+  function music(src, loop = true) {
     deps.music.pause();
     deps.music.src = src;
+    deps.music.loop = loop; // victory and defeat play once, then silence
     deps.music.play().catch(() => { /* audio blocked or failed: play on without it */ });
   }
 
@@ -281,7 +287,7 @@ export function createBattle(deps) {
         if (e.message === 'Commander is KIA') return deathFromRefusal(d, { is_kia: true });
         if (/Shattered/.test(e.message)) return deathFromRefusal(d, { is_shattered: true });
         if (/already deployed/.test(e.message)) return deps.showError(COPY.missionBusy, back);
-        if (e.message === 'campaign is not active') return deps.staleCampaign();
+        if (e.message === 'campaign is not active') return deps.staleCampaign(true);
         return deps.showError(COPY.missionRefused, back);
       case 'notfound':
         return deps.staleCampaign(); // the stored Commander or Section is not this wallet's
@@ -358,7 +364,8 @@ export function createBattle(deps) {
     const roll = $('battle-roll');
     const banner = $('battle-outcome');
     for (const n of [chance, roll, banner]) { n.classList.remove('shown'); n.textContent = ''; }
-    banner.className = 'battle-outcome';
+    banner.classList.remove(...[...banner.classList].filter(c => c.startsWith('outcome-')));
+    $('btn-skip').textContent = COPY.battleSkip;
     deps.show('screen-battle');
 
     const steps = [];
@@ -377,7 +384,10 @@ export function createBattle(deps) {
       banner.classList.add(`outcome-${outcome}`);
       revealThen(banner, next, id);
     });
-    const go = i => { if (id === run && i < steps.length) steps[i](() => go(i + 1)); };
+    const go = i => {
+      if (id === run && i < steps.length) steps[i](() => go(i + 1));
+      else if (id === run) $('btn-skip').textContent = COPY.battleContinue; // the last step has run
+    };
     // The first reveal waits one frame so the screen is laid out before the transition starts.
     requestAnimationFrame(() => go(0));
   }
@@ -395,7 +405,7 @@ export function createBattle(deps) {
     const { report, commander: c } = result;
     const outcome = report.outcome;
     still($('aar-still'), ART[outcome] || ART.Defeat, outcome === 'Wipeout');
-    music(MUSIC[outcome] || MUSIC.Defeat);
+    music(MUSIC[outcome] || MUSIC.Defeat, false);
     const banner = $('aar-outcome');
     banner.className = `aar-outcome outcome-${outcome}`;
     banner.textContent = COPY.outcome[outcome] || outcome;
@@ -436,7 +446,8 @@ export function createBattle(deps) {
     }
     const camp = store.campaign();
     if (camp && !store.offered(camp.campaign_id)) { // the checkout, once per campaign (BP-3c-2b)
-      return deps.offerCheckout(() => { music(MUSIC.hub); deps.enterHub(); });
+      music(MUSIC.hub);
+      return beforeOffer({ commander: result.report.commander_name }, () => deps.offerCheckout(() => deps.enterHub()));
     }
     music(MUSIC.hub);
     deps.enterHub();
@@ -481,9 +492,10 @@ export function createBattle(deps) {
       await postAbandon(camp.campaign_id);
     } catch (e) {
       busy = false;
-      if (!(e instanceof ApiError && e.kind === 'conflict' && e.message === 'campaign is not active')) {
-        return deps.handleError(e, abandonAndRejoin);
-      }
+      // Already retired, gone (404) or not this wallet's (403): a fresh join, never a Retry loop.
+      const over = e instanceof ApiError
+        && ((e.kind === 'conflict' && e.message === 'campaign is not active') || e.kind === 'notfound' || e.kind === 'forbidden');
+      if (!over) return deps.handleError(e, abandonAndRejoin);
     }
     busy = false;
     result = null;

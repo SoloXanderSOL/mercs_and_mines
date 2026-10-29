@@ -51,6 +51,7 @@ const UNITS = 'mm.units';       // GET /api/units, static: once per tab
 const genesisKey = w => `mm.genesis.${w}`; // {holds} from a 200 only, per wallet (BP-3c-2)
 const CHECKOUT_REF = 'mm.checkout.ref'; // {reference, wallet}: this tab's unfinished checkout (BP-3c-2b)
 const offeredKey = id => `mm.checkout.offered.${id}`; // the checkout was offered after this campaign's AAR
+const MUTE = 'mm.mute'; // the music's mute (BP-3c-3), kept for the tab
 
 export const store = {
   session: () => readKey(SESSION),                       // {token_id, expires_at}
@@ -72,9 +73,12 @@ export const store = {
   // The checkout's two keys live outside clearAll(): a 401 and a re-sign-in keep them.
   checkoutRef: () => readKey(CHECKOUT_REF),
   setCheckoutRef: r => writeKey(CHECKOUT_REF, { reference: r.reference, wallet: r.wallet }),
-  clearCheckoutRef: () => removeKey(CHECKOUT_REF),
+  clearCheckoutRef: reference => { if (readKey(CHECKOUT_REF)?.reference === reference) removeKey(CHECKOUT_REF); },
   offered: id => readKey(offeredKey(id)) === true,
   setOffered: id => writeKey(offeredKey(id), true),
+  // The mute is outside clearAll() too: it survives a 401 and a re-sign-in.
+  muted: () => readKey(MUTE) === true,
+  setMuted: b => writeKey(MUTE, !!b),
   clearCampaign() {
     const c = readKey(CAMPAIGN);
     if (c && c.campaign_id) {

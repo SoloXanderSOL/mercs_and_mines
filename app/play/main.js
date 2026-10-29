@@ -54,6 +54,9 @@ const COPY = {
   generic: 'Something went wrong on our side. Tap to retry.',
   revealHeading: 'Meet your Commander',
   revealOutfit: 'Your outfit',
+  revealClosedNote: 'Your last campaign was closed, so Command has issued you a new Commander.',
+  muteOn: 'Mute music',
+  muteOff: 'Unmute music',
   hubTitle: 'Your Sector',
   hubBack: 'Back',
   hubRecentre: 'Recentre',
@@ -90,6 +93,7 @@ let debugExtra = '';        // the last mission's `stress=… xp=…`, for the d
 let battle = null;          // battle.js (BP-3b-2), created at the bottom
 let checkout = null;        // checkout.js (BP-3c-2b), created at the bottom
 let paySignature = '';      // the last payment's signature, for the debug footer only
+let closedNote = false;     // the stored campaign was closed (409): the next reveal says so once
 
 // ── screens ─────────────────────────────────────────────────────────────────
 function show(id) {
@@ -135,6 +139,16 @@ const music = new Audio();
 music.preload = 'none';
 music.loop = true;
 music.volume = 0.5;
+
+// The mute button sits on every screen; its state is kept for the tab (BP-3c-3).
+function applyMute() {
+  const muted = store.muted();
+  music.muted = muted;
+  const button = $('btn-mute');
+  button.textContent = muted ? '🔇' : '🔊';
+  button.setAttribute('aria-pressed', String(muted));
+  button.setAttribute('aria-label', muted ? COPY.muteOff : COPY.muteOn);
+}
 
 // The tap never waits: the music starts when it has buffered, and sign-in shows at once.
 function onStart() {
@@ -300,6 +314,7 @@ async function loadRoster(camp, conflicts) {
       note(e);
       store.clearCampaign(); // the stored campaign is over or gone
       lastRoster = null;
+      if (e.kind === 'conflict') closedNote = true;
       if (conflicts >= 1) return showError(COPY.generic, () => enterCampaign(0));
       return doJoin(conflicts + 1);
     }
@@ -330,6 +345,10 @@ function showReveal(camp, roster) {
     lastError = `commander ${camp.commander_id} not in roster`;
     return showError(COPY.generic, () => loadRoster(camp, 1));
   }
+  const closed = $('reveal-note');
+  closed.textContent = closedNote ? COPY.revealClosedNote : '';
+  closed.hidden = !closedNote;
+  closedNote = false;
   show('screen-reveal');
 }
 
@@ -360,6 +379,7 @@ async function loadSector(camp, conflicts) {
       note(e);
       store.clearCampaign(); // the stored campaign is over or gone: the roster's rule
       lastRoster = null;
+      if (e.kind === 'conflict') closedNote = true;
       if (conflicts >= 1) return showError(COPY.generic, () => enterCampaign(0));
       return doJoin(conflicts + 1);
     }
@@ -476,6 +496,8 @@ function wire() {
   $('btn-missions').addEventListener('click', () => battle.openMissions());
   // The toolbar showing or hiding, or a turn of the phone, resizes the stage.
   window.addEventListener('resize', () => { if (map && !$('screen-hub').hidden) map.resize(); });
+  $('btn-mute').addEventListener('click', () => { store.setMuted(!store.muted()); applyMute(); });
+  applyMute(); // at load: a reload keeps the tab's mute
   if (DEBUG) $('debug').hidden = false;
 }
 
@@ -494,7 +516,9 @@ function reloadRoster() {
 }
 
 // The stored campaign is over or not this wallet's: the roster's rule (clear, re-join once).
-function staleCampaign() {
+// `closed`: the server said it was closed (409), so the next reveal says so.
+function staleCampaign(closed) {
+  if (closed) closedNote = true;
   store.clearCampaign();
   lastRoster = null;
   dropMap();
