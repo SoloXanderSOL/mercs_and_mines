@@ -96,6 +96,23 @@ body { display: flex; align-items: center; justify-content: center; }
 .title-logo { width: 92cqw; max-height: 40cqh; object-fit: contain; }
 .title-tagline { margin: 0; font-family: var(--display); font-size: 5.5cqw; font-style: italic; color: var(--muted); }
 
+/* ── Genesis (BP-3c-2): a text badge, no art ────────────────────────────── */
+.screen-genesis { gap: 4cqw; }
+.genesis-badge {
+  margin: 0;
+  padding: 2cqw 5cqw;
+  font-family: var(--display);
+  font-weight: 800;
+  font-size: 5.5cqw;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--accent);
+  border: 0.6cqw solid var(--accent);
+  border-radius: 1.5cqw;
+}
+.genesis-title { margin: 0; font-family: var(--display); font-weight: 800; font-size: 7.5cqw; line-height: 1.15; }
+.genesis-body { margin: 0; max-width: 84cqw; font-size: 4.6cqw; line-height: 1.45; color: var(--muted); }
+
 /* ── working ────────────────────────────────────────────────────────────── */
 .spinner {
   width: 14cqw; height: 14cqw;

@@ -48,6 +48,7 @@ const rosterKey = id => `mm.roster.${id}`;
 const sectorKey = id => `mm.sector.${id}`; // ~87 KB; sessionStorage allows ~5 MB per origin
 const MISSIONS = 'mm.missions'; // GET /api/missions, static: once per tab (BP-3b-2)
 const UNITS = 'mm.units';       // GET /api/units, static: once per tab
+const genesisKey = w => `mm.genesis.${w}`; // {holds} from a 200 only, per wallet (BP-3c-2)
 
 export const store = {
   session: () => readKey(SESSION),                       // {token_id, expires_at}
@@ -62,6 +63,8 @@ export const store = {
   setMissions: body => writeKey(MISSIONS, body),
   units: () => readKey(UNITS),
   setUnits: body => writeKey(UNITS, body),
+  genesis: wallet => readKey(genesisKey(wallet)),
+  setGenesis: (wallet, answer) => writeKey(genesisKey(wallet), answer),
   clearCampaign() {
     const c = readKey(CAMPAIGN);
     if (c && c.campaign_id) {
@@ -193,6 +196,13 @@ export async function getUnits() {
   if (cached) return cached;
   const r = await request('GET', '/api/units');
   store.setUnits(r.body); // {KEY: UnitDefinition, …}
+  return r.body;
+}
+
+// The Genesis Token lookup (BP-4). It gates nothing (ODQ-53 (a)): the screen shows a badge or
+// courtesy copy. Only `holds_genesis_token` is read; the mint is never read or shown.
+export async function getGenesis() {
+  const r = await request('GET', '/api/genesis');
   return r.body;
 }
 

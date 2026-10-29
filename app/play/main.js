@@ -1,6 +1,6 @@
 // Seeker client entry point (BP-3a-1, portrait-first since BP-3a-1b / ODQ-58): title → MWA
-// sign-in → join → Commander reveal → hub (the sector map since BP-3a-2). One upright layout;
-// nothing is locked or blocked.
+// sign-in → Genesis (BP-3c-2) → join → Commander reveal → hub (the sector map since BP-3a-2).
+// One upright layout; nothing is locked or blocked.
 //
 // Boot and reload rule (spec check §8):
 //   1. no stored session → title;
@@ -14,7 +14,7 @@
 // the sector only, never a re-join. The sector is fetched once per campaign and cached for the
 // tab. Nothing runs on a timer and nothing retries by itself: every retry is a tap.
 
-import { ApiError, store, counters, getSession, postJoin, getRoster, getSector } from './api.js';
+import { ApiError, store, counters, getSession, postJoin, getRoster, getSector, getGenesis } from './api.js';
 import { loadWallet, signIn, WalletError } from './wallet.js';
 import { renderReveal } from './reveal.js';
 import { HexMap, PALETTE, TERRAIN_ORDER, OVERLAY } from './hexmap.js';
@@ -33,7 +33,17 @@ const COPY = {
   signinExpired: 'The challenge expired while you were deciding. Tap to try again.',
   signinFailed: "The signature didn't check out. Tap to try again.",
   signinCapacity: 'Sign-in is at capacity. Tap to try again in a moment.',
-  sessionExpired: 'Your session has expired. Please sign in again.',
+  sessionExpired: 'Your session has ended. Please sign in again.',
+  // The Genesis screen (BP-3c-2): it shows, it never gates (ODQ-53 (a)).
+  genesisWorking: 'Checking your wallet for a Genesis Token...',
+  genesisBadge: 'Genesis Charter',
+  genesisHoldsTitle: 'Your Seeker came with a campaign attached.',
+  genesisHoldsBody: 'Genesis Token verified. Your first campaign is on the house, and the house would like that remembered.',
+  genesisNoneTitle: 'No Genesis Token on this wallet.',
+  genesisNoneBody: 'Command has issued you a courtesy campaign anyway. Try not to make it awkward.',
+  genesisUnknownTitle: "Command couldn't check your papers just now.",
+  genesisUnknownBody: "Your campaign is ready regardless. The paperwork can wait. The mines can't.",
+  genesisContinue: 'Continue',
   joinWorking: 'Requisitioning your outfit...',
   joinFull: 'The demo is at capacity. Every Commander is spoken for. Please try again shortly.',
   joinClosed: 'Recruitment is closed for now.',
@@ -62,7 +72,7 @@ const COPY = {
 
 const $ = id => document.getElementById(id);
 const SCREENS = ['screen-title', 'screen-signin', 'screen-working', 'screen-reveal', 'screen-hub', 'screen-error',
-  'screen-missions', 'screen-briefing', 'screen-battle', 'screen-aar', 'screen-end'];
+  'screen-missions', 'screen-briefing', 'screen-battle', 'screen-aar', 'screen-end', 'screen-genesis'];
 const DEBUG = new URLSearchParams(location.search).get('debug') === '1';
 
 let busy = false;           // one wallet or server flow at a time
@@ -164,7 +174,9 @@ function signInCopy(e) {
   return COPY.offline; // the wallet library itself failed to load
 }
 
-async function onSignIn() {
+// `sign` resolves with the server's SessionToken (today's MWA sign-in by default). A caller
+// with its own Genesis copy passes `opts.genesisNote` ({title, body}), and no lookup runs.
+async function onSignIn(sign = signIn, opts = {}) {
   if (busy) return;
   // Airplane mode: say so now, rather than open a wallet whose challenge can't be fetched.
   if (navigator.onLine === false) {
@@ -177,17 +189,66 @@ async function onSignIn() {
   $('btn-signin').disabled = true;
   $('signin-status').textContent = '';
   try {
-    const token = await signIn();
+    const token = await sign();
     store.setSession(token);
     store.clearCampaign(); // a fresh sign-in may be another wallet
     lastRoster = null;
-    await enterCampaign(0);
+    await showGenesis(token.wallet_address, opts.genesisNote);
   } catch (e) {
     note(e);
     $('signin-status').textContent = signInCopy(e);
   } finally {
     busy = false;
     $('btn-signin').disabled = false;
+  }
+}
+
+// ── Genesis (BP-3c-2) ───────────────────────────────────────────────────────
+// After each sign-in, never on boot. A cached answer (a 200's, per wallet) is shown with no
+// lookup; a failed lookup shows the neutral copy and is not cached; only a 401 leaves the
+// screen. Continue goes to the join and the reveal. Nothing here gates the campaign.
+function renderGenesis(holds, title, body) {
+  $('genesis-badge').hidden = !holds;
+  $('genesis-title').textContent = title;
+  $('genesis-body').textContent = body;
+  show('screen-genesis');
+}
+
+function renderGenesisAnswer(holds) {
+  if (holds) return renderGenesis(true, COPY.genesisHoldsTitle, COPY.genesisHoldsBody);
+  return renderGenesis(false, COPY.genesisNoneTitle, COPY.genesisNoneBody);
+}
+
+async function showGenesis(wallet, genesisNote) {
+  if (genesisNote) return renderGenesis(false, genesisNote.title, genesisNote.body);
+  const cached = wallet ? store.genesis(wallet) : null;
+  if (cached) return renderGenesisAnswer(cached.holds === true);
+  $('working-text').textContent = COPY.genesisWorking;
+  show('screen-working');
+  let answer;
+  try {
+    answer = await getGenesis();
+  } catch (e) {
+    if (e instanceof ApiError && e.kind === 'unauth') return handleError(e, null);
+    note(e);
+    return renderGenesis(false, COPY.genesisUnknownTitle, COPY.genesisUnknownBody);
+  }
+  const holds = Boolean(answer && answer.holds_genesis_token === true);
+  if (wallet) store.setGenesis(wallet, { holds });
+  return renderGenesisAnswer(holds);
+}
+
+async function onGenesisContinue() {
+  if (busy) return;
+  busy = true;
+  $('btn-genesis-continue').disabled = true;
+  try {
+    await enterCampaign(0);
+  } catch (e) {
+    handleError(e, () => enterCampaign(0));
+  } finally {
+    busy = false;
+    $('btn-genesis-continue').disabled = false;
   }
 }
 
@@ -378,6 +439,8 @@ function fillCopy() {
   $('btn-start').textContent = COPY.start;
   $('title-tagline').textContent = COPY.tagline;
   $('btn-signin').textContent = COPY.signinButton;
+  $('genesis-badge').textContent = COPY.genesisBadge;
+  $('btn-genesis-continue').textContent = COPY.genesisContinue;
   $('signin-explainer').textContent = COPY.signinExplainer;
   $('signin-lna').textContent = COPY.signinLna;
   $('hub-title').textContent = COPY.hubTitle;
@@ -389,7 +452,8 @@ function fillCopy() {
 
 function wire() {
   $('btn-start').addEventListener('click', onStart);
-  $('btn-signin').addEventListener('click', onSignIn);
+  $('btn-signin').addEventListener('click', () => onSignIn());
+  $('btn-genesis-continue').addEventListener('click', onGenesisContinue);
   $('btn-error-retry').addEventListener('click', () => { const r = errorRetry; errorRetry = null; if (r) r(); });
   $('btn-continue').addEventListener('click', enterHub);
   $('btn-back').addEventListener('click', () => {

@@ -44,7 +44,7 @@ function clearSaved() {
 // ── encoding ────────────────────────────────────────────────────────────────
 const B58 = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
 
-function base58(bytes) {
+export function base58(bytes) {
   let n = 0n;
   for (const b of bytes) n = (n << 8n) + BigInt(b);
   let s = '';
