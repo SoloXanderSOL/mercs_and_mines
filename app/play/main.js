@@ -19,6 +19,7 @@ import { loadWallet, signIn, WalletError } from './wallet.js';
 import { renderReveal } from './reveal.js';
 import { HexMap, PALETTE, TERRAIN_ORDER, OVERLAY } from './hexmap.js';
 import { createBattle } from './battle.js';
+import { mountWaysIn } from './demo_ways_in.js'; // demo-only (ODQ-69)
 
 // Booth copy, verbatim from the BP-3a-1, BP-3a-1b, BP-3a-2 and BP-3b-2 prompts (the battle's own
 // copy lives in battle.js).
@@ -502,6 +503,7 @@ function startFresh() {
 
 fillCopy();
 buildLegend();
+mountWaysIn({ $, onSignIn }); // demo-only (ODQ-69)
 wire();
 battle = createBattle({
   $, DEBUG, music, show, showError, handleError, note, enterHub, enterCampaign,
