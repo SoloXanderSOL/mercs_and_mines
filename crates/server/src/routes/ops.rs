@@ -1,8 +1,9 @@
-//! The ops routes (BP-8a-1 board, BP-8a-2 travel legs; **demo-only**; Breakpoint plan §4d).
+//! The ops routes (BP-8a-1 board, BP-8a-2 travel legs, BP-8b-1a the drill; **demo-only**;
+//! Breakpoint plan §4d).
 //! The `dev` port deletes this file with `demo_ops.rs`.
 //!
 //! Every route answers the same body (`OpsView`), so the client never polls: a `POST`
-//! returns the whole state. The three share one `ops_ip` / `ops_wallet` budget.
+//! returns the whole state. Every route shares one `ops_ip` / `ops_wallet` budget.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -19,10 +20,14 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use shared::SessionToken;
 use sim_engine::rng::generate_seed;
+use sim_engine::roster::ForemanSpecialization;
 use uuid::Uuid;
 
 use crate::auth::AuthSession;
-use crate::demo_ops::{ops_board, ops_time, ActiveOpView, OpsBoard, OpsSite, ReturnRefusal, StartRefusal};
+use crate::demo_ops::{
+    dig_threshold, ops_board, ops_time, ActiveOpView, DigStart, DrillOutcome, DrillRefusal, OpsBoard, OpsSite, ReturnRefusal,
+    StartRefusal,
+};
 use crate::repository::{CampaignInstance, CampaignLifecycle, SectorState};
 use crate::state::AppState;
 
@@ -41,6 +46,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/campaign/:campaign_id/ops", get(get_ops_board))
         .route("/api/campaign/:campaign_id/ops/start", post(post_ops_start).layer(DefaultBodyLimit::max(OPS_BODY_LIMIT)))
         .route("/api/campaign/:campaign_id/ops/return", post(post_ops_return))
+        .route("/api/campaign/:campaign_id/ops/drill", post(post_ops_drill))
 }
 
 /// The ops state as the client sees it, from every route. `now` is the server's clock, so the
@@ -79,13 +85,14 @@ fn ops_limits(
 }
 
 /// `401` (wallet not base58) → `404` (unknown campaign) → `403` (not a member) → `409` (not
-/// `Active`; the campaign's entry is dropped). Returns the campaign and the member's gateway.
+/// `Active`; the campaign's entry is dropped). Returns the campaign, the member's gateway and
+/// the wallet's bytes.
 async fn ops_member(
     state: &AppState,
     token: &SessionToken,
     campaign_id: Uuid,
     route: &str,
-) -> Result<(CampaignInstance, Option<(i32, i32)>), AppError> {
+) -> Result<(CampaignInstance, Option<(i32, i32)>, Vec<u8>), AppError> {
     let wallet: Vec<u8> = bs58::decode(&token.wallet_address)
         .into_vec()
         .map_err(|_| unauthorized("session wallet is not valid base58"))?;
@@ -110,7 +117,7 @@ async fn ops_member(
         return Err(conflict("campaign is not active"));
     }
     let gateway = membership.and_then(|m| Some((m.gateway_hex_q?, m.gateway_hex_r?)));
-    Ok((campaign, gateway))
+    Ok((campaign, gateway, wallet))
 }
 
 /// BP-1d's repair for a sector that is gone. When it retires the campaign (`409`), the
@@ -201,7 +208,7 @@ async fn get_ops_board(
         return Ok(r);
     }
     let now = Utc::now();
-    let (campaign, gateway) = ops_member(&state, &token, campaign_id, "get_ops_board").await?;
+    let (campaign, gateway, _) = ops_member(&state, &token, campaign_id, "get_ops_board").await?;
     let Some(gw) = gateway else {
         let view = OpsView { campaign_id, gateway: None, sites: &[], active_op: None, ore_banked: 0, now: ops_time(now) };
         return Ok(Json(view).into_response());
@@ -214,11 +221,13 @@ async fn get_ops_board(
 /// demo-only). Order: `401` → `429` `ops_ip` → `429` `ops_wallet` → axum's body rejection,
 /// counted (`413` over `OPS_BODY_LIMIT`; `400`, `415`, `422`) → `404` → `403` → `409` not
 /// `Active` (entry dropped) → `409` no gateway → the board, a hit proven by `EXISTS` (a lost
-/// sector is repaired: `409` once retired, entry dropped) → `400` unknown site → `409` an op
+/// sector is repaired: `409` once retired, entry dropped) → `400` unknown site → for a dig
+/// only, the Crew and Foreman reads (`500` on failure) and `409` no Crew left → `409` an op
 /// is under way → `503` the store is full of ops → `200`, the whole state.
 /// - The leg: `depart_at = now`, `arrive_at = now + the site's travel_secs`.
-/// - The op's seed is drawn here from OS entropy and handed to the store, which never sends it.
-///   Nothing rolls from it until BP-8b-1.
+/// - The op's seed is drawn here from OS entropy and handed to the store, which never sends it;
+///   the drill rolls from it.
+/// - A dig reads its Crew and threshold once, here (`dig_start`); a contract reads neither.
 /// - No launch lock: an op that starts while the reaper retires the campaign is retired with
 ///   it, and the next ops call answers `409` (an accepted residual, as BP-3c-1b-1's).
 async fn post_ops_start(
@@ -237,7 +246,7 @@ async fn post_ops_start(
         Err(rej) => return Ok(rej.into_response()),
     };
     let now = Utc::now();
-    let (campaign, gateway) = ops_member(&state, &token, campaign_id, "post_ops_start").await?;
+    let (campaign, gateway, wallet) = ops_member(&state, &token, campaign_id, "post_ops_start").await?;
     let Some(gw) = gateway else {
         return Err(conflict("no gateway assigned"));
     };
@@ -245,13 +254,32 @@ async fn post_ops_start(
     let Some(site) = board.sites.iter().find(|s| s.site_id == req.site_id) else {
         return Err(bad_request("unknown site"));
     };
+    let dig = if site.kind == "dig" { Some(dig_start(&state, campaign_id, &wallet).await?) } else { None };
     let op_seed = generate_seed();
-    match state.demo_ops.store.start_op(campaign_id, gw, Arc::clone(&board), site, op_seed, now) {
+    match state.demo_ops.store.start_op(campaign_id, gw, Arc::clone(&board), site, op_seed, dig, now) {
         Ok(()) => {}
         Err(StartRefusal::Busy) => return Err(conflict("an op is already under way")),
         Err(StartRefusal::Full) => return Err(service_unavailable("the ops board is full")),
     }
     Ok(ops_response(&state, campaign_id, gw, &board, now))
+}
+
+/// A dig's Crew and threshold (BP-8b-1a). The Crew is the member's first by the lister's order
+/// (a demo member holds one, the join's); `409` when it has no heads left, since only a new run
+/// brings a fresh one. The first Foreman's specialization sets the threshold (`dig_threshold`);
+/// no Foreman means the plain threshold.
+async fn dig_start(state: &AppState, campaign_id: Uuid, wallet: &[u8]) -> Result<DigStart, AppError> {
+    let crews = state.crew_repo.list_crews_for_member(campaign_id, wallet).await.map_err(|e| {
+        internal_error(format!("post_ops_start: list_crews_for_member failed for campaign {campaign_id}: {e}"))
+    })?;
+    let Some(crew) = crews.first().filter(|c| c.headcount > 0) else {
+        return Err(conflict("no Crew left to dig: start a new run"));
+    };
+    let foremen = state.foreman_repo.list_foremen_for_member(campaign_id, wallet).await.map_err(|e| {
+        internal_error(format!("post_ops_start: list_foremen_for_member failed for campaign {campaign_id}: {e}"))
+    })?;
+    let coolant = foremen.first().is_some_and(|f| f.specialization == ForemanSpecialization::CoolantJockey.as_str());
+    Ok(DigStart { crew_id: crew.crew_id, threshold: dig_threshold(coolant) })
 }
 
 /// Brings the team home, `POST /api/campaign/:campaign_id/ops/return` (BP-8a-2, demo-only).
@@ -260,7 +288,8 @@ async fn post_ops_start(
 /// → `409` still travelling → `409` already heading home → `200`, the whole state.
 /// - The homeward leg takes the site's `travel_secs` again (§4d: "each way"), not the
 ///   gateway's terrain: every gateway is City-State (×0.5), which would halve every trip home.
-/// - From a dig site the team comes home empty; BP-8b-2's pull is the loaded return.
+/// - From a dig the team walks away and the ore on site is lost (`ended_by: walked_away`,
+///   BP-8b-1a); BP-8b-2's pull is the loaded return.
 async fn post_ops_return(
     AuthSession(token): AuthSession,
     State(state): State<Arc<AppState>>,
@@ -272,7 +301,7 @@ async fn post_ops_return(
         return Ok(r);
     }
     let now = Utc::now();
-    let (campaign, gateway) = ops_member(&state, &token, campaign_id, "post_ops_return").await?;
+    let (campaign, gateway, _) = ops_member(&state, &token, campaign_id, "post_ops_return").await?;
     let Some(gw) = gateway else {
         return Err(conflict("no op under way"));
     };
@@ -282,6 +311,52 @@ async fn post_ops_return(
         Err(ReturnRefusal::NoOp) => return Err(conflict("no op under way")),
         Err(ReturnRefusal::NotArrived) => return Err(conflict("still travelling")),
         Err(ReturnRefusal::AlreadyHomeward) => return Err(conflict("already heading home")),
+    }
+    Ok(ops_response(&state, campaign_id, gw, &board, now))
+}
+
+/// One drill on a dig, `POST /api/campaign/:campaign_id/ops/drill` (BP-8b-1a, demo-only). No
+/// body is read. Order: `401` → `429` `ops_ip` → `429` `ops_wallet` → `404` → `403` → `409`
+/// not `Active` (entry dropped) → `409` no op under way (also: no gateway) → the board → `409`
+/// no op under way → `409` not a dig site → `409` already heading home → `409` still
+/// travelling → `200`, the whole state.
+/// - No DB read unless the drill melts down: the Crew and the threshold were read at `ops/start`.
+/// - **A meltdown** is committed in the store first (the team is already heading home, so a
+///   second drill can't lose the heads twice). Then, with the store's lock released and after
+///   `load_board` has returned (its sector repair takes the launch lock itself), the route takes
+///   the launch lock and writes the Crew's loss (`CrewLoss::lose_heads`; Reviewer BP-8a-2 CF5).
+///   A failed write is `500` and the op stays melted: the team still goes home empty and the
+///   Crew keeps its heads, which the journal records.
+async fn post_ops_drill(
+    AuthSession(token): AuthSession,
+    State(state): State<Arc<AppState>>,
+    ci: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    Path(campaign_id): Path<Uuid>,
+) -> Result<Response, AppError> {
+    if let Some(r) = ops_limits(&state, &token, ci, &headers)? {
+        return Ok(r);
+    }
+    let now = Utc::now();
+    let (campaign, gateway, _) = ops_member(&state, &token, campaign_id, "post_ops_drill").await?;
+    let Some(gw) = gateway else {
+        return Err(conflict("no op under way"));
+    };
+    let board = load_board(&state, &campaign, gw, now, false, "post_ops_drill").await?;
+    match state.demo_ops.store.drill_op(campaign_id, now) {
+        Ok(DrillOutcome::Drilled) => {}
+        Ok(DrillOutcome::Meltdown { crew_id, heads }) => {
+            let _launch = state.launch_locks.lock(campaign_id).await;
+            if let Err(e) = state.crew_loss.lose_heads(crew_id, heads).await {
+                return Err(internal_error(format!(
+                    "post_ops_drill: lose_heads({heads}) failed for crew {crew_id} of campaign {campaign_id}: {e}"
+                )));
+            }
+        }
+        Err(DrillRefusal::NoOp) => return Err(conflict("no op under way")),
+        Err(DrillRefusal::Contract) => return Err(conflict("not a dig site")),
+        Err(DrillRefusal::AlreadyHomeward) => return Err(conflict("already heading home")),
+        Err(DrillRefusal::NotArrived) => return Err(conflict("still travelling")),
     }
     Ok(ops_response(&state, campaign_id, gw, &board, now))
 }
@@ -734,6 +809,196 @@ mod tests {
         let (status, body, _) = start(&state, c.campaign_id, "contract:SUPPLY_RAID").await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["active_op"]["site_id"], "contract:SUPPLY_RAID");
+    }
+
+    const DIG: &str = "dig:11,-4";
+
+    /// The member's Crew (8 heads) and Foreman, as a join writes them; the Foreman is the
+    /// Coolant-Jockey or, when `coolant` is false, the first other specialization. Returns the Crew.
+    async fn seed_crew(state: &AppState, campaign: Uuid, coolant: bool) -> Uuid {
+        let mut foreman = crate::foreman_gen::generate_foreman(WALLET.to_vec(), campaign, 7);
+        let other = ForemanSpecialization::ALL.iter().map(|s| s.as_str()).find(|s| *s != "Coolant-Jockey").unwrap();
+        foreman.specialization = if coolant { "Coolant-Jockey" } else { other }.to_string();
+        state.foreman_repo.create_foreman(foreman).await.expect("create_foreman");
+        let crew = crate::repository::CrewRecord::new_hire(campaign, WALLET.to_vec());
+        let id = crew.crew_id;
+        state.crew_repo.create_crew(crew).await.expect("create_crew");
+        id
+    }
+
+    async fn headcount(state: &AppState, crew: Uuid) -> i16 {
+        state.crew_repo.get_crew(crew).await.unwrap().expect("the Crew").headcount
+    }
+
+    /// A dig at `DIG`, on site (its arrival crossed) with the seed `seed`.
+    async fn dig_on_site(state: &Arc<AppState>, campaign: Uuid, seed: u32) {
+        let (status, started, _) = start(state, campaign, DIG).await;
+        assert_eq!(status, StatusCode::OK, "{started}");
+        state.demo_ops.store.rewind_op(campaign, site_secs(&started, DIG));
+        state.demo_ops.store.set_op_seed(campaign, seed);
+    }
+
+    async fn drill(state: &Arc<AppState>, campaign: Uuid) -> (StatusCode, serde_json::Value, Vec<u8>) {
+        post(state, campaign, "drill", None).await
+    }
+
+    /// A dig campaign: `Active`, the sector seeded, the Crew and a Foreman. Returns both ids.
+    async fn dig_campaign(state: &Arc<AppState>, coolant: bool) -> (Uuid, Uuid) {
+        let c = campaign_with(state, WALLET, true, Some(GATEWAY)).await;
+        seed_sector(state, &c).await;
+        let crew = seed_crew(state, c.campaign_id, coolant).await;
+        (c.campaign_id, crew)
+    }
+
+    /// The drill's refusals in its order, on a contract and on a dig.
+    #[tokio::test]
+    async fn ops_drill_refusals() {
+        let state = Arc::new(session_state());
+        let contract = campaign_with(&state, WALLET, true, Some(GATEWAY)).await;
+        seed_sector(&state, &contract).await;
+        let (status, body, _) = drill(&state, contract.campaign_id).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("no op under way")));
+        assert_eq!(start(&state, contract.campaign_id, SITE).await.0, StatusCode::OK);
+        let (status, body, _) = drill(&state, contract.campaign_id).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("not a dig site")));
+        let (c, _) = dig_campaign(&state, false).await;
+        let (status, started, _) = start(&state, c, DIG).await;
+        assert_eq!(status, StatusCode::OK, "{started}");
+        let (status, body, _) = drill(&state, c).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("still travelling")));
+        state.demo_ops.store.rewind_op(c, site_secs(&started, DIG));
+        assert_eq!(post(&state, c, "return", None).await.0, StatusCode::OK);
+        let (status, body, _) = drill(&state, c).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("already heading home")));
+    }
+
+    /// Three drills through the route: heat 15 per drill and ore 10 × n on the tier-1 site,
+    /// the dig's exact keys, and no seed or Crew in the body.
+    #[tokio::test]
+    async fn ops_drill_adds_heat_and_ore() {
+        let state = Arc::new(session_state());
+        let (c, _) = dig_campaign(&state, false).await;
+        dig_on_site(&state, c, 2).await;
+        let mut seen = Vec::new();
+        let mut last = Vec::new();
+        for _ in 0..3 {
+            let (status, body, bytes) = drill(&state, c).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let d = &body["active_op"]["dig"];
+            seen.push((d["drills"].as_u64(), d["heat"].as_u64(), d["ore_on_site"].as_u64(), d["next_ore"].as_u64(), d["threshold"].as_u64()));
+            assert!(d["ended_by"].is_null());
+            last = bytes;
+        }
+        assert_eq!(seen, vec![(Some(1), Some(15), Some(10), Some(20), Some(100)), (Some(2), Some(30), Some(30), Some(30), Some(100)), (Some(3), Some(45), Some(60), Some(40), Some(100))]);
+        let text = String::from_utf8_lossy(&last);
+        assert!(!text.contains("seed") && !text.contains("crew"), "{text}");
+    }
+
+    /// Seed 2, threshold 100: the 7th drill melts down, the team heads home empty and the Crew
+    /// loses 3 heads (8 → 5) under a launch lock that is released afterwards.
+    #[tokio::test]
+    async fn ops_meltdown_on_the_7th_costs_the_crew_3_heads() {
+        let state = Arc::new(session_state());
+        let (c, crew) = dig_campaign(&state, false).await;
+        dig_on_site(&state, c, 2).await;
+        for i in 1..=6 {
+            let (status, body, _) = drill(&state, c).await;
+            assert_eq!(status, StatusCode::OK, "drill {i}: {body}");
+            assert_eq!(body["active_op"]["leg"], "outbound", "drill {i}");
+        }
+        let (status, body, _) = drill(&state, c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let op = &body["active_op"];
+        assert_eq!(op["leg"], "homeward");
+        assert_eq!(op["depart_at"], body["now"]);
+        assert_eq!((op["dig"]["heat"].as_u64(), op["dig"]["ore_on_site"].as_u64()), (Some(105), Some(0)));
+        assert_eq!(op["dig"]["ended_by"], "meltdown");
+        assert_eq!(headcount(&state, crew).await, 5);
+        assert_eq!(state.launch_locks.len(), 0, "the launch lock is released");
+        let (status, body, _) = drill(&state, c).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("already heading home")));
+        assert_eq!(headcount(&state, crew).await, 5, "the heads are lost once");
+    }
+
+    /// A Coolant-Jockey Foreman: threshold 115, so seed 2's 7th drill digs and the 8th melts
+    /// down, costing 1 head (8 → 7).
+    #[tokio::test]
+    async fn ops_coolant_jockey_melts_down_on_the_8th() {
+        let state = Arc::new(session_state());
+        let (c, crew) = dig_campaign(&state, true).await;
+        dig_on_site(&state, c, 2).await;
+        for i in 1..=7 {
+            let (status, body, _) = drill(&state, c).await;
+            assert_eq!(status, StatusCode::OK, "drill {i}: {body}");
+            assert_eq!(body["active_op"]["dig"]["threshold"], 115, "drill {i}");
+            assert_eq!(body["active_op"]["leg"], "outbound", "drill {i}");
+        }
+        let (status, body, _) = drill(&state, c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["active_op"]["dig"]["ended_by"], "meltdown");
+        assert_eq!(headcount(&state, crew).await, 7);
+    }
+
+    /// A dig start needs a Crew with heads: none, then one at 0, are both `409`, and no op starts.
+    /// A contract start needs neither (every contract test above runs with no Crew).
+    #[tokio::test]
+    async fn ops_dig_start_needs_a_crew_with_heads() {
+        let state = Arc::new(session_state());
+        let c = campaign_with(&state, WALLET, true, Some(GATEWAY)).await;
+        seed_sector(&state, &c).await;
+        let (status, body, _) = start(&state, c.campaign_id, DIG).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("no Crew left to dig: start a new run")));
+        let crew = seed_crew(&state, c.campaign_id, false).await;
+        state.crew_loss.lose_heads(crew, 8).await.expect("lose_heads");
+        let (status, body, _) = start(&state, c.campaign_id, DIG).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("no Crew left to dig: start a new run")));
+        assert!(state.demo_ops.store.op_view(c.campaign_id, chrono::Utc::now()).is_none());
+    }
+
+    struct FailingCrewLoss;
+
+    #[async_trait::async_trait]
+    impl crate::demo_crew_loss::CrewLoss for FailingCrewLoss {
+        async fn lose_heads(&self, _: Uuid, _: i16) -> Result<i16, RepositoryError> {
+            Err(RepositoryError::Internal("db down".into()))
+        }
+    }
+
+    /// A failed Crew write is `500`; the op stays melted and the Crew keeps its heads.
+    #[tokio::test]
+    async fn ops_meltdown_write_failure_is_500_and_the_op_stays_melted() {
+        let mut state = session_state();
+        state.crew_loss = Arc::new(FailingCrewLoss);
+        let state = Arc::new(state);
+        let (c, crew) = dig_campaign(&state, false).await;
+        dig_on_site(&state, c, 2).await;
+        for _ in 1..=6 {
+            assert_eq!(drill(&state, c).await.0, StatusCode::OK);
+        }
+        let (status, body, _) = drill(&state, c).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        let op = state.demo_ops.store.op_view(c, chrono::Utc::now()).expect("op");
+        assert_eq!(op.leg, crate::demo_ops::OpLeg::Homeward);
+        assert_eq!(op.dig.expect("a dig").ended_by, Some(crate::demo_ops::OpEnd::Meltdown));
+        assert_eq!(headcount(&state, crew).await, 8);
+        assert_eq!(state.launch_locks.len(), 0);
+    }
+
+    /// F6 through the route: a return after two drills walks away from the ore on site.
+    #[tokio::test]
+    async fn ops_return_after_a_drill_walks_away_from_the_ore() {
+        let state = Arc::new(session_state());
+        let (c, crew) = dig_campaign(&state, false).await;
+        dig_on_site(&state, c, 2).await;
+        assert_eq!(drill(&state, c).await.0, StatusCode::OK);
+        assert_eq!(drill(&state, c).await.0, StatusCode::OK);
+        let (status, body, _) = post(&state, c, "return", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let op = &body["active_op"];
+        assert_eq!(op["leg"], "homeward");
+        assert_eq!((op["dig"]["drills"].as_u64(), op["dig"]["ore_on_site"].as_u64()), (Some(2), Some(0)));
+        assert_eq!(op["dig"]["ended_by"], "walked_away");
+        assert_eq!(headcount(&state, crew).await, 8, "walking away costs no heads");
     }
 
     /// One `ops_wallet` budget for every ops route: a board read and a start spend it, so the

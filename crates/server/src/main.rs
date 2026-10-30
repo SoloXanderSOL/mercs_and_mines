@@ -80,6 +80,8 @@ async fn main() {
         Arc::new(mercs_server::demo_reaper::PostgresReaperStore::new(pool.clone()));
     // BP-3c-1b-2 (demo-only): the address cap's liveness read (ODQ-68 (c')).
     state.live_campaigns  = Arc::new(mercs_server::demo_address_cap::PostgresLiveCampaigns::new(pool.clone()));
+    // BP-8b-1a (demo-only): the meltdown's Crew loss.
+    state.crew_loss       = Arc::new(mercs_server::demo_crew_loss::PostgresCrewLoss::new(pool.clone()));
     state.pool  = Some(pool);
     state.redis = Some(redis_mgr);
     let state = Arc::new(state);

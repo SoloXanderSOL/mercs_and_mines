@@ -8478,3 +8478,36 @@ async fn address_cap_refuses_then_admits_after_an_archive() {
     assert_eq!(retired, Some(true), "c106 retired");
     assert_eq!(admitted, StatusCode::CREATED, "{admitted_body}");
 }
+
+// ── BP-8b-1a (demo-only): the meltdown's Crew loss ──────────────────────────
+
+/// The only wallet the BP-8b-1a test uses.
+const CREW_LOSS_WALLET: [u8; 32] = [109u8; 32];
+
+/// BP-8b-1a — `PostgresCrewLoss::lose_heads` takes heads in one `UPDATE` and stops at 0
+/// (`GREATEST` keeps `crew_records_headcount_range`); an unknown Crew is `NotFound`.
+#[tokio::test]
+async fn postgres_crew_loss_takes_heads_down_to_zero() {
+    use mercs_server::demo_crew_loss::{CrewLoss, PostgresCrewLoss};
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    clean_wallet_4g1(&pool, &CREW_LOSS_WALLET).await;
+    let campaign_id = seed_account_and_campaign(&pool, CREW_LOSS_WALLET, 0x8B1A_i64).await;
+    let crews = PostgresCrewRepository::new(pool.clone());
+    let crew = CrewRecord::new_hire(campaign_id, CREW_LOSS_WALLET.to_vec());
+    crews.create_crew(crew.clone()).await.expect("create_crew failed");
+    let loss = PostgresCrewLoss::new(pool.clone());
+
+    let first = loss.lose_heads(crew.crew_id, 3).await;
+    let second = loss.lose_heads(crew.crew_id, 8).await;
+    let stored = crews.get_crew(crew.crew_id).await;
+    let unknown = loss.lose_heads(uuid::Uuid::new_v4(), 1).await;
+    clean_wallet_4g1(&pool, &CREW_LOSS_WALLET).await;
+
+    assert_eq!(first.expect("first loss"), 5, "8 - 3");
+    assert_eq!(second.expect("second loss"), 0, "5 - 8 stops at 0");
+    assert_eq!(stored.expect("get_crew").expect("the Crew").headcount, 0);
+    assert!(matches!(unknown, Err(RepositoryError::NotFound)), "{unknown:?}");
+}

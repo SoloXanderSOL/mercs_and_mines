@@ -18,6 +18,7 @@
 //! launch lock, so an op started between the keep check and the retire is retired with the
 //! campaign; and kept campaigns stay in the oldest-first `LIMIT`, so 200 or more of them
 //! would hide idle ones behind them until they stop moving.
+//! A drill counts as moving (BP-8b-1a), so a team still digging on site is kept.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -492,7 +493,7 @@ mod tests {
         let (reading, _) = campaign(&state, true).await;
         let cutoff = Utc::now() + chrono::Duration::hours(1);
         let later = cutoff + chrono::Duration::seconds(1);
-        state.demo_ops.store.start_op(moving, (5, 0), ops_board(), &ops_site(), 7, later).expect("start");
+        state.demo_ops.store.start_op(moving, (5, 0), ops_board(), &ops_site(), 7, None, later).expect("start");
         state.demo_ops.store.put_board(reading, (5, 0), ops_board(), later);
         let mut warns = ReaperWarns::new();
 
@@ -500,6 +501,44 @@ mod tests {
         assert_eq!(lifecycle(&state, moving).await, CampaignLifecycle::Active);
         assert_eq!(lifecycle(&state, reading).await, CampaignLifecycle::Archived);
         assert_eq!(state.demo_ops.store.len(), 1, "the retired campaign's entry is dropped");
+    }
+
+    fn ops_dig() -> crate::demo_ops::OpsSite {
+        crate::demo_ops::OpsSite { site_id: "dig:9,1".into(), kind: "dig", tier: Some(1), mission_id: None, ..ops_site() }
+    }
+
+    fn ops_crew() -> Option<crate::demo_ops::DigStart> {
+        Some(crate::demo_ops::DigStart { crew_id: Uuid::new_v4(), threshold: 100 })
+    }
+
+    /// CF1 (BP-8b-1a): the team arrived 990 s before the cutoff and drilled after it: kept.
+    #[tokio::test]
+    async fn reaper_keeps_a_team_still_drilling() {
+        let state = state();
+        let store = store(&state);
+        let (c, _) = campaign(&state, true).await;
+        let cutoff = Utc::now() + chrono::Duration::hours(1);
+        let secs = chrono::Duration::seconds;
+        state.demo_ops.store.start_op(c, (5, 0), ops_board(), &ops_dig(), 7, ops_crew(), cutoff - secs(1000)).expect("start");
+        state.demo_ops.store.drill_op(c, cutoff + secs(1)).expect("drill");
+
+        assert_eq!(reap_once(&state, &store, cutoff, &mut ReaperWarns::new()).await, 0);
+        assert_eq!(lifecycle(&state, c).await, CampaignLifecycle::Active);
+    }
+
+    /// The counter-case: the same team parked on site with no drill since is retired.
+    #[tokio::test]
+    async fn reaper_retires_a_team_parked_on_site() {
+        let state = state();
+        let store = store(&state);
+        let (c, _) = campaign(&state, true).await;
+        let cutoff = Utc::now() + chrono::Duration::hours(1);
+        let secs = chrono::Duration::seconds;
+        state.demo_ops.store.start_op(c, (5, 0), ops_board(), &ops_dig(), 7, ops_crew(), cutoff - secs(1000)).expect("start");
+
+        assert_eq!(reap_once(&state, &store, cutoff, &mut ReaperWarns::new()).await, 1);
+        assert_eq!(lifecycle(&state, c).await, CampaignLifecycle::Archived);
+        assert!(state.demo_ops.store.is_empty());
     }
 
     /// BP-8a-2: the sweep prunes the entries of campaigns that are no longer `Active`, even

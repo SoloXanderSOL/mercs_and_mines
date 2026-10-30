@@ -1,4 +1,4 @@
-//! The ops board (BP-8a-1, **demo-only**) and its travel legs (BP-8a-2): the dig sites and
+//! The ops board (BP-8a-1, **demo-only**), its travel legs (BP-8a-2) and the dig (BP-8b-1a): the dig sites and
 //! merc contracts a demo player can send their team to, and the in-memory store that holds
 //! each campaign's op (Breakpoint plan §4d). The `dev` port deletes this file, `routes/ops.rs`,
 //! the `lib.rs` line, the `AppState` field and the two `routes/mod.rs` lines, each marked
@@ -12,11 +12,17 @@
 //! - **The contract seed is displayed provenance, never a roll seed.** It only places
 //!   pins the player sees (code `CLAUDE.md` §4). The op's own seed is drawn from OS entropy
 //!   at `ops/start`, stored on the private `ActiveOp` and never serialised.
-//! - **Leg times are wall clock** (`DateTime<Utc>`): the ops layer is not the sim, rolls
-//!   nothing in BP-8a-2 and logs nothing, so code `CLAUDE.md` §2's ban on wall clock inside
-//!   `Step()` does not reach it. Every store method takes `now`, so tests pass any instant.
+//! - **Leg times are wall clock** (`DateTime<Utc>`): the ops layer is not the sim and logs
+//!   nothing, so code `CLAUDE.md` §2's ban on wall clock inside `Step()` does not reach it.
+//!   Every store method takes `now`, so tests pass any instant.
 //! - One lock, never held across an `.await`: every method takes it, does map work, and
 //!   returns owned data. In memory only: a restart empties it.
+//! - **The dig (BP-8b-1a):** each drill adds heat and ore on site; at the threshold the site
+//!   melts down, the ore on site is lost and the Crew loses heads (`drill_op`, §4d's numbers).
+//!   A drill's rolls depend on the op's seed and the drill's number alone (`drill_roll`).
+//! - **The meltdown is the layer's one durable effect:** the route writes the Crew's heads
+//!   through `demo_crew_loss::CrewLoss` after the store has committed the meltdown. No replay
+//!   rebuilds it, which is acceptable only because the layer is demo-only.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -52,6 +58,20 @@ pub const DEMO_OPS_CAP: usize = 1_000;
 /// Demo travel, seconds per hex before the destination's terrain modifier. Never canon:
 /// canon is 20 minutes per hex (`Hex_Map_and_Travel` §2).
 pub const DEMO_SECS_PER_HEX: u32 = 2;
+/// Heat each drill adds, and the meltdown threshold (§4d: the 7th drill melts down).
+pub const DEMO_HEAT_PER_DRILL: u32 = 15;
+pub const DEMO_HEAT_THRESHOLD: u32 = 100;
+/// A Coolant-Jockey Foreman's threshold, in percent of `DEMO_HEAT_THRESHOLD` (×1.15 → 115).
+pub const DEMO_COOLANT_THRESHOLD_PCT: u32 = 115;
+/// Drill *n* yields `n ×` this on a tier-1 vein, and `DEMO_TIER3_ORE_MULTIPLIER` times that on tier 3.
+pub const DEMO_ORE_PER_DRILL: u32 = 10;
+pub const DEMO_TIER3_ORE_MULTIPLIER: u32 = 2;
+/// Heads a meltdown costs the Crew, inclusive.
+pub const DEMO_MELTDOWN_HEADS_MIN: u32 = 1;
+pub const DEMO_MELTDOWN_HEADS_MAX: u32 = 3;
+/// Draws each drill takes from the op's roll stream: the raid d100 (read from BP-8b-1b), then
+/// the meltdown's heads. Both are drawn on every drill, so the raid changes no meltdown.
+pub const DEMO_ROLLS_PER_DRILL: u32 = 2;
 
 /// One pin on the board. A dig carries `tier`; a contract carries `mission_id` and `name`.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -215,8 +235,76 @@ pub enum OpLeg {
     Homeward,
 }
 
+/// Why a dig's team is heading home (BP-8b-1a; BP-8b-1b adds a raid's retreat, BP-8b-2 the pull).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpEnd {
+    /// The heat reached the threshold: the ore on site is lost and the Crew lost heads.
+    Meltdown,
+    /// `ops/return` from a dig: the ore on site is left behind.
+    WalkedAway,
+}
+
+/// What `ops/start` reads for a dig: the Crew that digs and the meltdown threshold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DigStart {
+    pub crew_id: Uuid,
+    pub threshold: u32,
+}
+
+/// A dig in progress, private. `tier` comes from the site; the rest from `DigStart` and the drills.
+struct DigState {
+    tier: u8,
+    threshold: u32,
+    crew_id: Uuid,
+    drills: u32,
+    heat: u32,
+    ore_on_site: u32,
+    ended_by: Option<OpEnd>,
+}
+
+/// The dig as the client sees it: never the seed or the Crew's id.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct DigView {
+    pub drills: u32,
+    pub heat: u32,
+    pub threshold: u32,
+    pub ore_on_site: u32,
+    /// The ore the next drill would add; 0 once the team is heading home.
+    pub next_ore: u32,
+    pub ended_by: Option<OpEnd>,
+}
+
+/// The meltdown threshold for a dig: `DEMO_HEAT_THRESHOLD`, or ×1.15 with a Coolant-Jockey Foreman.
+pub fn dig_threshold(coolant_jockey: bool) -> u32 {
+    if coolant_jockey {
+        DEMO_HEAT_THRESHOLD * DEMO_COOLANT_THRESHOLD_PCT / 100
+    } else {
+        DEMO_HEAT_THRESHOLD
+    }
+}
+
+/// The ore drill `n` (1-based) yields on a vein of `tier`.
+fn ore_for(n: u32, tier: u8) -> u32 {
+    let mult = if tier == 3 { DEMO_TIER3_ORE_MULTIPLIER } else { 1 };
+    DEMO_ORE_PER_DRILL * n * mult
+}
+
+/// Drill `n`'s rolls (1-based), `(raid d100, meltdown heads)`, a function of `(op_seed, n)`
+/// alone: `Rng::new(op_seed)` skips `DEMO_ROLLS_PER_DRILL × (n − 1)` draws, then draws both.
+/// So reads between drills move nothing. The d100 is unread until BP-8b-1b's raid.
+fn drill_roll(op_seed: u32, n: u32) -> (u32, u32) {
+    let mut rng = Rng::new(op_seed);
+    for _ in 0..DEMO_ROLLS_PER_DRILL * n.saturating_sub(1) {
+        rng.next_u32();
+    }
+    let raid_d100 = rng.roll_d100();
+    let heads = rng.roll_int(DEMO_MELTDOWN_HEADS_MIN, DEMO_MELTDOWN_HEADS_MAX);
+    (raid_d100, heads)
+}
+
 /// The op in flight, private: never serialised (`ActiveOpView` is what the client sees).
-/// BP-8b-1 adds heat, ore on site and the raid trigger; BP-8b-2 the haul and the ambush.
+/// BP-8b-1a adds the dig; BP-8b-1b the raid trigger; BP-8b-2 the haul and the ambush.
 struct ActiveOp {
     site_id: String,
     kind: &'static str,
@@ -226,9 +314,10 @@ struct ActiveOp {
     /// The site's one-way time; both legs take it, so the trip is symmetric (§4d: "each way").
     travel_secs: u32,
     /// Drawn by `generate_seed()` at `ops/start`, never derived from the campaign id and never
-    /// sent. BP-8b-1's rolls are the first reader.
-    #[allow(dead_code)]
+    /// sent or logged. `drill_op` rolls from it (`drill_roll`).
     op_seed: u32,
+    /// The dig; `None` on a contract.
+    dig: Option<DigState>,
 }
 
 /// The op as the client sees it. Times are RFC 3339 with milliseconds; `arrived` is
@@ -241,6 +330,9 @@ pub struct ActiveOpView {
     pub depart_at: String,
     pub arrive_at: String,
     pub arrived: bool,
+    /// The dig's numbers; absent on a contract, so a contract op keeps its six keys.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dig: Option<DigView>,
 }
 
 /// The wire format of every time the ops routes send.
@@ -255,6 +347,26 @@ pub enum StartRefusal {
     Busy,
     /// The campaign has no entry and every entry at the cap holds an op.
     Full,
+}
+
+/// Why `drill_op` refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DrillRefusal {
+    /// No op, or its homeward leg has arrived and been cleared.
+    NoOp,
+    /// The op is a contract.
+    Contract,
+    /// The team is on its way home (after a meltdown or a return).
+    AlreadyHomeward,
+    /// The outbound leg has not arrived yet.
+    NotArrived,
+}
+
+/// What a drill did. A meltdown names the Crew and the heads it loses, for the route to write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DrillOutcome {
+    Drilled,
+    Meltdown { crew_id: Uuid, heads: i16 },
 }
 
 /// Why `return_op` refused.
@@ -276,7 +388,7 @@ struct OpsEntry {
     board: Arc<OpsBoard>,
     touched: DateTime<Utc>,
     op: Option<ActiveOp>,
-    /// The latest departure or homeward arrival. Outlives the op, so a player who has just
+    /// The latest departure, drill or homeward arrival. Outlives the op, so a player who has just
     /// come home still counts as moving for the reaper.
     moved_at: Option<DateTime<Utc>>,
 }
@@ -301,6 +413,14 @@ impl OpsEntry {
             depart_at: ops_time(op.depart_at),
             arrive_at: ops_time(op.arrive_at),
             arrived: now >= op.arrive_at,
+            dig: op.dig.as_ref().map(|d| DigView {
+                drills: d.drills,
+                heat: d.heat,
+                threshold: d.threshold,
+                ore_on_site: d.ore_on_site,
+                next_ore: if op.leg == OpLeg::Homeward { 0 } else { ore_for(d.drills + 1, d.tier) },
+                ended_by: d.ended_by,
+            }),
         })
     }
 }
@@ -310,8 +430,12 @@ impl OpsEntry {
 /// **Writes later bricks must keep:**
 /// - the board write (`put_board`) updates `gateway`, `board` and `touched` in place and never
 ///   touches the op, `moved_at` or (from BP-8b-2) the banked ore;
-/// - only `start_op`, `return_op` and the arrival clear (`settle_arrival`, run by every op
-///   read and write) write the op, and BP-8b's drill, pull and bank after them;
+/// - only `start_op`, `return_op`, `drill_op` and the arrival clear (`settle_arrival`, run
+///   first by every op read and write) write the op; BP-8b-1b's raid latch and BP-8b-2's pull
+///   and bank come after them. Each takes the lock, calls `settle_arrival` first and returns
+///   owned data; none is held across an `.await`;
+/// - **the keep list** (the reaper's `moved_since`): a departure, a homeward arrival and a
+///   drill each write `moved_at`. Reading the board or the op does not;
 /// - the eviction skips any entry holding an op (and, from BP-8b-2, any holding banked ore);
 /// - an entry is dropped only by `remove` (a read of a campaign that is no longer `Active`,
 ///   the reaper's retire) and the reaper's prune (`retain_campaigns`).
@@ -385,7 +509,8 @@ impl DemoOpsStore {
 
     /// Starts the outbound leg to `site`: `depart_at = now`, `arrive_at = now + travel_secs`.
     /// One op per campaign (`Busy`); a campaign with no entry is cached with `board` first
-    /// (`Full` when every entry at the cap holds an op).
+    /// (`Full` when every entry at the cap holds an op). A dig passes `dig` (its tier comes
+    /// from the site); a contract passes `None`.
     pub fn start_op(
         &self,
         campaign_id: Uuid,
@@ -393,6 +518,7 @@ impl DemoOpsStore {
         board: Arc<OpsBoard>,
         site: &OpsSite,
         op_seed: u32,
+        dig: Option<DigStart>,
         now: DateTime<Utc>,
     ) -> Result<(), StartRefusal> {
         let mut inner = self.lock();
@@ -417,6 +543,15 @@ impl DemoOpsStore {
             arrive_at: now + Duration::seconds(i64::from(site.travel_secs)),
             travel_secs: site.travel_secs,
             op_seed,
+            dig: dig.map(|d| DigState {
+                tier: site.tier.unwrap_or(1),
+                threshold: d.threshold,
+                crew_id: d.crew_id,
+                drills: 0,
+                heat: 0,
+                ore_on_site: 0,
+                ended_by: None,
+            }),
         });
         e.moved_at = Some(now);
         e.touched = now;
@@ -424,6 +559,8 @@ impl DemoOpsStore {
     }
 
     /// Starts the homeward leg once the outbound one has arrived, taking the site's time again.
+    /// From a dig the team walks away: the ore on site is left (`OpEnd::WalkedAway`, F6);
+    /// BP-8b-2's pull is the loaded return.
     pub fn return_op(&self, campaign_id: Uuid, now: DateTime<Utc>) -> Result<(), ReturnRefusal> {
         let mut inner = self.lock();
         let Some(e) = inner.get_mut(&campaign_id) else {
@@ -439,12 +576,57 @@ impl DemoOpsStore {
         if now < op.arrive_at {
             return Err(ReturnRefusal::NotArrived);
         }
+        if let Some(d) = op.dig.as_mut() {
+            d.ore_on_site = 0;
+            d.ended_by = Some(OpEnd::WalkedAway);
+        }
         op.leg = OpLeg::Homeward;
         op.depart_at = now;
         op.arrive_at = now + Duration::seconds(i64::from(op.travel_secs));
         e.moved_at = Some(now);
         e.touched = now;
         Ok(())
+    }
+
+    /// One drill on an arrived dig: drill `n` adds `DEMO_HEAT_PER_DRILL` heat; at the threshold
+    /// the site melts down (the ore on site is lost, the homeward leg starts at once and the
+    /// Crew's heads are returned for the route to write), otherwise it adds `ore_for(n, tier)`.
+    /// Writes `moved_at` (the keep list). Refusals in order: `NoOp` → `Contract` →
+    /// `AlreadyHomeward` → `NotArrived`. The meltdown is committed here, before the route's
+    /// write, so a second drill sees `AlreadyHomeward` and the heads can't be lost twice.
+    pub fn drill_op(&self, campaign_id: Uuid, now: DateTime<Utc>) -> Result<DrillOutcome, DrillRefusal> {
+        let mut inner = self.lock();
+        let Some(e) = inner.get_mut(&campaign_id) else {
+            return Err(DrillRefusal::NoOp);
+        };
+        e.settle_arrival(now);
+        let Some(op) = e.op.as_mut() else {
+            return Err(DrillRefusal::NoOp);
+        };
+        let Some(dig) = op.dig.as_mut() else {
+            return Err(DrillRefusal::Contract);
+        };
+        if op.leg == OpLeg::Homeward {
+            return Err(DrillRefusal::AlreadyHomeward);
+        }
+        if now < op.arrive_at {
+            return Err(DrillRefusal::NotArrived);
+        }
+        dig.drills += 1;
+        let (_raid_d100, heads) = drill_roll(op.op_seed, dig.drills);
+        dig.heat += DEMO_HEAT_PER_DRILL;
+        e.moved_at = Some(now);
+        e.touched = now;
+        if dig.heat >= dig.threshold {
+            dig.ore_on_site = 0;
+            dig.ended_by = Some(OpEnd::Meltdown);
+            op.leg = OpLeg::Homeward;
+            op.depart_at = now;
+            op.arrive_at = now + Duration::seconds(i64::from(op.travel_secs));
+            return Ok(DrillOutcome::Meltdown { crew_id: dig.crew_id, heads: heads as i16 });
+        }
+        dig.ore_on_site += ore_for(dig.drills, dig.tier);
+        Ok(DrillOutcome::Drilled)
     }
 
     /// The op as the client sees it, after clearing an arrived homeward leg.
@@ -455,7 +637,7 @@ impl DemoOpsStore {
         e.view(now)
     }
 
-    /// The reaper's keep check: the team departed or came home at or after `cutoff` (a leg
+    /// The reaper's keep check: the team departed, drilled or came home at or after `cutoff` (a leg
     /// that has arrived by `now` counts at its arrival). Reading the board is not moving.
     pub fn moved_since(&self, campaign_id: Uuid, cutoff: DateTime<Utc>, now: DateTime<Utc>) -> bool {
         let inner = self.lock();
@@ -499,6 +681,14 @@ impl DemoOpsStore {
                 op.arrive_at -= back;
             }
             e.moved_at = e.moved_at.map(|t| t - back);
+        }
+    }
+
+    /// Fixes the op's seed, so a test chooses its rolls instead of hoping for them.
+    #[cfg(test)]
+    pub(crate) fn set_op_seed(&self, campaign_id: Uuid, seed: u32) {
+        if let Some(op) = self.lock().get_mut(&campaign_id).and_then(|e| e.op.as_mut()) {
+            op.op_seed = seed;
         }
     }
 }
@@ -730,7 +920,7 @@ mod tests {
     fn ops_store_board_write_keeps_the_op() {
         let store = DemoOpsStore::new(2);
         let a = Uuid::from_u128(1);
-        store.start_op(a, (5, 0), board(), &site(), 7, at(0)).expect("start");
+        store.start_op(a, (5, 0), board(), &site(), 7, None, at(0)).expect("start");
         assert!(store.put_board(a, (0, 5), board(), at(1)));
         assert!(store.board(a, (0, 5), at(2)).is_some(), "the new gateway's board is cached");
         let op = store.op_view(a, at(2)).expect("the op survives the board write");
@@ -744,7 +934,7 @@ mod tests {
     fn ops_store_eviction_skips_entries_with_an_op() {
         let store = DemoOpsStore::new(2);
         let (a, b, c) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
-        store.start_op(a, (5, 0), board(), &site(), 7, at(0)).expect("start");
+        store.start_op(a, (5, 0), board(), &site(), 7, None, at(0)).expect("start");
         store.put_board(b, (5, 0), board(), at(1));
         assert!(store.put_board(c, (5, 0), board(), at(2)));
         assert_eq!(store.len(), 2);
@@ -757,9 +947,9 @@ mod tests {
     fn ops_store_full_of_ops_refuses_a_start_and_caches_no_board() {
         let store = DemoOpsStore::new(1);
         let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
-        store.start_op(a, (5, 0), board(), &site(), 7, at(0)).expect("start");
+        store.start_op(a, (5, 0), board(), &site(), 7, None, at(0)).expect("start");
         assert!(!store.put_board(b, (5, 0), board(), at(1)), "nothing evictable");
-        assert_eq!(store.start_op(b, (5, 0), board(), &site(), 8, at(1)), Err(StartRefusal::Full));
+        assert_eq!(store.start_op(b, (5, 0), board(), &site(), 8, None, at(1)), Err(StartRefusal::Full));
         assert_eq!(store.len(), 1);
         assert!(store.op_view(a, at(2)).is_some());
     }
@@ -768,8 +958,8 @@ mod tests {
     fn ops_store_one_op_per_campaign() {
         let store = DemoOpsStore::new(2);
         let a = Uuid::from_u128(1);
-        store.start_op(a, (5, 0), board(), &site(), 7, at(0)).expect("start");
-        assert_eq!(store.start_op(a, (5, 0), board(), &site(), 8, at(20)), Err(StartRefusal::Busy), "arrived outbound is still out");
+        store.start_op(a, (5, 0), board(), &site(), 7, None, at(0)).expect("start");
+        assert_eq!(store.start_op(a, (5, 0), board(), &site(), 8, None, at(20)), Err(StartRefusal::Busy), "arrived outbound is still out");
         assert_eq!(store.op_view(a, at(20)).expect("op").depart_at, ops_time(at(0)), "the first op is untouched");
     }
 
@@ -778,7 +968,7 @@ mod tests {
         let store = DemoOpsStore::new(2);
         let a = Uuid::from_u128(1);
         assert_eq!(store.return_op(a, at(0)), Err(ReturnRefusal::NoOp));
-        store.start_op(a, (5, 0), board(), &site(), 7, at(0)).expect("start");
+        store.start_op(a, (5, 0), board(), &site(), 7, None, at(0)).expect("start");
         assert_eq!(store.return_op(a, at(9)), Err(ReturnRefusal::NotArrived));
         assert_eq!(store.return_op(a, at(10)), Ok(()));
         let op = store.op_view(a, at(11)).expect("op");
@@ -791,13 +981,155 @@ mod tests {
     fn ops_store_homeward_arrival_clears_the_op_and_keeps_moved_at() {
         let store = DemoOpsStore::new(2);
         let a = Uuid::from_u128(1);
-        store.start_op(a, (5, 0), board(), &site(), 7, at(0)).expect("start");
+        store.start_op(a, (5, 0), board(), &site(), 7, None, at(0)).expect("start");
         store.return_op(a, at(10)).expect("return");
         assert!(store.op_view(a, at(19)).is_some(), "still on the way home");
         assert!(store.op_view(a, at(500)).is_none(), "home: the op is cleared");
         assert!(store.moved_since(a, at(20), at(500)), "the arrival at 20 s is the last movement");
         assert!(!store.moved_since(a, at(21), at(500)));
-        assert!(store.start_op(a, (5, 0), board(), &site(), 8, at(501)).is_ok(), "a new op can start");
+        assert!(store.start_op(a, (5, 0), board(), &site(), 8, None, at(501)).is_ok(), "a new op can start");
+    }
+
+    /// A tier-`tier` dig site 10 s out.
+    fn dig(tier: u8) -> OpsSite {
+        OpsSite {
+            site_id: format!("dig:9,{tier}"),
+            kind: "dig",
+            q: 9,
+            r: i32::from(tier),
+            distance: 4,
+            travel_secs: 10,
+            tier: Some(tier),
+            mission_id: None,
+            name: None,
+        }
+    }
+
+    const CREW: Uuid = Uuid::from_u128(0xC0);
+
+    /// A dig on a tier-`tier` vein, started at 0 s and on site from 10 s, its seed `seed`.
+    fn on_site(store: &DemoOpsStore, a: Uuid, tier: u8, threshold: u32, seed: u32) {
+        let crew = DigStart { crew_id: CREW, threshold };
+        store.start_op(a, (5, 0), board(), &dig(tier), seed, Some(crew), at(0)).expect("start");
+    }
+
+    fn dig_view(store: &DemoOpsStore, a: Uuid, now: DateTime<Utc>) -> DigView {
+        store.op_view(a, now).expect("op").dig.expect("a dig")
+    }
+
+    /// Drill n's rolls against an independent Mulberry32 (Linux's Python oracle, BP-8b-1 spec
+    /// check): seed 2's raid d100 and meltdown heads for drills 1–8, and three single slots.
+    #[test]
+    fn ops_drill_roll_is_a_function_of_the_seed_and_the_drill() {
+        let got: Vec<(u32, u32)> = (1..=8).map(|n| drill_roll(2, n)).collect();
+        assert_eq!(got, vec![(74, 1), (29, 2), (88, 2), (50, 2), (79, 1), (79, 1), (43, 3), (59, 1)]);
+        assert_eq!(drill_roll(7, 1).0, 2);
+        assert_eq!(drill_roll(5, 3).0, 9);
+        assert_eq!(drill_roll(8, 7).1, 1);
+    }
+
+    /// §4d: +15 heat per drill; drill n yields 10 × n on tier 1 and twice that on tier 3.
+    #[test]
+    fn ops_store_drill_adds_heat_and_ore_by_tier() {
+        let store = DemoOpsStore::new(4);
+        let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        on_site(&store, a, 1, 100, 2);
+        on_site(&store, b, 3, 100, 2);
+        let mut seen = Vec::new();
+        for i in 1..=3 {
+            assert_eq!(store.drill_op(a, at(10 + i)), Ok(DrillOutcome::Drilled));
+            assert_eq!(store.drill_op(b, at(10 + i)), Ok(DrillOutcome::Drilled));
+            let (va, vb) = (dig_view(&store, a, at(20)), dig_view(&store, b, at(20)));
+            seen.push((va.drills, va.heat, va.ore_on_site, va.next_ore, vb.ore_on_site, vb.next_ore));
+        }
+        assert_eq!(seen, vec![(1, 15, 10, 20, 20, 40), (2, 30, 30, 30, 60, 60), (3, 45, 60, 40, 120, 80)]);
+    }
+
+    /// Seed 2, threshold 100: drills 1–6 dig, the 7th (heat 105) melts down and costs 3 heads.
+    #[test]
+    fn ops_store_meltdown_on_the_7th_drill_at_100() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        on_site(&store, a, 1, 100, 2);
+        for i in 1..=6 {
+            assert_eq!(store.drill_op(a, at(10 + i)), Ok(DrillOutcome::Drilled), "drill {i}");
+        }
+        assert_eq!(store.drill_op(a, at(20)), Ok(DrillOutcome::Meltdown { crew_id: CREW, heads: 3 }));
+        let op = store.op_view(a, at(21)).expect("op");
+        assert_eq!(op.leg, OpLeg::Homeward);
+        assert_eq!((op.depart_at, op.arrive_at), (ops_time(at(20)), ops_time(at(30))));
+        let d = op.dig.expect("a dig");
+        assert_eq!((d.drills, d.heat, d.ore_on_site, d.next_ore, d.ended_by), (7, 105, 0, 0, Some(OpEnd::Meltdown)));
+        assert_eq!(store.drill_op(a, at(22)), Err(DrillRefusal::AlreadyHomeward));
+    }
+
+    /// §4d: a Coolant-Jockey's threshold is 115, so seed 2's 7th drill digs and the 8th melts down (1 head).
+    #[test]
+    fn ops_store_coolant_threshold_is_115_and_melts_on_the_8th() {
+        assert_eq!((dig_threshold(false), dig_threshold(true)), (100, 115));
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        on_site(&store, a, 1, 115, 2);
+        for i in 1..=7 {
+            assert_eq!(store.drill_op(a, at(10 + i)), Ok(DrillOutcome::Drilled), "drill {i}");
+        }
+        assert_eq!(dig_view(&store, a, at(18)).heat, 105);
+        assert_eq!(store.drill_op(a, at(18)), Ok(DrillOutcome::Meltdown { crew_id: CREW, heads: 1 }));
+        assert_eq!(dig_view(&store, a, at(19)).heat, 120);
+    }
+
+    #[test]
+    fn ops_store_drill_refusals() {
+        let store = DemoOpsStore::new(4);
+        let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        assert_eq!(store.drill_op(a, at(0)), Err(DrillRefusal::NoOp));
+        store.start_op(a, (5, 0), board(), &site(), 7, None, at(0)).expect("start");
+        assert_eq!(store.drill_op(a, at(20)), Err(DrillRefusal::Contract));
+        on_site(&store, b, 1, 100, 2);
+        assert_eq!(store.drill_op(b, at(9)), Err(DrillRefusal::NotArrived));
+        store.return_op(b, at(10)).expect("return");
+        assert_eq!(store.drill_op(b, at(11)), Err(DrillRefusal::AlreadyHomeward));
+        assert_eq!(dig_view(&store, b, at(11)).drills, 0, "no refusal drills");
+    }
+
+    /// CF1: a drill counts as movement for the reaper; a read does not.
+    #[test]
+    fn ops_store_drill_counts_as_moving() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        on_site(&store, a, 1, 100, 2);
+        store.op_view(a, at(500));
+        assert!(!store.moved_since(a, at(400), at(600)), "arrived at 10 s, nothing since");
+        store.drill_op(a, at(500)).expect("drill");
+        assert!(store.moved_since(a, at(400), at(600)));
+        assert!(!store.moved_since(a, at(501), at(600)));
+    }
+
+    /// F6: a return from a dig leaves the ore on site behind.
+    #[test]
+    fn ops_store_return_from_a_dig_walks_away() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        on_site(&store, a, 1, 100, 2);
+        store.drill_op(a, at(11)).expect("drill");
+        store.drill_op(a, at(12)).expect("drill");
+        assert_eq!(dig_view(&store, a, at(13)).ore_on_site, 30);
+        assert_eq!(store.return_op(a, at(13)), Ok(()));
+        let d = dig_view(&store, a, at(14));
+        assert_eq!((d.drills, d.ore_on_site, d.next_ore, d.ended_by), (2, 0, 0, Some(OpEnd::WalkedAway)));
+    }
+
+    /// The dig's exact keys; nothing names the seed or the Crew.
+    #[test]
+    fn ops_dig_view_has_exactly_its_keys() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        on_site(&store, a, 1, 100, 2);
+        let v = serde_json::to_value(store.op_view(a, at(11)).expect("op")).unwrap();
+        let keys: std::collections::BTreeSet<&str> = v["dig"].as_object().expect("dig").keys().map(|k| k.as_str()).collect();
+        assert_eq!(keys, ["drills", "ended_by", "heat", "next_ore", "ore_on_site", "threshold"].into_iter().collect());
+        let text = v.to_string();
+        assert!(!text.contains("seed") && !text.contains("crew"), "{text}");
     }
 
     /// `b` is not listed but was touched after the listing (a launch that raced the prune).
