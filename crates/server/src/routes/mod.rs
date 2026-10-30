@@ -11,6 +11,7 @@ pub mod convoy_events;
 pub mod convoys;
 mod genesis;
 mod checkout;
+mod ops; // (BP-8a-1, demo-only)
 mod roster;
 mod sector;
 pub mod ws_combat;
@@ -960,6 +961,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(roster::router())
         .merge(genesis::router())
         .merge(checkout::router())
+        .merge(ops::router()) // (BP-8a-1, demo-only)
         .with_state(state)
         .fallback_service(ServeDir::new("app").append_index_html_on_directories(true))
 }

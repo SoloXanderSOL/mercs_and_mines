@@ -11,6 +11,7 @@ pub mod checkout_store;
 pub mod demo_checkout;
 pub mod demo_reaper;
 pub mod demo_address_cap;
+pub mod demo_ops;
 pub mod advisor_gen;
 pub mod augmentee_gen;
 pub mod api_types;

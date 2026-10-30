@@ -123,6 +123,8 @@ pub struct AppState {
     /// The cap's liveness read. In memory it reads the same store as `campaign_repo`;
     /// `main.rs` sets the Postgres one. A Postgres route test that reaches the cap sets it too.
     pub live_campaigns: Arc<dyn crate::demo_address_cap::LiveCampaigns>,
+    /// The ops board's store and limiters (BP-8a-1, demo-only).
+    pub demo_ops: crate::demo_ops::DemoOps,
 }
 
 impl AppState {
@@ -165,6 +167,7 @@ impl AppState {
             rate_limits:        RateLimits::new(),
             launch_locks:       LaunchLocks::default(),
             address_campaigns:  crate::demo_address_cap::AddressCampaigns::new(crate::demo_address_cap::DEMO_ADDRESS_LIVE_CAP),
+            demo_ops:           crate::demo_ops::DemoOps::default(),
         }
     }
 }
