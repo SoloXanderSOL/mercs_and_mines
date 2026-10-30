@@ -11,6 +11,13 @@
 //! before it saves the campaign. Accepted residual: a mission that passed the route's unlocked
 //! `Active` check but inserts after the retire resolves on an `Archived` campaign; the player's
 //! next call gets `409` and the client re-joins.
+//!
+//! The ops layer (BP-8a-2): a campaign whose team departed or came home since the cutoff is
+//! kept (`DemoOpsStore::moved_since`, checked under the launch lock), and each sweep first
+//! prunes the ops store to the `Active` campaigns. Accepted residuals: `ops/start` takes no
+//! launch lock, so an op started between the keep check and the retire is retired with the
+//! campaign; and kept campaigns stay in the oldest-first `LIMIT`, so 200 or more of them
+//! would hide idle ones behind them until they stop moving.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -140,11 +147,12 @@ impl ReaperStore for InMemoryReaperStore {
     }
 }
 
-/// Repeat-warning state: the select, and one keyed counter per campaign for the retire.
-/// Built fresh by the task, so a supervised restart warns again.
+/// Repeat-warning state: the select, the ops prune's listing, and one keyed counter per
+/// campaign for the retire. Built fresh by the task, so a supervised restart warns again.
 #[derive(Debug)]
 pub struct ReaperWarns {
     pub select: RepeatWarn,
+    pub prune: RepeatWarn,
     pub retire: KeyedRepeatWarn,
 }
 
@@ -152,6 +160,7 @@ impl ReaperWarns {
     pub fn new() -> Self {
         Self {
             select: RepeatWarn::new(REAP_WARN_EVERY_SWEEPS),
+            prune: RepeatWarn::new(REAP_WARN_EVERY_SWEEPS),
             retire: KeyedRepeatWarn::new(REAP_WARN_EVERY_SWEEPS),
         }
     }
@@ -160,6 +169,27 @@ impl ReaperWarns {
 impl Default for ReaperWarns {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// The ops store's prune (BP-8a-2): keeps the entries of `Active` campaigns and any entry
+/// touched after the listing was taken (a campaign launched meanwhile). A failed listing
+/// skips the prune: retain only after a full listing.
+async fn prune_ops(state: &AppState, warns: &mut ReaperWarns) {
+    let listed_at = Utc::now();
+    match state.campaign_repo.list_campaigns_by_state(CampaignLifecycle::Active).await {
+        Ok(active) => {
+            if let Some(n) = warns.prune.ok() {
+                tracing::info!("demo reaper: the ops prune's campaign list recovered after {n} failed sweeps");
+            }
+            let ids: HashSet<Uuid> = active.iter().map(|c| c.campaign_id).collect();
+            state.demo_ops.store.retain_campaigns(&ids, listed_at);
+        }
+        Err(e) => match warns.prune.fail() {
+            Some(1) => tracing::warn!("demo reaper: the ops prune's campaign list failed: {e}"),
+            Some(n) => tracing::warn!("demo reaper: the ops prune's campaign list still failing ({n} consecutive sweeps): {e}"),
+            None => {}
+        },
     }
 }
 
@@ -177,6 +207,7 @@ pub async fn reap_once_with_seam(
     warns: &mut ReaperWarns,
     seam: Option<&PauseHook>,
 ) -> usize {
+    prune_ops(state, warns).await;
     let idle = match store.list_idle_campaigns(cutoff, DEMO_REAP_MAX_PER_SWEEP).await {
         Ok(v) => {
             if let Some(n) = warns.select.ok() {
@@ -202,6 +233,9 @@ pub async fn reap_once_with_seam(
     let mut retired = 0;
     for (campaign_id, sector_id) in idle {
         let _launch = state.launch_locks.lock(campaign_id).await;
+        if state.demo_ops.store.moved_since(campaign_id, cutoff, Utc::now()) {
+            continue;
+        }
         match store.retire_if_idle(campaign_id, cutoff).await {
             Ok(r) => {
                 if let Some(n) = warns.retire.ok(campaign_id) {
@@ -221,6 +255,7 @@ pub async fn reap_once_with_seam(
             }
         }
         retired += 1;
+        state.demo_ops.store.remove(campaign_id);
         if let Err(e) = state.sector_repo.delete_sector(sector_id).await {
             tracing::warn!(
                 "demo reaper: campaign {campaign_id} retired, sector {sector_id} NOT deleted (SREM sectors:all + DEL by hand); this sweep stops: {e:?}"
@@ -427,5 +462,75 @@ mod tests {
         assert_eq!(reaped, 1);
         assert_eq!(lifecycle(&state, c).await, CampaignLifecycle::Archived);
         assert_eq!(state.launch_locks.len(), 0, "no launch lock left behind");
+    }
+
+    fn ops_board() -> Arc<crate::demo_ops::OpsBoard> {
+        Arc::new(crate::demo_ops::OpsBoard { sites: vec![] })
+    }
+
+    fn ops_site() -> crate::demo_ops::OpsSite {
+        crate::demo_ops::OpsSite {
+            site_id: "contract:GUARD_DUTY".into(),
+            kind: "contract",
+            q: 8,
+            r: 0,
+            distance: 3,
+            travel_secs: 10,
+            tier: None,
+            mission_id: Some("GUARD_DUTY"),
+            name: None,
+        }
+    }
+
+    /// BP-8a-2: a campaign whose team departed after the cutoff is kept; one whose entry holds
+    /// only a board (reading is not moving) is retired.
+    #[tokio::test]
+    async fn reaper_keeps_a_campaign_whose_op_moved_recently() {
+        let state = state();
+        let store = store(&state);
+        let (moving, _) = campaign(&state, true).await;
+        let (reading, _) = campaign(&state, true).await;
+        let cutoff = Utc::now() + chrono::Duration::hours(1);
+        let later = cutoff + chrono::Duration::seconds(1);
+        state.demo_ops.store.start_op(moving, (5, 0), ops_board(), &ops_site(), 7, later).expect("start");
+        state.demo_ops.store.put_board(reading, (5, 0), ops_board(), later);
+        let mut warns = ReaperWarns::new();
+
+        assert_eq!(reap_once(&state, &store, cutoff, &mut warns).await, 1);
+        assert_eq!(lifecycle(&state, moving).await, CampaignLifecycle::Active);
+        assert_eq!(lifecycle(&state, reading).await, CampaignLifecycle::Archived);
+        assert_eq!(state.demo_ops.store.len(), 1, "the retired campaign's entry is dropped");
+    }
+
+    /// BP-8a-2: the sweep prunes the entries of campaigns that are no longer `Active`, even
+    /// when it retires nothing itself.
+    #[tokio::test]
+    async fn reaper_sweep_prunes_entries_of_non_active_campaigns() {
+        let state = state();
+        let store = store(&state);
+        let (live, _) = campaign(&state, true).await;
+        let (gone, _) = campaign(&state, true).await;
+        let earlier = Utc::now() - chrono::Duration::hours(1);
+        state.demo_ops.store.put_board(live, (5, 0), ops_board(), earlier);
+        state.demo_ops.store.put_board(gone, (5, 0), ops_board(), earlier);
+        assert!(state.campaign_repo.retire_if_active(gone).await.expect("retire_if_active"));
+        let past = DateTime::parse_from_rfc3339("2000-01-01T00:00:00Z").unwrap().with_timezone(&Utc);
+
+        assert_eq!(reap_once(&state, &store, past, &mut ReaperWarns::new()).await, 0);
+        assert_eq!(state.demo_ops.store.len(), 1);
+        assert!(state.demo_ops.store.board(live, (5, 0), Utc::now()).is_some(), "the live campaign's entry is kept");
+    }
+
+    /// BP-8a-2: the reaper drops the entry of a campaign it retires, in the same sweep.
+    #[tokio::test]
+    async fn reaper_drops_the_entry_of_a_campaign_it_retires() {
+        let state = state();
+        let store = store(&state);
+        let (c, _) = campaign(&state, true).await;
+        state.demo_ops.store.put_board(c, (5, 0), ops_board(), Utc::now());
+
+        assert_eq!(reap_once(&state, &store, Utc::now() + chrono::Duration::hours(1), &mut ReaperWarns::new()).await, 1);
+        assert_eq!(lifecycle(&state, c).await, CampaignLifecycle::Archived);
+        assert!(state.demo_ops.store.is_empty());
     }
 }

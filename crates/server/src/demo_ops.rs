@@ -1,7 +1,7 @@
-//! The ops board (BP-8a-1, **demo-only**): the dig sites and merc contracts a demo player
-//! can send their team to, and the in-memory store that will hold each campaign's op
-//! (Breakpoint plan §4d). The `dev` port deletes this file, `routes/ops.rs`, the `lib.rs`
-//! line, the `AppState` field and the two `routes/mod.rs` lines, each marked
+//! The ops board (BP-8a-1, **demo-only**) and its travel legs (BP-8a-2): the dig sites and
+//! merc contracts a demo player can send their team to, and the in-memory store that holds
+//! each campaign's op (Breakpoint plan §4d). The `dev` port deletes this file, `routes/ops.rs`,
+//! the `lib.rs` line, the `AppState` field and the two `routes/mod.rs` lines, each marked
 //! "(BP-8a-1, demo-only)". Phase 2's Strike Mining inherits none of it.
 //!
 //! - **The board is a pure function** of the sector, the player's gateway and the campaign
@@ -10,7 +10,11 @@
 //! - **The board is cached per campaign** (`DemoOpsStore`), so a board read costs no sector
 //!   read after the first: uncached, every read moved the ~86 KB sector out of Redis.
 //! - **The contract seed is displayed provenance, never a roll seed.** It only places
-//!   pins the player sees (code `CLAUDE.md` §4); the secret `op_seed` is BP-8a-2's.
+//!   pins the player sees (code `CLAUDE.md` §4). The op's own seed is drawn from OS entropy
+//!   at `ops/start`, stored on the private `ActiveOp` and never serialised.
+//! - **Leg times are wall clock** (`DateTime<Utc>`): the ops layer is not the sim, rolls
+//!   nothing in BP-8a-2 and logs nothing, so code `CLAUDE.md` §2's ban on wall clock inside
+//!   `Step()` does not reach it. Every store method takes `now`, so tests pass any instant.
 //! - One lock, never held across an `.await`: every method takes it, does map work, and
 //!   returns owned data. In memory only: a restart empties it.
 
@@ -18,6 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde::Serialize;
 use sim_engine::missions::missions;
 use sim_engine::rng::Rng;
@@ -202,16 +207,117 @@ pub fn ops_board(
     OpsBoard { sites }
 }
 
-/// One campaign's ops state. BP-8a-1 holds the cached board only; BP-8a-2 adds the op and
-/// BP-8b-2 the banked ore (an absent entry reads as no op and 0 ore).
+/// Which way the team is travelling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpLeg {
+    Outbound,
+    Homeward,
+}
+
+/// The op in flight, private: never serialised (`ActiveOpView` is what the client sees).
+/// BP-8b-1 adds heat, ore on site and the raid trigger; BP-8b-2 the haul and the ambush.
+struct ActiveOp {
+    site_id: String,
+    kind: &'static str,
+    leg: OpLeg,
+    depart_at: DateTime<Utc>,
+    arrive_at: DateTime<Utc>,
+    /// The site's one-way time; both legs take it, so the trip is symmetric (§4d: "each way").
+    travel_secs: u32,
+    /// Drawn by `generate_seed()` at `ops/start`, never derived from the campaign id and never
+    /// sent. BP-8b-1's rolls are the first reader.
+    #[allow(dead_code)]
+    op_seed: u32,
+}
+
+/// The op as the client sees it. Times are RFC 3339 with milliseconds; `arrived` is
+/// `now >= arrive_at` at the read.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ActiveOpView {
+    pub leg: OpLeg,
+    pub site_id: String,
+    pub kind: &'static str,
+    pub depart_at: String,
+    pub arrive_at: String,
+    pub arrived: bool,
+}
+
+/// The wire format of every time the ops routes send.
+pub fn ops_time(t: DateTime<Utc>) -> String {
+    t.to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+/// Why `start_op` refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartRefusal {
+    /// An op is still out (an arrived homeward leg is cleared first, so this one is not home).
+    Busy,
+    /// The campaign has no entry and every entry at the cap holds an op.
+    Full,
+}
+
+/// Why `return_op` refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReturnRefusal {
+    /// No op, or its homeward leg has arrived and been cleared.
+    NoOp,
+    /// The outbound leg has not arrived yet.
+    NotArrived,
+    /// The team is already on its way home.
+    AlreadyHomeward,
+}
+
+/// One campaign's ops state: the cached board, the op in flight and when the team last moved.
+/// BP-8b-2 adds the banked ore.
 struct OpsEntry {
     /// The gateway the board was computed for; another gateway is a miss.
     gateway: (i32, i32),
     board: Arc<OpsBoard>,
-    touched: Instant,
+    touched: DateTime<Utc>,
+    op: Option<ActiveOp>,
+    /// The latest departure or homeward arrival. Outlives the op, so a player who has just
+    /// come home still counts as moving for the reaper.
+    moved_at: Option<DateTime<Utc>>,
 }
 
-/// Every campaign's ops state, in memory and bounded by `cap`.
+impl OpsEntry {
+    /// Clears a homeward leg that has arrived, recording the arrival (not the read) as the
+    /// last movement. Every read and write of the op calls it first, under the lock.
+    fn settle_arrival(&mut self, now: DateTime<Utc>) {
+        if let Some(op) = &self.op {
+            if op.leg == OpLeg::Homeward && now >= op.arrive_at {
+                self.moved_at = Some(op.arrive_at);
+                self.op = None;
+            }
+        }
+    }
+
+    fn view(&self, now: DateTime<Utc>) -> Option<ActiveOpView> {
+        self.op.as_ref().map(|op| ActiveOpView {
+            leg: op.leg,
+            site_id: op.site_id.clone(),
+            kind: op.kind,
+            depart_at: ops_time(op.depart_at),
+            arrive_at: ops_time(op.arrive_at),
+            arrived: now >= op.arrive_at,
+        })
+    }
+}
+
+/// Every campaign's ops state, in memory, bounded by `cap`.
+///
+/// **Writes later bricks must keep:**
+/// - the board write (`put_board`) updates `gateway`, `board` and `touched` in place and never
+///   touches the op, `moved_at` or (from BP-8b-2) the banked ore;
+/// - only `start_op`, `return_op` and the arrival clear (`settle_arrival`, run by every op
+///   read and write) write the op, and BP-8b's drill, pull and bank after them;
+/// - the eviction skips any entry holding an op (and, from BP-8b-2, any holding banked ore);
+/// - an entry is dropped only by `remove` (a read of a campaign that is no longer `Active`,
+///   the reaper's retire) and the reaper's prune (`retain_campaigns`).
+///
+/// **Keyed per campaign with one gateway and one op: correct only while `DEMO_PLAYER_CAP = 1`**
+/// (`routes/campaign.rs`). A second member per campaign needs a per-wallet key.
 pub struct DemoOpsStore {
     inner: Mutex<HashMap<Uuid, OpsEntry>>,
     cap: usize,
@@ -233,32 +339,141 @@ impl DemoOpsStore {
         self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// Makes room for a new entry: below the cap, nothing; at it, evicts the least recently
+    /// touched entry that holds no op and journals (first, then at most hourly). `false` when
+    /// every entry holds an op.
+    fn make_room(&self, inner: &mut HashMap<Uuid, OpsEntry>) -> bool {
+        if inner.len() < self.cap {
+            return true;
+        }
+        let victim = inner.iter().filter(|(_, e)| e.op.is_none()).min_by_key(|(_, e)| e.touched).map(|(id, _)| *id);
+        let Some(id) = victim else {
+            return false;
+        };
+        inner.remove(&id);
+        if let Some(n) = self.evict_warn.hit(Instant::now()) {
+            tracing::warn!(evicted = n, cap = self.cap, "ops boards at their cap: evicting the least recently read");
+        }
+        true
+    }
+
     /// The cached board for `campaign_id` at `gateway`, touched; `None` on a miss.
-    pub fn board(&self, campaign_id: Uuid, gateway: (i32, i32), now: Instant) -> Option<Arc<OpsBoard>> {
+    pub fn board(&self, campaign_id: Uuid, gateway: (i32, i32), now: DateTime<Utc>) -> Option<Arc<OpsBoard>> {
         let mut inner = self.lock();
         let entry = inner.get_mut(&campaign_id).filter(|e| e.gateway == gateway)?;
         entry.touched = now;
         Some(Arc::clone(&entry.board))
     }
 
-    /// Caches `board`, replacing the campaign's entry. A new campaign at the cap first evicts
-    /// the least recently touched entry and journals (first, then at most hourly). Every
-    /// BP-8a-1 entry is a recomputable board; BP-8a-2 evicts only entries with no op.
-    pub fn insert(&self, campaign_id: Uuid, gateway: (i32, i32), board: Arc<OpsBoard>, now: Instant) {
+    /// Caches `board`. An existing entry gets the new `gateway`, `board` and `touched` in
+    /// place, keeping its op. A new entry at the cap first evicts (`make_room`). `false`: not
+    /// cached, because every entry holds an op (the caller serves the board uncached).
+    pub fn put_board(&self, campaign_id: Uuid, gateway: (i32, i32), board: Arc<OpsBoard>, now: DateTime<Utc>) -> bool {
         let mut inner = self.lock();
-        if !inner.contains_key(&campaign_id) && inner.len() >= self.cap {
-            let victim = inner.iter().min_by_key(|(_, e)| e.touched).map(|(id, _)| *id);
-            if let Some(id) = victim {
-                inner.remove(&id);
-            }
-            if let Some(n) = self.evict_warn.hit(now) {
-                tracing::warn!(evicted = n, cap = self.cap, "ops boards at their cap: evicting the least recently read");
-            }
+        if let Some(e) = inner.get_mut(&campaign_id) {
+            e.gateway = gateway;
+            e.board = board;
+            e.touched = now;
+            return true;
         }
-        inner.insert(campaign_id, OpsEntry { gateway, board, touched: now });
+        if !self.make_room(&mut inner) {
+            return false;
+        }
+        inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, op: None, moved_at: None });
+        true
     }
 
-    /// Drops the campaign's entry (a read of a campaign that is no longer `Active`).
+    /// Starts the outbound leg to `site`: `depart_at = now`, `arrive_at = now + travel_secs`.
+    /// One op per campaign (`Busy`); a campaign with no entry is cached with `board` first
+    /// (`Full` when every entry at the cap holds an op).
+    pub fn start_op(
+        &self,
+        campaign_id: Uuid,
+        gateway: (i32, i32),
+        board: Arc<OpsBoard>,
+        site: &OpsSite,
+        op_seed: u32,
+        now: DateTime<Utc>,
+    ) -> Result<(), StartRefusal> {
+        let mut inner = self.lock();
+        if !inner.contains_key(&campaign_id) {
+            if !self.make_room(&mut inner) {
+                return Err(StartRefusal::Full);
+            }
+            inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, op: None, moved_at: None });
+        }
+        let Some(e) = inner.get_mut(&campaign_id) else {
+            return Err(StartRefusal::Full);
+        };
+        e.settle_arrival(now);
+        if e.op.is_some() {
+            return Err(StartRefusal::Busy);
+        }
+        e.op = Some(ActiveOp {
+            site_id: site.site_id.clone(),
+            kind: site.kind,
+            leg: OpLeg::Outbound,
+            depart_at: now,
+            arrive_at: now + Duration::seconds(i64::from(site.travel_secs)),
+            travel_secs: site.travel_secs,
+            op_seed,
+        });
+        e.moved_at = Some(now);
+        e.touched = now;
+        Ok(())
+    }
+
+    /// Starts the homeward leg once the outbound one has arrived, taking the site's time again.
+    pub fn return_op(&self, campaign_id: Uuid, now: DateTime<Utc>) -> Result<(), ReturnRefusal> {
+        let mut inner = self.lock();
+        let Some(e) = inner.get_mut(&campaign_id) else {
+            return Err(ReturnRefusal::NoOp);
+        };
+        e.settle_arrival(now);
+        let Some(op) = e.op.as_mut() else {
+            return Err(ReturnRefusal::NoOp);
+        };
+        if op.leg == OpLeg::Homeward {
+            return Err(ReturnRefusal::AlreadyHomeward);
+        }
+        if now < op.arrive_at {
+            return Err(ReturnRefusal::NotArrived);
+        }
+        op.leg = OpLeg::Homeward;
+        op.depart_at = now;
+        op.arrive_at = now + Duration::seconds(i64::from(op.travel_secs));
+        e.moved_at = Some(now);
+        e.touched = now;
+        Ok(())
+    }
+
+    /// The op as the client sees it, after clearing an arrived homeward leg.
+    pub fn op_view(&self, campaign_id: Uuid, now: DateTime<Utc>) -> Option<ActiveOpView> {
+        let mut inner = self.lock();
+        let e = inner.get_mut(&campaign_id)?;
+        e.settle_arrival(now);
+        e.view(now)
+    }
+
+    /// The reaper's keep check: the team departed or came home at or after `cutoff` (a leg
+    /// that has arrived by `now` counts at its arrival). Reading the board is not moving.
+    pub fn moved_since(&self, campaign_id: Uuid, cutoff: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+        let inner = self.lock();
+        let Some(e) = inner.get(&campaign_id) else {
+            return false;
+        };
+        let arrived = e.op.as_ref().map(|op| op.arrive_at).filter(|t| *t <= now);
+        e.moved_at.max(arrived).is_some_and(|t| t >= cutoff)
+    }
+
+    /// The reaper's prune: keeps the entries of `active` campaigns, and any entry touched at or
+    /// after `listed_at` (a campaign launched after the list was read).
+    pub fn retain_campaigns(&self, active: &HashSet<Uuid>, listed_at: DateTime<Utc>) {
+        self.lock().retain(|id, e| active.contains(id) || e.touched >= listed_at);
+    }
+
+    /// Drops the campaign's entry (a read of a campaign that is no longer `Active`, the reaper's
+    /// retire).
     pub fn remove(&self, campaign_id: Uuid) {
         self.lock().remove(&campaign_id);
     }
@@ -270,6 +485,21 @@ impl DemoOpsStore {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Moves the campaign's op (and its last movement) `secs` into the past, so a route test
+    /// crosses an arrival without sleeping.
+    #[cfg(test)]
+    pub(crate) fn rewind_op(&self, campaign_id: Uuid, secs: i64) {
+        let mut inner = self.lock();
+        if let Some(e) = inner.get_mut(&campaign_id) {
+            let back = Duration::seconds(secs);
+            if let Some(op) = e.op.as_mut() {
+                op.depart_at -= back;
+                op.arrive_at -= back;
+            }
+            e.moved_at = e.moved_at.map(|t| t - back);
+        }
     }
 }
 
@@ -448,29 +678,139 @@ mod tests {
         Arc::new(OpsBoard { sites: vec![] })
     }
 
+    /// A contract site 10 s out.
+    fn site() -> OpsSite {
+        OpsSite {
+            site_id: "contract:GUARD_DUTY".into(),
+            kind: "contract",
+            q: 8,
+            r: 0,
+            distance: 3,
+            travel_secs: 10,
+            tier: None,
+            mission_id: Some("GUARD_DUTY"),
+            name: None,
+        }
+    }
+
+    fn t0() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-11-15T10:00:00Z").unwrap().with_timezone(&Utc)
+    }
+
+    fn at(secs: i64) -> DateTime<Utc> {
+        t0() + Duration::seconds(secs)
+    }
+
     #[test]
     fn ops_store_at_its_cap_evicts_the_least_recently_read() {
         let store = DemoOpsStore::new(2);
-        let t0 = Instant::now();
         let (a, b, c) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
-        store.insert(a, (5, 0), board(), t0);
-        store.insert(b, (5, 0), board(), t0 + std::time::Duration::from_secs(1));
-        assert!(store.board(a, (5, 0), t0 + std::time::Duration::from_secs(2)).is_some(), "a is read last");
-        store.insert(c, (5, 0), board(), t0 + std::time::Duration::from_secs(3));
+        assert!(store.put_board(a, (5, 0), board(), at(0)));
+        assert!(store.put_board(b, (5, 0), board(), at(1)));
+        assert!(store.board(a, (5, 0), at(2)).is_some(), "a is read last");
+        assert!(store.put_board(c, (5, 0), board(), at(3)));
         assert_eq!(store.len(), 2);
-        assert!(store.board(b, (5, 0), t0).is_none(), "b was evicted");
-        assert!(store.board(a, (5, 0), t0).is_some());
-        assert!(store.board(c, (5, 0), t0).is_some());
+        assert!(store.board(b, (5, 0), at(4)).is_none(), "b was evicted");
+        assert!(store.board(a, (5, 0), at(4)).is_some());
+        assert!(store.board(c, (5, 0), at(4)).is_some());
     }
 
     #[test]
     fn ops_store_misses_on_another_gateway_and_forgets_on_remove() {
         let store = DemoOpsStore::new(2);
         let a = Uuid::from_u128(1);
-        let now = Instant::now();
-        store.insert(a, (5, 0), board(), now);
-        assert!(store.board(a, (0, 5), now).is_none());
+        store.put_board(a, (5, 0), board(), at(0));
+        assert!(store.board(a, (0, 5), at(0)).is_none());
         store.remove(a);
         assert!(store.is_empty());
+    }
+
+    /// CF1: a board write on an entry that holds an op replaces the board and keeps the op.
+    #[test]
+    fn ops_store_board_write_keeps_the_op() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        store.start_op(a, (5, 0), board(), &site(), 7, at(0)).expect("start");
+        assert!(store.put_board(a, (0, 5), board(), at(1)));
+        assert!(store.board(a, (0, 5), at(2)).is_some(), "the new gateway's board is cached");
+        let op = store.op_view(a, at(2)).expect("the op survives the board write");
+        assert_eq!(op.site_id, "contract:GUARD_DUTY");
+        assert_eq!(op.leg, OpLeg::Outbound);
+    }
+
+    /// Cap 2: `a` holds an op and is the least recently touched, `b` holds a board only. A new
+    /// campaign evicts `b`, never `a`.
+    #[test]
+    fn ops_store_eviction_skips_entries_with_an_op() {
+        let store = DemoOpsStore::new(2);
+        let (a, b, c) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
+        store.start_op(a, (5, 0), board(), &site(), 7, at(0)).expect("start");
+        store.put_board(b, (5, 0), board(), at(1));
+        assert!(store.put_board(c, (5, 0), board(), at(2)));
+        assert_eq!(store.len(), 2);
+        assert!(store.op_view(a, at(3)).is_some(), "the op entry is kept");
+        assert!(store.board(b, (5, 0), at(3)).is_none(), "the board-only entry is evicted");
+    }
+
+    /// Cap 1, held by an op: another campaign's start is refused and its board is not cached.
+    #[test]
+    fn ops_store_full_of_ops_refuses_a_start_and_caches_no_board() {
+        let store = DemoOpsStore::new(1);
+        let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        store.start_op(a, (5, 0), board(), &site(), 7, at(0)).expect("start");
+        assert!(!store.put_board(b, (5, 0), board(), at(1)), "nothing evictable");
+        assert_eq!(store.start_op(b, (5, 0), board(), &site(), 8, at(1)), Err(StartRefusal::Full));
+        assert_eq!(store.len(), 1);
+        assert!(store.op_view(a, at(2)).is_some());
+    }
+
+    #[test]
+    fn ops_store_one_op_per_campaign() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        store.start_op(a, (5, 0), board(), &site(), 7, at(0)).expect("start");
+        assert_eq!(store.start_op(a, (5, 0), board(), &site(), 8, at(20)), Err(StartRefusal::Busy), "arrived outbound is still out");
+        assert_eq!(store.op_view(a, at(20)).expect("op").depart_at, ops_time(at(0)), "the first op is untouched");
+    }
+
+    #[test]
+    fn ops_store_return_needs_an_arrived_outbound() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        assert_eq!(store.return_op(a, at(0)), Err(ReturnRefusal::NoOp));
+        store.start_op(a, (5, 0), board(), &site(), 7, at(0)).expect("start");
+        assert_eq!(store.return_op(a, at(9)), Err(ReturnRefusal::NotArrived));
+        assert_eq!(store.return_op(a, at(10)), Ok(()));
+        let op = store.op_view(a, at(11)).expect("op");
+        assert_eq!(op.leg, OpLeg::Homeward);
+        assert_eq!((op.depart_at, op.arrive_at, op.arrived), (ops_time(at(10)), ops_time(at(20)), false));
+        assert_eq!(store.return_op(a, at(12)), Err(ReturnRefusal::AlreadyHomeward));
+    }
+
+    #[test]
+    fn ops_store_homeward_arrival_clears_the_op_and_keeps_moved_at() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        store.start_op(a, (5, 0), board(), &site(), 7, at(0)).expect("start");
+        store.return_op(a, at(10)).expect("return");
+        assert!(store.op_view(a, at(19)).is_some(), "still on the way home");
+        assert!(store.op_view(a, at(500)).is_none(), "home: the op is cleared");
+        assert!(store.moved_since(a, at(20), at(500)), "the arrival at 20 s is the last movement");
+        assert!(!store.moved_since(a, at(21), at(500)));
+        assert!(store.start_op(a, (5, 0), board(), &site(), 8, at(501)).is_ok(), "a new op can start");
+    }
+
+    /// `b` is not listed but was touched after the listing (a launch that raced the prune).
+    #[test]
+    fn ops_store_retain_drops_unlisted_but_keeps_entries_touched_after_the_listing() {
+        let store = DemoOpsStore::new(4);
+        let (a, b, c) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
+        store.put_board(a, (5, 0), board(), at(0));
+        store.put_board(b, (5, 0), board(), at(10));
+        store.put_board(c, (5, 0), board(), at(0));
+        store.retain_campaigns(&HashSet::from([a]), at(5));
+        assert!(store.board(a, (5, 0), at(11)).is_some());
+        assert!(store.board(b, (5, 0), at(11)).is_some());
+        assert!(store.board(c, (5, 0), at(11)).is_none());
     }
 }
