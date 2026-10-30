@@ -1,4 +1,5 @@
-//! The ops routes (BP-8a-1 board, BP-8a-2 travel legs, BP-8b-1a the drill; **demo-only**;
+//! The ops routes (BP-8a-1 board, BP-8a-2 travel legs, BP-8b-1a the drill, BP-8b-1b the raid;
+//! **demo-only**;
 //! Breakpoint plan §4d).
 //! The `dev` port deletes this file with `demo_ops.rs`.
 //!
@@ -25,8 +26,8 @@ use uuid::Uuid;
 
 use crate::auth::AuthSession;
 use crate::demo_ops::{
-    dig_threshold, ops_board, ops_time, ActiveOpView, DigStart, DrillOutcome, DrillRefusal, OpsBoard, OpsSite, ReturnRefusal,
-    StartRefusal,
+    dig_threshold, ops_board, ops_time, raid_result, ActiveOpView, DigStart, DrillOutcome, DrillRefusal, OpsBoard, OpsSite,
+    ReturnRefusal, StartRefusal,
 };
 use crate::repository::{CampaignInstance, CampaignLifecycle, SectorState};
 use crate::state::AppState;
@@ -186,6 +187,27 @@ fn ops_response(state: &AppState, campaign_id: Uuid, gw: (i32, i32), board: &Ops
     Json(view).into_response()
 }
 
+/// Latches a pending raid (BP-8b-1b), run by every ops route right after `load_board`. No raid
+/// pending: nothing is read. Otherwise the store names the dig's Commander and the trigger; the
+/// Commander's deployments are read with no store lock held (`list_deployments_by_commander`,
+/// one sequential scan, `500` on failure); and the store applies the fight's result only if the
+/// trigger is unchanged. A fight not yet started or still `active` leaves the raid pending.
+async fn latch_pending_raid(state: &AppState, campaign_id: Uuid, now: DateTime<Utc>, route: &str) -> Result<(), AppError> {
+    let Some(pending) = state.demo_ops.store.pending_raid(campaign_id, now) else {
+        return Ok(());
+    };
+    let commander_id = pending.commander_id;
+    let deps = state.commander_repo.list_deployments_by_commander(commander_id).await.map_err(|e| {
+        internal_error(format!("{route}: list_deployments_by_commander failed for commander {commander_id} of campaign {campaign_id}: {e}"))
+    })?;
+    let result = raid_result(&deps, &pending.trigger)
+        .map_err(|e| internal_error(format!("{route}: raid of campaign {campaign_id}: {e}")))?;
+    if let Some(result) = result {
+        state.demo_ops.store.latch_raid(campaign_id, &pending.trigger, result, now);
+    }
+    Ok(())
+}
+
 /// A member's ops board, `GET /api/campaign/:campaign_id/ops` (BP-8a-1, demo-only). Order:
 /// `401` (no session) → `429` per address (`ops_ip`) → `429` per wallet (`ops_wallet`) →
 /// `404` (unknown campaign) → `403` (not a member) → `409` (not `Active`; the campaign's
@@ -197,6 +219,7 @@ fn ops_response(state: &AppState, campaign_id: Uuid, gw: (i32, i32), board: &Ops
 ///   board uncached.
 /// - A retire that lands between the state check and the insert leaves an entry behind; the
 ///   campaign's next read drops it, and the reaper's prune within 5 minutes.
+/// - A pending raid is latched after the board (`latch_pending_raid`; `500` on a failed read).
 async fn get_ops_board(
     AuthSession(token): AuthSession,
     State(state): State<Arc<AppState>>,
@@ -214,6 +237,7 @@ async fn get_ops_board(
         return Ok(Json(view).into_response());
     };
     let board = load_board(&state, &campaign, gw, now, false, "get_ops_board").await?;
+    latch_pending_raid(&state, campaign_id, now, "get_ops_board").await?;
     Ok(ops_response(&state, campaign_id, gw, &board, now))
 }
 
@@ -221,13 +245,16 @@ async fn get_ops_board(
 /// demo-only). Order: `401` → `429` `ops_ip` → `429` `ops_wallet` → axum's body rejection,
 /// counted (`413` over `OPS_BODY_LIMIT`; `400`, `415`, `422`) → `404` → `403` → `409` not
 /// `Active` (entry dropped) → `409` no gateway → the board, a hit proven by `EXISTS` (a lost
-/// sector is repaired: `409` once retired, entry dropped) → `400` unknown site → for a dig
-/// only, the Crew and Foreman reads (`500` on failure) and `409` no Crew left → `409` an op
-/// is under way → `503` the store is full of ops → `200`, the whole state.
+/// sector is repaired: `409` once retired, entry dropped) → a pending raid latched (`500` on a
+/// failed read) → `400` unknown site → for a dig only, the Crew, Foreman and Commander reads
+/// (`500` on failure), `409` no Crew left and `409` no Commander left → `409` an op is under
+/// way → `503` the store is full of ops → `200`, the whole state.
 /// - The leg: `depart_at = now`, `arrive_at = now + the site's travel_secs`.
 /// - The op's seed is drawn here from OS entropy and handed to the store, which never sends it;
 ///   the drill rolls from it.
-/// - A dig reads its Crew and threshold once, here (`dig_start`); a contract reads neither.
+/// - A dig reads its Crew, threshold and Commander once, here (`dig_start`); a contract reads none.
+/// - The latch runs here too, so a raid already fought (a Wipeout clears the op) frees the start
+///   without waiting for a board read.
 /// - No launch lock: an op that starts while the reaper retires the campaign is retired with
 ///   it, and the next ops call answers `409` (an accepted residual, as BP-3c-1b-1's).
 async fn post_ops_start(
@@ -251,6 +278,7 @@ async fn post_ops_start(
         return Err(conflict("no gateway assigned"));
     };
     let board = load_board(&state, &campaign, gw, now, true, "post_ops_start").await?;
+    latch_pending_raid(&state, campaign_id, now, "post_ops_start").await?;
     let Some(site) = board.sites.iter().find(|s| s.site_id == req.site_id) else {
         return Err(bad_request("unknown site"));
     };
@@ -264,10 +292,13 @@ async fn post_ops_start(
     Ok(ops_response(&state, campaign_id, gw, &board, now))
 }
 
-/// A dig's Crew and threshold (BP-8b-1a). The Crew is the member's first by the lister's order
-/// (a demo member holds one, the join's); `409` when it has no heads left, since only a new run
-/// brings a fresh one. The first Foreman's specialization sets the threshold (`dig_threshold`);
-/// no Foreman means the plain threshold.
+/// A dig's Crew, threshold (BP-8b-1a) and Commander (BP-8b-1b). The Crew is the member's first
+/// by the lister's order (a demo member holds one, the join's); `409` when it has no heads left,
+/// since only a new run brings a fresh one. The first Foreman's specialization sets the threshold
+/// (`dig_threshold`); no Foreman means the plain threshold. The Commander, who fights the dig's
+/// raids, is the first usable one (not KIA, not Shattered: the mission route's refusals); a
+/// member holds at most one, so the client's raid fight picks the same. `409` when none is
+/// usable. The Crew is checked first, so a member with neither hears about the Crew.
 async fn dig_start(state: &AppState, campaign_id: Uuid, wallet: &[u8]) -> Result<DigStart, AppError> {
     let crews = state.crew_repo.list_crews_for_member(campaign_id, wallet).await.map_err(|e| {
         internal_error(format!("post_ops_start: list_crews_for_member failed for campaign {campaign_id}: {e}"))
@@ -279,13 +310,20 @@ async fn dig_start(state: &AppState, campaign_id: Uuid, wallet: &[u8]) -> Result
         internal_error(format!("post_ops_start: list_foremen_for_member failed for campaign {campaign_id}: {e}"))
     })?;
     let coolant = foremen.first().is_some_and(|f| f.specialization == ForemanSpecialization::CoolantJockey.as_str());
-    Ok(DigStart { crew_id: crew.crew_id, threshold: dig_threshold(coolant) })
+    let commanders = state.commander_repo.list_commanders_for_member(campaign_id, wallet).await.map_err(|e| {
+        internal_error(format!("post_ops_start: list_commanders_for_member failed for campaign {campaign_id}: {e}"))
+    })?;
+    let Some(commander) = commanders.iter().find(|c| !c.is_kia && !c.is_shattered) else {
+        return Err(conflict("no Commander left to lead: start a new run"));
+    };
+    Ok(DigStart { crew_id: crew.crew_id, commander_id: commander.commander_id, threshold: dig_threshold(coolant) })
 }
 
 /// Brings the team home, `POST /api/campaign/:campaign_id/ops/return` (BP-8a-2, demo-only).
 /// No body is read. Order: `401` → `429` `ops_ip` → `429` `ops_wallet` → `404` → `403` →
 /// `409` not `Active` (entry dropped) → `409` no op under way (also: no gateway) → the board
-/// → `409` still travelling → `409` already heading home → `200`, the whole state.
+/// → a pending raid latched → `409` no op under way → `409` already heading home → `409` still
+/// travelling → `409` raiders at the site → `200`, the whole state.
 /// - The homeward leg takes the site's `travel_secs` again (§4d: "each way"), not the
 ///   gateway's terrain: every gateway is City-State (×0.5), which would halve every trip home.
 /// - From a dig the team walks away and the ore on site is lost (`ended_by: walked_away`,
@@ -306,20 +344,23 @@ async fn post_ops_return(
         return Err(conflict("no op under way"));
     };
     let board = load_board(&state, &campaign, gw, now, false, "post_ops_return").await?;
+    latch_pending_raid(&state, campaign_id, now, "post_ops_return").await?;
     match state.demo_ops.store.return_op(campaign_id, now) {
         Ok(()) => {}
         Err(ReturnRefusal::NoOp) => return Err(conflict("no op under way")),
         Err(ReturnRefusal::NotArrived) => return Err(conflict("still travelling")),
         Err(ReturnRefusal::AlreadyHomeward) => return Err(conflict("already heading home")),
+        Err(ReturnRefusal::RaidPending) => return Err(conflict("raiders at the site")),
     }
     Ok(ops_response(&state, campaign_id, gw, &board, now))
 }
 
 /// One drill on a dig, `POST /api/campaign/:campaign_id/ops/drill` (BP-8b-1a, demo-only). No
 /// body is read. Order: `401` → `429` `ops_ip` → `429` `ops_wallet` → `404` → `403` → `409`
-/// not `Active` (entry dropped) → `409` no op under way (also: no gateway) → the board → `409`
-/// no op under way → `409` not a dig site → `409` already heading home → `409` still
-/// travelling → `200`, the whole state.
+/// not `Active` (entry dropped) → `409` no op under way (also: no gateway) → the board → a
+/// pending raid latched → `409` no op under way → `409` not a dig site → `409` already heading
+/// home → `409` still travelling → `409` raiders at the site → `200`, the whole state.
+/// - A drill that brings raiders answers `200` with `dig.raid` set; the client opens the fight.
 /// - No DB read unless the drill melts down: the Crew and the threshold were read at `ops/start`.
 /// - **A meltdown** is committed in the store first (the team is already heading home, so a
 ///   second drill can't lose the heads twice). Then, with the store's lock released and after
@@ -343,6 +384,7 @@ async fn post_ops_drill(
         return Err(conflict("no op under way"));
     };
     let board = load_board(&state, &campaign, gw, now, false, "post_ops_drill").await?;
+    latch_pending_raid(&state, campaign_id, now, "post_ops_drill").await?;
     match state.demo_ops.store.drill_op(campaign_id, now) {
         Ok(DrillOutcome::Drilled) => {}
         Ok(DrillOutcome::Meltdown { crew_id, heads }) => {
@@ -357,6 +399,7 @@ async fn post_ops_drill(
         Err(DrillRefusal::Contract) => return Err(conflict("not a dig site")),
         Err(DrillRefusal::AlreadyHomeward) => return Err(conflict("already heading home")),
         Err(DrillRefusal::NotArrived) => return Err(conflict("still travelling")),
+        Err(DrillRefusal::RaidPending) => return Err(conflict("raiders at the site")),
     }
     Ok(ops_response(&state, campaign_id, gw, &board, now))
 }
@@ -813,8 +856,8 @@ mod tests {
 
     const DIG: &str = "dig:11,-4";
 
-    /// The member's Crew (8 heads) and Foreman, as a join writes them; the Foreman is the
-    /// Coolant-Jockey or, when `coolant` is false, the first other specialization. Returns the Crew.
+    /// The member's Crew (8 heads), Foreman and Commander, as a join writes them; the Foreman is
+    /// the Coolant-Jockey or, when `coolant` is false, the first other specialization. Returns the Crew.
     async fn seed_crew(state: &AppState, campaign: Uuid, coolant: bool) -> Uuid {
         let mut foreman = crate::foreman_gen::generate_foreman(WALLET.to_vec(), campaign, 7);
         let other = ForemanSpecialization::ALL.iter().map(|s| s.as_str()).find(|s| *s != "Coolant-Jockey").unwrap();
@@ -823,6 +866,8 @@ mod tests {
         let crew = crate::repository::CrewRecord::new_hire(campaign, WALLET.to_vec());
         let id = crew.crew_id;
         state.crew_repo.create_crew(crew).await.expect("create_crew");
+        let commander = crate::commander_gen::generate_commander(WALLET.to_vec(), campaign, 42);
+        state.commander_repo.create_commander(commander).await.expect("create_commander");
         id
     }
 
@@ -842,7 +887,8 @@ mod tests {
         post(state, campaign, "drill", None).await
     }
 
-    /// A dig campaign: `Active`, the sector seeded, the Crew and a Foreman. Returns both ids.
+    /// A dig campaign: `Active`, the sector seeded, the Crew, a Foreman and a Commander. Returns
+    /// the campaign and the Crew.
     async fn dig_campaign(state: &Arc<AppState>, coolant: bool) -> (Uuid, Uuid) {
         let c = campaign_with(state, WALLET, true, Some(GATEWAY)).await;
         seed_sector(state, &c).await;
@@ -999,6 +1045,130 @@ mod tests {
         assert_eq!((op["dig"]["drills"].as_u64(), op["dig"]["ore_on_site"].as_u64()), (Some(2), Some(0)));
         assert_eq!(op["dig"]["ended_by"], "walked_away");
         assert_eq!(headcount(&state, crew).await, 8, "walking away costs no heads");
+    }
+
+    /// The member's only Commander (the one `seed_crew` writes).
+    async fn commander_of(state: &AppState, campaign: Uuid) -> Uuid {
+        let all = state.commander_repo.list_commanders_for_member(campaign, &WALLET).await.expect("list");
+        assert_eq!(all.len(), 1);
+        all[0].commander_id
+    }
+
+    /// The raid's fight as the mission route records it, started now (after the trigger): the
+    /// deployment opened and resolved with `outcome`, which on a Wipeout also marks the Commander
+    /// KIA. The route can't choose an outcome (its seed is OS entropy), so the record is written
+    /// through the repository (spec check F1).
+    async fn fight(state: &AppState, campaign: Uuid, outcome: sim_engine::game_types::OutcomeType) -> Uuid {
+        let commander = commander_of(state, campaign).await;
+        let d = crate::repository::NewDeployment {
+            deployment_id: Uuid::new_v4(),
+            commander_id: commander,
+            session_id: Uuid::new_v4(),
+            mission_id: "GUARD_DUTY".into(),
+            started_at: chrono::Utc::now(),
+            player_wallet: WALLET.to_vec(),
+            campaign_id: campaign,
+            section_ids: vec![],
+        };
+        assert_eq!(state.commander_repo.start_deployment(&d).await.expect("start"), crate::repository::DeploymentStart::Started);
+        let cfg = sim_engine::config::SimConfig::default();
+        state.commander_repo.resolve_deployment(d.deployment_id, commander, 0, 1, 0.0, &outcome, &cfg).await.expect("resolve");
+        commander
+    }
+
+    /// Seed 7 raids on drill 1. Drill and return are refused while the raid waits (a board read
+    /// latches nothing before the fight); a won fight is latched on the next read and drilling
+    /// resumes.
+    #[tokio::test]
+    async fn ops_raid_blocks_drill_and_return_until_the_fight_is_won() {
+        let state = Arc::new(session_state());
+        let (c, _) = dig_campaign(&state, false).await;
+        dig_on_site(&state, c, 7).await;
+        let (status, body, bytes) = drill(&state, c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let d = &body["active_op"]["dig"];
+        assert_eq!(d["raid"], serde_json::json!({"mission_id": "GUARD_DUTY"}));
+        assert!(d["next_raid_pct"].is_null());
+        assert_eq!((d["heat"].as_u64(), d["ore_on_site"].as_u64()), (Some(15), Some(10)));
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(!text.contains("trigger") && !text.contains("commander"), "{text}");
+        let (status, body, _) = drill(&state, c).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("raiders at the site")));
+        let (status, body, _) = post(&state, c, "return", None).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("raiders at the site")));
+        let (status, body) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["active_op"]["dig"]["raid"]["mission_id"], "GUARD_DUTY", "no fight yet");
+        fight(&state, c, sim_engine::game_types::OutcomeType::Success).await;
+        let (status, body) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let d = &body["active_op"]["dig"];
+        assert!(d["raid"].is_null(), "{body}");
+        assert_eq!(d["next_raid_pct"], 10);
+        assert_eq!(body["active_op"]["leg"], "outbound");
+        let (status, body, _) = drill(&state, c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["active_op"]["dig"]["drills"], 2);
+    }
+
+    /// A lost raid: the team heads home from the read that latches it, with half the ore on site.
+    #[tokio::test]
+    async fn ops_raid_defeat_sends_the_team_home_with_half_the_ore() {
+        let state = Arc::new(session_state());
+        let (c, crew) = dig_campaign(&state, false).await;
+        dig_on_site(&state, c, 7).await;
+        assert_eq!(drill(&state, c).await.0, StatusCode::OK);
+        fight(&state, c, sim_engine::game_types::OutcomeType::Defeat).await;
+        let (status, body) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let op = &body["active_op"];
+        assert_eq!(op["leg"], "homeward");
+        assert_eq!(op["depart_at"], body["now"]);
+        assert_eq!(op["dig"]["ended_by"], "retreat");
+        assert_eq!((op["dig"]["carried"].as_u64(), op["dig"]["ore_on_site"].as_u64()), (Some(5), Some(0)));
+        let (status, body, _) = drill(&state, c).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("already heading home")));
+        assert_eq!(headcount(&state, crew).await, 8, "a retreat costs no heads");
+    }
+
+    /// A Wipeout: the op is cleared on the next call (here the start itself), and with the only
+    /// Commander KIA the next dig is refused.
+    #[tokio::test]
+    async fn ops_raid_wipeout_ends_the_op_and_the_next_dig_needs_a_commander() {
+        let state = Arc::new(session_state());
+        let (c, _) = dig_campaign(&state, false).await;
+        dig_on_site(&state, c, 7).await;
+        assert_eq!(drill(&state, c).await.0, StatusCode::OK);
+        let commander = fight(&state, c, sim_engine::game_types::OutcomeType::Wipeout).await;
+        assert!(state.commander_repo.get_commander(commander).await.unwrap().expect("the Commander").is_kia);
+        let (status, body, _) = start(&state, c, DIG).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("no Commander left to lead: start a new run")));
+        assert!(state.demo_ops.store.op_view(c, chrono::Utc::now()).is_none(), "the latch cleared the op");
+    }
+
+    /// A dig start needs a usable Commander: a KIA one, then a Shattered one too, are refused; a
+    /// third, usable one (listed last) is found.
+    #[tokio::test]
+    async fn ops_dig_start_needs_a_usable_commander() {
+        let state = Arc::new(session_state());
+        let c = campaign_with(&state, WALLET, true, Some(GATEWAY)).await;
+        seed_sector(&state, &c).await;
+        state.crew_repo.create_crew(crate::repository::CrewRecord::new_hire(c.campaign_id, WALLET.to_vec())).await.expect("create_crew");
+        let mut kia = crate::commander_gen::generate_commander(WALLET.to_vec(), c.campaign_id, 1);
+        kia.is_kia = true;
+        state.commander_repo.create_commander(kia).await.expect("create_commander");
+        let (status, body, _) = start(&state, c.campaign_id, DIG).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("no Commander left to lead: start a new run")));
+        let mut shattered = crate::commander_gen::generate_commander(WALLET.to_vec(), c.campaign_id, 2);
+        shattered.is_shattered = true;
+        state.commander_repo.create_commander(shattered).await.expect("create_commander");
+        let (status, body, _) = start(&state, c.campaign_id, DIG).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("no Commander left to lead: start a new run")));
+        assert!(state.demo_ops.store.op_view(c.campaign_id, chrono::Utc::now()).is_none());
+        let usable = crate::commander_gen::generate_commander(WALLET.to_vec(), c.campaign_id, 3);
+        state.commander_repo.create_commander(usable).await.expect("create_commander");
+        let (status, body, _) = start(&state, c.campaign_id, DIG).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
     }
 
     /// One `ops_wallet` budget for every ops route: a board read and a start spend it, so the

@@ -508,7 +508,7 @@ mod tests {
     }
 
     fn ops_crew() -> Option<crate::demo_ops::DigStart> {
-        Some(crate::demo_ops::DigStart { crew_id: Uuid::new_v4(), threshold: 100 })
+        Some(crate::demo_ops::DigStart { crew_id: Uuid::new_v4(), commander_id: Uuid::new_v4(), threshold: 100 })
     }
 
     /// CF1 (BP-8b-1a): the team arrived 990 s before the cutoff and drilled after it: kept.
