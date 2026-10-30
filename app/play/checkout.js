@@ -19,6 +19,13 @@ const CLUSTER_RE = /^[a-z]+(-[a-z]+)?$/; // the cluster names a host below: noth
 const POLL_MS = 3000;
 const WINDOW_MS = 30000;
 const NOT_SIGNED = [-1, -3]; // MWA: authorization failed, not signed: nothing went out
+const LAPSE_TICK_MS = 5000;     // the no-signature check (BP-3c-5): a height read every 5 s,
+const GET_EVERY = 3;            // a server GET every third read,
+const LAPSE_WINDOW_MS = 120000; // for at most 2 minutes, then Check again
+const SETTLE_GAP_MS = 3000;     // past the server's 2 s check cache before the last GET
+const BLOCKS_VALID = 150;       // a blockhash's life in blocks
+const MARGIN_BLOCKS = 64;       // the wallet's or the server's RPC lagging ours (~16 s on devnet)
+const RPC_DEADLINE_MS = 15000;  // every test-network call gives up after this, like every server call
 
 const nextPoll = ms => new Promise(r => setTimeout(r, ms)); // the checkout poll's only timer
 
@@ -31,6 +38,9 @@ const COPY = {
   checkoutWorking: 'Drawing up the invoice...',
   checkoutWallet: 'Approve the payment in your wallet.',
   checkoutChecking: "Payment sent. Command's accountants are counting it...",
+  checkoutCheckingLast: 'Checking your last payment...',
+  checkoutLapsed: 'Your last payment never went through, so nothing was charged. You can pay now.',
+  checkoutLastPendingBody: "Still checking whether your last payment went out. Nothing more will be charged. Check again in a moment.",
   checkoutPaidTitle: 'Paid. Your next campaign is booked.',
   checkoutPaidBody: '{amount} test USDC, paid on the Solana test network.',
   checkoutContinue: 'Continue',
@@ -122,6 +132,30 @@ async function simulated(w3, conn, body, payerAddress) {
   return sim.value.err === null ? tx : null;
 }
 
+// The test network, with a deadline and no hidden retries on a 429 (BP-3c-5; Reviewer BP-3c-2b F5).
+function connect(w3, cluster) {
+  return new w3.Connection(`https://api.${cluster}.solana.com`, {
+    commitment: 'confirmed',
+    disableRetryOnRateLimit: true,
+    fetch: (url, options) => fetch(url, { ...options, signal: AbortSignal.timeout(RPC_DEADLINE_MS) }),
+  });
+}
+
+// True once a transaction handed over in a wallet session that ended at `endHeight` can no longer
+// land: any blockhash that wallet signed was fetched before its session ended, and lives 150
+// blocks. A missing endHeight (a reload, a failed read, an older build's reference) is read now:
+// no wallet session in this tab is open (walletOpen is 0), so every one has ended.
+async function pastLastBlock(conn, reference) {
+  let rec = store.checkoutRef();
+  if (!rec || rec.reference !== reference) return false;
+  if (rec.endHeight == null) {
+    store.setCheckoutEnd(reference, await conn.getBlockHeight('confirmed'));
+    rec = store.checkoutRef();
+    if (!rec || rec.reference !== reference || rec.endHeight == null) return false;
+  }
+  return (await conn.getBlockHeight('finalized')) > rec.endHeight + BLOCKS_VALID + MARGIN_BLOCKS;
+}
+
 // ── the screen ──────────────────────────────────────────────────────────────
 // `deps` is main.js's side: $, show, handleError, note, rateText, offlineText, genericText and
 // setSignature (the debug footer).
@@ -130,6 +164,7 @@ export function createCheckout(deps) {
   let gen = 0;       // bumped whenever the screen is left: every await checks it
   let running = -1;  // the generation with a flow in flight (one tap at a time)
   let then = null;   // where Continue and Not now go
+  let walletOpen = 0; // wallet sessions open in this tab: while one is, nothing is declared dead
 
   const alive = g => g === gen && !$('screen-checkout').hidden;
 
@@ -167,7 +202,7 @@ export function createCheckout(deps) {
 
   // The invoice and wallet steps can be left (Not now): the generation bumps, so a late answer does nothing.
   const working = (line, leavable = false) => render({ line, spinner: true, secondary: leavable ? notNow : null });
-  const offerScreen = () => render({ body: COPY.checkoutOfferBody, primary: [COPY.checkoutPay, pay], secondary: notNow });
+  const offerScreen = (line = '') => render({ line, body: COPY.checkoutOfferBody, primary: [COPY.checkoutPay, pay], secondary: notNow });
   const walkthrough = () => render({ title: COPY.walkthroughTitle, body: COPY.walkthroughBody, primary: cont(false) });
   const noFunds = () => render({ line: COPY.checkoutNoFunds, body: COPY.walkthroughBody, primary: cont(false) });
   const retryable = line => render({ line, primary: tryAgain, secondary: notNow });
@@ -207,7 +242,7 @@ export function createCheckout(deps) {
   function checkFailed(reference = store.checkoutRef()?.reference) {
     render({
       body: COPY.checkoutCheckFailed,
-      primary: reference ? [COPY.checkoutCheckAgain, () => start(g => poll(g, reference))] : tryAgain,
+      primary: reference ? [COPY.checkoutCheckAgain, () => start(g => recheck(g, reference))] : tryAgain,
       secondary: cont(false),
     });
   }
@@ -262,6 +297,65 @@ export function createCheckout(deps) {
     }
   }
 
+  // Check again after a failed check: "Payment sent" only for a reference the wallet said it sent.
+  async function recheck(g, reference) {
+    const rec = store.checkoutRef();
+    if (rec && rec.reference === reference && !rec.signature) {
+      const body = await getCheckoutIntent(reference);
+      if (!alive(g)) return;
+      return body.status === 'pending' ? lapse(g, reference, body.cluster) : settle(g, body);
+    }
+    return poll(g, reference);
+  }
+
+  // A stored reference with no signature (BP-3c-5): the wallet may have closed before it sent, so
+  // this never says "Payment sent". It reads the height every 5 s and asks the server every third
+  // read. It clears the reference only once the transaction can no longer land: the finalized
+  // height past the bar, then 3 s, then one more GET that still answers pending. A failed height
+  // read or a failed GET keeps the reference.
+  async function lapse(g, reference, cluster) {
+    working(COPY.checkoutCheckingLast, true);
+    if (!CLUSTER_RE.test(String(cluster))) return unavailable();
+    const conn = connect(await loadWeb3(), cluster);
+    if (!alive(g)) return;
+    const deadline = performance.now() + LAPSE_WINDOW_MS;
+    for (let tick = 1; ; tick += 1) {
+      if (walletOpen === 0) {
+        let dead;
+        try {
+          dead = await pastLastBlock(conn, reference);
+        } catch (e) {
+          deps.note(e);
+          return alive(g) && checkFailed(reference);
+        }
+        if (!alive(g)) return;
+        if (dead) {
+          await nextPoll(SETTLE_GAP_MS);
+          if (!alive(g)) return;
+          const last = await getCheckoutIntent(reference);
+          if (!alive(g)) return;
+          if (last.status !== 'pending') return settle(g, last);
+          store.clearCheckoutRef(reference);
+          return offerScreen(COPY.checkoutLapsed);
+        }
+      }
+      if (performance.now() + LAPSE_TICK_MS > deadline) {
+        return render({
+          body: COPY.checkoutLastPendingBody,
+          primary: [COPY.checkoutCheckAgain, () => start(g2 => lapse(g2, reference, cluster))],
+          secondary: cont(false),
+        });
+      }
+      await nextPoll(LAPSE_TICK_MS);
+      if (!alive(g)) return;
+      if (tick % GET_EVERY === 0) {
+        const body = await getCheckoutIntent(reference);
+        if (!alive(g)) return;
+        if (body.status !== 'pending') return settle(g, body);
+      }
+    }
+  }
+
   // Pay and Try again.
   async function attempt(g) {
     working(COPY.checkoutWorking, true);
@@ -279,6 +373,7 @@ export function createCheckout(deps) {
         store.clearCheckoutRef(stored.reference); // expired, a restart, or not this wallet's
       }
       if (!alive(g)) return;
+      if (body && body.status === 'pending' && !stored.signature) return lapse(g, stored.reference, body.cluster);
       if (body) return settle(g, body);
     }
 
@@ -287,7 +382,7 @@ export function createCheckout(deps) {
     if (!alive(g)) return;
     if (!CLUSTER_RE.test(String(body.cluster))) return unavailable();
     const w3 = await loadWeb3();
-    const conn = new w3.Connection(`https://api.${body.cluster}.solana.com`, 'confirmed');
+    const conn = connect(w3, body.cluster);
     if (!alive(g)) return;
 
     if (wallet) { // (i) before the wallet opens: a wallet that can't pay never sees the payment
@@ -306,6 +401,7 @@ export function createCheckout(deps) {
     let stop = null;   // why prepare declined
     let handed = false;
     let signature;
+    walletOpen += 1;
     try {
       signature = await payWithWallet(body.cluster, async address => {
         // (ii) the account the wallet offers, simulated again on a fresh blockhash
@@ -328,6 +424,11 @@ export function createCheckout(deps) {
     } catch (e) {
       if (handed && e instanceof WalletError && NOT_SIGNED.includes(e.code)) store.clearCheckoutRef(body.reference);
       throw e;
+    } finally {
+      walletOpen -= 1;
+      if (handed) { // the session is over: no blockhash this wallet signed is newer than this height
+        try { store.setCheckoutEnd(body.reference, await conn.getBlockHeight('confirmed')); } catch (e) { deps.note(e); }
+      }
     }
     if (!signature) {
       if (!alive(g)) return;
@@ -335,6 +436,7 @@ export function createCheckout(deps) {
       if (stop === 'network') return retryable(COPY.checkoutNetwork);
       return noFunds();
     }
+    store.markCheckoutSent(body.reference, signature);
     deps.setSignature(signature);
     if (!alive(g)) return;
     return poll(g, body.reference);

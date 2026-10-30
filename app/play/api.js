@@ -49,7 +49,7 @@ const sectorKey = id => `mm.sector.${id}`; // ~87 KB; sessionStorage allows ~5 M
 const MISSIONS = 'mm.missions'; // GET /api/missions, static: once per tab (BP-3b-2)
 const UNITS = 'mm.units';       // GET /api/units, static: once per tab
 const genesisKey = w => `mm.genesis.${w}`; // {holds} from a 200 only, per wallet (BP-3c-2)
-const CHECKOUT_REF = 'mm.checkout.ref'; // {reference, wallet}: this tab's unfinished checkout (BP-3c-2b)
+const CHECKOUT_REF = 'mm.checkout.ref'; // {reference, wallet, signature?, endHeight?}: this tab's unfinished checkout (BP-3c-2b, BP-3c-5)
 const offeredKey = id => `mm.checkout.offered.${id}`; // the checkout was offered after this campaign's AAR
 const MUTE = 'mm.mute'; // the music's mute (BP-3c-3), kept for the tab
 
@@ -73,6 +73,9 @@ export const store = {
   // The checkout's two keys live outside clearAll(): a 401 and a re-sign-in keep them.
   checkoutRef: () => readKey(CHECKOUT_REF),
   setCheckoutRef: r => writeKey(CHECKOUT_REF, { reference: r.reference, wallet: r.wallet }),
+  // Written after the handover, each only while the stored reference is still this one (BP-3c-5).
+  markCheckoutSent: (reference, signature) => { const r = readKey(CHECKOUT_REF); if (r?.reference === reference) writeKey(CHECKOUT_REF, { ...r, signature }); },
+  setCheckoutEnd: (reference, h) => { const r = readKey(CHECKOUT_REF); if (r?.reference === reference) writeKey(CHECKOUT_REF, { ...r, endHeight: Math.max(r.endHeight ?? 0, h) }); },
   clearCheckoutRef: reference => { if (readKey(CHECKOUT_REF)?.reference === reference) removeKey(CHECKOUT_REF); },
   offered: id => readKey(offeredKey(id)) === true,
   setOffered: id => writeKey(offeredKey(id), true),

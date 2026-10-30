@@ -152,6 +152,23 @@ function applyMute() {
   button.setAttribute('aria-label', muted ? COPY.muteOff : COPY.muteOn);
 }
 
+// The hub's track when the map shows (BP-3c-5): after a reload or a Retry nothing else cues it.
+// A hub track already playing is left alone. A muted element plays silently (applyMute). If the
+// browser blocks it, the next tap while the hub shows starts it.
+let hubTapArmed = false;
+function hubMusic() {
+  const src = new URL(MUSIC_SRC, document.baseURI).href;
+  if (music.src === src && !music.paused) return;
+  if (music.src !== src) music.src = src;
+  music.loop = true;
+  music.play().catch(armHubTap);
+}
+function armHubTap() {
+  if (hubTapArmed) return;
+  hubTapArmed = true;
+  document.addEventListener('click', () => { hubTapArmed = false; if (!$('screen-hub').hidden) hubMusic(); }, { capture: true, once: true });
+}
+
 // The tap never waits: the music starts when it has buffered, and sign-in shows at once.
 function onStart() {
   if (!music.src) music.src = MUSIC_SRC;
@@ -362,6 +379,7 @@ async function enterHub() {
   if (!camp) return enterCampaign(0);
   if (map && mapCampaign === camp.campaign_id) {
     show('screen-hub');
+    hubMusic();
     map.resize();
     return;
   }
@@ -396,6 +414,7 @@ async function loadSector(camp, conflicts) {
 // The hub must be visible first: the canvas needs its layout size for the first draw.
 function showMap(camp, sector, t0) {
   show('screen-hub');
+  hubMusic();
   if (map) map.destroy();
   map = new HexMap($('hub-map'), sector);
   mapCampaign = camp.campaign_id;
@@ -466,6 +485,11 @@ function renderDebug() {
     + (lastError ? ` · last error: ${lastError}` : '');
 }
 
+// The footer's build line. An offline boot leaves it '?', so Retry reads it again (BP-3c-5).
+function refreshBuild() {
+  getVersion().then(v => { debugBuild = String((v && v.build_sha) || '').slice(0, 7); renderDebug(); }, () => {});
+}
+
 // ── wiring ──────────────────────────────────────────────────────────────────
 function fillCopy() {
   $('btn-start').textContent = COPY.start;
@@ -486,7 +510,7 @@ function wire() {
   $('btn-start').addEventListener('click', onStart);
   $('btn-signin').addEventListener('click', () => onSignIn());
   $('btn-genesis-continue').addEventListener('click', onGenesisContinue);
-  $('btn-error-retry').addEventListener('click', () => { const r = errorRetry; errorRetry = null; if (r) r(); });
+  $('btn-error-retry').addEventListener('click', () => { const r = errorRetry; errorRetry = null; if (DEBUG && !debugBuild) refreshBuild(); if (r) r(); });
   $('btn-continue').addEventListener('click', enterHub);
   $('btn-back').addEventListener('click', () => {
     const camp = store.campaign();
@@ -502,7 +526,7 @@ function wire() {
   applyMute(); // at load: a reload keeps the tab's mute
   if (DEBUG) {
     $('debug').hidden = false;
-    getVersion().then(v => { debugBuild = String((v && v.build_sha) || '').slice(0, 7); renderDebug(); }, () => {});
+    refreshBuild();
     if ('caches' in window) caches.keys().then(keys => { debugCache = keys.filter(k => k.startsWith('mm-play-')).join(', '); renderDebug(); }, () => {});
   }
 }
