@@ -21,6 +21,7 @@ import { renderReveal } from './reveal.js';
 import { HexMap, PALETTE, TERRAIN_ORDER, OVERLAY } from './hexmap.js';
 import { createBattle } from './battle.js';
 import { mountWaysIn } from './demo_ways_in.js'; // demo-only (ODQ-69)
+import { mountOps } from './demo_ops.js'; // demo-only (BP-9a)
 
 // Booth copy, verbatim from the BP-3a-1, BP-3a-1b, BP-3a-2 and BP-3b-2 prompts (the battle's own
 // copy lives in battle.js).
@@ -576,6 +577,7 @@ battle = createBattle({
   getRoster: () => lastRoster,
   setDebugExtra: text => { debugExtra = text; renderDebug(); },
 });
+mountOps({ $, show, handleError, staleCampaign, enterHub, openMission: (id, back) => battle.openMission(id, back) }); // demo-only (BP-9a)
 checkout = createCheckout({
   $, show, handleError, note, rateText,
   offlineText: COPY.offline,
