@@ -49,7 +49,7 @@ self.addEventListener('fetch', event => {
   if (url.pathname.startsWith('/assets/music/')) return;
   if (url.origin === self.location.origin) {
     if (url.pathname === '/play.html' || url.pathname.startsWith('/play/')) {
-      event.respondWith(networkFirst(request, url));
+      event.respondWith(shell(event, url));
     } else if (url.pathname.startsWith('/assets/art/') || SHELL.includes(url.pathname)) {
       event.respondWith(cacheFirst(request, CACHE));
     }
@@ -58,9 +58,36 @@ self.addEventListener('fetch', event => {
   if (CDN_HOSTS.includes(url.hostname)) event.respondWith(cacheFirst(request, CDN_CACHE));
 });
 
+// The shell is all or nothing per page, so one page never runs two builds' modules together
+// (Reviewer BP-3c-4 F1, h8). A page that came from the cache takes the rest of its shell from the
+// cache at once; a page that came from the network waits for the network for the rest, with no
+// deadline. A client the worker hasn't seen (loaded before it took control) gets the deadline.
+const cachedClients = new Set();
+const liveClients = new Set();
+
+function remember(set, id) {
+  if (!id) return;
+  if (set.size > 100) set.clear(); // bounded: an id is only needed while its page loads
+  set.add(id);
+}
+
+function shell(event, url) {
+  const request = event.request;
+  if (request.mode === 'navigate') {
+    return networkFirst(request, url, NETWORK_DEADLINE_MS).then(result => {
+      remember(result.cached ? cachedClients : liveClients, event.resultingClientId);
+      return result.response;
+    });
+  }
+  if (cachedClients.has(event.clientId)) return cacheFirst(request, CACHE);
+  const deadline = liveClients.has(event.clientId) ? null : NETWORK_DEADLINE_MS;
+  return networkFirst(request, url, deadline).then(result => result.response);
+}
+
 // The network leg revalidates (no-cache), so a deploy is never hidden by the browser's HTTP cache.
-// It is never aborted: a late answer still refreshes the cache.
-async function networkFirst(request, url) {
+// It is never aborted: a late answer still refreshes the cache. A failure, the deadline or a
+// non-ok answer (a 502 mid-restart) is answered from the cache when there is a copy.
+async function networkFirst(request, url, deadlineMs) {
   const fresh = fetch(new Request(request, { cache: 'no-cache' })).then(response => {
     if (response.ok) {
       const copy = response.clone();
@@ -69,14 +96,22 @@ async function networkFirst(request, url) {
     return response;
   });
   fresh.catch(() => {});
-  const late = new Promise(resolve => setTimeout(resolve, NETWORK_DEADLINE_MS, 'late'));
+  const fromCache = async () => {
+    const hit = await caches.match(request, MATCH);
+    return hit ? { response: hit, cached: true } : null;
+  };
+  const late = deadlineMs === null
+    ? new Promise(() => {})
+    : new Promise(resolve => setTimeout(resolve, deadlineMs, 'late'));
   try {
     const first = await Promise.race([fresh, late]);
-    if (first !== 'late') return first;
-    const hit = await caches.match(request, MATCH);
-    return hit || fresh; // no copy yet: keep waiting, a slow first visit is not failed
+    if (first !== 'late' && first.ok) return { response: first, cached: false };
+    const hit = await fromCache();
+    if (hit) return hit;
+    // no copy yet: keep waiting, a slow first visit is not failed
+    return { response: first === 'late' ? await fresh : first, cached: false };
   } catch (err) {
-    const hit = await caches.match(request, MATCH);
+    const hit = await fromCache();
     if (hit) return hit;
     throw err;
   }
@@ -87,7 +122,7 @@ async function cacheFirst(request, name) {
   const hit = await caches.match(request);
   if (hit) return hit;
   const response = await fetch(request);
-  if (response.ok || response.type === 'opaque') {
+  if (response.ok) {
     const copy = response.clone();
     caches.open(name).then(cache => cache.put(request, copy)).catch(() => {});
   }
