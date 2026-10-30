@@ -1,4 +1,4 @@
-//! The ops board (BP-8a-1, **demo-only**), its travel legs (BP-8a-2), the dig (BP-8b-1a) and its raid (BP-8b-1b): the dig sites and
+//! The ops board (BP-8a-1, **demo-only**), its travel legs (BP-8a-2), the dig (BP-8b-1a), its raid (BP-8b-1b) and the haul (BP-8b-2): the dig sites and
 //! merc contracts a demo player can send their team to, and the in-memory store that holds
 //! each campaign's op (Breakpoint plan §4d). The `dev` port deletes this file, `routes/ops.rs`,
 //! the `lib.rs` line, the `AppState` field and the two `routes/mod.rs` lines, each marked
@@ -27,6 +27,8 @@
 //!   × n %, on the drill's first roll). The raid is fought as an ordinary `GUARD_DUTY` mission by the
 //!   dig's Commander, and the store reads the outcome from that Commander's deployment records
 //!   (`raid_result`), never from the phone.
+//! - **The haul (BP-8b-2):** a pull takes the ore on site home, where the arrival banks it for the
+//!   campaign. The haul may be ambushed halfway (`ambush_pct`), fought and read like a raid.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -81,6 +83,17 @@ pub const DEMO_ROLLS_PER_DRILL: u32 = 2;
 pub const DEMO_RAID_PCT_PER_DRILL: u32 = 5;
 /// The mission a raid is fought as (§4d: `GUARD_DUTY`'s numbers under raid copy).
 pub const DEMO_RAID_MISSION: &str = "GUARD_DUTY";
+/// The haul's ambush chance (§4d): `DEMO_AMBUSH_BASE_PCT` plus `DEMO_AMBUSH_PCT_PER_50` per whole
+/// 50 ore carried, at most `DEMO_AMBUSH_CAP_PCT`.
+pub const DEMO_AMBUSH_BASE_PCT: u32 = 10;
+pub const DEMO_AMBUSH_PCT_PER_50: u32 = 5;
+pub const DEMO_AMBUSH_CAP_PCT: u32 = 50;
+/// The ambush rolls from `Rng::new(op_seed + this)` (wrapping). Draw k of `Rng::new(s)` runs on
+/// state `s + k × 0x6D2B_79F5`, so a drill's stream would reach this one only at its 2³¹st draw; a
+/// dig reads at most 16.
+pub const DEMO_AMBUSH_SEED_OFFSET: u32 = 0x8000_0000;
+/// The mission an ambush is fought as (§4d: `GUARD_DUTY`'s numbers under ambush copy).
+pub const DEMO_AMBUSH_MISSION: &str = "GUARD_DUTY";
 
 /// One pin on the board. A dig carries `tier`; a contract carries `mission_id` and `name`.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -253,8 +266,10 @@ pub enum OpEnd {
     /// `ops/return` from a dig: the ore on site is left behind.
     WalkedAway,
     /// The raiders won (Defeat or TacticalRetreat, BP-8b-1b): half the ore on site rides home
-    /// (`carried`), the rest is lost.
+    /// (`carried`), the rest is lost. A lost ambush on the haul home reads the same (BP-8b-2).
     Retreat,
+    /// `ops/pull` (BP-8b-2): the ore on site rides home (`carried`) to be banked.
+    Pulled,
 }
 
 /// What `ops/start` reads for a dig: the Crew that digs, the Commander who fights its raids
@@ -266,11 +281,20 @@ pub struct DigStart {
     pub threshold: u32,
 }
 
-/// A raid waiting for its fight: when the raiders came and the mission it is fought as.
+/// Which battle a trigger waits for: raiders at the site (BP-8b-1b) or an ambush on the haul
+/// home (BP-8b-2). Only one is ever pending.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BattleKind {
+    Raid,
+    Ambush,
+}
+
+/// A battle waiting for its fight: when it began, the mission it is fought as, and its kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RaidTrigger {
     pub trigger_at: DateTime<Utc>,
     pub mission_id: &'static str,
+    pub kind: BattleKind,
 }
 
 /// What a route needs to latch a raid: the Commander whose deployments to read, and the trigger.
@@ -298,10 +322,15 @@ struct DigState {
     heat: u32,
     ore_on_site: u32,
     ended_by: Option<OpEnd>,
-    /// Set by a drill that brought raiders; cleared by `latch_raid`.
+    /// Set by a drill that brought raiders, or by the haul's ambush when it fires (BP-8b-2);
+    /// cleared by `latch_raid`.
     raid: Option<RaidTrigger>,
-    /// The ore a retreat brings home (BP-8b-2 banks it; until then it is dropped at arrival).
+    /// The ore riding home: a pull's whole load, or half the pile after a lost fight. The
+    /// homeward arrival banks it.
     carried: u32,
+    /// When the haul's ambush fires (the leg's midpoint), set by a pull that rolled one; never
+    /// sent. Cleared when its fight is latched (BP-8b-2).
+    ambush_at: Option<DateTime<Utc>>,
 }
 
 /// A pending raid as the client sees it: the mission to open, never the trigger or the Commander.
@@ -325,7 +354,10 @@ pub struct DigView {
     pub next_raid_pct: Option<u32>,
     /// The raid waiting for its fight, or `null`.
     pub raid: Option<RaidView>,
-    /// The ore riding home after a retreat; 0 otherwise.
+    /// The ambush waiting for its fight on the way home, or `null`; `null` until it fires, so
+    /// an ambushed haul and a clear one read the same until then (BP-8b-2).
+    pub ambush: Option<RaidView>,
+    /// The ore riding home (a pull's load, or half after a lost fight); 0 otherwise.
     pub carried: u32,
 }
 
@@ -355,6 +387,17 @@ fn drill_roll(op_seed: u32, n: u32) -> (u32, u32) {
     let raid_d100 = rng.roll_d100();
     let heads = rng.roll_int(DEMO_MELTDOWN_HEADS_MIN, DEMO_MELTDOWN_HEADS_MAX);
     (raid_d100, heads)
+}
+
+/// The haul's ambush chance in percent for a load of `load` ore (§4d).
+fn ambush_pct(load: u32) -> u32 {
+    (DEMO_AMBUSH_BASE_PCT + DEMO_AMBUSH_PCT_PER_50 * (load / 50)).min(DEMO_AMBUSH_CAP_PCT)
+}
+
+/// The haul's ambush d100: the first draw of `Rng::new(op_seed + DEMO_AMBUSH_SEED_OFFSET)`, a
+/// function of the op's seed alone, on a stream no drill reads (so no drill's roll moves).
+fn ambush_d100(op_seed: u32) -> u32 {
+    Rng::new(op_seed.wrapping_add(DEMO_AMBUSH_SEED_OFFSET)).roll_d100()
 }
 
 /// The raid's fight among the Commander's deployments: the earliest one that is not `aborted`,
@@ -393,14 +436,14 @@ struct ActiveOp {
     /// The site's one-way time; both legs take it, so the trip is symmetric (§4d: "each way").
     travel_secs: u32,
     /// Drawn by `generate_seed()` at `ops/start`, never derived from the campaign id and never
-    /// sent or logged. `drill_op` rolls from it (`drill_roll`).
+    /// sent or logged. `drill_op` rolls from it (`drill_roll`), and `pull_op` (`ambush_d100`).
     op_seed: u32,
     /// The dig; `None` on a contract.
     dig: Option<DigState>,
 }
 
 /// The op as the client sees it. Times are RFC 3339 with milliseconds; `arrived` is
-/// `now >= arrive_at` at the read.
+/// `now >= arrive_at` at the read, and `false` while a haul's ambush is still to be fought.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ActiveOpView {
     pub leg: OpLeg,
@@ -424,7 +467,7 @@ pub fn ops_time(t: DateTime<Utc>) -> String {
 pub enum StartRefusal {
     /// An op is still out (an arrived homeward leg is cleared first, so this one is not home).
     Busy,
-    /// The campaign has no entry and every entry at the cap holds an op.
+    /// The campaign has no entry and every entry at the cap holds an op or banked ore.
     Full,
 }
 
@@ -463,8 +506,25 @@ pub enum ReturnRefusal {
     RaidPending,
 }
 
-/// One campaign's ops state: the cached board, the op in flight and when the team last moved.
-/// BP-8b-2 adds the banked ore.
+/// Why `pull_op` refused (BP-8b-2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PullRefusal {
+    /// No op, or its homeward leg has arrived and been cleared.
+    NoOp,
+    /// The op is a contract.
+    Contract,
+    /// The team is already on its way home.
+    AlreadyHomeward,
+    /// The outbound leg has not arrived yet.
+    NotArrived,
+    /// No ore on site: a return brings the team home.
+    NothingToHaul,
+    /// Raiders are at the site: the raid must be fought first.
+    RaidPending,
+}
+
+/// One campaign's ops state: the cached board, the op in flight, when the team last moved and
+/// the banked ore.
 struct OpsEntry {
     /// The gateway the board was computed for; another gateway is a miss.
     gateway: (i32, i32),
@@ -474,17 +534,32 @@ struct OpsEntry {
     /// The latest departure, drill or homeward arrival. Outlives the op, so a player who has just
     /// come home still counts as moving for the reaper.
     moved_at: Option<DateTime<Utc>>,
+    /// The ore this campaign has banked (BP-8b-2): added at each homeward arrival, never
+    /// cleared. It leaves only with the entry, so a New run (a new campaign) starts at 0.
+    ore_banked: u32,
 }
 
 impl OpsEntry {
-    /// Clears a homeward leg that has arrived, recording the arrival (not the read) as the
-    /// last movement. Every read and write of the op calls it first, under the lock.
+    /// First fires a haul's ambush once its time has come (BP-8b-2): the trigger is set at
+    /// `now`, the reveal, so no fight started before the player could know of it is latched, and
+    /// the team waits on the road. Then clears a homeward leg that has arrived with no battle
+    /// waiting and none to come, banking what it carried and recording the arrival (not the
+    /// read) as the last movement. Every read and write of the op calls it first, under the lock.
     fn settle_arrival(&mut self, now: DateTime<Utc>) {
-        if let Some(op) = &self.op {
-            if op.leg == OpLeg::Homeward && now >= op.arrive_at {
-                self.moved_at = Some(op.arrive_at);
-                self.op = None;
+        let Some(op) = self.op.as_mut() else {
+            return;
+        };
+        if let Some(d) = op.dig.as_mut() {
+            if d.raid.is_none() && d.ambush_at.is_some_and(|t| now >= t) {
+                d.raid = Some(RaidTrigger { trigger_at: now, mission_id: DEMO_AMBUSH_MISSION, kind: BattleKind::Ambush });
             }
+        }
+        let waiting = op.dig.as_ref().is_some_and(|d| d.raid.is_some() || d.ambush_at.is_some());
+        if op.leg == OpLeg::Homeward && now >= op.arrive_at && !waiting {
+            let (arrived_at, carried) = (op.arrive_at, op.dig.as_ref().map_or(0, |d| d.carried));
+            self.ore_banked = self.ore_banked.saturating_add(carried);
+            self.moved_at = Some(arrived_at);
+            self.op = None;
         }
     }
 
@@ -495,7 +570,7 @@ impl OpsEntry {
             kind: op.kind,
             depart_at: ops_time(op.depart_at),
             arrive_at: ops_time(op.arrive_at),
-            arrived: now >= op.arrive_at,
+            arrived: now >= op.arrive_at && op.dig.as_ref().is_none_or(|d| d.ambush_at.is_none()),
             dig: op.dig.as_ref().map(|d| DigView {
                 drills: d.drills,
                 heat: d.heat,
@@ -508,7 +583,8 @@ impl OpsEntry {
                 } else {
                     None
                 },
-                raid: d.raid.map(|r| RaidView { mission_id: r.mission_id }),
+                raid: d.raid.filter(|r| r.kind == BattleKind::Raid).map(|r| RaidView { mission_id: r.mission_id }),
+                ambush: d.raid.filter(|r| r.kind == BattleKind::Ambush).map(|r| RaidView { mission_id: r.mission_id }),
                 carried: d.carried,
             }),
         })
@@ -519,22 +595,33 @@ impl OpsEntry {
 ///
 /// **Writes later bricks must keep:**
 /// - the board write (`put_board`) updates `gateway`, `board` and `touched` in place and never
-///   touches the op, `moved_at` or (from BP-8b-2) the banked ore;
-/// - only `start_op`, `return_op`, `drill_op`, `latch_raid` and the arrival clear
-///   (`settle_arrival`, run first by every op read and write) write the op; BP-8b-2's pull and
-///   bank come after them. Each takes the lock, calls `settle_arrival` first and returns owned
-///   data; none is held across an `.await`;
+///   touches the op, `moved_at` or the banked ore;
+/// - only `start_op`, `return_op`, `drill_op`, `pull_op`, `latch_raid` and `settle_arrival` (the
+///   ambush's reveal and the arrival, run first by every op read and write) write the op, and
+///   only the arrival writes the banked ore. Each takes the lock, calls `settle_arrival` first
+///   and returns owned data; none is held across an `.await`;
 /// - **the raid (BP-8b-1b):** `drill_op` writes the trigger under the lock from the drill's
 ///   first roll, after the drill's heat and ore and only if the drill did not melt down. While
 ///   a trigger is set, every ops route latches it in three steps: `pending_raid` (under the
 ///   lock) returns the Commander and the trigger; the route reads that Commander's deployments
 ///   with no lock held; `latch_raid` (under the lock again) applies the outcome only if the
 ///   stored trigger is still the one it read, so a stale read never applies an old fight to a
-///   newer raid. `drill` and `return` refuse while a trigger is set (`RaidPending`);
-/// - **the keep list** (the reaper's `moved_since`): a departure, a homeward arrival, a drill
-///   and a latch each write `moved_at`. Reading the board or the op does not; a read that
-///   latches a raid does;
-/// - the eviction skips any entry holding an op (and, from BP-8b-2, any holding banked ore);
+///   newer raid. `drill`, `return` and `pull` refuse while a raid is set (`RaidPending`);
+/// - **the haul (BP-8b-2):** `pull_op` loads the ore on site into `carried`, rolls the ambush
+///   once (`ambush_d100`, a stream no drill reads) and stores only its fire time (`ambush_at`,
+///   the leg's midpoint), never sent. `settle_arrival` fires it first, at the first read at or
+///   after `ambush_at`: the trigger (`BattleKind::Ambush`, `trigger_at` = that read's `now`) is
+///   latched in the raid's three steps, and the leg waits on the road until then. Then it banks:
+///   a homeward leg that has arrived with no trigger and no ambush to come adds `carried` to
+///   `ore_banked`, before the op clears. `latch_raid` applies an ambush's fight like a raid's
+///   (compare-and-set, `moved_at`): Held resumes the rest of the leg with the whole load,
+///   Defeat or TacticalRetreat with half (floor), Wipeout clears the op and banks nothing;
+/// - **the keep list** (the reaper's `moved_since`): a departure (start, return, pull), a
+///   homeward arrival, a drill and a latch each write `moved_at`. Reading the board or the op
+///   does not, nor does the ambush's reveal; a read that latches a battle does. While an
+///   ambush waits, `moved_since` still counts the leg's passed `arrive_at`, at most
+///   `travel_secs` (≤ 48 s) after the pull: an accepted overcount;
+/// - the eviction skips any entry holding an op or banked ore;
 /// - an entry is dropped only by `remove` (a read of a campaign that is no longer `Active`,
 ///   the reaper's retire) and the reaper's prune (`retain_campaigns`).
 ///
@@ -562,13 +649,17 @@ impl DemoOpsStore {
     }
 
     /// Makes room for a new entry: below the cap, nothing; at it, evicts the least recently
-    /// touched entry that holds no op and journals (first, then at most hourly). `false` when
-    /// every entry holds an op.
+    /// touched entry that holds no op and no banked ore, and journals (first, then at most
+    /// hourly). `false` when every entry holds an op or banked ore.
     fn make_room(&self, inner: &mut HashMap<Uuid, OpsEntry>) -> bool {
         if inner.len() < self.cap {
             return true;
         }
-        let victim = inner.iter().filter(|(_, e)| e.op.is_none()).min_by_key(|(_, e)| e.touched).map(|(id, _)| *id);
+        let victim = inner
+            .iter()
+            .filter(|(_, e)| e.op.is_none() && e.ore_banked == 0)
+            .min_by_key(|(_, e)| e.touched)
+            .map(|(id, _)| *id);
         let Some(id) = victim else {
             return false;
         };
@@ -589,7 +680,7 @@ impl DemoOpsStore {
 
     /// Caches `board`. An existing entry gets the new `gateway`, `board` and `touched` in
     /// place, keeping its op. A new entry at the cap first evicts (`make_room`). `false`: not
-    /// cached, because every entry holds an op (the caller serves the board uncached).
+    /// cached, because every entry holds an op or banked ore (the caller serves the board uncached).
     pub fn put_board(&self, campaign_id: Uuid, gateway: (i32, i32), board: Arc<OpsBoard>, now: DateTime<Utc>) -> bool {
         let mut inner = self.lock();
         if let Some(e) = inner.get_mut(&campaign_id) {
@@ -601,7 +692,7 @@ impl DemoOpsStore {
         if !self.make_room(&mut inner) {
             return false;
         }
-        inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, op: None, moved_at: None });
+        inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, op: None, moved_at: None, ore_banked: 0 });
         true
     }
 
@@ -624,7 +715,7 @@ impl DemoOpsStore {
             if !self.make_room(&mut inner) {
                 return Err(StartRefusal::Full);
             }
-            inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, op: None, moved_at: None });
+            inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, op: None, moved_at: None, ore_banked: 0 });
         }
         let Some(e) = inner.get_mut(&campaign_id) else {
             return Err(StartRefusal::Full);
@@ -652,6 +743,7 @@ impl DemoOpsStore {
                 ended_by: None,
                 raid: None,
                 carried: 0,
+                ambush_at: None,
             }),
         });
         e.moved_at = Some(now);
@@ -729,7 +821,7 @@ impl DemoOpsStore {
         e.touched = now;
         let melts = dig.heat >= dig.threshold;
         if !melts && raid_d100 <= DEMO_RAID_PCT_PER_DRILL * dig.drills {
-            dig.raid = Some(RaidTrigger { trigger_at: now, mission_id: DEMO_RAID_MISSION });
+            dig.raid = Some(RaidTrigger { trigger_at: now, mission_id: DEMO_RAID_MISSION, kind: BattleKind::Raid });
         }
         if melts {
             dig.ore_on_site = 0;
@@ -743,8 +835,53 @@ impl DemoOpsStore {
         Ok(DrillOutcome::Drilled)
     }
 
-    /// The raid waiting for its fight, after clearing an arrived homeward leg: the dig's
-    /// Commander and the trigger. `None` when no raid is pending.
+    /// Hauls the ore home from an arrived dig (BP-8b-2): the ore on site rides home as `carried`
+    /// (`OpEnd::Pulled`) and the homeward leg starts at `now` with the site's time. The ambush is
+    /// rolled once, here: on `ambush_d100 ≤ ambush_pct(load)` only its fire time is stored, the
+    /// leg's midpoint in milliseconds (an odd `travel_secs` is common), and nothing sends it.
+    /// Writes `moved_at` (the keep list). Refusals in order: `NoOp` → `Contract` →
+    /// `AlreadyHomeward` → `NotArrived` → `NothingToHaul` → `RaidPending`.
+    pub fn pull_op(&self, campaign_id: Uuid, now: DateTime<Utc>) -> Result<(), PullRefusal> {
+        let mut inner = self.lock();
+        let Some(e) = inner.get_mut(&campaign_id) else {
+            return Err(PullRefusal::NoOp);
+        };
+        e.settle_arrival(now);
+        let Some(op) = e.op.as_mut() else {
+            return Err(PullRefusal::NoOp);
+        };
+        let Some(dig) = op.dig.as_mut() else {
+            return Err(PullRefusal::Contract);
+        };
+        if op.leg == OpLeg::Homeward {
+            return Err(PullRefusal::AlreadyHomeward);
+        }
+        if now < op.arrive_at {
+            return Err(PullRefusal::NotArrived);
+        }
+        if dig.ore_on_site == 0 {
+            return Err(PullRefusal::NothingToHaul);
+        }
+        if dig.raid.is_some() {
+            return Err(PullRefusal::RaidPending);
+        }
+        let load = dig.ore_on_site;
+        dig.carried = load;
+        dig.ore_on_site = 0;
+        dig.ended_by = Some(OpEnd::Pulled);
+        op.leg = OpLeg::Homeward;
+        op.depart_at = now;
+        op.arrive_at = now + Duration::seconds(i64::from(op.travel_secs));
+        if ambush_d100(op.op_seed) <= ambush_pct(load) {
+            dig.ambush_at = Some(now + Duration::milliseconds(i64::from(op.travel_secs) * 500));
+        }
+        e.moved_at = Some(now);
+        e.touched = now;
+        Ok(())
+    }
+
+    /// The battle waiting for its fight (a raid, or a haul's ambush once fired), after settling
+    /// the op: the dig's Commander and the trigger. `None` when none is pending.
     pub fn pending_raid(&self, campaign_id: Uuid, now: DateTime<Utc>) -> Option<PendingRaid> {
         let mut inner = self.lock();
         let e = inner.get_mut(&campaign_id)?;
@@ -753,11 +890,14 @@ impl DemoOpsStore {
         dig.raid.map(|trigger| PendingRaid { commander_id: dig.commander_id, trigger })
     }
 
-    /// Applies a fought raid, only if `trigger` is still the dig's pending one (`false`, and no
-    /// write, otherwise). `Held`: the trigger clears and drilling resumes. `Retreat`: half the
-    /// ore on site (floor) is `carried`, the rest is lost, and the homeward leg starts at `now`
-    /// (`OpEnd::Retreat`). `Wiped`: the op is cleared and its ore lost (the mission route has
-    /// already marked the Commander KIA). Each writes `moved_at` (the keep list).
+    /// Applies a fought battle, only if `trigger` is still the dig's pending one (`false`, and no
+    /// write, otherwise). A raid: `Held`, the trigger clears and drilling resumes; `Retreat`, half
+    /// the ore on site (floor) is `carried`, the rest is lost, and the homeward leg starts at
+    /// `now` (`OpEnd::Retreat`). An ambush (BP-8b-2): `Held` resumes the leg, shifted by the
+    /// wait so the team sets off from the midpoint, with the whole load; `Retreat` the same with
+    /// half of it (floor, `OpEnd::Retreat`). `Wiped`, either kind: the op is cleared and its ore
+    /// lost (the mission route has already marked the Commander KIA). Each writes `moved_at`
+    /// (the keep list).
     pub fn latch_raid(&self, campaign_id: Uuid, trigger: &RaidTrigger, result: RaidResult, now: DateTime<Utc>) -> bool {
         let mut inner = self.lock();
         let Some(e) = inner.get_mut(&campaign_id) else {
@@ -774,9 +914,9 @@ impl DemoOpsStore {
             return false;
         }
         dig.raid = None;
-        match result {
-            RaidResult::Held => {}
-            RaidResult::Retreat => {
+        match (trigger.kind, result) {
+            (BattleKind::Raid, RaidResult::Held) => {}
+            (BattleKind::Raid, RaidResult::Retreat) => {
                 dig.carried = dig.ore_on_site / 2;
                 dig.ore_on_site = 0;
                 dig.ended_by = Some(OpEnd::Retreat);
@@ -784,7 +924,16 @@ impl DemoOpsStore {
                 op.depart_at = now;
                 op.arrive_at = now + Duration::seconds(i64::from(op.travel_secs));
             }
-            RaidResult::Wiped => e.op = None,
+            (BattleKind::Ambush, RaidResult::Held | RaidResult::Retreat) => {
+                if result == RaidResult::Retreat {
+                    dig.carried /= 2;
+                    dig.ended_by = Some(OpEnd::Retreat);
+                }
+                let wait = now - dig.ambush_at.take().unwrap_or(now);
+                op.depart_at += wait;
+                op.arrive_at += wait;
+            }
+            (_, RaidResult::Wiped) => e.op = None,
         }
         e.moved_at = Some(now);
         e.touched = now;
@@ -799,8 +948,20 @@ impl DemoOpsStore {
         e.view(now)
     }
 
-    /// The reaper's keep check: the team departed, drilled, latched a raid or came home at or after `cutoff` (a leg
-    /// that has arrived by `now` counts at its arrival). Reading the board is not moving.
+    /// The op as the client sees it and the campaign's banked ore, from one lock (BP-8b-2). A
+    /// campaign with no entry has banked nothing.
+    pub fn ops_snapshot(&self, campaign_id: Uuid, now: DateTime<Utc>) -> (Option<ActiveOpView>, u32) {
+        let mut inner = self.lock();
+        let Some(e) = inner.get_mut(&campaign_id) else {
+            return (None, 0);
+        };
+        e.settle_arrival(now);
+        (e.view(now), e.ore_banked)
+    }
+
+    /// The reaper's keep check: the team departed, drilled, latched a battle or came home at or after `cutoff` (a leg
+    /// that has arrived by `now` counts at its arrival, also while a haul's ambush waits: an
+    /// accepted overcount of at most `travel_secs`). Reading the board is not moving.
     pub fn moved_since(&self, campaign_id: Uuid, cutoff: DateTime<Utc>, now: DateTime<Utc>) -> bool {
         let inner = self.lock();
         let Some(e) = inner.get(&campaign_id) else {
@@ -831,8 +992,9 @@ impl DemoOpsStore {
         self.len() == 0
     }
 
-    /// Moves the campaign's op (and its last movement) `secs` into the past, so a route test
-    /// crosses an arrival without sleeping.
+    /// Moves the campaign's op (its leg and a haul's hidden ambush time) and its last movement
+    /// `secs` into the past, so a route test crosses an arrival without sleeping. A trigger's
+    /// time stays: a fight's `started_at` is the real clock.
     #[cfg(test)]
     pub(crate) fn rewind_op(&self, campaign_id: Uuid, secs: i64) {
         let mut inner = self.lock();
@@ -841,6 +1003,9 @@ impl DemoOpsStore {
             if let Some(op) = e.op.as_mut() {
                 op.depart_at -= back;
                 op.arrive_at -= back;
+                if let Some(d) = op.dig.as_mut() {
+                    d.ambush_at = d.ambush_at.map(|t| t - back);
+                }
             }
             e.moved_at = e.moved_at.map(|t| t - back);
         }
@@ -1292,7 +1457,7 @@ mod tests {
         store.drill_op(a, at(11)).expect("drill");
         let v = serde_json::to_value(store.op_view(a, at(12)).expect("op")).unwrap();
         let keys: std::collections::BTreeSet<&str> = v["dig"].as_object().expect("dig").keys().map(|k| k.as_str()).collect();
-        let want = ["carried", "drills", "ended_by", "heat", "next_ore", "next_raid_pct", "ore_on_site", "raid", "threshold"];
+        let want = ["ambush", "carried", "drills", "ended_by", "heat", "next_ore", "next_raid_pct", "ore_on_site", "raid", "threshold"];
         assert_eq!(keys, want.into_iter().collect());
         assert_eq!(v["dig"]["raid"], serde_json::json!({"mission_id": "GUARD_DUTY"}));
         let text = v.to_string();
@@ -1305,7 +1470,7 @@ mod tests {
     }
 
     fn trigger(at_secs: i64) -> RaidTrigger {
-        RaidTrigger { trigger_at: at(at_secs), mission_id: DEMO_RAID_MISSION }
+        RaidTrigger { trigger_at: at(at_secs), mission_id: DEMO_RAID_MISSION, kind: BattleKind::Raid }
     }
 
     /// §4d: drill n raids on its d100 ≤ 5 × n. Seed 7's drill 1 (d100 2) raids at heat 15 and ore
@@ -1470,6 +1635,223 @@ mod tests {
         assert_eq!(at115, vec![Some(5), Some(10), Some(15), Some(20), Some(25), Some(30), Some(35)]);
         store.drill_op(b, at(21)).expect("drill 7");
         assert_eq!(dig_view(&store, b, at(22)).next_raid_pct, None, "heat 105: the 8th drill melts down at 115");
+    }
+
+    /// The ambush's d100 against an independent Mulberry32 (Linux's Python oracle, BP-8b-2 spec
+    /// check), and §4d's chance: 10 % + 5 % per whole 50 ore carried, capped at 50 %.
+    #[test]
+    fn ops_ambush_roll_matches_the_oracle() {
+        let got: Vec<u32> = [7, 5, 14, 57, 2].into_iter().map(ambush_d100).collect();
+        assert_eq!(got, vec![61, 59, 4, 13, 53]);
+        let pct: Vec<u32> = [0, 49, 50, 99, 100, 399, 400, 1000].into_iter().map(ambush_pct).collect();
+        assert_eq!(pct, vec![10, 10, 15, 15, 20, 45, 50, 50]);
+    }
+
+    fn ambush_trigger(at_secs: i64) -> RaidTrigger {
+        RaidTrigger { trigger_at: at(at_secs), mission_id: DEMO_AMBUSH_MISSION, kind: BattleKind::Ambush }
+    }
+
+    /// A tier-1 dig on seed `seed`, `drills` drills at 11 s, 12 s, …, then a pull at 20 s: the
+    /// homeward leg runs 20 s → 30 s and an ambush would fire at 25 s. No seed used here raids
+    /// on its first three drills.
+    fn pulled(store: &DemoOpsStore, a: Uuid, seed: u32, drills: i64) {
+        on_site(store, a, 1, 100, seed);
+        for i in 1..=drills {
+            assert_eq!(store.drill_op(a, at(10 + i)), Ok(DrillOutcome::Drilled), "drill {i}");
+        }
+        assert_eq!(store.pull_op(a, at(20)), Ok(()));
+    }
+
+    /// Seed 2 (ambush d100 53 > 15 %): the pull loads all 60 ore and heads home, with no ambush
+    /// at any time.
+    #[test]
+    fn ops_store_pull_loads_the_ore_and_heads_home() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        pulled(&store, a, 2, 3);
+        let op = store.op_view(a, at(26)).expect("op");
+        assert_eq!((op.leg, op.depart_at, op.arrive_at, op.arrived), (OpLeg::Homeward, ops_time(at(20)), ops_time(at(30)), false));
+        let d = op.dig.expect("a dig");
+        assert_eq!((d.carried, d.ore_on_site, d.next_ore, d.next_raid_pct, d.ended_by), (60, 0, 0, None, Some(OpEnd::Pulled)));
+        assert_eq!((d.raid, d.ambush), (None, None));
+        assert_eq!(store.pending_raid(a, at(29)), None);
+    }
+
+    /// The pull's refusals in order; none moves anything.
+    #[test]
+    fn ops_store_pull_refusals() {
+        let store = DemoOpsStore::new(4);
+        let (a, b, c) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
+        assert_eq!(store.pull_op(a, at(0)), Err(PullRefusal::NoOp));
+        store.start_op(a, (5, 0), board(), &site(), 7, None, at(0)).expect("start");
+        assert_eq!(store.pull_op(a, at(20)), Err(PullRefusal::Contract));
+        on_site(&store, b, 1, 100, 7);
+        assert_eq!(store.pull_op(b, at(9)), Err(PullRefusal::NotArrived));
+        assert_eq!(store.pull_op(b, at(10)), Err(PullRefusal::NothingToHaul));
+        store.drill_op(b, at(11)).expect("drill 1: seed 7 raids");
+        assert_eq!(store.pull_op(b, at(12)), Err(PullRefusal::RaidPending));
+        let d = dig_view(&store, b, at(12));
+        assert_eq!((d.ore_on_site, d.carried, d.ended_by, d.raid.is_some()), (10, 0, None, true));
+        on_site(&store, c, 1, 100, 2);
+        store.drill_op(c, at(11)).expect("drill");
+        assert_eq!(store.pull_op(c, at(12)), Ok(()));
+        assert_eq!(store.pull_op(c, at(13)), Err(PullRefusal::AlreadyHomeward), "before NotArrived: the leg is still out");
+    }
+
+    /// The arrival banks the load once, and a second haul adds to it.
+    #[test]
+    fn ops_store_arrival_banks_the_load() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        pulled(&store, a, 2, 3);
+        assert_eq!(store.ops_snapshot(a, at(29)).1, 0, "still on the road");
+        assert_eq!(store.ops_snapshot(a, at(30)), (None, 60));
+        assert_eq!(store.ops_snapshot(a, at(31)), (None, 60), "banked once");
+        assert!(store.moved_since(a, at(30), at(31)), "the arrival is the last movement");
+        let crew = DigStart { crew_id: CREW, commander_id: COMMANDER, threshold: 100 };
+        store.start_op(a, (5, 0), board(), &dig(1), 2, Some(crew), at(40)).expect("start");
+        store.drill_op(a, at(51)).expect("drill");
+        store.pull_op(a, at(52)).expect("pull");
+        assert_eq!(store.ops_snapshot(a, at(62)), (None, 70));
+    }
+
+    /// Reviewer BP-8b-1b F4: a retreat's `carried` (seed 7: 10 ore, half is 5) is banked on arrival.
+    #[test]
+    fn ops_store_retreat_banks_what_it_carried() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        on_site(&store, a, 1, 100, 7);
+        store.drill_op(a, at(11)).expect("drill");
+        assert!(store.latch_raid(a, &trigger(11), RaidResult::Retreat, at(20)));
+        assert_eq!(store.ops_snapshot(a, at(29)).1, 0);
+        assert_eq!(store.ops_snapshot(a, at(30)), (None, 5));
+    }
+
+    /// A walk-away, a meltdown and a contract carry nothing home, so they bank nothing.
+    #[test]
+    fn ops_store_walk_away_meltdown_and_contract_bank_nothing() {
+        let store = DemoOpsStore::new(4);
+        let (a, b, c) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
+        on_site(&store, a, 1, 100, 2);
+        store.drill_op(a, at(11)).expect("drill");
+        store.drill_op(a, at(12)).expect("drill");
+        store.return_op(a, at(13)).expect("return");
+        assert_eq!(store.ops_snapshot(a, at(23)), (None, 0));
+        on_site(&store, b, 1, 100, 2);
+        for i in 1..=6 {
+            store.drill_op(b, at(10 + i)).expect("drill");
+        }
+        assert_eq!(store.drill_op(b, at(20)), Ok(DrillOutcome::Meltdown { crew_id: CREW, heads: 3 }));
+        assert_eq!(store.ops_snapshot(b, at(30)), (None, 0));
+        store.start_op(c, (5, 0), board(), &site(), 7, None, at(0)).expect("start");
+        store.return_op(c, at(10)).expect("return");
+        assert_eq!(store.ops_snapshot(c, at(20)), (None, 0));
+    }
+
+    /// Seed 14 (d100 4 ≤ 10 %) is ambushed and seed 2 (53) is not, on the same 30-ore haul. The two
+    /// read the same until the midpoint (25 s); the first read from then on fires seed 14's ambush
+    /// at that read's time, and its leg waits on the road while seed 2's comes home and banks.
+    #[test]
+    fn ops_store_ambush_is_hidden_until_its_midpoint() {
+        let store = DemoOpsStore::new(4);
+        let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        pulled(&store, a, 14, 2);
+        pulled(&store, b, 2, 2);
+        assert_eq!(store.op_view(a, at(24)), store.op_view(b, at(24)));
+        assert_eq!(store.pending_raid(a, at(24)), None);
+        assert_eq!(store.pending_raid(a, at(26)), Some(PendingRaid { commander_id: COMMANDER, trigger: ambush_trigger(26) }));
+        assert_eq!(store.pending_raid(b, at(26)), None);
+        let op = store.op_view(a, at(40)).expect("the ambushed team is still on the road");
+        assert_eq!((op.leg, op.arrived), (OpLeg::Homeward, false));
+        let d = op.dig.expect("a dig");
+        assert_eq!((d.ambush, d.raid, d.carried), (Some(RaidView { mission_id: "GUARD_DUTY" }), None, 30));
+        assert_eq!(store.ops_snapshot(a, at(40)).1, 0);
+        assert_eq!(store.ops_snapshot(b, at(40)), (None, 30));
+    }
+
+    /// Each result of seed 14's ambush (fired at 25 s, fought by 28 s): Held resumes the leg
+    /// shifted by the 3 s wait with all 30 ore, Retreat with 15, Wiped clears the op; the
+    /// arrivals at 33 s bank 30 and 15.
+    #[test]
+    fn ops_store_ambush_latch_applies_each_result() {
+        let store = DemoOpsStore::new(4);
+        let (a, b, c) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
+        for id in [a, b, c] {
+            pulled(&store, id, 14, 2);
+            assert_eq!(store.pending_raid(id, at(25)).map(|p| p.trigger), Some(ambush_trigger(25)));
+        }
+        assert!(store.latch_raid(a, &ambush_trigger(25), RaidResult::Held, at(28)));
+        let op = store.op_view(a, at(32)).expect("op");
+        assert_eq!((op.depart_at, op.arrive_at, op.arrived), (ops_time(at(23)), ops_time(at(33)), false));
+        let d = op.dig.expect("a dig");
+        assert_eq!((d.carried, d.ended_by, d.ambush), (30, Some(OpEnd::Pulled), None));
+        assert!(store.latch_raid(b, &ambush_trigger(25), RaidResult::Retreat, at(28)));
+        let d = dig_view(&store, b, at(32));
+        assert_eq!((d.carried, d.ended_by, d.ambush), (15, Some(OpEnd::Retreat), None));
+        assert!(store.latch_raid(c, &ambush_trigger(25), RaidResult::Wiped, at(28)));
+        assert_eq!(store.ops_snapshot(c, at(28)), (None, 0));
+        assert_eq!(store.ops_snapshot(a, at(33)), (None, 30));
+        assert_eq!(store.ops_snapshot(b, at(33)), (None, 15));
+        assert_eq!(store.ops_snapshot(c, at(40)), (None, 0));
+    }
+
+    /// Two reads that both saw the ambush latch it once: the second finds no trigger, so a
+    /// Retreat halves the load once (30 → 15, never 7).
+    #[test]
+    fn ops_store_ambush_latches_once() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        pulled(&store, a, 14, 2);
+        store.pending_raid(a, at(25)).expect("the ambush fires");
+        assert!(store.latch_raid(a, &ambush_trigger(25), RaidResult::Retreat, at(28)));
+        assert!(!store.latch_raid(a, &ambush_trigger(25), RaidResult::Retreat, at(29)), "already latched");
+        assert_eq!(dig_view(&store, a, at(30)).carried, 15);
+    }
+
+    /// A pull and an ambush latch each count as movement, read before the leg's arrival so the
+    /// arrival term can't stand in for them (BP-8b-1b N7). The reveal does not count.
+    #[test]
+    fn ops_store_pull_and_ambush_latch_count_as_moving() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        on_site(&store, a, 1, 100, 14);
+        store.drill_op(a, at(11)).expect("drill");
+        store.drill_op(a, at(12)).expect("drill");
+        assert!(!store.moved_since(a, at(400), at(450)), "drilled at 12 s, nothing since");
+        store.pull_op(a, at(500)).expect("pull");
+        assert!(store.moved_since(a, at(500), at(501)), "the pull");
+        store.pending_raid(a, at(505)).expect("the ambush fires at 505 s");
+        assert!(!store.moved_since(a, at(502), at(506)), "the reveal is not movement");
+        assert!(store.latch_raid(a, &ambush_trigger(505), RaidResult::Held, at(507)));
+        assert!(store.moved_since(a, at(507), at(508)), "the latch");
+    }
+
+    /// Reviewer BP-8a-2 CF4: cap 2, `a` holds banked ore and is the least recently touched, `b`
+    /// holds a board only. A new campaign evicts `b`, never `a`.
+    #[test]
+    fn ops_store_eviction_skips_banked_ore() {
+        let store = DemoOpsStore::new(2);
+        let (a, b, c) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
+        on_site(&store, a, 1, 100, 2);
+        store.drill_op(a, at(11)).expect("drill");
+        store.pull_op(a, at(12)).expect("pull");
+        assert_eq!(store.ops_snapshot(a, at(22)), (None, 10));
+        assert!(store.put_board(b, (5, 0), board(), at(30)));
+        assert!(store.put_board(c, (5, 0), board(), at(40)));
+        assert_eq!(store.len(), 2);
+        assert!(store.board(b, (5, 0), at(41)).is_none(), "the board-only entry is evicted");
+        assert_eq!(store.ops_snapshot(a, at(41)).1, 10, "the banked ore is kept");
+    }
+
+    /// §4d's step per 50 ore on seed 57 (d100 13): 30 ore (10 %) is not ambushed, 60 ore (15 %) is.
+    #[test]
+    fn ops_store_ambush_chance_steps_per_50_ore() {
+        let store = DemoOpsStore::new(4);
+        let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        pulled(&store, a, 57, 2);
+        pulled(&store, b, 57, 3);
+        assert_eq!(store.pending_raid(a, at(25)), None);
+        assert_eq!(store.pending_raid(b, at(25)).map(|p| p.trigger), Some(ambush_trigger(25)));
     }
 
     /// `b` is not listed but was touched after the listing (a launch that raced the prune).

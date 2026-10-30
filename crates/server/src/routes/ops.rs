@@ -1,4 +1,5 @@
-//! The ops routes (BP-8a-1 board, BP-8a-2 travel legs, BP-8b-1a the drill, BP-8b-1b the raid;
+//! The ops routes (BP-8a-1 board, BP-8a-2 travel legs, BP-8b-1a the drill, BP-8b-1b the raid,
+//! BP-8b-2 the haul;
 //! **demo-only**;
 //! Breakpoint plan §4d).
 //! The `dev` port deletes this file with `demo_ops.rs`.
@@ -27,7 +28,7 @@ use uuid::Uuid;
 use crate::auth::AuthSession;
 use crate::demo_ops::{
     dig_threshold, ops_board, ops_time, raid_result, ActiveOpView, DigStart, DrillOutcome, DrillRefusal, OpsBoard, OpsSite,
-    ReturnRefusal, StartRefusal,
+    PullRefusal, ReturnRefusal, StartRefusal,
 };
 use crate::repository::{CampaignInstance, CampaignLifecycle, SectorState};
 use crate::state::AppState;
@@ -48,10 +49,12 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/campaign/:campaign_id/ops/start", post(post_ops_start).layer(DefaultBodyLimit::max(OPS_BODY_LIMIT)))
         .route("/api/campaign/:campaign_id/ops/return", post(post_ops_return))
         .route("/api/campaign/:campaign_id/ops/drill", post(post_ops_drill))
+        .route("/api/campaign/:campaign_id/ops/pull", post(post_ops_pull))
 }
 
 /// The ops state as the client sees it, from every route. `now` is the server's clock, so the
-/// client's crawl survives a phone whose clock is off. `ore_banked` is always 0 until BP-8b-2.
+/// client's crawl survives a phone whose clock is off. `ore_banked` is the campaign's banked ore
+/// (BP-8b-2), 0 for a member with no gateway.
 #[derive(Serialize)]
 pub struct OpsView<'a> {
     pub campaign_id: Uuid,
@@ -176,22 +179,23 @@ async fn load_board(
 }
 
 fn ops_response(state: &AppState, campaign_id: Uuid, gw: (i32, i32), board: &OpsBoard, now: DateTime<Utc>) -> Response {
+    let (active_op, ore_banked) = state.demo_ops.store.ops_snapshot(campaign_id, now);
     let view = OpsView {
         campaign_id,
         gateway: Some(GatewayHex { q: gw.0, r: gw.1 }),
         sites: &board.sites,
-        active_op: state.demo_ops.store.op_view(campaign_id, now),
-        ore_banked: 0,
+        active_op,
+        ore_banked,
         now: ops_time(now),
     };
     Json(view).into_response()
 }
 
-/// Latches a pending raid (BP-8b-1b), run by every ops route right after `load_board`. No raid
-/// pending: nothing is read. Otherwise the store names the dig's Commander and the trigger; the
+/// Latches a pending battle (a raid, BP-8b-1b, or a haul's ambush, BP-8b-2), run by every ops
+/// route right after `load_board`. Nothing pending: nothing is read. Otherwise the store names the dig's Commander and the trigger; the
 /// Commander's deployments are read with no store lock held (`list_deployments_by_commander`,
 /// one sequential scan, `500` on failure); and the store applies the fight's result only if the
-/// trigger is unchanged. A fight not yet started or still `active` leaves the raid pending.
+/// trigger is unchanged. A fight not yet started or still `active` leaves the battle pending.
 async fn latch_pending_raid(state: &AppState, campaign_id: Uuid, now: DateTime<Utc>, route: &str) -> Result<(), AppError> {
     let Some(pending) = state.demo_ops.store.pending_raid(campaign_id, now) else {
         return Ok(());
@@ -400,6 +404,46 @@ async fn post_ops_drill(
         Err(DrillRefusal::AlreadyHomeward) => return Err(conflict("already heading home")),
         Err(DrillRefusal::NotArrived) => return Err(conflict("still travelling")),
         Err(DrillRefusal::RaidPending) => return Err(conflict("raiders at the site")),
+    }
+    Ok(ops_response(&state, campaign_id, gw, &board, now))
+}
+
+/// Hauls the ore home, `POST /api/campaign/:campaign_id/ops/pull` (BP-8b-2, demo-only). No body
+/// is read. Order: `401` → `429` `ops_ip` → `429` `ops_wallet` → `404` → `403` → `409` not
+/// `Active` (entry dropped) → `409` no op under way (also: no gateway) → the board → a pending
+/// raid latched → `409` no op under way → `409` not a dig site → `409` already heading home →
+/// `409` still travelling → `409` nothing to haul → `409` raiders at the site → `200`, the whole
+/// state.
+/// - The ore on site rides home (`carried`, `ended_by: pulled`) on a leg as long as the way
+///   out; the arrival banks it into `ore_banked` on the first ops call after it.
+/// - The ambush is rolled here and stored, never sent: the body of an ambushed haul reads like
+///   a clear one until the ambush fires at the leg's midpoint (`dig.ambush`).
+/// - Memory only, no DB write, so no launch lock (Reviewer BP-8a-2 CF5 covers durable writes).
+async fn post_ops_pull(
+    AuthSession(token): AuthSession,
+    State(state): State<Arc<AppState>>,
+    ci: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    Path(campaign_id): Path<Uuid>,
+) -> Result<Response, AppError> {
+    if let Some(r) = ops_limits(&state, &token, ci, &headers)? {
+        return Ok(r);
+    }
+    let now = Utc::now();
+    let (campaign, gateway, _) = ops_member(&state, &token, campaign_id, "post_ops_pull").await?;
+    let Some(gw) = gateway else {
+        return Err(conflict("no op under way"));
+    };
+    let board = load_board(&state, &campaign, gw, now, false, "post_ops_pull").await?;
+    latch_pending_raid(&state, campaign_id, now, "post_ops_pull").await?;
+    match state.demo_ops.store.pull_op(campaign_id, now) {
+        Ok(()) => {}
+        Err(PullRefusal::NoOp) => return Err(conflict("no op under way")),
+        Err(PullRefusal::Contract) => return Err(conflict("not a dig site")),
+        Err(PullRefusal::AlreadyHomeward) => return Err(conflict("already heading home")),
+        Err(PullRefusal::NotArrived) => return Err(conflict("still travelling")),
+        Err(PullRefusal::NothingToHaul) => return Err(conflict("nothing to haul: return instead")),
+        Err(PullRefusal::RaidPending) => return Err(conflict("raiders at the site")),
     }
     Ok(ops_response(&state, campaign_id, gw, &board, now))
 }
@@ -1169,6 +1213,167 @@ mod tests {
         state.commander_repo.create_commander(usable).await.expect("create_commander");
         let (status, body, _) = start(&state, c.campaign_id, DIG).await;
         assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    async fn pull(state: &Arc<AppState>, campaign: Uuid) -> (StatusCode, serde_json::Value, Vec<u8>) {
+        post(state, campaign, "pull", None).await
+    }
+
+    /// `DIG`'s one-way time, from a board read.
+    async fn dig_secs(state: &Arc<AppState>, campaign: Uuid) -> i64 {
+        let (status, body) = get(state, Some("t"), campaign).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        site_secs(&body, DIG)
+    }
+
+    /// The pull's refusals in its order, on a contract and on a dig, then a pull that goes
+    /// through (seed 2, one drill: 10 ore).
+    #[tokio::test]
+    async fn ops_pull_refusals() {
+        let state = Arc::new(session_state());
+        let contract = campaign_with(&state, WALLET, true, Some(GATEWAY)).await;
+        seed_sector(&state, &contract).await;
+        let (status, body, _) = pull(&state, contract.campaign_id).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("no op under way")));
+        assert_eq!(start(&state, contract.campaign_id, SITE).await.0, StatusCode::OK);
+        let (status, body, _) = pull(&state, contract.campaign_id).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("not a dig site")));
+        let (c, _) = dig_campaign(&state, false).await;
+        let (status, started, _) = start(&state, c, DIG).await;
+        assert_eq!(status, StatusCode::OK, "{started}");
+        let (status, body, _) = pull(&state, c).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("still travelling")));
+        state.demo_ops.store.rewind_op(c, site_secs(&started, DIG));
+        state.demo_ops.store.set_op_seed(c, 2);
+        let (status, body, _) = pull(&state, c).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("nothing to haul: return instead")));
+        assert_eq!(drill(&state, c).await.0, StatusCode::OK);
+        let (status, body, _) = pull(&state, c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let op = &body["active_op"];
+        assert_eq!((op["leg"].as_str(), op["dig"]["ended_by"].as_str()), (Some("homeward"), Some("pulled")));
+        assert_eq!((op["dig"]["carried"].as_u64(), op["dig"]["ore_on_site"].as_u64()), (Some(10), Some(0)));
+        assert_eq!(op["depart_at"], body["now"]);
+        assert_eq!(secs_between(op), site_secs(&body, DIG), "the haul takes the site's time");
+        let (status, body, _) = pull(&state, c).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("already heading home")));
+    }
+
+    /// Reviewer BP-8b-1b F4 through the routes: seed 7's raid is lost, the team retreats with 5
+    /// ore, and the first read after the arrival banks it.
+    #[tokio::test]
+    async fn ops_retreat_banks_carried_on_the_arrival_read() {
+        let state = Arc::new(session_state());
+        let (c, _) = dig_campaign(&state, false).await;
+        dig_on_site(&state, c, 7).await;
+        assert_eq!(drill(&state, c).await.0, StatusCode::OK);
+        fight(&state, c, sim_engine::game_types::OutcomeType::Defeat).await;
+        let (status, body) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!((body["active_op"]["dig"]["carried"].as_u64(), body["ore_banked"].as_u64()), (Some(5), Some(0)));
+        state.demo_ops.store.rewind_op(c, site_secs(&body, DIG));
+        let (status, body) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["active_op"].is_null(), "home: {body}");
+        assert_eq!(body["ore_banked"], 5);
+    }
+
+    /// Seed 2 (never ambushed): three drills, a pull of 60 ore, banked by the first read after the
+    /// arrival; the bank survives the next dig's start.
+    #[tokio::test]
+    async fn ops_pull_banks_on_the_arrival_read() {
+        let state = Arc::new(session_state());
+        let (c, _) = dig_campaign(&state, false).await;
+        dig_on_site(&state, c, 2).await;
+        for _ in 0..3 {
+            assert_eq!(drill(&state, c).await.0, StatusCode::OK);
+        }
+        let (status, body, _) = pull(&state, c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!((body["active_op"]["dig"]["carried"].as_u64(), body["ore_banked"].as_u64()), (Some(60), Some(0)));
+        assert!(body["active_op"]["dig"]["ambush"].is_null());
+        let (_, body) = get(&state, Some("t"), c).await;
+        assert_eq!((body["active_op"]["arrived"].as_bool(), body["ore_banked"].as_u64()), (Some(false), Some(0)), "on the road");
+        state.demo_ops.store.rewind_op(c, dig_secs(&state, c).await);
+        let (status, body) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["active_op"].is_null(), "home: {body}");
+        assert_eq!(body["ore_banked"], 60);
+        let (status, body, _) = start(&state, c, DIG).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["ore_banked"], 60, "the bank outlives the op");
+    }
+
+    /// Raiders can't be outrun with the ore: seed 7's raid refuses the pull, and nothing moves.
+    #[tokio::test]
+    async fn ops_pull_while_raiders_wait_is_409() {
+        let state = Arc::new(session_state());
+        let (c, _) = dig_campaign(&state, false).await;
+        dig_on_site(&state, c, 7).await;
+        assert_eq!(drill(&state, c).await.0, StatusCode::OK);
+        let (status, body, _) = pull(&state, c).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("raiders at the site")));
+        let (_, body) = get(&state, Some("t"), c).await;
+        assert_eq!(body["active_op"]["leg"], "outbound");
+        assert_eq!((body["active_op"]["dig"]["ore_on_site"].as_u64(), body["active_op"]["dig"]["carried"].as_u64()), (Some(10), Some(0)));
+    }
+
+    /// Seed 14 (ambush d100 4): the pull's body shows no ambush; the read after the midpoint fires
+    /// it and the team waits on the road; a won fight is latched by the next read and the leg
+    /// resumes; the read after its arrival banks all 30 ore.
+    #[tokio::test]
+    async fn ops_ambush_is_fought_then_the_haul_banks() {
+        let state = Arc::new(session_state());
+        let (c, _) = dig_campaign(&state, false).await;
+        dig_on_site(&state, c, 14).await;
+        assert_eq!(drill(&state, c).await.0, StatusCode::OK);
+        assert_eq!(drill(&state, c).await.0, StatusCode::OK);
+        let (status, body, bytes) = pull(&state, c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["active_op"]["dig"]["ambush"].is_null(), "never sent before it fires");
+        assert!(!String::from_utf8_lossy(&bytes).contains("ambush_at"));
+        let secs = site_secs(&body, DIG);
+        state.demo_ops.store.rewind_op(c, secs);
+        let (status, body) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let op = &body["active_op"];
+        assert_eq!(op["dig"]["ambush"], serde_json::json!({"mission_id": "GUARD_DUTY"}));
+        assert!(op["dig"]["raid"].is_null());
+        assert_eq!((op["leg"].as_str(), op["arrived"].as_bool(), body["ore_banked"].as_u64()), (Some("homeward"), Some(false), Some(0)));
+        fight(&state, c, sim_engine::game_types::OutcomeType::Success).await;
+        let (status, body) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let op = &body["active_op"];
+        assert!(op["dig"]["ambush"].is_null(), "{body}");
+        assert_eq!((op["arrived"].as_bool(), op["dig"]["carried"].as_u64()), (Some(false), Some(30)));
+        state.demo_ops.store.rewind_op(c, secs);
+        let (status, body) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["active_op"].is_null(), "home: {body}");
+        assert_eq!(body["ore_banked"], 30);
+    }
+
+    /// Seed 14's ambush ends in a Wipeout: the op is cleared, nothing is banked, and the next dig
+    /// needs a Commander.
+    #[tokio::test]
+    async fn ops_ambush_wipeout_banks_nothing() {
+        let state = Arc::new(session_state());
+        let (c, _) = dig_campaign(&state, false).await;
+        dig_on_site(&state, c, 14).await;
+        assert_eq!(drill(&state, c).await.0, StatusCode::OK);
+        assert_eq!(drill(&state, c).await.0, StatusCode::OK);
+        let (status, body, _) = pull(&state, c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        state.demo_ops.store.rewind_op(c, site_secs(&body, DIG));
+        let (_, body) = get(&state, Some("t"), c).await;
+        assert_eq!(body["active_op"]["dig"]["ambush"]["mission_id"], "GUARD_DUTY");
+        fight(&state, c, sim_engine::game_types::OutcomeType::Wipeout).await;
+        let (status, body) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["active_op"].is_null(), "{body}");
+        assert_eq!(body["ore_banked"], 0);
+        let (status, body, _) = start(&state, c, DIG).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("no Commander left to lead: start a new run")));
     }
 
     /// One `ops_wallet` budget for every ops route: a board read and a start spend it, so the
