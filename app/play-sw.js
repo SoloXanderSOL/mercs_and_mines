@@ -3,7 +3,7 @@
 // (a worker under /play/ could never control /play.html). It intercepts only allow-listed GETs:
 // /api/*, music (Audio sends Range requests), the test-network RPC and every non-GET pass through.
 // CACHE is bumped by hand by every client brick that changes app/play*; activate deletes the old one.
-let CACHE = 'mm-play-BP-3c-5';
+let CACHE = 'mm-play-BP-9a';
 const CDN_CACHE = 'mm-cdn-1'; // pinned, immutable CDN and font URLs: kept across deploys
 const SHELL = [
   '/play.html',

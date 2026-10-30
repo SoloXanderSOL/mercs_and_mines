@@ -14,6 +14,7 @@ const MAP_W = 3 * RADIUS + 2;           // flat-top map width in circumradius un
 const MAP_H = SQRT3 * (2 * RADIUS + 1); // flat-top map height in circumradius units (122.98)
 const MAX_S = 20;                       // a hex 40 CSS px across
 const INIT_S = 6;                       // a hex 12 CSS px across
+const TAP_SLOP = 8;                     // CSS px a tap may drift and still count as a tap
 
 // Wiki's palette (BP-3a-2), keyed by the `HexTerrain` variant strings (client contract).
 export const PALETTE = {
@@ -43,6 +44,10 @@ function hexPath(path, cx, cy, s) {
   path.closePath();
 }
 
+// One callback per new map (a new campaign gets a new HexMap on the same canvas). Unset, nothing runs.
+let mapCreated = null;
+export function onMapCreated(fn) { mapCreated = fn; }
+
 export class HexMap {
   // Builds the layer and draws the initial view at once (the caller times this).
   // `sector` is the sector route's body: {terrain, magma_veins, gateway (or null)}.
@@ -56,10 +61,14 @@ export class HexMap {
     this.pointers = new Map();
     this.frameQueued = false;
     this.listeners = new AbortController();
+    this.overlay = null; // (ctx, map) => void: drawn last in every frame, in CSS px
+    this.onTap = null;   // (clientX, clientY) => void: a tap that neither panned nor pinched
+    this.tap = null;
     this.buildLayer(sector.terrain || {});
     this.measure();
     this.home();
     this.bindGestures();
+    if (mapCreated) mapCreated(this);
   }
 
   // Terrain into the offscreen layer, once: 11 fills, not 3,781.
@@ -131,6 +140,26 @@ export class HexMap {
     requestAnimationFrame(() => { this.frameQueued = false; this.render(); });
   }
 
+  // Axial (q, r) → CSS px in the canvas box. Linear, so a fractional (q, r) works.
+  hexToScreen(q, r) {
+    const u = axialToUnit(q, r), v = this.view;
+    return [(u.x - v.cx) * v.s + this.w / 2, (u.y - v.cy) * v.s + this.h / 2];
+  }
+
+  // Client px → the hex under it ({q, r}), or null off the sector or before the box has a size.
+  hexAt(clientX, clientY) {
+    if (!this.w) return null;
+    const rect = this.canvas.getBoundingClientRect(), v = this.view;
+    const ux = v.cx + (clientX - rect.left - this.w / 2) / v.s;
+    const uy = v.cy + (clientY - rect.top - this.h / 2) / v.s;
+    const fq = ux / 1.5, fr = uy / SQRT3 - fq / 2, fs = -fq - fr;
+    let q = Math.round(fq), r = Math.round(fr);
+    const s = Math.round(fs);
+    const dq = Math.abs(q - fq), dr = Math.abs(r - fr), ds = Math.abs(s - fs);
+    if (dq > dr && dq > ds) q = -r - s; else if (dr > ds) r = -q - s;
+    return Math.max(Math.abs(q), Math.abs(r), Math.abs(q + r)) <= RADIUS ? { q, r } : null;
+  }
+
   render() {
     if (!this.w) return;
     const { ctx, view: v, dpr } = this;
@@ -141,10 +170,7 @@ export class HexMap {
     ctx.drawImage(this.layer,
       (-MAP_W / 2 - v.cx) * v.s + this.w / 2, (-MAP_H / 2 - v.cy) * v.s + this.h / 2,
       this.layer.width * k, this.layer.height * k);
-    const toScreen = (q, r) => {
-      const u = axialToUnit(q, r);
-      return [(u.x - v.cx) * v.s + this.w / 2, (u.y - v.cy) * v.s + this.h / 2];
-    };
+    const toScreen = (q, r) => this.hexToScreen(q, r);
     // Veins: a dot sized by tier; a tectonic anchor gets a ring.
     for (const vein of this.veins) {
       const [x, y] = toScreen(vein.q, vein.r);
@@ -171,19 +197,28 @@ export class HexMap {
       ctx.lineWidth = 2;
       ctx.stroke(p);
     }
+    if (this.overlay) this.overlay(ctx, this);
   }
 
   bindGestures() {
     const c = this.canvas;
     const opts = { signal: this.listeners.signal };
-    const end = e => { this.pointers.delete(e.pointerId); this.gestureStart(); };
+    const end = e => {
+      const tap = e.type === 'pointerup' && this.tap && this.tap.id === e.pointerId ? this.tap : null;
+      this.tap = null;
+      this.pointers.delete(e.pointerId);
+      this.gestureStart();
+      if (tap && this.onTap) this.onTap(e.clientX, e.clientY);
+    };
     c.addEventListener('pointerdown', e => {
       c.setPointerCapture(e.pointerId);
       this.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      this.tap = this.pointers.size === 1 ? { id: e.pointerId, x: e.clientX, y: e.clientY } : null;
       this.gestureStart();
     }, opts);
     c.addEventListener('pointermove', e => {
       if (!this.pointers.has(e.pointerId)) return;
+      if (this.tap && Math.hypot(e.clientX - this.tap.x, e.clientY - this.tap.y) > TAP_SLOP) this.tap = null;
       this.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
       this.gestureMove();
     }, opts);

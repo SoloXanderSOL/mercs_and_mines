@@ -107,6 +107,7 @@ export function createBattle(deps) {
   let resultFor = null;      // the Commander that response belongs to
   let run = 0;               // the presentation in progress; Skip and a new run bump it
   let oneRookie = null;      // the debug checkbox, created only under DEBUG
+  let onBriefingBack = null; // set by openMission; a briefing from the mission list goes back to the list
 
   function music(src, loop = true) {
     deps.music.pause();
@@ -145,7 +146,7 @@ export function createBattle(deps) {
 
   function wire() {
     $('btn-missions-back').addEventListener('click', deps.enterHub);
-    $('btn-briefing-back').addEventListener('click', showMissionList);
+    $('btn-briefing-back').addEventListener('click', () => (onBriefingBack || showMissionList)());
     $('btn-deploy').addEventListener('click', deploy);
     $('btn-skip').addEventListener('click', () => { if (result) showAar(); });
     $('btn-aar-continue').addEventListener('click', afterAar);
@@ -166,6 +167,23 @@ export function createBattle(deps) {
     showMissionList();
   }
 
+  // One contract's briefing, opened from elsewhere (a map pin); its Back runs `back`.
+  async function openMission(id, back) {
+    if (!missions || !units) {
+      $('working-text').textContent = '';
+      deps.show('screen-working');
+      try {
+        [missions, units] = await Promise.all([getMissions(), getUnits()]);
+      } catch (e) {
+        return deps.handleError(e, () => openMission(id, back)); // two static GETs: a retry is safe
+      }
+    }
+    const m = missions[id];
+    if (!m) return showMissionList(); // a contract the server no longer offers
+    onBriefingBack = back || null;
+    showBriefing(m);
+  }
+
   function pips(difficulty) {
     const d = Math.max(0, Math.min(10, Number(difficulty) || 0));
     return '●'.repeat(d) + '○'.repeat(10 - d);
@@ -178,6 +196,7 @@ export function createBattle(deps) {
   }
 
   function showMissionList() {
+    onBriefingBack = null;
     const list = $('missions-list');
     list.replaceChildren();
     for (const id of ORDER) {
@@ -506,5 +525,5 @@ export function createBattle(deps) {
 
   fillCopy();
   wire();
-  return { openMissions, showEndOfRun };
+  return { openMissions, openMission, showEndOfRun };
 }
