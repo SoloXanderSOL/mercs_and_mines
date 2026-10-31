@@ -1,4 +1,4 @@
-// demo-only (BP-9b): the dig site's panel, the Hold-or-Fold screen (Breakpoint §4d). Never ported to dev.
+// demo-only (BP-9b, BP-10b): the dig site's panel, the Hold-or-Fold screen (Breakpoint §4d). Never ported to dev.
 //
 // Pure rendering for demo_ops.js: the heat bar with its threshold tick, the status, risk and Crew
 // lines, and the copy for the dig's beats. It holds no state beyond the last ore figure it drew
@@ -58,7 +58,8 @@ export const DIG_CSS = `
 .ops-title.danger { color: var(--danger); }
 .ops-banked { position: absolute; top: 11.5cqw; right: 3cqw; padding: 1cqw 2.5cqw; font-family: var(--mono); font-size: 3.6cqw; color: var(--accent); background: rgba(11, 11, 12, 0.94); border: 0.3cqw solid var(--panel-edge); border-radius: 1.5cqw; }
 .screen-hub:has(.ops-strip:not([hidden])) .legend { display: none; }
-.screen-hub:has(.legend:not([hidden])) .ops-banked { display: none; }
+/* Off site, an open legend covers the chip and the Base button; on site the legend is hidden (Reviewer BP-9b F4). */
+.screen-hub:has(.ops-strip[hidden]):has(.legend:not([hidden])) :is(.ops-banked, .ops-base) { display: none; }
 .end-ops { margin: 0; max-width: 84cqw; font-size: 4.2cqw; line-height: 1.4; color: var(--accent); }
 @media (prefers-reduced-motion: reduce) {
   .dig-heat-fill { transition: none; }

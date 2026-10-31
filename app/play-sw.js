@@ -18,7 +18,7 @@ const SHELL = [
   '/assets/MM_title.png',
   '/assets/favicon-512.png',
 ];
-SHELL.push('/play/demo_ways_in.js', '/play/demo_card.js', '/play/demo_ops.js', '/play/demo_dig.js'); CACHE += '+demo-BP-9b'; // demo-only (ODQ-69)
+SHELL.push('/play/demo_ways_in.js', '/play/demo_card.js', '/play/demo_ops.js', '/play/demo_dig.js', '/play/demo_base.js'); CACHE += '+demo-BP-10b'; // demo-only (ODQ-69)
 const CDN_HOSTS = ['cdn.jsdelivr.net', 'fonts.googleapis.com', 'fonts.gstatic.com'];
 const NETWORK_DEADLINE_MS = 4000; // a hung venue network answers from the cache after this
 const MATCH = { ignoreSearch: true }; // /play.html?debug=1 finds the /play.html entry

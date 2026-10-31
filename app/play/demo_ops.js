@@ -12,10 +12,15 @@
 // response shows it, and the next ops read after the fight latches the outcome. Beyond the
 // player's taps the client reads the board three times: on the hub's re-entry with an op out, at a
 // pulled haul's midpoint (where an ambush reveals) and when a laden leg lands (where the ore banks).
+//
+// BP-10b: the Base button opens demo_base.js's sheet, where banked ore buys the four buildings
+// (POST ops/build, one per tap). Nothing can be built while any op is out, so the sheet says so
+// rather than offering a build the server would refuse (Reviewer BP-10a CF2).
 
 import { request, ApiError, store, getMissions, getRoster } from './api.js';
 import { onMapCreated } from './hexmap.js';
 import { DIG_COPY, DIG_CSS, createDigPanel, renderDig, hideDig, homewardLines, flash } from './demo_dig.js';
+import { BASE_COPY, BASE_CSS, createBase, renderBase, hideBase } from './demo_base.js';
 
 // Booth copy, verbatim from the BP-9a prompt.
 const COPY = {
@@ -73,9 +78,12 @@ let landAsked = false;  // the laden leg's arrival read has been sent
 let throttleUntil = 0;  // a 429's Retry-After, in browser ms: no call and no button until then
 let throttleSecs = 0;
 let hubWasShown = false;
+let base = {};          // the server's base: which buildings stand
+let baseOpen = false;   // the base sheet is showing
+let justBuilt = null;   // the building the last adopted POST put up, for its moment on the sheet
 
 let strip = null, titleNode = null, lineNodes = [], actions = null, buttons = [];
-let dig = null, bankChip = null, endNote = null;
+let dig = null, bankChip = null, endNote = null, baseButton = null, baseSheet = null;
 const handlers = [null, null];
 
 // ── time and progress ────────────────────────────────────────────────────────
@@ -143,6 +151,17 @@ function refresh() {
   shownPhase = null;
   shownSecs = null;
   const rate = Date.now() < throttleUntil ? fill(DIG_COPY.rate, { n: throttleSecs }) : '';
+  baseButton.hidden = !gateway;
+  if (baseOpen) {
+    // The sheet covers the strip; the phase is noted so a leg's frames don't redraw it each time.
+    hideStrip();
+    if (op) shownPhase = `${op.leg}:${progress(op) >= 1}`;
+    if (op && progress(op) < 1) shownSecs = secsLeft(op);
+    renderBase(baseSheet, { base, banked, out: Boolean(op), held: held(), rate }, justBuilt);
+    justBuilt = null;
+    return;
+  }
+  hideBase(baseSheet);
   if (op && op.leg === 'outbound' && op.dig && progress(op) >= 1) return showDig(op);
   hideDig(dig);
   if (op) {
@@ -168,7 +187,7 @@ function refresh() {
     return setStrip('', [fill(COPY.onSite, { title }), rate], [[COPY.ret, sendReturn]]);
   }
   if (selected) return showSheet(selected);
-  if (bankNote) return setStrip('', [bankNote, rate], [[COPY.close, close]]);
+  if (bankNote) return setStrip('', [bankNote, rate], [[BASE_COPY.button, openBase], [COPY.close, close]]);
   if (noDigOpen) return setStrip('', [COPY.noDig, rate], [[COPY.close, close]]);
   if (rate) return setStrip('', [rate], []);
   hideStrip();
@@ -212,6 +231,20 @@ function close() {
   noDigOpen = false;
   bankNote = null;
   hideStrip();
+}
+
+// The Base button toggles the sheet; the bank note's Base opens it.
+function openBase() {
+  baseOpen = true;
+  selected = null;
+  noDigOpen = false;
+  bankNote = null;
+  refresh();
+}
+
+function closeBase() {
+  baseOpen = false;
+  refresh();
 }
 
 // The raid's or the ambush's GUARD_DUTY briefing, with the dig's lead line over the mission's
@@ -289,8 +322,10 @@ function draw(ctx, m) {
       selected = null;
       refresh();
     } else {
-      if (home && !landAsked) { landAsked = true; load(); } // a laden leg landed: that read banks the ore
-      if (!ambush && op.leg === 'homeward' && op.dig && op.dig.ended_by === 'pulled' && p >= 0.5 && !midAsked) {
+      // Each flag is set only when its read is sent: a read skipped while another call is in flight
+      // is sent from the frame after that call clears (Reviewer BP-9b F1).
+      if (home && !landAsked && !held()) { landAsked = true; load(); } // a laden leg landed: that read banks the ore
+      if (!ambush && op.leg === 'homeward' && op.dig && op.dig.ended_by === 'pulled' && p >= 0.5 && !midAsked && !held()) {
         midAsked = true; // an ambush on this haul reveals on the first read at or after the midpoint
         load();
       }
@@ -334,7 +369,7 @@ function pick(x, y) {
 }
 
 function tap(x, y) {
-  if (op) return; // the strip stays while the team is out
+  if (op || baseOpen) return; // the strip stays while the team is out; the sheet covers the map
   selected = pick(x, y);
   noDigOpen = false;
   bankNote = null;
@@ -343,7 +378,8 @@ function tap(x, y) {
 }
 
 // ── calls ────────────────────────────────────────────────────────────────────
-function adopt(body) {
+// `built`: the building id when this body answers that building's POST, else undefined.
+function adopt(body, built) {
   if (!body || body.campaign_id !== campaignId) return;
   offset = Date.parse(body.now) - Date.now();
   sites = Array.isArray(body.sites) ? body.sites : [];
@@ -352,6 +388,8 @@ function adopt(body) {
   const was = banked;
   op = body.active_op || null;
   banked = Number(body.ore_banked) || 0;
+  base = body.base || {};
+  justBuilt = built && base[built] === true ? built : null;
   if (op) selected = null;
   else if (selected) selected = siteOf(selected.site_id); // the board may have moved on (Reviewer BP-9a F4)
   const key = op ? `${op.site_id}:${op.leg}` : null;
@@ -422,6 +460,7 @@ async function load() {
     err = e;
   }
   busy = false;
+  if (map) map.requestFrame(); // a landing or midpoint read skipped meanwhile goes out from this frame
   if (id !== campaignId) return;
   if (!err) return adopt(body);
   refresh();
@@ -431,7 +470,8 @@ async function load() {
 }
 
 // One POST; a refusal other than a stale campaign re-reads the board once and shows its state.
-async function send(path, body) {
+// `built`: the building a build POST asks for, so its success gets the sheet's moment.
+async function send(path, body, built) {
   const id = campaignId;
   if (held() || !id) return;
   busy = true;
@@ -443,8 +483,9 @@ async function send(path, body) {
     err = e;
   }
   busy = false;
+  if (map) map.requestFrame();
   if (id !== campaignId) return;
-  if (!err) return adopt(res);
+  if (!err) return adopt(res, built);
   refresh();
   if (stale(err) || rated(err)) return;
   if (err instanceof ApiError && (err.kind === 'conflict' || (err.kind === 'bad' && err.message === 'unknown site'))) return load();
@@ -468,6 +509,10 @@ function sendPull() {
   send(opsPath(campaignId) + '/pull', undefined);
 }
 
+function sendBuild(id) {
+  send(opsPath(campaignId) + '/build', { building: id }, id);
+}
+
 // ── the hub's re-entry and the end screen ─────────────────────────────────────
 // Both are seen through their `hidden` attribute, which main.js's show() sets, so no keeper code
 // calls in here. Back on the hub with an op out, one read latches a fought raid or ambush (the
@@ -477,19 +522,22 @@ function watch() {
   hubWasShown = !hub.hidden;
   new MutationObserver(() => {
     const shown = !hub.hidden;
-    if (shown && !hubWasShown && op) load();
+    if (shown && !hubWasShown && op && op.dig) load(); // a contract has nothing to latch (Reviewer BP-9b F2)
     hubWasShown = shown;
   }).observe(hub, { attributes: true, attributeFilter: ['hidden'] });
   new MutationObserver(() => { if (!end.hidden) writeEndNote(); }).observe(end, { attributes: true, attributeFilter: ['hidden'] });
 }
 
-// New run starts a new campaign, and ore belongs to the campaign: the end screen says what stays behind.
+// New run starts a new campaign, and ore and buildings belong to the campaign: the end screen says
+// what stays behind.
 function writeEndNote() {
   const camp = store.campaign();
   let text = '';
   if (camp && camp.campaign_id === campaignId) {
-    if (banked > 0) text = fill(DIG_COPY.endBanked, { total: banked });
-    else if (op && op.dig && op.dig.ore_on_site + op.dig.carried > 0) text = DIG_COPY.endOut;
+    const built = Object.keys(base).some(k => base[k] === true);
+    if (banked > 0) text = fill(built ? BASE_COPY.endBase : DIG_COPY.endBanked, { total: banked });
+    else if (op && op.dig && op.dig.ore_on_site + op.dig.carried > 0) text = built ? BASE_COPY.endBaseOut : DIG_COPY.endOut;
+    else if (built) text = BASE_COPY.endBaseOnly;
   }
   endNote.textContent = text;
   endNote.hidden = !text;
@@ -514,6 +562,9 @@ function attach(m) {
   legKey = null;
   midAsked = false;
   landAsked = false;
+  base = {};
+  baseOpen = false;
+  justBuilt = null;
   refresh();
   m.overlay = draw;
   m.onTap = tap;
@@ -524,7 +575,7 @@ function attach(m) {
 export function mountOps(d) {
   deps = d;
   const style = document.createElement('style');
-  style.textContent = CSS + DIG_CSS;
+  style.textContent = CSS + DIG_CSS + BASE_CSS;
   document.head.append(style);
   strip = el('div', 'ops-strip');
   strip.hidden = true;
@@ -541,7 +592,12 @@ export function mountOps(d) {
   strip.append(titleNode, dig.node, ...lineNodes, actions);
   bankChip = el('div', 'ops-banked');
   bankChip.hidden = true;
-  deps.$('screen-hub').append(strip, bankChip);
+  baseButton = el('button', 'ops-base', BASE_COPY.button);
+  baseButton.type = 'button';
+  baseButton.hidden = true;
+  baseButton.addEventListener('click', () => (baseOpen ? closeBase() : openBase()));
+  baseSheet = createBase(sendBuild, closeBase);
+  deps.$('screen-hub').append(strip, bankChip, baseButton, baseSheet.node);
   endNote = el('p', 'end-ops');
   endNote.hidden = true;
   deps.$('btn-new-run').before(endNote);
