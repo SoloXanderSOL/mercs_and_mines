@@ -29,6 +29,9 @@
 //!   (`raid_result`), never from the phone.
 //! - **The haul (BP-8b-2):** a pull takes the ore on site home, where the arrival banks it for the
 //!   campaign. The haul may be ambushed halfway (`ambush_pct`), fought and read like a raid.
+//! - **The merc base (BP-10a):** banked ore buys four buildings (`BaseBuilding`), one copy each,
+//!   only while the team is home. What stands (`OpsBase`) changes the dig's numbers, and the drill,
+//!   the view and the pull all read them from `OpsBase`, so the panel never disagrees with the roll.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -94,6 +97,21 @@ pub const DEMO_AMBUSH_CAP_PCT: u32 = 50;
 pub const DEMO_AMBUSH_SEED_OFFSET: u32 = 0x8000_0000;
 /// The mission an ambush is fought as (§4d: `GUARD_DUTY`'s numbers under ambush copy).
 pub const DEMO_AMBUSH_MISSION: &str = "GUARD_DUTY";
+/// The merc base (BP-10a): the four buildings' effects and costs in banked ore. T1 names from
+/// `Base_Infrastructure_Tech_Tree`; the numbers are demo-only, never canon.
+/// The Radio Shack's raid chance per drill, in place of `DEMO_RAID_PCT_PER_DRILL`.
+pub const DEMO_SHACK_RAID_PCT_PER_DRILL: u32 = 3;
+/// The Hobbyist Benches' heat per drill, in place of `DEMO_HEAT_PER_DRILL`.
+pub const DEMO_BENCHES_HEAT_PER_DRILL: u32 = 10;
+/// The Gunsmith's ore per drill: `× NUM / DEN` (floor, per drill), after the tier multiplier.
+pub const DEMO_GUNSMITH_ORE_NUM: u32 = 5;
+pub const DEMO_GUNSMITH_ORE_DEN: u32 = 4;
+/// The Grease-Pit divides the haul's ambush chance by this (floor), after its cap.
+pub const DEMO_GREASE_PIT_AMBUSH_DIV: u32 = 2;
+pub const DEMO_COST_RADIO_SHACK: u32 = 50;
+pub const DEMO_COST_GUNSMITH: u32 = 80;
+pub const DEMO_COST_GREASE_PIT: u32 = 80;
+pub const DEMO_COST_HOBBYIST_BENCHES: u32 = 120;
 
 /// One pin on the board. A dig carries `tier`; a contract carries `mission_id` and `name`.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -400,6 +418,108 @@ fn ambush_d100(op_seed: u32) -> u32 {
     Rng::new(op_seed.wrapping_add(DEMO_AMBUSH_SEED_OFFSET)).roll_d100()
 }
 
+/// A merc-base building (BP-10a): the body's `building` id, its cost and its flag on `OpsBase`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BaseBuilding {
+    RadioShack,
+    HobbyistBenches,
+    GreasePit,
+    Gunsmith,
+}
+
+impl BaseBuilding {
+    /// The building a body's `building` id names; `None` for any other string.
+    pub fn from_id(id: &str) -> Option<Self> {
+        match id {
+            "radio_shack" => Some(Self::RadioShack),
+            "hobbyist_benches" => Some(Self::HobbyistBenches),
+            "grease_pit" => Some(Self::GreasePit),
+            "gunsmith" => Some(Self::Gunsmith),
+            _ => None,
+        }
+    }
+
+    /// Its cost in banked ore.
+    pub fn cost(self) -> u32 {
+        match self {
+            Self::RadioShack => DEMO_COST_RADIO_SHACK,
+            Self::HobbyistBenches => DEMO_COST_HOBBYIST_BENCHES,
+            Self::GreasePit => DEMO_COST_GREASE_PIT,
+            Self::Gunsmith => DEMO_COST_GUNSMITH,
+        }
+    }
+}
+
+/// The campaign's merc base (BP-10a): which buildings stand, serialised as the body's `base`.
+/// **The one reader of the dig's base numbers:** the drill, the view and the pull call these
+/// methods and never the plain constants, so what the panel shows is what the roll uses.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct OpsBase {
+    pub radio_shack: bool,
+    pub hobbyist_benches: bool,
+    pub grease_pit: bool,
+    pub gunsmith: bool,
+}
+
+impl OpsBase {
+    /// Heat each drill adds: the Hobbyist Benches' 10, else §4d's 15.
+    fn heat_per_drill(&self) -> u32 {
+        if self.hobbyist_benches {
+            DEMO_BENCHES_HEAT_PER_DRILL
+        } else {
+            DEMO_HEAT_PER_DRILL
+        }
+    }
+
+    /// Drill `n`'s raid chance in percent: 3 × n with the Radio Shack, else §4d's 5 × n.
+    fn raid_pct(&self, n: u32) -> u32 {
+        let per = if self.radio_shack {
+            DEMO_SHACK_RAID_PCT_PER_DRILL
+        } else {
+            DEMO_RAID_PCT_PER_DRILL
+        };
+        per * n
+    }
+
+    /// The ore drill `n` yields on a vein of `tier`: × 5 / 4 (floor) with the Gunsmith.
+    fn ore(&self, n: u32, tier: u8) -> u32 {
+        let plain = ore_for(n, tier);
+        if self.gunsmith {
+            plain * DEMO_GUNSMITH_ORE_NUM / DEMO_GUNSMITH_ORE_DEN
+        } else {
+            plain
+        }
+    }
+
+    /// The haul's ambush chance for a load of `load` ore: halved (floor) with the Grease-Pit.
+    fn haul_ambush_pct(&self, load: u32) -> u32 {
+        let capped = ambush_pct(load);
+        if self.grease_pit {
+            capped / DEMO_GREASE_PIT_AMBUSH_DIV
+        } else {
+            capped
+        }
+    }
+
+    fn has(&self, building: BaseBuilding) -> bool {
+        match building {
+            BaseBuilding::RadioShack => self.radio_shack,
+            BaseBuilding::HobbyistBenches => self.hobbyist_benches,
+            BaseBuilding::GreasePit => self.grease_pit,
+            BaseBuilding::Gunsmith => self.gunsmith,
+        }
+    }
+
+    fn set(&mut self, building: BaseBuilding) {
+        match building {
+            BaseBuilding::RadioShack => self.radio_shack = true,
+            BaseBuilding::HobbyistBenches => self.hobbyist_benches = true,
+            BaseBuilding::GreasePit => self.grease_pit = true,
+            BaseBuilding::Gunsmith => self.gunsmith = true,
+        }
+    }
+}
+
 /// The raid's fight among the Commander's deployments: the earliest one that is not `aborted`,
 /// is the trigger's mission and started strictly after the trigger (`started_at` is the app's
 /// clock, as `trigger_at` is). `None` while there is none or it is still `active` (a later
@@ -467,7 +587,7 @@ pub fn ops_time(t: DateTime<Utc>) -> String {
 pub enum StartRefusal {
     /// An op is still out (an arrived homeward leg is cleared first, so this one is not home).
     Busy,
-    /// The campaign has no entry and every entry at the cap holds an op or banked ore.
+    /// The campaign has no entry and every entry at the cap holds an op, banked ore or a building.
     Full,
 }
 
@@ -523,8 +643,19 @@ pub enum PullRefusal {
     RaidPending,
 }
 
-/// One campaign's ops state: the cached board, the op in flight, when the team last moved and
-/// the banked ore.
+/// Why `build_op` refused (BP-10a).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BuildRefusal {
+    /// An op is out (a dig, a contract, or a haul still on the road): the base is built from home.
+    OpOut,
+    /// The building already stands.
+    AlreadyBuilt,
+    /// The banked ore is short of the building's cost (also: the campaign has no entry).
+    NotEnoughOre,
+}
+
+/// One campaign's ops state: the cached board, the op in flight, when the team last moved, the
+/// banked ore and the merc base.
 struct OpsEntry {
     /// The gateway the board was computed for; another gateway is a miss.
     gateway: (i32, i32),
@@ -534,9 +665,11 @@ struct OpsEntry {
     /// The latest departure, drill or homeward arrival. Outlives the op, so a player who has just
     /// come home still counts as moving for the reaper.
     moved_at: Option<DateTime<Utc>>,
-    /// The ore this campaign has banked (BP-8b-2): added at each homeward arrival, never
-    /// cleared. It leaves only with the entry, so a New run (a new campaign) starts at 0.
+    /// The ore this campaign has banked (BP-8b-2): added at each homeward arrival, debited by a
+    /// build (BP-10a). It leaves only with the entry, so a New run (a new campaign) starts at 0.
     ore_banked: u32,
+    /// The buildings that stand (BP-10a). They leave only with the entry, as the banked ore does.
+    base: OpsBase,
 }
 
 impl OpsEntry {
@@ -576,10 +709,10 @@ impl OpsEntry {
                 heat: d.heat,
                 threshold: d.threshold,
                 ore_on_site: d.ore_on_site,
-                next_ore: if op.leg == OpLeg::Homeward { 0 } else { ore_for(d.drills + 1, d.tier) },
+                next_ore: if op.leg == OpLeg::Homeward { 0 } else { self.base.ore(d.drills + 1, d.tier) },
                 ended_by: d.ended_by,
-                next_raid_pct: if op.leg == OpLeg::Outbound && d.raid.is_none() && d.heat + DEMO_HEAT_PER_DRILL < d.threshold {
-                    Some(DEMO_RAID_PCT_PER_DRILL * (d.drills + 1))
+                next_raid_pct: if op.leg == OpLeg::Outbound && d.raid.is_none() && d.heat + self.base.heat_per_drill() < d.threshold {
+                    Some(self.base.raid_pct(d.drills + 1))
                 } else {
                     None
                 },
@@ -595,11 +728,15 @@ impl OpsEntry {
 ///
 /// **Writes later bricks must keep:**
 /// - the board write (`put_board`) updates `gateway`, `board` and `touched` in place and never
-///   touches the op, `moved_at` or the banked ore;
+///   touches the op, `moved_at`, the banked ore or the base;
 /// - only `start_op`, `return_op`, `drill_op`, `pull_op`, `latch_raid` and `settle_arrival` (the
-///   ambush's reveal and the arrival, run first by every op read and write) write the op, and
-///   only the arrival writes the banked ore. Each takes the lock, calls `settle_arrival` first
-///   and returns owned data; none is held across an `.await`;
+///   ambush's reveal and the arrival, run first by every op read and write) write the op. The
+///   arrival adds to the banked ore and `build_op` debits it; only `build_op` writes the base,
+///   and never while an op is out. Each takes the lock, calls `settle_arrival` first and returns
+///   owned data; none is held across an `.await`;
+/// - **the merc base (BP-10a):** the drill's heat, raid chance and ore, the view's `next_ore`,
+///   melt check and `next_raid_pct`, and the pull's ambush chance all come from `OpsBase`'s
+///   methods, never the plain constants;
 /// - **the raid (BP-8b-1b):** `drill_op` writes the trigger under the lock from the drill's
 ///   first roll, after the drill's heat and ore and only if the drill did not melt down. While
 ///   a trigger is set, every ops route latches it in three steps: `pending_raid` (under the
@@ -617,11 +754,11 @@ impl OpsEntry {
 ///   (compare-and-set, `moved_at`): Held resumes the rest of the leg with the whole load,
 ///   Defeat or TacticalRetreat with half (floor), Wipeout clears the op and banks nothing;
 /// - **the keep list** (the reaper's `moved_since`): a departure (start, return, pull), a
-///   homeward arrival, a drill and a latch each write `moved_at`. Reading the board or the op
+///   homeward arrival, a drill, a latch and a build each write `moved_at`. Reading the board or the op
 ///   does not, nor does the ambush's reveal; a read that latches a battle does. While an
 ///   ambush waits, `moved_since` still counts the leg's passed `arrive_at`, at most
 ///   `travel_secs` (≤ 48 s) after the pull: an accepted overcount;
-/// - the eviction skips any entry holding an op or banked ore;
+/// - the eviction skips any entry holding an op, banked ore or a building;
 /// - an entry is dropped only by `remove` (a read of a campaign that is no longer `Active`,
 ///   the reaper's retire) and the reaper's prune (`retain_campaigns`).
 ///
@@ -649,15 +786,15 @@ impl DemoOpsStore {
     }
 
     /// Makes room for a new entry: below the cap, nothing; at it, evicts the least recently
-    /// touched entry that holds no op and no banked ore, and journals (first, then at most
-    /// hourly). `false` when every entry holds an op or banked ore.
+    /// touched entry that holds no op, no banked ore and no building, and journals (first, then
+    /// at most hourly). `false` when every entry holds an op, banked ore or a building.
     fn make_room(&self, inner: &mut HashMap<Uuid, OpsEntry>) -> bool {
         if inner.len() < self.cap {
             return true;
         }
         let victim = inner
             .iter()
-            .filter(|(_, e)| e.op.is_none() && e.ore_banked == 0)
+            .filter(|(_, e)| e.op.is_none() && e.ore_banked == 0 && e.base == OpsBase::default())
             .min_by_key(|(_, e)| e.touched)
             .map(|(id, _)| *id);
         let Some(id) = victim else {
@@ -680,7 +817,8 @@ impl DemoOpsStore {
 
     /// Caches `board`. An existing entry gets the new `gateway`, `board` and `touched` in
     /// place, keeping its op. A new entry at the cap first evicts (`make_room`). `false`: not
-    /// cached, because every entry holds an op or banked ore (the caller serves the board uncached).
+    /// cached, because every entry holds an op, banked ore or a building (the caller serves the
+    /// board uncached).
     pub fn put_board(&self, campaign_id: Uuid, gateway: (i32, i32), board: Arc<OpsBoard>, now: DateTime<Utc>) -> bool {
         let mut inner = self.lock();
         if let Some(e) = inner.get_mut(&campaign_id) {
@@ -692,7 +830,7 @@ impl DemoOpsStore {
         if !self.make_room(&mut inner) {
             return false;
         }
-        inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, op: None, moved_at: None, ore_banked: 0 });
+        inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, op: None, moved_at: None, ore_banked: 0, base: OpsBase::default() });
         true
     }
 
@@ -715,7 +853,7 @@ impl DemoOpsStore {
             if !self.make_room(&mut inner) {
                 return Err(StartRefusal::Full);
             }
-            inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, op: None, moved_at: None, ore_banked: 0 });
+            inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, op: None, moved_at: None, ore_banked: 0, base: OpsBase::default() });
         }
         let Some(e) = inner.get_mut(&campaign_id) else {
             return Err(StartRefusal::Full);
@@ -785,11 +923,11 @@ impl DemoOpsStore {
         Ok(())
     }
 
-    /// One drill on an arrived dig: drill `n` adds `DEMO_HEAT_PER_DRILL` heat; at the threshold
-    /// the site melts down (the ore on site is lost, the homeward leg starts at once and the
-    /// Crew's heads are returned for the route to write), otherwise it adds `ore_for(n, tier)`
-    /// and, when the first roll is at most `DEMO_RAID_PCT_PER_DRILL × n`, sets the raid trigger
-    /// (a meltdown rolls no raid). Writes `moved_at` (the keep list). Refusals in order: `NoOp`
+    /// One drill on an arrived dig: drill `n` adds the base's heat (`OpsBase::heat_per_drill`); at
+    /// the threshold the site melts down (the ore on site is lost, the homeward leg starts at once
+    /// and the Crew's heads are returned for the route to write), otherwise it adds the base's ore
+    /// (`OpsBase::ore`) and, when the first roll is at most the base's raid chance
+    /// (`OpsBase::raid_pct`), sets the raid trigger (a meltdown rolls no raid). Writes `moved_at` (the keep list). Refusals in order: `NoOp`
     /// → `Contract` → `AlreadyHomeward` → `NotArrived` → `RaidPending`. The meltdown is committed
     /// here, before the route's write, so a second drill sees `AlreadyHomeward` and the heads
     /// can't be lost twice.
@@ -799,6 +937,7 @@ impl DemoOpsStore {
             return Err(DrillRefusal::NoOp);
         };
         e.settle_arrival(now);
+        let base = e.base;
         let Some(op) = e.op.as_mut() else {
             return Err(DrillRefusal::NoOp);
         };
@@ -816,11 +955,11 @@ impl DemoOpsStore {
         }
         dig.drills += 1;
         let (raid_d100, heads) = drill_roll(op.op_seed, dig.drills);
-        dig.heat += DEMO_HEAT_PER_DRILL;
+        dig.heat += base.heat_per_drill();
         e.moved_at = Some(now);
         e.touched = now;
         let melts = dig.heat >= dig.threshold;
-        if !melts && raid_d100 <= DEMO_RAID_PCT_PER_DRILL * dig.drills {
+        if !melts && raid_d100 <= base.raid_pct(dig.drills) {
             dig.raid = Some(RaidTrigger { trigger_at: now, mission_id: DEMO_RAID_MISSION, kind: BattleKind::Raid });
         }
         if melts {
@@ -831,13 +970,14 @@ impl DemoOpsStore {
             op.arrive_at = now + Duration::seconds(i64::from(op.travel_secs));
             return Ok(DrillOutcome::Meltdown { crew_id: dig.crew_id, heads: heads as i16 });
         }
-        dig.ore_on_site += ore_for(dig.drills, dig.tier);
+        dig.ore_on_site += base.ore(dig.drills, dig.tier);
         Ok(DrillOutcome::Drilled)
     }
 
     /// Hauls the ore home from an arrived dig (BP-8b-2): the ore on site rides home as `carried`
     /// (`OpEnd::Pulled`) and the homeward leg starts at `now` with the site's time. The ambush is
-    /// rolled once, here: on `ambush_d100 ≤ ambush_pct(load)` only its fire time is stored, the
+    /// rolled once, here: on `ambush_d100 ≤` the base's chance (`OpsBase::haul_ambush_pct`, so a
+    /// Grease-Pit counts only if it stood before the pull) only its fire time is stored, the
     /// leg's midpoint in milliseconds (an odd `travel_secs` is common), and nothing sends it.
     /// Writes `moved_at` (the keep list). Refusals in order: `NoOp` → `Contract` →
     /// `AlreadyHomeward` → `NotArrived` → `NothingToHaul` → `RaidPending`.
@@ -847,6 +987,7 @@ impl DemoOpsStore {
             return Err(PullRefusal::NoOp);
         };
         e.settle_arrival(now);
+        let base = e.base;
         let Some(op) = e.op.as_mut() else {
             return Err(PullRefusal::NoOp);
         };
@@ -872,7 +1013,7 @@ impl DemoOpsStore {
         op.leg = OpLeg::Homeward;
         op.depart_at = now;
         op.arrive_at = now + Duration::seconds(i64::from(op.travel_secs));
-        if ambush_d100(op.op_seed) <= ambush_pct(load) {
+        if ambush_d100(op.op_seed) <= base.haul_ambush_pct(load) {
             dig.ambush_at = Some(now + Duration::milliseconds(i64::from(op.travel_secs) * 500));
         }
         e.moved_at = Some(now);
@@ -948,15 +1089,44 @@ impl DemoOpsStore {
         e.view(now)
     }
 
-    /// The op as the client sees it and the campaign's banked ore, from one lock (BP-8b-2). A
-    /// campaign with no entry has banked nothing.
-    pub fn ops_snapshot(&self, campaign_id: Uuid, now: DateTime<Utc>) -> (Option<ActiveOpView>, u32) {
+    /// The op as the client sees it, the campaign's banked ore (BP-8b-2) and its base (BP-10a),
+    /// from one lock. A campaign with no entry has banked and built nothing.
+    pub fn ops_snapshot(&self, campaign_id: Uuid, now: DateTime<Utc>) -> (Option<ActiveOpView>, u32, OpsBase) {
         let mut inner = self.lock();
         let Some(e) = inner.get_mut(&campaign_id) else {
-            return (None, 0);
+            return (None, 0, OpsBase::default());
         };
         e.settle_arrival(now);
-        (e.view(now), e.ore_banked)
+        (e.view(now), e.ore_banked, e.base)
+    }
+
+    /// Builds `building` at the campaign's merc base (BP-10a): its cost is debited from the banked
+    /// ore. Settles first, so a haul that has just come home banks before the check and can pay on
+    /// the same call. Never while an op is out, so no base number changes under a live op and a
+    /// haul's ambush stays as the pull rolled it. Writes `moved_at` (the keep list). Refusals in
+    /// order: `OpOut` → `AlreadyBuilt` → `NotEnoughOre` (also for a campaign with no entry, which
+    /// has banked nothing).
+    pub fn build_op(&self, campaign_id: Uuid, building: BaseBuilding, now: DateTime<Utc>) -> Result<(), BuildRefusal> {
+        let mut inner = self.lock();
+        let Some(e) = inner.get_mut(&campaign_id) else {
+            return Err(BuildRefusal::NotEnoughOre);
+        };
+        e.settle_arrival(now);
+        if e.op.is_some() {
+            return Err(BuildRefusal::OpOut);
+        }
+        if e.base.has(building) {
+            return Err(BuildRefusal::AlreadyBuilt);
+        }
+        let cost = building.cost();
+        if e.ore_banked < cost {
+            return Err(BuildRefusal::NotEnoughOre);
+        }
+        e.ore_banked -= cost;
+        e.base.set(building);
+        e.moved_at = Some(now);
+        e.touched = now;
+        Ok(())
     }
 
     /// The reaper's keep check: the team departed, drilled, latched a battle or came home at or after `cutoff` (a leg
@@ -1008,6 +1178,15 @@ impl DemoOpsStore {
                 }
             }
             e.moved_at = e.moved_at.map(|t| t - back);
+        }
+    }
+
+    /// Stands `base` at the campaign's entry without spending ore or touching it, so a test sets
+    /// the buildings up without banking for them first.
+    #[cfg(test)]
+    pub(crate) fn set_base(&self, campaign_id: Uuid, base: OpsBase) {
+        if let Some(e) = self.lock().get_mut(&campaign_id) {
+            e.base = base;
         }
     }
 
@@ -1705,14 +1884,14 @@ mod tests {
         let a = Uuid::from_u128(1);
         pulled(&store, a, 2, 3);
         assert_eq!(store.ops_snapshot(a, at(29)).1, 0, "still on the road");
-        assert_eq!(store.ops_snapshot(a, at(30)), (None, 60));
-        assert_eq!(store.ops_snapshot(a, at(31)), (None, 60), "banked once");
+        assert_eq!(store.ops_snapshot(a, at(30)), (None, 60, OpsBase::default()));
+        assert_eq!(store.ops_snapshot(a, at(31)), (None, 60, OpsBase::default()), "banked once");
         assert!(store.moved_since(a, at(30), at(31)), "the arrival is the last movement");
         let crew = DigStart { crew_id: CREW, commander_id: COMMANDER, threshold: 100 };
         store.start_op(a, (5, 0), board(), &dig(1), 2, Some(crew), at(40)).expect("start");
         store.drill_op(a, at(51)).expect("drill");
         store.pull_op(a, at(52)).expect("pull");
-        assert_eq!(store.ops_snapshot(a, at(62)), (None, 70));
+        assert_eq!(store.ops_snapshot(a, at(62)), (None, 70, OpsBase::default()));
     }
 
     /// Reviewer BP-8b-1b F4: a retreat's `carried` (seed 7: 10 ore, half is 5) is banked on arrival.
@@ -1724,7 +1903,7 @@ mod tests {
         store.drill_op(a, at(11)).expect("drill");
         assert!(store.latch_raid(a, &trigger(11), RaidResult::Retreat, at(20)));
         assert_eq!(store.ops_snapshot(a, at(29)).1, 0);
-        assert_eq!(store.ops_snapshot(a, at(30)), (None, 5));
+        assert_eq!(store.ops_snapshot(a, at(30)), (None, 5, OpsBase::default()));
     }
 
     /// A walk-away, a meltdown and a contract carry nothing home, so they bank nothing.
@@ -1736,16 +1915,16 @@ mod tests {
         store.drill_op(a, at(11)).expect("drill");
         store.drill_op(a, at(12)).expect("drill");
         store.return_op(a, at(13)).expect("return");
-        assert_eq!(store.ops_snapshot(a, at(23)), (None, 0));
+        assert_eq!(store.ops_snapshot(a, at(23)), (None, 0, OpsBase::default()));
         on_site(&store, b, 1, 100, 2);
         for i in 1..=6 {
             store.drill_op(b, at(10 + i)).expect("drill");
         }
         assert_eq!(store.drill_op(b, at(20)), Ok(DrillOutcome::Meltdown { crew_id: CREW, heads: 3 }));
-        assert_eq!(store.ops_snapshot(b, at(30)), (None, 0));
+        assert_eq!(store.ops_snapshot(b, at(30)), (None, 0, OpsBase::default()));
         store.start_op(c, (5, 0), board(), &site(), 7, None, at(0)).expect("start");
         store.return_op(c, at(10)).expect("return");
-        assert_eq!(store.ops_snapshot(c, at(20)), (None, 0));
+        assert_eq!(store.ops_snapshot(c, at(20)), (None, 0, OpsBase::default()));
     }
 
     /// Seed 14 (d100 4 ≤ 10 %) is ambushed and seed 2 (53) is not, on the same 30-ore haul. The two
@@ -1766,7 +1945,7 @@ mod tests {
         let d = op.dig.expect("a dig");
         assert_eq!((d.ambush, d.raid, d.carried), (Some(RaidView { mission_id: "GUARD_DUTY" }), None, 30));
         assert_eq!(store.ops_snapshot(a, at(40)).1, 0);
-        assert_eq!(store.ops_snapshot(b, at(40)), (None, 30));
+        assert_eq!(store.ops_snapshot(b, at(40)), (None, 30, OpsBase::default()));
     }
 
     /// Each result of seed 14's ambush (fired at 25 s, fought by 28 s): Held resumes the leg
@@ -1789,10 +1968,10 @@ mod tests {
         let d = dig_view(&store, b, at(32));
         assert_eq!((d.carried, d.ended_by, d.ambush), (15, Some(OpEnd::Retreat), None));
         assert!(store.latch_raid(c, &ambush_trigger(25), RaidResult::Wiped, at(28)));
-        assert_eq!(store.ops_snapshot(c, at(28)), (None, 0));
-        assert_eq!(store.ops_snapshot(a, at(33)), (None, 30));
-        assert_eq!(store.ops_snapshot(b, at(33)), (None, 15));
-        assert_eq!(store.ops_snapshot(c, at(40)), (None, 0));
+        assert_eq!(store.ops_snapshot(c, at(28)), (None, 0, OpsBase::default()));
+        assert_eq!(store.ops_snapshot(a, at(33)), (None, 30, OpsBase::default()));
+        assert_eq!(store.ops_snapshot(b, at(33)), (None, 15, OpsBase::default()));
+        assert_eq!(store.ops_snapshot(c, at(40)), (None, 0, OpsBase::default()));
     }
 
     /// Two reads that both saw the ambush latch it once: the second finds no trigger, so a
@@ -1835,7 +2014,7 @@ mod tests {
         on_site(&store, a, 1, 100, 2);
         store.drill_op(a, at(11)).expect("drill");
         store.pull_op(a, at(12)).expect("pull");
-        assert_eq!(store.ops_snapshot(a, at(22)), (None, 10));
+        assert_eq!(store.ops_snapshot(a, at(22)), (None, 10, OpsBase::default()));
         assert!(store.put_board(b, (5, 0), board(), at(30)));
         assert!(store.put_board(c, (5, 0), board(), at(40)));
         assert_eq!(store.len(), 2);
@@ -1866,5 +2045,160 @@ mod tests {
         assert!(store.board(a, (5, 0), at(11)).is_some());
         assert!(store.board(b, (5, 0), at(11)).is_some());
         assert!(store.board(c, (5, 0), at(11)).is_none());
+    }
+
+    /// The four buildings' numbers (Linux's oracle, BP-10a spec check): each flag moves only its
+    /// own number. The ids and the costs are pinned as literals.
+    #[test]
+    fn ops_base_numbers_match_the_oracle() {
+        let plain = OpsBase::default();
+        let all = OpsBase { radio_shack: true, hobbyist_benches: true, grease_pit: true, gunsmith: true };
+        assert_eq!((plain.heat_per_drill(), all.heat_per_drill()), (15, 10));
+        let raid: Vec<(u32, u32)> = (1..=3).map(|n| (plain.raid_pct(n), all.raid_pct(n))).collect();
+        assert_eq!(raid, vec![(5, 3), (10, 6), (15, 9)]);
+        let ore: Vec<(u32, u32, u32, u32)> = (1..=3).map(|n| (plain.ore(n, 1), all.ore(n, 1), plain.ore(n, 3), all.ore(n, 3))).collect();
+        assert_eq!(ore, vec![(10, 12, 20, 25), (20, 25, 40, 50), (30, 37, 60, 75)]);
+        let ambush: Vec<(u32, u32)> = [30, 50, 60, 120, 450].into_iter().map(|l| (plain.haul_ambush_pct(l), all.haul_ambush_pct(l))).collect();
+        assert_eq!(ambush, vec![(10, 5), (15, 7), (15, 7), (20, 10), (50, 25)]);
+        let ids = ["radio_shack", "hobbyist_benches", "grease_pit", "gunsmith", "barracks", ""];
+        let costs: Vec<Option<u32>> = ids.into_iter().map(|id| BaseBuilding::from_id(id).map(BaseBuilding::cost)).collect();
+        assert_eq!(costs, vec![Some(50), Some(120), Some(80), Some(80), None, None]);
+    }
+
+    /// Seed 2's three-drill haul (60 ore), banked by a read at 30 s.
+    fn banked_60(store: &DemoOpsStore, a: Uuid) {
+        pulled(store, a, 2, 3);
+        assert_eq!(store.ops_snapshot(a, at(30)).1, 60);
+    }
+
+    /// A build debits its cost and stands. Already built comes before short of ore, and a
+    /// refusal moves nothing.
+    #[test]
+    fn ops_store_build_debits_the_bank_and_stands() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        assert_eq!(store.build_op(a, BaseBuilding::RadioShack, at(0)), Err(BuildRefusal::NotEnoughOre), "no entry: nothing banked");
+        banked_60(&store, a);
+        assert_eq!(store.build_op(a, BaseBuilding::RadioShack, at(31)), Ok(()));
+        let shack = OpsBase { radio_shack: true, ..OpsBase::default() };
+        assert_eq!(store.ops_snapshot(a, at(32)), (None, 10, shack));
+        assert_eq!(store.build_op(a, BaseBuilding::RadioShack, at(33)), Err(BuildRefusal::AlreadyBuilt));
+        assert_eq!(store.build_op(a, BaseBuilding::Gunsmith, at(34)), Err(BuildRefusal::NotEnoughOre));
+        assert_eq!(store.ops_snapshot(a, at(35)), (None, 10, shack));
+    }
+
+    /// Never while an op is out, and "out" comes first: a haul on the road (nothing banked yet),
+    /// then an outbound contract, its arrival and its homeward leg. The haul's arrival banks
+    /// before the check, so the same call pays.
+    #[test]
+    fn ops_store_build_refuses_while_an_op_is_out() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        pulled(&store, a, 2, 3);
+        assert_eq!(store.build_op(a, BaseBuilding::RadioShack, at(25)), Err(BuildRefusal::OpOut), "on the road, 0 banked");
+        assert_eq!(store.build_op(a, BaseBuilding::RadioShack, at(30)), Ok(()), "the arrival banks 60, then pays 50");
+        assert_eq!(store.ops_snapshot(a, at(30)).1, 10);
+        store.start_op(a, (5, 0), board(), &site(), 7, None, at(40)).expect("start");
+        assert_eq!(store.build_op(a, BaseBuilding::RadioShack, at(45)), Err(BuildRefusal::OpOut), "before AlreadyBuilt");
+        assert_eq!(store.build_op(a, BaseBuilding::RadioShack, at(50)), Err(BuildRefusal::OpOut), "arrived at the contract");
+        store.return_op(a, at(50)).expect("return");
+        assert_eq!(store.build_op(a, BaseBuilding::RadioShack, at(55)), Err(BuildRefusal::OpOut), "heading home");
+        assert_eq!(store.build_op(a, BaseBuilding::RadioShack, at(60)), Err(BuildRefusal::AlreadyBuilt), "home");
+    }
+
+    /// The base feeds the drill and the view alike (sync 2026-10-31, claim 4). The Benches and
+    /// the Shack at the Coolant-Jockey's 115 on seed 2 (no raid on drills 1–11): 10 heat a
+    /// drill, the view's raid chance 3 × (drills + 1) while the next drill is safe, `None` at
+    /// 110 heat, and the 12th drill melts (120). Only heat 100 tells 10 from 15 here: 110 < 115,
+    /// 115 is not. The Gunsmith on tier 3: 25, 50, 75 on site, then `next_ore` 100.
+    #[test]
+    fn ops_store_base_feeds_the_drill_and_the_view() {
+        let store = DemoOpsStore::new(4);
+        let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        store.put_board(a, (5, 0), board(), at(0));
+        store.set_base(a, OpsBase { radio_shack: true, hobbyist_benches: true, ..OpsBase::default() });
+        on_site(&store, a, 1, 115, 2);
+        let mut seen = vec![dig_view(&store, a, at(11)).next_raid_pct];
+        for i in 1..=11 {
+            assert_eq!(store.drill_op(a, at(10 + i)), Ok(DrillOutcome::Drilled), "drill {i}");
+            seen.push(dig_view(&store, a, at(30)).next_raid_pct);
+        }
+        let want: Vec<Option<u32>> = (1..=11).map(|n| Some(3 * n)).chain([None]).collect();
+        assert_eq!(seen, want);
+        let d = dig_view(&store, a, at(30));
+        assert_eq!((d.heat, d.threshold, d.raid), (110, 115, None));
+        assert_eq!(store.drill_op(a, at(31)), Ok(DrillOutcome::Meltdown { crew_id: CREW, heads: 1 }));
+        assert_eq!(dig_view(&store, a, at(32)).heat, 120);
+        store.put_board(b, (5, 0), board(), at(0));
+        store.set_base(b, OpsBase { gunsmith: true, ..OpsBase::default() });
+        on_site(&store, b, 3, 100, 2);
+        let mut piles = vec![];
+        for i in 1..=3 {
+            store.drill_op(b, at(10 + i)).expect("drill");
+            piles.push(dig_view(&store, b, at(20)).ore_on_site);
+        }
+        assert_eq!(piles, vec![25, 75, 150]);
+        assert_eq!(dig_view(&store, b, at(20)).next_ore, 100);
+    }
+
+    /// The Radio Shack's flip (Linux's oracle): seed 45's first drill rolls d100 4, a raid at 5 %
+    /// and none at 3 %.
+    #[test]
+    fn ops_store_radio_shack_flips_seed_45s_first_raid() {
+        assert_eq!(drill_roll(45, 1).0, 4);
+        let store = DemoOpsStore::new(4);
+        let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        store.put_board(b, (5, 0), board(), at(0));
+        store.set_base(b, OpsBase { radio_shack: true, ..OpsBase::default() });
+        on_site(&store, a, 1, 100, 45);
+        on_site(&store, b, 1, 100, 45);
+        store.drill_op(a, at(11)).expect("drill");
+        store.drill_op(b, at(11)).expect("drill");
+        assert!(dig_view(&store, a, at(12)).raid.is_some());
+        assert_eq!(dig_view(&store, b, at(12)).raid, None);
+    }
+
+    /// The Grease-Pit's flip on seed 57 (ambush d100 13) and a 60-ore haul: ambushed at 15 %, not
+    /// at 7 %, so the Pit's haul banks all 60.
+    #[test]
+    fn ops_store_grease_pit_halves_the_ambush() {
+        let store = DemoOpsStore::new(4);
+        let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let pit = OpsBase { grease_pit: true, ..OpsBase::default() };
+        store.put_board(b, (5, 0), board(), at(0));
+        store.set_base(b, pit);
+        pulled(&store, a, 57, 3);
+        pulled(&store, b, 57, 3);
+        assert_eq!(store.pending_raid(a, at(25)).map(|p| p.trigger), Some(ambush_trigger(25)));
+        assert_eq!(store.pending_raid(b, at(25)), None);
+        assert_eq!(store.ops_snapshot(b, at(30)), (None, 60, pit));
+    }
+
+    /// Reviewer BP-8b-2 F5: cap 2, `a` holds only a building (no op, nothing banked) and is the
+    /// least recently touched, `b` a board only. A new campaign evicts `b`, never `a`.
+    #[test]
+    fn ops_store_eviction_skips_a_base() {
+        let store = DemoOpsStore::new(2);
+        let (a, b, c) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
+        let benches = OpsBase { hobbyist_benches: true, ..OpsBase::default() };
+        store.put_board(a, (5, 0), board(), at(0));
+        store.set_base(a, benches);
+        assert!(store.put_board(b, (5, 0), board(), at(10)));
+        assert!(store.put_board(c, (5, 0), board(), at(20)));
+        assert_eq!(store.len(), 2);
+        assert!(store.board(b, (5, 0), at(21)).is_none(), "the board-only entry is evicted");
+        assert_eq!(store.ops_snapshot(a, at(21)).2, benches, "the base is kept");
+    }
+
+    /// A build counts as movement (the keep list). No op is out, so no leg's arrival can stand
+    /// in for it.
+    #[test]
+    fn ops_store_build_counts_as_moving() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        banked_60(&store, a);
+        assert!(!store.moved_since(a, at(400), at(450)), "home at 30 s, nothing since");
+        assert_eq!(store.build_op(a, BaseBuilding::RadioShack, at(500)), Ok(()));
+        assert!(store.moved_since(a, at(500), at(501)), "the build");
     }
 }

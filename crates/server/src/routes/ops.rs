@@ -1,5 +1,5 @@
 //! The ops routes (BP-8a-1 board, BP-8a-2 travel legs, BP-8b-1a the drill, BP-8b-1b the raid,
-//! BP-8b-2 the haul;
+//! BP-8b-2 the haul, BP-10a the merc base;
 //! **demo-only**;
 //! Breakpoint plan §4d).
 //! The `dev` port deletes this file with `demo_ops.rs`.
@@ -27,8 +27,8 @@ use uuid::Uuid;
 
 use crate::auth::AuthSession;
 use crate::demo_ops::{
-    dig_threshold, ops_board, ops_time, raid_result, ActiveOpView, DigStart, DrillOutcome, DrillRefusal, OpsBoard, OpsSite,
-    PullRefusal, ReturnRefusal, StartRefusal,
+    dig_threshold, ops_board, ops_time, raid_result, ActiveOpView, BaseBuilding, BuildRefusal, DigStart, DrillOutcome,
+    DrillRefusal, OpsBase, OpsBoard, OpsSite, PullRefusal, ReturnRefusal, StartRefusal,
 };
 use crate::repository::{CampaignInstance, CampaignLifecycle, SectorState};
 use crate::state::AppState;
@@ -39,8 +39,9 @@ use super::{
     unauthorized, AppError,
 };
 
-/// Request body cap for `ops/start`, layered on the route: the overflow reaches the handler as
-/// a `JsonRejection` after the limiters, so it is counted (`413`).
+/// Request body cap for `ops/start` and `ops/build` (the two routes that read a body), layered on
+/// each route: the overflow reaches the handler as a `JsonRejection` after the limiters, so it is
+/// counted (`413`).
 pub const OPS_BODY_LIMIT: usize = 1024;
 
 pub fn router() -> Router<Arc<AppState>> {
@@ -50,11 +51,13 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/campaign/:campaign_id/ops/return", post(post_ops_return))
         .route("/api/campaign/:campaign_id/ops/drill", post(post_ops_drill))
         .route("/api/campaign/:campaign_id/ops/pull", post(post_ops_pull))
+        .route("/api/campaign/:campaign_id/ops/build", post(post_ops_build).layer(DefaultBodyLimit::max(OPS_BODY_LIMIT)))
 }
 
 /// The ops state as the client sees it, from every route. `now` is the server's clock, so the
 /// client's crawl survives a phone whose clock is off. `ore_banked` is the campaign's banked ore
-/// (BP-8b-2), 0 for a member with no gateway.
+/// (BP-8b-2) and `base` its merc base's buildings (BP-10a), 0 and none built for a member with
+/// no gateway.
 #[derive(Serialize)]
 pub struct OpsView<'a> {
     pub campaign_id: Uuid,
@@ -62,12 +65,20 @@ pub struct OpsView<'a> {
     pub sites: &'a [OpsSite],
     pub active_op: Option<ActiveOpView>,
     pub ore_banked: u32,
+    pub base: OpsBase,
     pub now: String,
 }
 
 #[derive(Deserialize)]
 pub struct OpsStartRequest {
     pub site_id: String,
+}
+
+/// `building` is a string, matched after the member checks, so an unknown id is `400` as an
+/// unknown site is (a serde enum would be axum's `422`, before them).
+#[derive(Deserialize)]
+pub struct OpsBuildRequest {
+    pub building: String,
 }
 
 /// The shared budget: `429` per address (`ops_ip`), then per wallet (`ops_wallet`).
@@ -179,13 +190,14 @@ async fn load_board(
 }
 
 fn ops_response(state: &AppState, campaign_id: Uuid, gw: (i32, i32), board: &OpsBoard, now: DateTime<Utc>) -> Response {
-    let (active_op, ore_banked) = state.demo_ops.store.ops_snapshot(campaign_id, now);
+    let (active_op, ore_banked, base) = state.demo_ops.store.ops_snapshot(campaign_id, now);
     let view = OpsView {
         campaign_id,
         gateway: Some(GatewayHex { q: gw.0, r: gw.1 }),
         sites: &board.sites,
         active_op,
         ore_banked,
+        base,
         now: ops_time(now),
     };
     Json(view).into_response()
@@ -237,7 +249,7 @@ async fn get_ops_board(
     let now = Utc::now();
     let (campaign, gateway, _) = ops_member(&state, &token, campaign_id, "get_ops_board").await?;
     let Some(gw) = gateway else {
-        let view = OpsView { campaign_id, gateway: None, sites: &[], active_op: None, ore_banked: 0, now: ops_time(now) };
+        let view = OpsView { campaign_id, gateway: None, sites: &[], active_op: None, ore_banked: 0, base: OpsBase::default(), now: ops_time(now) };
         return Ok(Json(view).into_response());
     };
     let board = load_board(&state, &campaign, gw, now, false, "get_ops_board").await?;
@@ -448,6 +460,52 @@ async fn post_ops_pull(
     Ok(ops_response(&state, campaign_id, gw, &board, now))
 }
 
+/// Builds at the merc base, `POST /api/campaign/:campaign_id/ops/build {building}` (BP-10a,
+/// demo-only). Order: `401` → `429` `ops_ip` → `429` `ops_wallet` → axum's body rejection,
+/// counted (`413` over `OPS_BODY_LIMIT`; `400`, `415`, `422`) → `404` → `403` → `409` not `Active`
+/// (entry dropped) → `409` no gateway → the board → a pending raid latched → `400` unknown building
+/// → `409` the team is out → `409` already built → `409` not enough banked ore → `200`, the whole
+/// state.
+/// - The cost is debited from `ore_banked` and `base` names what stands. A haul that has come
+///   home banks first, so its ore can pay on the same call.
+/// - Never while an op is out (a contract until its homeward leg lands, a haul still on the
+///   road), so no base number changes under a live op and a haul's ambush stays as the pull
+///   rolled it. A pending raid means an op is out, so no `RaidPending` arm is needed.
+/// - Memory only, no DB write, so no launch lock (Reviewer BP-8a-2 CF5 covers durable writes).
+async fn post_ops_build(
+    AuthSession(token): AuthSession,
+    State(state): State<Arc<AppState>>,
+    ci: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    Path(campaign_id): Path<Uuid>,
+    body: Result<Json<OpsBuildRequest>, JsonRejection>,
+) -> Result<Response, AppError> {
+    if let Some(r) = ops_limits(&state, &token, ci, &headers)? {
+        return Ok(r);
+    }
+    let Json(req) = match body {
+        Ok(j) => j,
+        Err(rej) => return Ok(rej.into_response()),
+    };
+    let now = Utc::now();
+    let (campaign, gateway, _) = ops_member(&state, &token, campaign_id, "post_ops_build").await?;
+    let Some(gw) = gateway else {
+        return Err(conflict("no gateway assigned"));
+    };
+    let board = load_board(&state, &campaign, gw, now, false, "post_ops_build").await?;
+    latch_pending_raid(&state, campaign_id, now, "post_ops_build").await?;
+    let Some(building) = BaseBuilding::from_id(&req.building) else {
+        return Err(bad_request("unknown building"));
+    };
+    match state.demo_ops.store.build_op(campaign_id, building, now) {
+        Ok(()) => {}
+        Err(BuildRefusal::OpOut) => return Err(conflict("the team is out: build when they're home")),
+        Err(BuildRefusal::AlreadyBuilt) => return Err(conflict("already built")),
+        Err(BuildRefusal::NotEnoughOre) => return Err(conflict("not enough banked ore")),
+    }
+    Ok(ops_response(&state, campaign_id, gw, &board, now))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -589,7 +647,7 @@ mod tests {
         let (status, body) = get(&state, Some("t"), c.campaign_id).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let keys: std::collections::BTreeSet<&str> = body.as_object().expect("an object").keys().map(|k| k.as_str()).collect();
-        assert_eq!(keys, ["active_op", "campaign_id", "gateway", "now", "ore_banked", "sites"].into_iter().collect());
+        assert_eq!(keys, ["active_op", "base", "campaign_id", "gateway", "now", "ore_banked", "sites"].into_iter().collect());
         assert_eq!(body["campaign_id"], c.campaign_id.to_string());
         assert_eq!(body["gateway"], serde_json::json!({"q": 5, "r": 0}));
         assert!(body["active_op"].is_null());
@@ -738,7 +796,7 @@ mod tests {
         let (status, body, bytes) = start(&state, c.campaign_id, SITE).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let keys: std::collections::BTreeSet<&str> = body.as_object().expect("an object").keys().map(|k| k.as_str()).collect();
-        assert_eq!(keys, ["active_op", "campaign_id", "gateway", "now", "ore_banked", "sites"].into_iter().collect());
+        assert_eq!(keys, ["active_op", "base", "campaign_id", "gateway", "now", "ore_banked", "sites"].into_iter().collect());
         let op = &body["active_op"];
         let op_keys: std::collections::BTreeSet<&str> = op.as_object().expect("an op").keys().map(|k| k.as_str()).collect();
         assert_eq!(op_keys, ["arrive_at", "arrived", "depart_at", "kind", "leg", "site_id"].into_iter().collect());
@@ -1388,5 +1446,71 @@ mod tests {
         assert_eq!(get(&state, Some("t"), c.campaign_id).await.0, StatusCode::OK);
         assert_eq!(start(&state, c.campaign_id, SITE).await.0, StatusCode::OK);
         assert_eq!(post(&state, c.campaign_id, "return", None).await.0, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    async fn build(state: &Arc<AppState>, campaign: Uuid, building: &str) -> (StatusCode, serde_json::Value, Vec<u8>) {
+        post(state, campaign, "build", Some(&serde_json::json!({ "building": building }).to_string())).await
+    }
+
+    /// Seed 2's 60-ore haul lands; the build's own call banks it and pays the Radio Shack's 50,
+    /// and `base` shows it. Then already built, then short of ore; a board read shows the same.
+    #[tokio::test]
+    async fn ops_build_spends_the_bank_and_shows_the_base() {
+        let state = Arc::new(session_state());
+        let (c, _) = dig_campaign(&state, false).await;
+        dig_on_site(&state, c, 2).await;
+        for _ in 0..3 {
+            assert_eq!(drill(&state, c).await.0, StatusCode::OK);
+        }
+        let (status, body, _) = pull(&state, c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let none = serde_json::json!({"radio_shack": false, "hobbyist_benches": false, "grease_pit": false, "gunsmith": false});
+        assert_eq!(body["base"], none);
+        state.demo_ops.store.rewind_op(c, site_secs(&body, DIG));
+        let (status, body, _) = build(&state, c, "radio_shack").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["active_op"].is_null(), "home: {body}");
+        let shack = serde_json::json!({"radio_shack": true, "hobbyist_benches": false, "grease_pit": false, "gunsmith": false});
+        assert_eq!((body["ore_banked"].as_u64(), &body["base"]), (Some(10), &shack));
+        let (status, body, _) = build(&state, c, "radio_shack").await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("already built")));
+        let (status, body, _) = build(&state, c, "gunsmith").await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("not enough banked ore")));
+        let (status, body) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!((body["ore_banked"].as_u64(), &body["base"]), (Some(10), &shack));
+    }
+
+    /// The build's refusals in its order: no gateway; an unknown building, after the member
+    /// checks; the team out on a contract, before anything about the bank (0 banked here).
+    #[tokio::test]
+    async fn ops_build_refusals() {
+        let state = Arc::new(session_state());
+        let no_gw = campaign_with(&state, WALLET, true, None).await;
+        let (status, body, _) = build(&state, no_gw.campaign_id, "radio_shack").await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("no gateway assigned")));
+        let c = campaign_with(&state, WALLET, true, Some(GATEWAY)).await;
+        seed_sector(&state, &c).await;
+        let (status, body, _) = build(&state, c.campaign_id, "barracks").await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::BAD_REQUEST, Some("unknown building")));
+        assert_eq!(start(&state, c.campaign_id, SITE).await.0, StatusCode::OK);
+        let (status, body, _) = build(&state, c.campaign_id, "radio_shack").await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("the team is out: build when they're home")));
+        let (_, body) = get(&state, Some("t"), c.campaign_id).await;
+        assert_eq!(body["active_op"]["site_id"], SITE);
+        assert_eq!(body["ore_banked"], 0);
+    }
+
+    /// Axum's rejections on the build's body, after the limiters and before the campaign is read
+    /// (the id is unknown, so anything past the body would be `404`).
+    #[tokio::test]
+    async fn ops_build_body_rejections() {
+        let state = Arc::new(session_state());
+        let c = Uuid::new_v4();
+        let big = format!("{{\"building\":\"{}\"}}", "x".repeat(2048));
+        assert_eq!(post(&state, c, "build", Some(&big)).await.0, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(post(&state, c, "build", Some("{")).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(post(&state, c, "build", None).await.0, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(post(&state, c, "build", Some("{}")).await.0, StatusCode::UNPROCESSABLE_ENTITY);
     }
 }
