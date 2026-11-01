@@ -41,7 +41,7 @@ use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde::Serialize;
 use sim_engine::game_types::{UnitBattleResult, UnitStatus};
 use sim_engine::missions::missions;
-use sim_engine::rng::Rng;
+use sim_engine::rng::{generate_seed, Rng};
 use uuid::Uuid;
 
 use crate::map_gen::{hex_axial_distance, HexTerrain, MagmaVeinNode, SAFE_ZONE_RADIUS};
@@ -62,13 +62,17 @@ pub const OPS_CONTRACT_MIN_HEXES: u32 = 3;
 pub const OPS_CONTRACT_MAX_HEXES: u32 = 6;
 /// At most this many tier-1 dig sites, nearest first.
 pub const OPS_TIER1_SITES: usize = 2;
-/// The contract pins' missions, in the client's order (`app/play/battle.js` `ORDER`).
-pub const OPS_CONTRACT_MISSIONS: [&str; 4] = ["GUARD_DUTY", "ORE_EXTRACTION", "SUPPLY_RAID", "BLACK_SITE_RAID"];
+/// The contract pins' missions, in the client's order (`app/play/battle.js` `ORDER`; BP-11b-1
+/// brings `ORDER` in line).
+pub const OPS_CONTRACT_MISSIONS: [&str; 4] = ["GUARD_DUTY", "CRASHED_SHIP_RAID", "SUPPLY_RAID", "BLACK_SITE_RAID"];
 /// Cached campaigns before an insert evicts.
 pub const DEMO_OPS_CAP: usize = 1_000;
 /// Demo travel, seconds per hex before the destination's terrain modifier. Never canon:
 /// canon is 20 minutes per hex (`Hex_Map_and_Travel` §2).
 pub const DEMO_SECS_PER_HEX: u32 = 2;
+/// A fought contract is off the board for 45 s, then returns at another hex of its ring
+/// (BP-11a-3).
+pub const DEMO_SITE_REFRESH_SECS: i64 = 45;
 /// Heat each drill adds, and the meltdown threshold (§4d: the 7th drill melts down).
 pub const DEMO_HEAT_PER_DRILL: u32 = 15;
 pub const DEMO_HEAT_THRESHOLD: u32 = 100;
@@ -142,6 +146,10 @@ pub struct OpsSite {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct OpsBoard {
     pub sites: Vec<OpsSite>,
+    /// Every hex a contract may stand on, `(q, r, distance, travel_secs)` sorted by `(q, r)`
+    /// (BP-11a-3): where a fought contract returns after 45 s. Never sent.
+    #[serde(skip)]
+    pub contract_pool: Vec<(i32, i32, u32, u32)>,
 }
 
 /// The hex's terrain if the hex is on the map and passable. A hex missing from the map is
@@ -187,7 +195,8 @@ fn dig_site(v: &MagmaVeinNode, distance: u32, terrain: &HexTerrain) -> OpsSite {
 /// - **Contracts:** hexes `OPS_CONTRACT_MIN_HEXES..=OPS_CONTRACT_MAX_HEXES` from the gateway
 ///   that are passable, hold no vein and lie outside the Safe Zone, sorted by `(q, r)`, then
 ///   a partial Fisher–Yates for the first `OPS_CONTRACT_MISSIONS.len()` with
-///   `Rng::new(ops_site_seed(campaign_id))`. Fewer candidates → fewer contracts.
+///   `Rng::new(ops_site_seed(campaign_id))`. Fewer candidates → fewer contracts. The sorted
+///   candidates, before the shuffle, are the board's `contract_pool` (BP-11a-3).
 pub fn ops_board(
     terrain: &HashMap<String, HexTerrain>,
     veins: &[MagmaVeinNode],
@@ -247,6 +256,7 @@ pub fn ops_board(
         }
     }
     candidates.sort_by_key(|(q, r, _, _)| (*q, *r));
+    let contract_pool = candidates.iter().map(|&(q, r, d, t)| (q, r, d, travel_secs(d, t))).collect();
     let n = candidates.len();
     let picks = OPS_CONTRACT_MISSIONS.len().min(n);
     let mut rng = Rng::new(ops_site_seed(campaign_id));
@@ -267,7 +277,7 @@ pub fn ops_board(
             name: missions().get(mission_id).map(|m| m.name.clone()),
         });
     }
-    OpsBoard { sites }
+    OpsBoard { sites, contract_pool }
 }
 
 /// Which way the team is travelling.
@@ -586,6 +596,9 @@ pub fn raid_result(deps: &[DeploymentRecord], trigger: &RaidTrigger) -> Result<O
 /// BP-8b-1a adds the dig; BP-8b-1b the raid trigger; BP-8b-2 the haul and the ambush.
 struct ActiveOp {
     site_id: String,
+    /// The site's hex as the op started (BP-11a-3): where the team stands once on site, whatever
+    /// the board shows for `site_id` later.
+    at: (i32, i32),
     kind: &'static str,
     leg: OpLeg,
     depart_at: DateTime<Utc>,
@@ -607,17 +620,27 @@ struct ActiveOp {
 pub struct ActiveOpView {
     pub leg: OpLeg,
     pub site_id: String,
+    /// The team's own site hex (BP-11a-3), so the client never maps the op through the board: a
+    /// fought contract's `site_id` returns elsewhere while the team still stands here.
+    pub at: OpHex,
     pub kind: &'static str,
     pub depart_at: String,
     pub arrive_at: String,
     pub arrived: bool,
-    /// The dig's numbers; absent on a contract, so a contract op keeps its six keys.
+    /// The dig's numbers; absent on a contract, so a contract op keeps its seven keys.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dig: Option<DigView>,
     /// A contract's fight once latched (BP-11a-2): `"won"` (Held) or `"lost"` (Retreat). Absent
-    /// before the fight and on a dig, so an unfought contract keeps its six keys.
+    /// before the fight and on a dig, so an unfought contract keeps its seven keys.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fought: Option<&'static str>,
+}
+
+/// A hex as the ops routes send it: `{"q": …, "r": …}`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct OpHex {
+    pub q: i32,
+    pub r: i32,
 }
 
 /// The wire format of every time the ops routes send.
@@ -697,6 +720,15 @@ pub enum BuildRefusal {
     NotEnoughOre,
 }
 
+/// A contract's own state on the board (BP-11a-3), kept apart from the cached board: when its
+/// fight was latched (off the board until 45 s later), and the hex it returned at,
+/// `(q, r, distance, travel_secs)` from the pool; `None` = the board's own pin.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ContractSlot {
+    finished_at: Option<DateTime<Utc>>,
+    pin: Option<(i32, i32, u32, u32)>,
+}
+
 /// One campaign's ops state: the cached board, the op in flight, when the team last moved, the
 /// banked ore and the merc base.
 struct OpsEntry {
@@ -716,6 +748,9 @@ struct OpsEntry {
     credits_banked: u32,
     /// The buildings that stand (BP-10a). They leave only with the entry, as the banked ore does.
     base: OpsBase,
+    /// The contracts' own state, by mission id (BP-11a-3): finished by an applied latch, moved
+    /// by the refresh, cleared with a new gateway.
+    contracts: HashMap<&'static str, ContractSlot>,
 }
 
 impl OpsEntry {
@@ -724,7 +759,9 @@ impl OpsEntry {
     /// the team waits on the road. Then clears a homeward leg that has arrived with no battle
     /// waiting and none to come, banking what it carried and recording the arrival (not the
     /// read) as the last movement. Every read and write of the op calls it first, under the lock.
+    /// It first runs the board refresh (`settle_contracts`, BP-11a-3).
     fn settle_arrival(&mut self, now: DateTime<Utc>) {
+        self.settle_contracts(now);
         let Some(op) = self.op.as_mut() else {
             return;
         };
@@ -742,10 +779,84 @@ impl OpsEntry {
         }
     }
 
+    /// The board refresh (BP-11a-3): a contract finished at least 45 s ago returns at another
+    /// hex of the board's pool, one draw from a fresh seed (display only, never a roll's seed):
+    /// never on another contract's hex, its own old hex or the op's hex. With no hex free it
+    /// stays off the board and the next settle tries again. A clock test under the lock: it
+    /// reads nothing outside the entry, writes no `moved_at`, and never touches the op or
+    /// anything banked.
+    fn settle_contracts(&mut self, now: DateTime<Utc>) {
+        let wait = Duration::seconds(DEMO_SITE_REFRESH_SECS);
+        let due: Vec<&'static str> = self
+            .contracts
+            .iter()
+            .filter(|(_, s)| s.finished_at.is_some_and(|t| now >= t + wait))
+            .map(|(m, _)| *m)
+            .collect();
+        for mission in due {
+            let own = self.contract_hex(mission);
+            let shown: HashSet<(i32, i32)> = self
+                .board
+                .sites
+                .iter()
+                .filter_map(|s| s.mission_id)
+                .filter(|m| *m != mission)
+                .filter_map(|m| self.contract_hex(m))
+                .collect();
+            let at = self.op.as_ref().map(|op| op.at);
+            let free: Vec<(i32, i32, u32, u32)> = self
+                .board
+                .contract_pool
+                .iter()
+                .copied()
+                .filter(|&(q, r, _, _)| Some((q, r)) != own && !shown.contains(&(q, r)) && Some((q, r)) != at)
+                .collect();
+            if free.is_empty() {
+                continue;
+            }
+            let pick = free[Rng::new(generate_seed()).roll_int(0, (free.len() - 1) as u32) as usize];
+            if let Some(slot) = self.contracts.get_mut(mission) {
+                slot.pin = Some(pick);
+                slot.finished_at = None;
+            }
+        }
+    }
+
+    /// A contract's current hex (BP-11a-3): its returned pin, else the board's own.
+    fn contract_hex(&self, mission: &str) -> Option<(i32, i32)> {
+        if let Some((q, r, _, _)) = self.contracts.get(mission).and_then(|s| s.pin) {
+            return Some((q, r));
+        }
+        self.board.sites.iter().find(|s| s.mission_id == Some(mission)).map(|s| (s.q, s.r))
+    }
+
+    /// The board as the client sees it (BP-11a-3): a finished contract is dropped, a returned one
+    /// stands at its new pin with the same `site_id`, mission and name. A slot whose mission is
+    /// not on the board hides nothing.
+    fn sites(&self) -> Vec<OpsSite> {
+        self.board
+            .sites
+            .iter()
+            .filter_map(|s| {
+                let Some(slot) = s.mission_id.and_then(|m| self.contracts.get(m)) else {
+                    return Some(s.clone());
+                };
+                if slot.finished_at.is_some() {
+                    return None;
+                }
+                Some(match slot.pin {
+                    Some((q, r, distance, travel_secs)) => OpsSite { q, r, distance, travel_secs, ..s.clone() },
+                    None => s.clone(),
+                })
+            })
+            .collect()
+    }
+
     fn view(&self, now: DateTime<Utc>) -> Option<ActiveOpView> {
         self.op.as_ref().map(|op| ActiveOpView {
             leg: op.leg,
             site_id: op.site_id.clone(),
+            at: OpHex { q: op.at.0, r: op.at.1 },
             kind: op.kind,
             depart_at: ops_time(op.depart_at),
             arrive_at: ops_time(op.arrive_at),
@@ -786,10 +897,12 @@ fn contract_trigger(op: &ActiveOp, now: DateTime<Utc>) -> Option<RaidTrigger> {
     Some(RaidTrigger { trigger_at: op.arrive_at, mission_id: c.mission_id, kind: BattleKind::Contract })
 }
 
-/// What every ops body shows from the store (BP-11a-2): the op, the banked ore and pay, and the
-/// base, read under one lock.
+/// What every ops body shows from the store (BP-11a-2): the board's sites as they stand now
+/// (BP-11a-3; `None` with no entry, when the route serves its own board), the op, the banked
+/// ore and pay, and the base, read under one lock.
 #[derive(Clone, Debug, PartialEq)]
 pub struct OpsSnapshot {
+    pub sites: Option<Vec<OpsSite>>,
     pub op: Option<ActiveOpView>,
     pub ore_banked: u32,
     pub credits_banked: u32,
@@ -800,7 +913,12 @@ pub struct OpsSnapshot {
 ///
 /// **Writes later bricks must keep:**
 /// - the board write (`put_board`) updates `gateway`, `board` and `touched` in place and never
-///   touches the op, `moved_at`, the banked ore or the base;
+///   touches the op, `moved_at`, the banked ore or the base; a new gateway clears the contracts'
+///   own state (BP-11a-3);
+/// - **the board refresh (BP-11a-3):** only `latch_raid`'s applied contract path finishes a
+///   contract (one line); `settle_contracts`, run first by `settle_arrival`, returns it 45 s
+///   later at another hex. The body's `sites` come from the entry (`OpsEntry::sites`), and
+///   `ops/start` looks its site up there (`site`), so a finished contract is unknown;
 /// - only `start_op`, `return_op`, `drill_op`, `pull_op`, `latch_raid` and `settle_arrival` (the
 ///   ambush's reveal and the arrival, run first by every op read and write) write the op. The
 ///   arrival adds to the banked ore and `build_op` debits it; only `build_op` writes the base,
@@ -858,8 +976,11 @@ impl DemoOpsStore {
     }
 
     /// Makes room for a new entry: below the cap, nothing; at it, evicts the least recently
-    /// touched entry that holds no op, no banked ore, no banked credits and no building, and journals (first, then
-    /// at most hourly). `false` when every entry holds an op, banked ore, banked credits or a building.
+    /// touched entry that holds no op, no banked ore, no banked credits and no building, and
+    /// journals (first, then at most hourly). `false` when every entry holds an op, banked ore,
+    /// banked credits or a building. An entry whose only state is a finished contract can go
+    /// (BP-11a-3, accepted): its next read recomputes the board and the contract is back early. A
+    /// won contract banked its pay, so it is never the victim.
     fn make_room(&self, inner: &mut HashMap<Uuid, OpsEntry>) -> bool {
         if inner.len() < self.cap {
             return true;
@@ -888,12 +1009,16 @@ impl DemoOpsStore {
     }
 
     /// Caches `board`. An existing entry gets the new `gateway`, `board` and `touched` in
-    /// place, keeping its op. A new entry at the cap first evicts (`make_room`). `false`: not
-    /// cached, because every entry holds an op, banked ore or a building (the caller serves the
-    /// board uncached).
+    /// place, keeping its op; a new gateway also clears the contracts' own state (BP-11a-3), so
+    /// every contract stands at the new board's pin. A new entry at the cap first evicts
+    /// (`make_room`). `false`: not cached, because every entry holds an op, banked ore or a
+    /// building (the caller serves the board uncached).
     pub fn put_board(&self, campaign_id: Uuid, gateway: (i32, i32), board: Arc<OpsBoard>, now: DateTime<Utc>) -> bool {
         let mut inner = self.lock();
         if let Some(e) = inner.get_mut(&campaign_id) {
+            if e.gateway != gateway {
+                e.contracts.clear();
+            }
             e.gateway = gateway;
             e.board = board;
             e.touched = now;
@@ -902,7 +1027,7 @@ impl DemoOpsStore {
         if !self.make_room(&mut inner) {
             return false;
         }
-        inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, op: None, moved_at: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default() });
+        inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, op: None, moved_at: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), contracts: HashMap::new() });
         true
     }
 
@@ -926,7 +1051,7 @@ impl DemoOpsStore {
             if !self.make_room(&mut inner) {
                 return Err(StartRefusal::Full);
             }
-            inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, op: None, moved_at: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default() });
+            inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, op: None, moved_at: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), contracts: HashMap::new() });
         }
         let Some(e) = inner.get_mut(&campaign_id) else {
             return Err(StartRefusal::Full);
@@ -937,6 +1062,7 @@ impl DemoOpsStore {
         }
         e.op = Some(ActiveOp {
             site_id: site.site_id.clone(),
+            at: (site.q, site.r),
             kind: site.kind,
             leg: OpLeg::Outbound,
             depart_at: now,
@@ -1097,8 +1223,8 @@ impl DemoOpsStore {
     }
 
     /// The battle waiting for its fight (a raid, or a haul's ambush once fired, or a contract's
-    /// fight once the team is on site (BP-11a-2)), after settling the op: the dig's Commander and
-    /// the trigger. `None` when none is pending.
+    /// fight once the team is on site (BP-11a-2)), after settling the op: the op's Commander, the
+    /// trigger and its Section. `None` when none is pending.
     pub fn pending_raid(&self, campaign_id: Uuid, now: DateTime<Utc>) -> Option<PendingRaid> {
         let mut inner = self.lock();
         let e = inner.get_mut(&campaign_id)?;
@@ -1122,6 +1248,9 @@ impl DemoOpsStore {
     /// or `Retreat` records the result and the team stays on site. `Wiped`, any kind: the op is
     /// cleared and its ore lost (the mission route has already marked the Commander KIA), or, at 0
     /// soldiers (BP-11a-1), with no fight and no death. Each writes `moved_at` (the keep list).
+    /// An applied contract latch, whatever its result, also finishes the contract (BP-11a-3): it
+    /// leaves the board, and the refresh brings it back 45 s later. A refused latch finishes
+    /// nothing.
     pub fn latch_raid(&self, campaign_id: Uuid, trigger: &RaidTrigger, result: RaidResult, credits: u32, now: DateTime<Utc>) -> bool {
         let mut inner = self.lock();
         let Some(e) = inner.get_mut(&campaign_id) else {
@@ -1143,6 +1272,7 @@ impl DemoOpsStore {
                 }
                 RaidResult::Wiped => e.op = None,
             }
+            e.contracts.entry(trigger.mission_id).or_default().finished_at = Some(now);
         } else {
             let Some(dig) = op.dig.as_mut() else {
                 return false;
@@ -1196,15 +1326,36 @@ impl DemoOpsStore {
         (s.op, s.ore_banked, s.base)
     }
 
-    /// The op as the client sees it, the banked ore and pay (BP-11a-2) and the base, from one
-    /// lock, after settling. A campaign with no entry has banked and built nothing.
+    /// The board's sites as they stand (BP-11a-3), the op as the client sees it, the banked ore
+    /// and pay (BP-11a-2) and the base, from one lock, after settling. A campaign with no entry
+    /// has no sites of its own (`None`), and has banked and built nothing.
     pub fn ops_state(&self, campaign_id: Uuid, now: DateTime<Utc>) -> OpsSnapshot {
         let mut inner = self.lock();
         let Some(e) = inner.get_mut(&campaign_id) else {
-            return OpsSnapshot { op: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default() };
+            return OpsSnapshot { sites: None, op: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default() };
         };
         e.settle_arrival(now);
-        OpsSnapshot { op: e.view(now), ore_banked: e.ore_banked, credits_banked: e.credits_banked, base: e.base }
+        OpsSnapshot {
+            sites: Some(e.sites()),
+            op: e.view(now),
+            ore_banked: e.ore_banked,
+            credits_banked: e.credits_banked,
+            base: e.base,
+        }
+    }
+
+    /// The site `site_id` as it stands, after settling (BP-11a-3): from the entry's sites, else
+    /// from `board` (a campaign with no entry). `None` for an unknown or finished site.
+    pub fn site(&self, campaign_id: Uuid, board: &OpsBoard, site_id: &str, now: DateTime<Utc>) -> Option<OpsSite> {
+        let mut inner = self.lock();
+        let sites = match inner.get_mut(&campaign_id) {
+            Some(e) => {
+                e.settle_arrival(now);
+                e.sites()
+            }
+            None => board.sites.clone(),
+        };
+        sites.into_iter().find(|s| s.site_id == site_id)
     }
 
     /// Builds `building` at the campaign's merc base (BP-10a): its cost is debited from the banked
@@ -1269,9 +1420,10 @@ impl DemoOpsStore {
         self.len() == 0
     }
 
-    /// Moves the campaign's op (its leg and a haul's hidden ambush time) and its last movement
-    /// `secs` into the past, so a route test crosses an arrival without sleeping. A trigger's
-    /// time stays: a fight's `started_at` is the real clock.
+    /// Moves the campaign's op (its leg and a haul's hidden ambush time), its last movement and
+    /// its finished contracts' times (BP-11a-3) `secs` into the past, so a route test crosses an
+    /// arrival or a refresh without sleeping. A trigger's time stays: a fight's `started_at` is
+    /// the real clock.
     #[cfg(test)]
     pub(crate) fn rewind_op(&self, campaign_id: Uuid, secs: i64) {
         let mut inner = self.lock();
@@ -1285,6 +1437,11 @@ impl DemoOpsStore {
                 }
             }
             e.moved_at = e.moved_at.map(|t| t - back);
+            for slot in e.contracts.values_mut() {
+                if let Some(t) = slot.finished_at.as_mut() {
+                    *t -= back;
+                }
+            }
         }
     }
 
@@ -1483,7 +1640,7 @@ mod tests {
     }
 
     fn board() -> Arc<OpsBoard> {
-        Arc::new(OpsBoard { sites: vec![] })
+        Arc::new(OpsBoard { sites: vec![], contract_pool: vec![] })
     }
 
     /// A contract site 10 s out.
@@ -2370,11 +2527,126 @@ mod tests {
         store.return_op(a, at(13)).expect("return");
         assert_eq!(
             store.ops_state(a, at(30)),
-            OpsSnapshot { op: None, ore_banked: 0, credits_banked: 400, base: OpsBase::default() }
+            OpsSnapshot { sites: Some(vec![]), op: None, ore_banked: 0, credits_banked: 400, base: OpsBase::default() }
         );
         assert!(!store.put_board(b, (5, 0), board(), at(31)), "not cached");
         assert_eq!(store.len(), 1);
         assert!(store.board(a, (5, 0), at(32)).is_some(), "the banked entry is kept");
         assert!(store.board(b, (5, 0), at(32)).is_none());
+    }
+
+    /// BP-11a-3: the four contracts in `OPS_CONTRACT_MISSIONS` order at (8, 0) … (11, 0), each
+    /// 10 s out (the first is `site()`'s pin), with `pool` as the board's contract pool (each
+    /// pool hex 4 hexes and 8 s out).
+    fn contract_board(pool: &[(i32, i32)]) -> Arc<OpsBoard> {
+        let sites = OPS_CONTRACT_MISSIONS
+            .iter()
+            .enumerate()
+            .map(|(i, m)| OpsSite {
+                site_id: format!("contract:{m}"),
+                kind: "contract",
+                q: 8 + i as i32,
+                r: 0,
+                distance: 3 + i as u32,
+                travel_secs: 10,
+                tier: None,
+                mission_id: Some(*m),
+                name: Some(format!("name of {m}")),
+            })
+            .collect();
+        Arc::new(OpsBoard { sites, contract_pool: pool.iter().map(|&(q, r)| (q, r, 4, 8)).collect() })
+    }
+
+    /// The `GUARD_DUTY` contract's trigger once the team has arrived at 10 s.
+    fn guard_duty_arrival() -> RaidTrigger {
+        RaidTrigger { trigger_at: at(10), mission_id: "GUARD_DUTY", kind: BattleKind::Contract }
+    }
+
+    /// The team sent to `GUARD_DUTY` on `b` at 0 s and its fight latched (won, 400) at 12 s.
+    fn fought_guard_duty(store: &DemoOpsStore, a: Uuid, b: &Arc<OpsBoard>) {
+        let lead = ContractStart { commander_id: COMMANDER, section_id: None };
+        store.start_op(a, (5, 0), Arc::clone(b), &b.sites[0], 7, None, Some(lead), at(0)).expect("start");
+        assert!(store.latch_raid(a, &guard_duty_arrival(), RaidResult::Held, 400, at(12)));
+    }
+
+    fn shown(store: &DemoOpsStore, a: Uuid, now: DateTime<Utc>) -> Vec<OpsSite> {
+        store.ops_state(a, now).sites.expect("the campaign has an entry")
+    }
+
+    fn guard_duty(sites: &[OpsSite]) -> Option<&OpsSite> {
+        sites.iter().find(|s| s.site_id == "contract:GUARD_DUTY")
+    }
+
+    /// BP-11a-3: a fought contract is off the board from its latch (12 s) until 44 s later, and
+    /// 45 s later it is back at a pool hex, with the same site id, mission and name.
+    #[test]
+    fn ops_store_finished_contract_returns_after_45s_elsewhere() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        let b = contract_board(&[(3, 4), (4, 4)]);
+        fought_guard_duty(&store, a, &b);
+        for t in [13, 56] {
+            assert_eq!(guard_duty(&shown(&store, a, at(t))), None, "off the board at {t} s");
+            assert_eq!(store.site(a, &b, "contract:GUARD_DUTY", at(t)), None, "unknown at {t} s");
+        }
+        let sites = shown(&store, a, at(57));
+        let back = guard_duty(&sites).expect("back at 57 s").clone();
+        assert_eq!((back.mission_id, back.name.as_deref(), back.kind), (Some("GUARD_DUTY"), Some("name of GUARD_DUTY"), "contract"));
+        assert!([(3, 4), (4, 4)].contains(&(back.q, back.r)), "a pool hex: {back:?}");
+        assert_ne!((back.q, back.r), (8, 0), "elsewhere");
+        assert_eq!((back.distance, back.travel_secs), (4, 8), "the pool hex's numbers");
+        assert_eq!(sites.len(), 4);
+        assert_eq!(store.site(a, &b, "contract:GUARD_DUTY", at(58)), Some(back));
+        assert_eq!(store.op_view(a, at(58)).expect("op").fought, Some("won"), "the refresh leaves the op");
+        assert_eq!(store.ops_state(a, at(58)).credits_banked, 400);
+    }
+
+    /// BP-11a-3: with every pool hex taken (the other three contracts and the old hex, where
+    /// the team stands), the contract stays off the board.
+    #[test]
+    fn ops_store_refresh_with_no_free_hex_keeps_the_contract_off() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        let b = contract_board(&[(8, 0), (9, 0), (10, 0), (11, 0)]);
+        fought_guard_duty(&store, a, &b);
+        assert_eq!(guard_duty(&shown(&store, a, at(57))), None);
+        assert_eq!(guard_duty(&shown(&store, a, at(102))), None);
+        assert_eq!(shown(&store, a, at(102)).len(), 3);
+    }
+
+    /// BP-11a-3: a latch that is refused (the contract was already fought) finishes nothing, so
+    /// it can't take a returned contract off the board again.
+    #[test]
+    fn ops_store_stale_contract_latch_finishes_nothing() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        let b = contract_board(&[(3, 4)]);
+        fought_guard_duty(&store, a, &b);
+        assert_eq!(guard_duty(&shown(&store, a, at(13))), None);
+        assert!(guard_duty(&shown(&store, a, at(57))).is_some(), "back at 57 s");
+        assert!(!store.latch_raid(a, &guard_duty_arrival(), RaidResult::Held, 400, at(58)), "already fought");
+        let back = guard_duty(&shown(&store, a, at(58))).cloned().expect("still on the board");
+        assert_eq!((back.q, back.r), (3, 4));
+        assert_eq!(store.ops_state(a, at(58)).credits_banked, 400);
+    }
+
+    /// BP-11a-3: a board written for a new gateway clears the contracts' own state, so the fought
+    /// contract stands at the new board's own pin at once.
+    #[test]
+    fn ops_store_new_gateway_clears_the_contract_slots() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        let b = contract_board(&[(3, 4)]);
+        fought_guard_duty(&store, a, &b);
+        assert_eq!(guard_duty(&shown(&store, a, at(13))), None);
+        assert!(store.put_board(a, (0, 5), contract_board(&[]), at(14)));
+        let pin = guard_duty(&shown(&store, a, at(15))).cloned().expect("back with the new board");
+        assert_eq!((pin.q, pin.r), (8, 0));
+    }
+
+    /// BP-11a-3: the relic contract replaces Ore Extraction, in the same place.
+    #[test]
+    fn ops_contract_missions_are_the_relic_list() {
+        assert_eq!(OPS_CONTRACT_MISSIONS, ["GUARD_DUTY", "CRASHED_SHIP_RAID", "SUPPLY_RAID", "BLACK_SITE_RAID"]);
     }
 }

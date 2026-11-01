@@ -197,10 +197,13 @@ async fn load_board(
 
 fn ops_response(state: &AppState, campaign_id: Uuid, gw: (i32, i32), board: &OpsBoard, now: DateTime<Utc>) -> Response {
     let s = state.demo_ops.store.ops_state(campaign_id, now);
+    // BP-11a-3: the sites as they stand (a fought contract off the board, a returned one moved);
+    // the route's own board only when the campaign has no entry (a store full of ops).
+    let sites = s.sites.as_deref().unwrap_or(&board.sites);
     let view = OpsView {
         campaign_id,
         gateway: Some(GatewayHex { q: gw.0, r: gw.1 }),
-        sites: &board.sites,
+        sites,
         active_op: s.op,
         ore_banked: s.ore_banked,
         credits_banked: s.credits_banked,
@@ -275,9 +278,9 @@ async fn fight_result(state: &AppState, dep: &DeploymentRecord, route: &str) -> 
     Ok(FightLoss { section_id, losses: fight_losses(&report.unit_results), credits: report.rewards.credits })
 }
 
-/// Latches a pending battle (a raid, BP-8b-1b, a haul's ambush, BP-8b-2, or a contract's fight, BP-11a-2), run by every ops
-/// route right after `load_board`. Nothing pending: nothing is read. Otherwise the store names
-/// the dig's Commander, the trigger and the dig's Section, and:
+/// Latches a pending battle (a raid, BP-8b-1b, a haul's ambush, BP-8b-2, or a contract's fight,
+/// BP-11a-2), run by every ops route right after `load_board`. Nothing pending: nothing is read.
+/// Otherwise the store names the op's Commander, the trigger and its Section, and:
 /// - **at 0** (BP-11a-1): a Section with no soldiers left can't fight, so the battle latches as a
 ///   Wipeout without a fight: no deployment read, no loss write;
 /// - otherwise the Commander's deployments are read with no store lock held
@@ -288,7 +291,8 @@ async fn fight_result(state: &AppState, dep: &DeploymentRecord, route: &str) -> 
 /// - **the losses** (BP-11a-1): only when that latch applied, under the launch lock as the
 ///   meltdown's write, the Section that fought loses one soldier per KIA or MIA. A failed write is
 ///   `500`, and the latch stands.
-/// - **the pay** (BP-11a-2): the recomputed report's credits are banked by the latch itself, so they land exactly when it applies.
+/// - **the pay** (BP-11a-2): the recomputed report's credits are banked by the latch itself, so
+///   they land exactly when it applies.
 async fn latch_pending_raid(state: &AppState, campaign_id: Uuid, now: DateTime<Utc>, route: &str) -> Result<(), AppError> {
     let Some(pending) = state.demo_ops.store.pending_raid(campaign_id, now) else {
         return Ok(());
@@ -376,6 +380,9 @@ async fn get_ops_board(
 /// Commander read (`500` on failure) and `409` no Commander left → for any site, the
 /// member's first Section read (`500` on failure) and `409` when it is at 0 (BP-11a-1) → `409`
 /// an op is under way → `503` the store is full of ops → `200`, the whole state.
+/// - The site is looked up as it stands (BP-11a-3): a fought contract is `400 unknown site`
+///   (before `409` an op is under way) until it returns 45 s later at another hex. A return
+///   landing between the lookup and the start sends the team to the old pin (accepted).
 /// - The leg: `depart_at = now`, `arrive_at = now + the site's travel_secs`.
 /// - The op's seed is drawn here from OS entropy and handed to the store, which never sends it;
 ///   the drill rolls from it.
@@ -406,7 +413,8 @@ async fn post_ops_start(
     };
     let board = load_board(&state, &campaign, gw, now, true, "post_ops_start").await?;
     latch_pending_raid(&state, campaign_id, now, "post_ops_start").await?;
-    let Some(site) = board.sites.iter().find(|s| s.site_id == req.site_id) else {
+    // BP-11a-3: the site as it stands, so a fought contract is unknown until it returns.
+    let Some(site) = state.demo_ops.store.site(campaign_id, &board, &req.site_id, now) else {
         return Err(bad_request("unknown site"));
     };
     let dig = if site.kind == "dig" { Some(dig_start(&state, campaign_id, &wallet).await?) } else { None };
@@ -424,7 +432,7 @@ async fn post_ops_start(
     let contract = lead.map(|commander_id| ContractStart { commander_id, section_id: first_section.map(|s| s.section_id) });
     let dig = dig.map(|d| DigStart { section_id: first_section.map(|s| s.section_id), ..d });
     let op_seed = generate_seed();
-    match state.demo_ops.store.start_op(campaign_id, gw, Arc::clone(&board), site, op_seed, dig, contract, now) {
+    match state.demo_ops.store.start_op(campaign_id, gw, Arc::clone(&board), &site, op_seed, dig, contract, now) {
         Ok(()) => {}
         Err(StartRefusal::Busy) => return Err(conflict("an op is already under way")),
         Err(StartRefusal::Full) => return Err(service_unavailable("the ops board is full")),
@@ -933,7 +941,7 @@ mod tests {
         assert_eq!(keys, ["active_op", "base", "campaign_id", "credits_banked", "gateway", "now", "ore_banked", "sites"].into_iter().collect());
         let op = &body["active_op"];
         let op_keys: std::collections::BTreeSet<&str> = op.as_object().expect("an op").keys().map(|k| k.as_str()).collect();
-        assert_eq!(op_keys, ["arrive_at", "arrived", "depart_at", "kind", "leg", "site_id"].into_iter().collect());
+        assert_eq!(op_keys, ["arrive_at", "arrived", "at", "depart_at", "kind", "leg", "site_id"].into_iter().collect());
         assert_eq!((op["leg"].as_str(), op["site_id"].as_str(), op["kind"].as_str()), (Some("outbound"), Some(SITE), Some("contract")));
         assert_eq!(op["arrived"], false);
         assert_eq!(op["depart_at"], body["now"]);
@@ -1098,14 +1106,15 @@ mod tests {
 
     const DIG: &str = "dig:11,-4";
 
-    /// The member's Crew (8 heads), Foreman and Commander, as a join writes them; the Foreman is
-    /// the Coolant-Jockey or, when `coolant` is false, the first other specialization. Returns the Crew.
     /// A usable Commander for the member, as a join writes one (BP-11a-2: a contract needs one).
     async fn seed_commander(state: &AppState, campaign: Uuid) {
         let commander = crate::commander_gen::generate_commander(WALLET.to_vec(), campaign, 42);
         state.commander_repo.create_commander(commander).await.expect("create_commander");
     }
 
+    /// The member's Crew (8 heads), Foreman and Commander, as a join writes them; the Foreman is
+    /// the Coolant-Jockey or, when `coolant` is false, the first other specialization. Returns
+    /// the Crew.
     async fn seed_crew(state: &AppState, campaign: Uuid, coolant: bool) -> Uuid {
         let mut foreman = crate::foreman_gen::generate_foreman(WALLET.to_vec(), campaign, 7);
         let other = ForemanSpecialization::ALL.iter().map(|s| s.as_str()).find(|s| *s != "Coolant-Jockey").unwrap();
@@ -2045,5 +2054,41 @@ mod tests {
         assert_eq!(section_headcount(&state, section).await, 7, "one loss");
         assert_eq!(state.demo_ops.store.ops_state(c, Utc::now()).credits_banked, 400, "one pay");
         assert_eq!(state.launch_locks.len(), 0);
+    }
+
+    /// BP-11a-3: a won contract leaves the board at its latch (a start of it is `400 unknown
+    /// site`) while the team stays at its own hex (`at`) with `fought: "won"`; 45 s later it is
+    /// back at another hex and the op is unchanged. The test's own `AppState` reuses `WALLET`.
+    #[tokio::test]
+    async fn ops_fought_contract_leaves_the_board_and_returns() {
+        let state = Arc::new(session_state());
+        let c = campaign_with(&state, WALLET, true, Some(GATEWAY)).await;
+        seed_commander(&state, c.campaign_id).await;
+        seed_sector(&state, &c).await;
+        member_section(&state, c.campaign_id).await;
+        let (status, started, _) = start(&state, c.campaign_id, SITE).await;
+        assert_eq!(status, StatusCode::OK, "{started}");
+        let pin = started["sites"].as_array().expect("sites").iter().find(|s| s["site_id"] == SITE).expect("on the board").clone();
+        let hex = serde_json::json!({"q": pin["q"], "r": pin["r"]});
+        assert_eq!(started["active_op"]["at"], hex);
+        state.demo_ops.store.rewind_op(c.campaign_id, site_secs(&started, SITE));
+        fight_logged(&state, c.campaign_id, SUCCESS_SEED, None).await;
+        let on_board = |body: &serde_json::Value| body["sites"].as_array().expect("sites").iter().find(|s| s["site_id"] == SITE).cloned();
+        let (status, body) = get(&state, Some("t"), c.campaign_id).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["active_op"]["fought"], "won");
+        assert_eq!(body["active_op"]["at"], hex, "the team stands where it fought");
+        assert_eq!(on_board(&body), None, "off the board at the latch");
+        let (status, refused, _) = start(&state, c.campaign_id, SITE).await;
+        assert_eq!((status, refused["error"].as_str()), (StatusCode::BAD_REQUEST, Some("unknown site")));
+        state.demo_ops.store.rewind_op(c.campaign_id, 45);
+        let (status, body) = get(&state, Some("t"), c.campaign_id).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let back = on_board(&body).expect("back after 45 s");
+        assert_ne!(serde_json::json!({"q": back["q"], "r": back["r"]}), hex, "at another hex");
+        assert_eq!((&back["mission_id"], &back["kind"]), (&pin["mission_id"], &pin["kind"]));
+        assert_eq!(body["active_op"]["at"], hex, "the op is unchanged");
+        assert_eq!(body["active_op"]["fought"], "won");
+        assert_eq!(body["credits_banked"], 400);
     }
 }
