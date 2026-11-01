@@ -493,7 +493,7 @@ mod tests {
         let (reading, _) = campaign(&state, true).await;
         let cutoff = Utc::now() + chrono::Duration::hours(1);
         let later = cutoff + chrono::Duration::seconds(1);
-        state.demo_ops.store.start_op(moving, (5, 0), ops_board(), &ops_site(), 7, None, later).expect("start");
+        state.demo_ops.store.start_op(moving, (5, 0), ops_board(), &ops_site(), 7, None, None, later).expect("start");
         state.demo_ops.store.put_board(reading, (5, 0), ops_board(), later);
         let mut warns = ReaperWarns::new();
 
@@ -519,7 +519,7 @@ mod tests {
         let (c, _) = campaign(&state, true).await;
         let cutoff = Utc::now() + chrono::Duration::hours(1);
         let secs = chrono::Duration::seconds;
-        state.demo_ops.store.start_op(c, (5, 0), ops_board(), &ops_dig(), 7, ops_crew(), cutoff - secs(1000)).expect("start");
+        state.demo_ops.store.start_op(c, (5, 0), ops_board(), &ops_dig(), 7, ops_crew(), None, cutoff - secs(1000)).expect("start");
         state.demo_ops.store.drill_op(c, cutoff + secs(1)).expect("drill");
 
         assert_eq!(reap_once(&state, &store, cutoff, &mut ReaperWarns::new()).await, 0);
@@ -534,7 +534,7 @@ mod tests {
         let (c, _) = campaign(&state, true).await;
         let cutoff = Utc::now() + chrono::Duration::hours(1);
         let secs = chrono::Duration::seconds;
-        state.demo_ops.store.start_op(c, (5, 0), ops_board(), &ops_dig(), 7, ops_crew(), cutoff - secs(1000)).expect("start");
+        state.demo_ops.store.start_op(c, (5, 0), ops_board(), &ops_dig(), 7, ops_crew(), None, cutoff - secs(1000)).expect("start");
 
         assert_eq!(reap_once(&state, &store, cutoff, &mut ReaperWarns::new()).await, 1);
         assert_eq!(lifecycle(&state, c).await, CampaignLifecycle::Archived);

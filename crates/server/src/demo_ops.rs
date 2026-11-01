@@ -46,7 +46,7 @@ use uuid::Uuid;
 
 use crate::map_gen::{hex_axial_distance, HexTerrain, MagmaVeinNode, SAFE_ZONE_RADIUS};
 use crate::rate_limit::{ClientKey, FixedWindow, RateWarn, RATE_LIMIT_MAP_CAP, RATE_LIMIT_WINDOW};
-use crate::repository::DeploymentRecord;
+use crate::repository::{DeploymentRecord, PauseHook};
 
 /// Ops requests per client address per minute, every `…/ops*` route together.
 pub const OPS_PER_IP: u32 = 400;
@@ -304,12 +304,29 @@ pub struct DigStart {
     pub section_id: Option<Uuid>,
 }
 
-/// Which battle a trigger waits for: raiders at the site (BP-8b-1b) or an ambush on the haul
-/// home (BP-8b-2). Only one is ever pending.
+/// What `ops/start` reads for a contract (BP-11a-2): the Commander who fights it and the
+/// member's first Section, for the at-0 check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContractStart {
+    pub commander_id: Uuid,
+    pub section_id: Option<Uuid>,
+}
+
+/// A contract in progress, private (BP-11a-2). `result` is set once, by the latch.
+struct ContractState {
+    mission_id: &'static str,
+    commander_id: Uuid,
+    section_id: Option<Uuid>,
+    result: Option<RaidResult>,
+}
+
+/// Which battle a trigger waits for: raiders at the site (BP-8b-1b), an ambush on the haul
+/// home (BP-8b-2) or a contract's fight (BP-11a-2). Only one is ever pending.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BattleKind {
     Raid,
     Ambush,
+    Contract,
 }
 
 /// A battle waiting for its fight: when it began, the mission it is fought as, and its kind.
@@ -580,6 +597,8 @@ struct ActiveOp {
     op_seed: u32,
     /// The dig; `None` on a contract.
     dig: Option<DigState>,
+    /// The contract (BP-11a-2): its mission, its lead and its fight's result; `None` on a dig.
+    contract: Option<ContractState>,
 }
 
 /// The op as the client sees it. Times are RFC 3339 with milliseconds; `arrived` is
@@ -595,6 +614,10 @@ pub struct ActiveOpView {
     /// The dig's numbers; absent on a contract, so a contract op keeps its six keys.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dig: Option<DigView>,
+    /// A contract's fight once latched (BP-11a-2): `"won"` (Held) or `"lost"` (Retreat). Absent
+    /// before the fight and on a dig, so an unfought contract keeps its six keys.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fought: Option<&'static str>,
 }
 
 /// The wire format of every time the ops routes send.
@@ -688,6 +711,9 @@ struct OpsEntry {
     /// The ore this campaign has banked (BP-8b-2): added at each homeward arrival, debited by a
     /// build (BP-10a). It leaves only with the entry, so a New run (a new campaign) starts at 0.
     ore_banked: u32,
+    /// The pay this campaign has banked (BP-11a-2): added by every latched fight, inside
+    /// `latch_raid`. It leaves only with the entry, as the banked ore does.
+    credits_banked: u32,
     /// The buildings that stand (BP-10a). They leave only with the entry, as the banked ore does.
     base: OpsBase,
 }
@@ -740,8 +766,34 @@ impl OpsEntry {
                 ambush: d.raid.filter(|r| r.kind == BattleKind::Ambush).map(|r| RaidView { mission_id: r.mission_id }),
                 carried: d.carried,
             }),
+            fought: op.contract.as_ref().and_then(|c| match c.result {
+                Some(RaidResult::Held) => Some("won"),
+                Some(RaidResult::Retreat) => Some("lost"),
+                Some(RaidResult::Wiped) | None => None,
+            }),
         })
     }
+}
+
+/// The contract's fight as a battle trigger (BP-11a-2): once the team is on site and until the
+/// contract is fought. Its fight is the first deployment of the contract's mission started
+/// after the arrival, so a fight from the hub's list before the arrival is never the contract's.
+fn contract_trigger(op: &ActiveOp, now: DateTime<Utc>) -> Option<RaidTrigger> {
+    let c = op.contract.as_ref()?;
+    if op.leg != OpLeg::Outbound || now < op.arrive_at || c.result.is_some() {
+        return None;
+    }
+    Some(RaidTrigger { trigger_at: op.arrive_at, mission_id: c.mission_id, kind: BattleKind::Contract })
+}
+
+/// What every ops body shows from the store (BP-11a-2): the op, the banked ore and pay, and the
+/// base, read under one lock.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OpsSnapshot {
+    pub op: Option<ActiveOpView>,
+    pub ore_banked: u32,
+    pub credits_banked: u32,
+    pub base: OpsBase,
 }
 
 /// Every campaign's ops state, in memory, bounded by `cap`.
@@ -778,7 +830,7 @@ impl OpsEntry {
 ///   does not, nor does the ambush's reveal; a read that latches a battle does. While an
 ///   ambush waits, `moved_since` still counts the leg's passed `arrive_at`, at most
 ///   `travel_secs` (≤ 48 s) after the pull: an accepted overcount;
-/// - the eviction skips any entry holding an op, banked ore or a building;
+/// - the eviction skips any entry holding an op, banked ore, banked credits or a building;
 /// - an entry is dropped only by `remove` (a read of a campaign that is no longer `Active`,
 ///   the reaper's retire) and the reaper's prune (`retain_campaigns`).
 ///
@@ -806,15 +858,15 @@ impl DemoOpsStore {
     }
 
     /// Makes room for a new entry: below the cap, nothing; at it, evicts the least recently
-    /// touched entry that holds no op, no banked ore and no building, and journals (first, then
-    /// at most hourly). `false` when every entry holds an op, banked ore or a building.
+    /// touched entry that holds no op, no banked ore, no banked credits and no building, and journals (first, then
+    /// at most hourly). `false` when every entry holds an op, banked ore, banked credits or a building.
     fn make_room(&self, inner: &mut HashMap<Uuid, OpsEntry>) -> bool {
         if inner.len() < self.cap {
             return true;
         }
         let victim = inner
             .iter()
-            .filter(|(_, e)| e.op.is_none() && e.ore_banked == 0 && e.base == OpsBase::default())
+            .filter(|(_, e)| e.op.is_none() && e.ore_banked == 0 && e.credits_banked == 0 && e.base == OpsBase::default())
             .min_by_key(|(_, e)| e.touched)
             .map(|(id, _)| *id);
         let Some(id) = victim else {
@@ -850,14 +902,14 @@ impl DemoOpsStore {
         if !self.make_room(&mut inner) {
             return false;
         }
-        inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, op: None, moved_at: None, ore_banked: 0, base: OpsBase::default() });
+        inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, op: None, moved_at: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default() });
         true
     }
 
     /// Starts the outbound leg to `site`: `depart_at = now`, `arrive_at = now + travel_secs`.
     /// One op per campaign (`Busy`); a campaign with no entry is cached with `board` first
     /// (`Full` when every entry at the cap holds an op). A dig passes `dig` (its tier comes
-    /// from the site); a contract passes `None`.
+    /// from the site); a contract passes `contract` (BP-11a-2; its mission comes from the site).
     pub fn start_op(
         &self,
         campaign_id: Uuid,
@@ -866,6 +918,7 @@ impl DemoOpsStore {
         site: &OpsSite,
         op_seed: u32,
         dig: Option<DigStart>,
+        contract: Option<ContractStart>,
         now: DateTime<Utc>,
     ) -> Result<(), StartRefusal> {
         let mut inner = self.lock();
@@ -873,7 +926,7 @@ impl DemoOpsStore {
             if !self.make_room(&mut inner) {
                 return Err(StartRefusal::Full);
             }
-            inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, op: None, moved_at: None, ore_banked: 0, base: OpsBase::default() });
+            inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, op: None, moved_at: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default() });
         }
         let Some(e) = inner.get_mut(&campaign_id) else {
             return Err(StartRefusal::Full);
@@ -904,6 +957,7 @@ impl DemoOpsStore {
                 carried: 0,
                 ambush_at: None,
             }),
+            contract: contract.and_then(|c| site.mission_id.map(|mission_id| ContractState { mission_id, commander_id: c.commander_id, section_id: c.section_id, result: None })),
         });
         e.moved_at = Some(now);
         e.touched = now;
@@ -1042,25 +1096,33 @@ impl DemoOpsStore {
         Ok(())
     }
 
-    /// The battle waiting for its fight (a raid, or a haul's ambush once fired), after settling
-    /// the op: the dig's Commander and the trigger. `None` when none is pending.
+    /// The battle waiting for its fight (a raid, or a haul's ambush once fired, or a contract's
+    /// fight once the team is on site (BP-11a-2)), after settling the op: the dig's Commander and
+    /// the trigger. `None` when none is pending.
     pub fn pending_raid(&self, campaign_id: Uuid, now: DateTime<Utc>) -> Option<PendingRaid> {
         let mut inner = self.lock();
         let e = inner.get_mut(&campaign_id)?;
         e.settle_arrival(now);
-        let dig = e.op.as_ref()?.dig.as_ref()?;
+        let op = e.op.as_ref()?;
+        if let Some(trigger) = contract_trigger(op, now) {
+            let c = op.contract.as_ref()?;
+            return Some(PendingRaid { commander_id: c.commander_id, trigger, section_id: c.section_id });
+        }
+        let dig = op.dig.as_ref()?;
         dig.raid.map(|trigger| PendingRaid { commander_id: dig.commander_id, trigger, section_id: dig.section_id })
     }
 
-    /// Applies a fought battle, only if `trigger` is still the dig's pending one (`false`, and no
-    /// write, otherwise). A raid: `Held`, the trigger clears and drilling resumes; `Retreat`, half
-    /// the ore on site (floor) is `carried`, the rest is lost, and the homeward leg starts at
-    /// `now` (`OpEnd::Retreat`). An ambush (BP-8b-2): `Held` resumes the leg, shifted by the
-    /// wait so the team sets off from the midpoint, with the whole load; `Retreat` the same with
-    /// half of it (floor, `OpEnd::Retreat`). `Wiped`, either kind: the op is cleared and its ore
-    /// lost (the mission route has already marked the Commander KIA). Each writes `moved_at`
-    /// (the keep list).
-    pub fn latch_raid(&self, campaign_id: Uuid, trigger: &RaidTrigger, result: RaidResult, now: DateTime<Utc>) -> bool {
+    /// Applies a fought battle, only if `trigger` is still the op's pending one (`false`, and no
+    /// write, otherwise), and banks `credits`, the fight's pay, in the same step (BP-11a-2), so the
+    /// pay lands exactly when the latch does. A raid: `Held`, the trigger clears and drilling
+    /// resumes; `Retreat`, half the ore on site (floor) is `carried`, the rest is lost, and the
+    /// homeward leg starts at `now` (`OpEnd::Retreat`). An ambush (BP-8b-2): `Held` resumes the
+    /// leg, shifted by the wait so the team sets off from the midpoint, with the whole load;
+    /// `Retreat` the same with half of it (floor, `OpEnd::Retreat`). A contract (BP-11a-2): `Held`
+    /// or `Retreat` records the result and the team stays on site. `Wiped`, any kind: the op is
+    /// cleared and its ore lost (the mission route has already marked the Commander KIA), or, at 0
+    /// soldiers (BP-11a-1), with no fight and no death. Each writes `moved_at` (the keep list).
+    pub fn latch_raid(&self, campaign_id: Uuid, trigger: &RaidTrigger, result: RaidResult, credits: u32, now: DateTime<Utc>) -> bool {
         let mut inner = self.lock();
         let Some(e) = inner.get_mut(&campaign_id) else {
             return false;
@@ -1069,34 +1131,51 @@ impl DemoOpsStore {
         let Some(op) = e.op.as_mut() else {
             return false;
         };
-        let Some(dig) = op.dig.as_mut() else {
-            return false;
-        };
-        if dig.raid != Some(*trigger) {
-            return false;
-        }
-        dig.raid = None;
-        match (trigger.kind, result) {
-            (BattleKind::Raid, RaidResult::Held) => {}
-            (BattleKind::Raid, RaidResult::Retreat) => {
-                dig.carried = dig.ore_on_site / 2;
-                dig.ore_on_site = 0;
-                dig.ended_by = Some(OpEnd::Retreat);
-                op.leg = OpLeg::Homeward;
-                op.depart_at = now;
-                op.arrive_at = now + Duration::seconds(i64::from(op.travel_secs));
+        if trigger.kind == BattleKind::Contract {
+            if contract_trigger(op, now) != Some(*trigger) {
+                return false;
             }
-            (BattleKind::Ambush, RaidResult::Held | RaidResult::Retreat) => {
-                if result == RaidResult::Retreat {
-                    dig.carried /= 2;
-                    dig.ended_by = Some(OpEnd::Retreat);
+            match result {
+                RaidResult::Held | RaidResult::Retreat => {
+                    if let Some(c) = op.contract.as_mut() {
+                        c.result = Some(result);
+                    }
                 }
-                let wait = now - dig.ambush_at.take().unwrap_or(now);
-                op.depart_at += wait;
-                op.arrive_at += wait;
+                RaidResult::Wiped => e.op = None,
             }
-            (_, RaidResult::Wiped) => e.op = None,
+        } else {
+            let Some(dig) = op.dig.as_mut() else {
+                return false;
+            };
+            if dig.raid != Some(*trigger) {
+                return false;
+            }
+            dig.raid = None;
+            match (trigger.kind, result) {
+                (BattleKind::Raid, RaidResult::Held) => {}
+                (BattleKind::Raid, RaidResult::Retreat) => {
+                    dig.carried = dig.ore_on_site / 2;
+                    dig.ore_on_site = 0;
+                    dig.ended_by = Some(OpEnd::Retreat);
+                    op.leg = OpLeg::Homeward;
+                    op.depart_at = now;
+                    op.arrive_at = now + Duration::seconds(i64::from(op.travel_secs));
+                }
+                // `Contract` never reaches this match (it latches above); it is named only to
+                // keep the match exhaustive without a catch-all.
+                (BattleKind::Ambush | BattleKind::Contract, RaidResult::Held | RaidResult::Retreat) => {
+                    if result == RaidResult::Retreat {
+                        dig.carried /= 2;
+                        dig.ended_by = Some(OpEnd::Retreat);
+                    }
+                    let wait = now - dig.ambush_at.take().unwrap_or(now);
+                    op.depart_at += wait;
+                    op.arrive_at += wait;
+                }
+                (_, RaidResult::Wiped) => e.op = None,
+            }
         }
+        e.credits_banked = e.credits_banked.saturating_add(credits);
         e.moved_at = Some(now);
         e.touched = now;
         true
@@ -1113,12 +1192,19 @@ impl DemoOpsStore {
     /// The op as the client sees it, the campaign's banked ore (BP-8b-2) and its base (BP-10a),
     /// from one lock. A campaign with no entry has banked and built nothing.
     pub fn ops_snapshot(&self, campaign_id: Uuid, now: DateTime<Utc>) -> (Option<ActiveOpView>, u32, OpsBase) {
+        let s = self.ops_state(campaign_id, now);
+        (s.op, s.ore_banked, s.base)
+    }
+
+    /// The op as the client sees it, the banked ore and pay (BP-11a-2) and the base, from one
+    /// lock, after settling. A campaign with no entry has banked and built nothing.
+    pub fn ops_state(&self, campaign_id: Uuid, now: DateTime<Utc>) -> OpsSnapshot {
         let mut inner = self.lock();
         let Some(e) = inner.get_mut(&campaign_id) else {
-            return (None, 0, OpsBase::default());
+            return OpsSnapshot { op: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default() };
         };
         e.settle_arrival(now);
-        (e.view(now), e.ore_banked, e.base)
+        OpsSnapshot { op: e.view(now), ore_banked: e.ore_banked, credits_banked: e.credits_banked, base: e.base }
     }
 
     /// Builds `building` at the campaign's merc base (BP-10a): its cost is debited from the banked
@@ -1226,6 +1312,10 @@ pub struct DemoOps {
     pub store: DemoOpsStore,
     pub ip: FixedWindow<ClientKey>,
     pub wallet: FixedWindow<String>,
+    /// A test seam (BP-11a-2, Reviewer BP-11a-1 F1): when set, `latch_pending_raid` awaits it
+    /// between the fight's recompute and the store's latch, so a race test can park two readers
+    /// there. `None` in production.
+    pub latch_seam: Option<PauseHook>,
 }
 
 impl Default for DemoOps {
@@ -1234,6 +1324,7 @@ impl Default for DemoOps {
             store: DemoOpsStore::default(),
             ip: FixedWindow::new("ops_ip", OPS_PER_IP, RATE_LIMIT_WINDOW, RATE_LIMIT_MAP_CAP),
             wallet: FixedWindow::new("ops_wallet", OPS_PER_WALLET, RATE_LIMIT_WINDOW, RATE_LIMIT_MAP_CAP),
+            latch_seam: None,
         }
     }
 }
@@ -1447,7 +1538,7 @@ mod tests {
     fn ops_store_board_write_keeps_the_op() {
         let store = DemoOpsStore::new(2);
         let a = Uuid::from_u128(1);
-        store.start_op(a, (5, 0), board(), &site(), 7, None, at(0)).expect("start");
+        store.start_op(a, (5, 0), board(), &site(), 7, None, None, at(0)).expect("start");
         assert!(store.put_board(a, (0, 5), board(), at(1)));
         assert!(store.board(a, (0, 5), at(2)).is_some(), "the new gateway's board is cached");
         let op = store.op_view(a, at(2)).expect("the op survives the board write");
@@ -1461,7 +1552,7 @@ mod tests {
     fn ops_store_eviction_skips_entries_with_an_op() {
         let store = DemoOpsStore::new(2);
         let (a, b, c) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
-        store.start_op(a, (5, 0), board(), &site(), 7, None, at(0)).expect("start");
+        store.start_op(a, (5, 0), board(), &site(), 7, None, None, at(0)).expect("start");
         store.put_board(b, (5, 0), board(), at(1));
         assert!(store.put_board(c, (5, 0), board(), at(2)));
         assert_eq!(store.len(), 2);
@@ -1474,9 +1565,9 @@ mod tests {
     fn ops_store_full_of_ops_refuses_a_start_and_caches_no_board() {
         let store = DemoOpsStore::new(1);
         let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
-        store.start_op(a, (5, 0), board(), &site(), 7, None, at(0)).expect("start");
+        store.start_op(a, (5, 0), board(), &site(), 7, None, None, at(0)).expect("start");
         assert!(!store.put_board(b, (5, 0), board(), at(1)), "nothing evictable");
-        assert_eq!(store.start_op(b, (5, 0), board(), &site(), 8, None, at(1)), Err(StartRefusal::Full));
+        assert_eq!(store.start_op(b, (5, 0), board(), &site(), 8, None, None, at(1)), Err(StartRefusal::Full));
         assert_eq!(store.len(), 1);
         assert!(store.op_view(a, at(2)).is_some());
     }
@@ -1485,8 +1576,8 @@ mod tests {
     fn ops_store_one_op_per_campaign() {
         let store = DemoOpsStore::new(2);
         let a = Uuid::from_u128(1);
-        store.start_op(a, (5, 0), board(), &site(), 7, None, at(0)).expect("start");
-        assert_eq!(store.start_op(a, (5, 0), board(), &site(), 8, None, at(20)), Err(StartRefusal::Busy), "arrived outbound is still out");
+        store.start_op(a, (5, 0), board(), &site(), 7, None, None, at(0)).expect("start");
+        assert_eq!(store.start_op(a, (5, 0), board(), &site(), 8, None, None, at(20)), Err(StartRefusal::Busy), "arrived outbound is still out");
         assert_eq!(store.op_view(a, at(20)).expect("op").depart_at, ops_time(at(0)), "the first op is untouched");
     }
 
@@ -1495,7 +1586,7 @@ mod tests {
         let store = DemoOpsStore::new(2);
         let a = Uuid::from_u128(1);
         assert_eq!(store.return_op(a, at(0)), Err(ReturnRefusal::NoOp));
-        store.start_op(a, (5, 0), board(), &site(), 7, None, at(0)).expect("start");
+        store.start_op(a, (5, 0), board(), &site(), 7, None, None, at(0)).expect("start");
         assert_eq!(store.return_op(a, at(9)), Err(ReturnRefusal::NotArrived));
         assert_eq!(store.return_op(a, at(10)), Ok(()));
         let op = store.op_view(a, at(11)).expect("op");
@@ -1508,13 +1599,13 @@ mod tests {
     fn ops_store_homeward_arrival_clears_the_op_and_keeps_moved_at() {
         let store = DemoOpsStore::new(2);
         let a = Uuid::from_u128(1);
-        store.start_op(a, (5, 0), board(), &site(), 7, None, at(0)).expect("start");
+        store.start_op(a, (5, 0), board(), &site(), 7, None, None, at(0)).expect("start");
         store.return_op(a, at(10)).expect("return");
         assert!(store.op_view(a, at(19)).is_some(), "still on the way home");
         assert!(store.op_view(a, at(500)).is_none(), "home: the op is cleared");
         assert!(store.moved_since(a, at(20), at(500)), "the arrival at 20 s is the last movement");
         assert!(!store.moved_since(a, at(21), at(500)));
-        assert!(store.start_op(a, (5, 0), board(), &site(), 8, None, at(501)).is_ok(), "a new op can start");
+        assert!(store.start_op(a, (5, 0), board(), &site(), 8, None, None, at(501)).is_ok(), "a new op can start");
     }
 
     /// A tier-`tier` dig site 10 s out.
@@ -1538,7 +1629,7 @@ mod tests {
     /// A dig on a tier-`tier` vein, started at 0 s and on site from 10 s, its seed `seed`.
     fn on_site(store: &DemoOpsStore, a: Uuid, tier: u8, threshold: u32, seed: u32) {
         let crew = DigStart { crew_id: CREW, commander_id: COMMANDER, threshold, section_id: None };
-        store.start_op(a, (5, 0), board(), &dig(tier), seed, Some(crew), at(0)).expect("start");
+        store.start_op(a, (5, 0), board(), &dig(tier), seed, Some(crew), None, at(0)).expect("start");
     }
 
     fn dig_view(store: &DemoOpsStore, a: Uuid, now: DateTime<Utc>) -> DigView {
@@ -1611,7 +1702,7 @@ mod tests {
         let store = DemoOpsStore::new(4);
         let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
         assert_eq!(store.drill_op(a, at(0)), Err(DrillRefusal::NoOp));
-        store.start_op(a, (5, 0), board(), &site(), 7, None, at(0)).expect("start");
+        store.start_op(a, (5, 0), board(), &site(), 7, None, None, at(0)).expect("start");
         assert_eq!(store.drill_op(a, at(20)), Err(DrillRefusal::Contract));
         on_site(&store, b, 1, 100, 2);
         assert_eq!(store.drill_op(b, at(9)), Err(DrillRefusal::NotArrived));
@@ -1735,16 +1826,16 @@ mod tests {
             on_site(&store, id, 1, 100, 7);
             store.drill_op(id, at(11)).expect("drill");
         }
-        assert!(store.latch_raid(a, &trigger(11), RaidResult::Held, at(20)));
+        assert!(store.latch_raid(a, &trigger(11), RaidResult::Held, 0, at(20)));
         let d = dig_view(&store, a, at(20));
         assert_eq!((d.raid, d.next_raid_pct, d.ore_on_site, d.carried, d.ended_by), (None, Some(10), 10, 0, None));
         assert_eq!(store.drill_op(a, at(21)), Ok(DrillOutcome::Drilled), "seed 7's drill 2 (d100 98) digs on");
-        assert!(store.latch_raid(b, &trigger(11), RaidResult::Retreat, at(20)));
+        assert!(store.latch_raid(b, &trigger(11), RaidResult::Retreat, 0, at(20)));
         let op = store.op_view(b, at(21)).expect("op");
         assert_eq!((op.leg, op.depart_at, op.arrive_at), (OpLeg::Homeward, ops_time(at(20)), ops_time(at(30))));
         let d = op.dig.expect("a dig");
         assert_eq!((d.carried, d.ore_on_site, d.ended_by, d.raid, d.next_raid_pct), (5, 0, Some(OpEnd::Retreat), None, None));
-        assert!(store.latch_raid(c, &trigger(11), RaidResult::Wiped, at(20)));
+        assert!(store.latch_raid(c, &trigger(11), RaidResult::Wiped, 0, at(20)));
         assert!(store.op_view(c, at(21)).is_none(), "the op is cleared");
     }
 
@@ -1811,9 +1902,9 @@ mod tests {
         store.drill_op(a, at(11)).expect("drill 1");
         store.drill_op(a, at(12)).expect("drill 2");
         assert_eq!(store.pending_raid(a, at(12)).map(|p| p.trigger), Some(trigger(12)));
-        assert!(store.latch_raid(a, &trigger(12), RaidResult::Held, at(13)));
+        assert!(store.latch_raid(a, &trigger(12), RaidResult::Held, 0, at(13)));
         store.drill_op(a, at(14)).expect("drill 3");
-        assert!(!store.latch_raid(a, &trigger(12), RaidResult::Retreat, at(15)), "the trigger has changed");
+        assert!(!store.latch_raid(a, &trigger(12), RaidResult::Retreat, 0, at(15)), "the trigger has changed");
         let op = store.op_view(a, at(15)).expect("op");
         assert_eq!(op.leg, OpLeg::Outbound);
         let d = op.dig.expect("a dig");
@@ -1829,7 +1920,7 @@ mod tests {
         on_site(&store, a, 1, 100, 7);
         store.drill_op(a, at(11)).expect("drill");
         assert!(!store.moved_since(a, at(400), at(600)), "drilled at 11 s, nothing since");
-        assert!(store.latch_raid(a, &trigger(11), RaidResult::Held, at(500)));
+        assert!(store.latch_raid(a, &trigger(11), RaidResult::Held, 0, at(500)));
         assert!(store.moved_since(a, at(400), at(600)));
     }
 
@@ -1901,7 +1992,7 @@ mod tests {
         let store = DemoOpsStore::new(4);
         let (a, b, c) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
         assert_eq!(store.pull_op(a, at(0)), Err(PullRefusal::NoOp));
-        store.start_op(a, (5, 0), board(), &site(), 7, None, at(0)).expect("start");
+        store.start_op(a, (5, 0), board(), &site(), 7, None, None, at(0)).expect("start");
         assert_eq!(store.pull_op(a, at(20)), Err(PullRefusal::Contract));
         on_site(&store, b, 1, 100, 7);
         assert_eq!(store.pull_op(b, at(9)), Err(PullRefusal::NotArrived));
@@ -1927,7 +2018,7 @@ mod tests {
         assert_eq!(store.ops_snapshot(a, at(31)), (None, 60, OpsBase::default()), "banked once");
         assert!(store.moved_since(a, at(30), at(31)), "the arrival is the last movement");
         let crew = DigStart { crew_id: CREW, commander_id: COMMANDER, threshold: 100, section_id: None };
-        store.start_op(a, (5, 0), board(), &dig(1), 2, Some(crew), at(40)).expect("start");
+        store.start_op(a, (5, 0), board(), &dig(1), 2, Some(crew), None, at(40)).expect("start");
         store.drill_op(a, at(51)).expect("drill");
         store.pull_op(a, at(52)).expect("pull");
         assert_eq!(store.ops_snapshot(a, at(62)), (None, 70, OpsBase::default()));
@@ -1940,7 +2031,7 @@ mod tests {
         let a = Uuid::from_u128(1);
         on_site(&store, a, 1, 100, 7);
         store.drill_op(a, at(11)).expect("drill");
-        assert!(store.latch_raid(a, &trigger(11), RaidResult::Retreat, at(20)));
+        assert!(store.latch_raid(a, &trigger(11), RaidResult::Retreat, 0, at(20)));
         assert_eq!(store.ops_snapshot(a, at(29)).1, 0);
         assert_eq!(store.ops_snapshot(a, at(30)), (None, 5, OpsBase::default()));
     }
@@ -1961,7 +2052,7 @@ mod tests {
         }
         assert_eq!(store.drill_op(b, at(20)), Ok(DrillOutcome::Meltdown { crew_id: CREW, heads: 3 }));
         assert_eq!(store.ops_snapshot(b, at(30)), (None, 0, OpsBase::default()));
-        store.start_op(c, (5, 0), board(), &site(), 7, None, at(0)).expect("start");
+        store.start_op(c, (5, 0), board(), &site(), 7, None, None, at(0)).expect("start");
         store.return_op(c, at(10)).expect("return");
         assert_eq!(store.ops_snapshot(c, at(20)), (None, 0, OpsBase::default()));
     }
@@ -1998,15 +2089,15 @@ mod tests {
             pulled(&store, id, 14, 2);
             assert_eq!(store.pending_raid(id, at(25)).map(|p| p.trigger), Some(ambush_trigger(25)));
         }
-        assert!(store.latch_raid(a, &ambush_trigger(25), RaidResult::Held, at(28)));
+        assert!(store.latch_raid(a, &ambush_trigger(25), RaidResult::Held, 0, at(28)));
         let op = store.op_view(a, at(32)).expect("op");
         assert_eq!((op.depart_at, op.arrive_at, op.arrived), (ops_time(at(23)), ops_time(at(33)), false));
         let d = op.dig.expect("a dig");
         assert_eq!((d.carried, d.ended_by, d.ambush), (30, Some(OpEnd::Pulled), None));
-        assert!(store.latch_raid(b, &ambush_trigger(25), RaidResult::Retreat, at(28)));
+        assert!(store.latch_raid(b, &ambush_trigger(25), RaidResult::Retreat, 0, at(28)));
         let d = dig_view(&store, b, at(32));
         assert_eq!((d.carried, d.ended_by, d.ambush), (15, Some(OpEnd::Retreat), None));
-        assert!(store.latch_raid(c, &ambush_trigger(25), RaidResult::Wiped, at(28)));
+        assert!(store.latch_raid(c, &ambush_trigger(25), RaidResult::Wiped, 0, at(28)));
         assert_eq!(store.ops_snapshot(c, at(28)), (None, 0, OpsBase::default()));
         assert_eq!(store.ops_snapshot(a, at(33)), (None, 30, OpsBase::default()));
         assert_eq!(store.ops_snapshot(b, at(33)), (None, 15, OpsBase::default()));
@@ -2021,8 +2112,8 @@ mod tests {
         let a = Uuid::from_u128(1);
         pulled(&store, a, 14, 2);
         store.pending_raid(a, at(25)).expect("the ambush fires");
-        assert!(store.latch_raid(a, &ambush_trigger(25), RaidResult::Retreat, at(28)));
-        assert!(!store.latch_raid(a, &ambush_trigger(25), RaidResult::Retreat, at(29)), "already latched");
+        assert!(store.latch_raid(a, &ambush_trigger(25), RaidResult::Retreat, 0, at(28)));
+        assert!(!store.latch_raid(a, &ambush_trigger(25), RaidResult::Retreat, 0, at(29)), "already latched");
         assert_eq!(dig_view(&store, a, at(30)).carried, 15);
     }
 
@@ -2040,7 +2131,7 @@ mod tests {
         assert!(store.moved_since(a, at(500), at(501)), "the pull");
         store.pending_raid(a, at(505)).expect("the ambush fires at 505 s");
         assert!(!store.moved_since(a, at(502), at(506)), "the reveal is not movement");
-        assert!(store.latch_raid(a, &ambush_trigger(505), RaidResult::Held, at(507)));
+        assert!(store.latch_raid(a, &ambush_trigger(505), RaidResult::Held, 0, at(507)));
         assert!(store.moved_since(a, at(507), at(508)), "the latch");
     }
 
@@ -2137,7 +2228,7 @@ mod tests {
         assert_eq!(store.build_op(a, BaseBuilding::RadioShack, at(25)), Err(BuildRefusal::OpOut), "on the road, 0 banked");
         assert_eq!(store.build_op(a, BaseBuilding::RadioShack, at(30)), Ok(()), "the arrival banks 60, then pays 50");
         assert_eq!(store.ops_snapshot(a, at(30)).1, 10);
-        store.start_op(a, (5, 0), board(), &site(), 7, None, at(40)).expect("start");
+        store.start_op(a, (5, 0), board(), &site(), 7, None, None, at(40)).expect("start");
         assert_eq!(store.build_op(a, BaseBuilding::RadioShack, at(45)), Err(BuildRefusal::OpOut), "before AlreadyBuilt");
         assert_eq!(store.build_op(a, BaseBuilding::RadioShack, at(50)), Err(BuildRefusal::OpOut), "arrived at the contract");
         store.return_op(a, at(50)).expect("return");
@@ -2239,5 +2330,51 @@ mod tests {
         assert!(!store.moved_since(a, at(400), at(450)), "home at 30 s, nothing since");
         assert_eq!(store.build_op(a, BaseBuilding::RadioShack, at(500)), Ok(()));
         assert!(store.moved_since(a, at(500), at(501)), "the build");
+    }
+
+    /// BP-11a-2: a contract's fight is pending only once the team is on site, as a `Contract`
+    /// trigger at the arrival; one latch applies, banks its pay and records the result.
+    #[test]
+    fn ops_store_contract_is_pending_once_on_site() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        let lead = ContractStart { commander_id: COMMANDER, section_id: None };
+        store.start_op(a, (5, 0), board(), &site(), 7, None, Some(lead), at(0)).expect("start");
+        assert_eq!(store.pending_raid(a, at(9)), None, "still travelling");
+        assert_eq!(
+            store.pending_raid(a, at(11)),
+            Some(PendingRaid {
+                commander_id: COMMANDER,
+                trigger: RaidTrigger { trigger_at: at(10), mission_id: "GUARD_DUTY", kind: BattleKind::Contract },
+                section_id: None,
+            })
+        );
+        let t = RaidTrigger { trigger_at: at(10), mission_id: "GUARD_DUTY", kind: BattleKind::Contract };
+        assert!(store.latch_raid(a, &t, RaidResult::Held, 400, at(12)));
+        assert_eq!(store.pending_raid(a, at(13)), None, "fought");
+        assert!(!store.latch_raid(a, &t, RaidResult::Held, 400, at(14)), "already latched");
+        assert_eq!(store.ops_state(a, at(15)).credits_banked, 400);
+        assert_eq!(store.op_view(a, at(15)).expect("op").fought, Some("won"));
+    }
+
+    /// Reviewer BP-10a F2 (BP-11a-2): at the cap, an entry holding only banked credits (no op, no
+    /// ore, no building) is never evicted, so a new campaign's board goes uncached.
+    #[test]
+    fn ops_store_eviction_skips_banked_credits() {
+        let store = DemoOpsStore::new(1);
+        let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let lead = ContractStart { commander_id: COMMANDER, section_id: None };
+        store.start_op(a, (5, 0), board(), &site(), 7, None, Some(lead), at(0)).expect("start");
+        let t = RaidTrigger { trigger_at: at(10), mission_id: "GUARD_DUTY", kind: BattleKind::Contract };
+        assert!(store.latch_raid(a, &t, RaidResult::Held, 400, at(12)));
+        store.return_op(a, at(13)).expect("return");
+        assert_eq!(
+            store.ops_state(a, at(30)),
+            OpsSnapshot { op: None, ore_banked: 0, credits_banked: 400, base: OpsBase::default() }
+        );
+        assert!(!store.put_board(b, (5, 0), board(), at(31)), "not cached");
+        assert_eq!(store.len(), 1);
+        assert!(store.board(a, (5, 0), at(32)).is_some(), "the banked entry is kept");
+        assert!(store.board(b, (5, 0), at(32)).is_none());
     }
 }

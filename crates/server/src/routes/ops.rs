@@ -32,7 +32,7 @@ use crate::api_types::MissionResolveRequest;
 use crate::auth::AuthSession;
 use crate::demo_ops::{
     dig_threshold, fight_losses, ops_board, ops_time, raid_fight, raid_result, ActiveOpView, BaseBuilding, BuildRefusal,
-    DigStart, DrillOutcome, DrillRefusal, OpsBase, OpsBoard, OpsSite, PullRefusal, RaidResult, ReturnRefusal,
+    ContractStart, DigStart, DrillOutcome, DrillRefusal, OpsBase, OpsBoard, OpsSite, PullRefusal, RaidResult, ReturnRefusal,
     StartRefusal, DEMO_MELTDOWN_MORALE_LOSS,
 };
 use crate::repository::{outcome_db_str, CampaignInstance, CampaignLifecycle, DeploymentRecord, SectorState};
@@ -61,8 +61,8 @@ pub fn router() -> Router<Arc<AppState>> {
 
 /// The ops state as the client sees it, from every route. `now` is the server's clock, so the
 /// client's crawl survives a phone whose clock is off. `ore_banked` is the campaign's banked ore
-/// (BP-8b-2) and `base` its merc base's buildings (BP-10a), 0 and none built for a member with
-/// no gateway.
+/// (BP-8b-2), `credits_banked` its banked pay (BP-11a-2) and `base` its merc base's buildings
+/// (BP-10a), 0 and none built for a member with no gateway.
 #[derive(Serialize)]
 pub struct OpsView<'a> {
     pub campaign_id: Uuid,
@@ -70,6 +70,7 @@ pub struct OpsView<'a> {
     pub sites: &'a [OpsSite],
     pub active_op: Option<ActiveOpView>,
     pub ore_banked: u32,
+    pub credits_banked: u32,
     pub base: OpsBase,
     pub now: String,
 }
@@ -195,14 +196,15 @@ async fn load_board(
 }
 
 fn ops_response(state: &AppState, campaign_id: Uuid, gw: (i32, i32), board: &OpsBoard, now: DateTime<Utc>) -> Response {
-    let (active_op, ore_banked, base) = state.demo_ops.store.ops_snapshot(campaign_id, now);
+    let s = state.demo_ops.store.ops_state(campaign_id, now);
     let view = OpsView {
         campaign_id,
         gateway: Some(GatewayHex { q: gw.0, r: gw.1 }),
         sites: &board.sites,
-        active_op,
-        ore_banked,
-        base,
+        active_op: s.op,
+        ore_banked: s.ore_banked,
+        credits_banked: s.credits_banked,
+        base: s.base,
         now: ops_time(now),
     };
     Json(view).into_response()
@@ -248,10 +250,14 @@ async fn replay_report(state: &AppState, dep: &DeploymentRecord, route: &str) ->
     Ok((report, section_id))
 }
 
-/// What a latched fight costs (BP-11a-1): the Section that fought and its soldiers lost.
+/// What a latched fight costs and pays (BP-11a-1, BP-11a-2): the Section that fought, its
+/// soldiers lost, and the credits the recomputed report pays. The pay comes from the server's
+/// recompute of the logged fight, never from the client's copy of the report; the squad that
+/// fought is still the one the client sent (GAP-93, ODQ-63).
 struct FightLoss {
     section_id: Uuid,
     losses: i16,
+    credits: u32,
 }
 
 /// A fight's losses from the recompute (BP-11a-1). A recomputed outcome that differs from the
@@ -266,10 +272,10 @@ async fn fight_result(state: &AppState, dep: &DeploymentRecord, route: &str) -> 
             dep.deployment_id, dep.commander_id, dep.outcome
         )));
     }
-    Ok(FightLoss { section_id, losses: fight_losses(&report.unit_results) })
+    Ok(FightLoss { section_id, losses: fight_losses(&report.unit_results), credits: report.rewards.credits })
 }
 
-/// Latches a pending battle (a raid, BP-8b-1b, or a haul's ambush, BP-8b-2), run by every ops
+/// Latches a pending battle (a raid, BP-8b-1b, a haul's ambush, BP-8b-2, or a contract's fight, BP-11a-2), run by every ops
 /// route right after `load_board`. Nothing pending: nothing is read. Otherwise the store names
 /// the dig's Commander, the trigger and the dig's Section, and:
 /// - **at 0** (BP-11a-1): a Section with no soldiers left can't fight, so the battle latches as a
@@ -282,6 +288,7 @@ async fn fight_result(state: &AppState, dep: &DeploymentRecord, route: &str) -> 
 /// - **the losses** (BP-11a-1): only when that latch applied, under the launch lock as the
 ///   meltdown's write, the Section that fought loses one soldier per KIA or MIA. A failed write is
 ///   `500`, and the latch stands.
+/// - **the pay** (BP-11a-2): the recomputed report's credits are banked by the latch itself, so they land exactly when it applies.
 async fn latch_pending_raid(state: &AppState, campaign_id: Uuid, now: DateTime<Utc>, route: &str) -> Result<(), AppError> {
     let Some(pending) = state.demo_ops.store.pending_raid(campaign_id, now) else {
         return Ok(());
@@ -294,7 +301,7 @@ async fn latch_pending_raid(state: &AppState, campaign_id: Uuid, now: DateTime<U
             .map_err(|e| internal_error(format!("{route}: get_section failed for section {section_id} of campaign {campaign_id}: {e}")))?
             .ok_or_else(|| internal_error(format!("{route}: section {section_id} of campaign {campaign_id} not found")))?;
         if section.headcount == 0 {
-            state.demo_ops.store.latch_raid(campaign_id, &pending.trigger, RaidResult::Wiped, now);
+            state.demo_ops.store.latch_raid(campaign_id, &pending.trigger, RaidResult::Wiped, 0, now);
             return Ok(());
         }
     }
@@ -310,7 +317,10 @@ async fn latch_pending_raid(state: &AppState, campaign_id: Uuid, now: DateTime<U
     let fight = raid_fight(&deps, &pending.trigger)
         .ok_or_else(|| internal_error(format!("{route}: raid of campaign {campaign_id} has a result but no fight")))?;
     let loss = fight_result(state, fight, route).await?;
-    let applied = state.demo_ops.store.latch_raid(campaign_id, &pending.trigger, result, now);
+    if let Some(seam) = &state.demo_ops.latch_seam {
+        seam().await;
+    }
+    let applied = state.demo_ops.store.latch_raid(campaign_id, &pending.trigger, result, loss.credits, now);
     if applied && loss.losses > 0 {
         let _launch = state.launch_locks.lock(campaign_id).await;
         if let Err(e) = state.section_loss.lose_soldiers(loss.section_id, loss.losses).await {
@@ -348,7 +358,7 @@ async fn get_ops_board(
     let now = Utc::now();
     let (campaign, gateway, _) = ops_member(&state, &token, campaign_id, "get_ops_board").await?;
     let Some(gw) = gateway else {
-        let view = OpsView { campaign_id, gateway: None, sites: &[], active_op: None, ore_banked: 0, base: OpsBase::default(), now: ops_time(now) };
+        let view = OpsView { campaign_id, gateway: None, sites: &[], active_op: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), now: ops_time(now) };
         return Ok(Json(view).into_response());
     };
     let board = load_board(&state, &campaign, gw, now, false, "get_ops_board").await?;
@@ -361,14 +371,15 @@ async fn get_ops_board(
 /// counted (`413` over `OPS_BODY_LIMIT`; `400`, `415`, `422`) → `404` → `403` → `409` not
 /// `Active` (entry dropped) → `409` no gateway → the board, a hit proven by `EXISTS` (a lost
 /// sector is repaired: `409` once retired, entry dropped) → a pending raid latched (`500` on a
-/// failed read) → `400` unknown site → for a dig only, the Crew, Foreman and Commander reads
-/// (`500` on failure), `409` no Crew left and `409` no Commander left → for any site, the
+/// failed read) → `400` unknown site → for a dig, the Crew, Foreman and Commander reads
+/// (`500` on failure), `409` no Crew left and `409` no Commander left; for a contract, the
+/// Commander read (`500` on failure) and `409` no Commander left → for any site, the
 /// member's first Section read (`500` on failure) and `409` when it is at 0 (BP-11a-1) → `409`
 /// an op is under way → `503` the store is full of ops → `200`, the whole state.
 /// - The leg: `depart_at = now`, `arrive_at = now + the site's travel_secs`.
 /// - The op's seed is drawn here from OS entropy and handed to the store, which never sends it;
 ///   the drill rolls from it.
-/// - A dig reads its Crew, threshold and Commander once, here (`dig_start`); a contract reads none.
+/// - A dig reads its Crew, threshold and Commander once, here (`dig_start`); a contract reads its Commander (`usable_commander`).
 /// - The latch runs here too, so a raid already fought (a Wipeout clears the op) frees the start
 ///   without waiting for a board read.
 /// - No launch lock: an op that starts while the reaper retires the campaign is retired with
@@ -399,6 +410,7 @@ async fn post_ops_start(
         return Err(bad_request("unknown site"));
     };
     let dig = if site.kind == "dig" { Some(dig_start(&state, campaign_id, &wallet).await?) } else { None };
+    let lead = if site.kind == "contract" { Some(usable_commander(&state, campaign_id, &wallet).await?) } else { None };
     // BP-11a-1: the member's first Section (oldest first). At 0 it has no one to send, for any
     // site; after the Commander check, so a KIA Commander still answers first. A member with no
     // Section passes, and the dig then has no at-0 check.
@@ -409,9 +421,10 @@ async fn post_ops_start(
     if first_section.is_some_and(|s| s.headcount == 0) {
         return Err(conflict("no soldiers left to send: start a new run"));
     }
+    let contract = lead.map(|commander_id| ContractStart { commander_id, section_id: first_section.map(|s| s.section_id) });
     let dig = dig.map(|d| DigStart { section_id: first_section.map(|s| s.section_id), ..d });
     let op_seed = generate_seed();
-    match state.demo_ops.store.start_op(campaign_id, gw, Arc::clone(&board), site, op_seed, dig, now) {
+    match state.demo_ops.store.start_op(campaign_id, gw, Arc::clone(&board), site, op_seed, dig, contract, now) {
         Ok(()) => {}
         Err(StartRefusal::Busy) => return Err(conflict("an op is already under way")),
         Err(StartRefusal::Full) => return Err(service_unavailable("the ops board is full")),
@@ -437,13 +450,21 @@ async fn dig_start(state: &AppState, campaign_id: Uuid, wallet: &[u8]) -> Result
         internal_error(format!("post_ops_start: list_foremen_for_member failed for campaign {campaign_id}: {e}"))
     })?;
     let coolant = foremen.first().is_some_and(|f| f.specialization == ForemanSpecialization::CoolantJockey.as_str());
+    let commander_id = usable_commander(state, campaign_id, wallet).await?;
+    Ok(DigStart { crew_id: crew.crew_id, commander_id, threshold: dig_threshold(coolant), section_id: None })
+}
+
+/// The member's first usable Commander (BP-11a-2, extracted from `dig_start`): not KIA, not
+/// Shattered (the mission route's refusals). `409` when none is usable. A dig's raids and a
+/// contract's fight are both fought by this one.
+async fn usable_commander(state: &AppState, campaign_id: Uuid, wallet: &[u8]) -> Result<Uuid, AppError> {
     let commanders = state.commander_repo.list_commanders_for_member(campaign_id, wallet).await.map_err(|e| {
         internal_error(format!("post_ops_start: list_commanders_for_member failed for campaign {campaign_id}: {e}"))
     })?;
     let Some(commander) = commanders.iter().find(|c| !c.is_kia && !c.is_shattered) else {
         return Err(conflict("no Commander left to lead: start a new run"));
     };
-    Ok(DigStart { crew_id: crew.crew_id, commander_id: commander.commander_id, threshold: dig_threshold(coolant), section_id: None })
+    Ok(commander.commander_id)
 }
 
 /// Brings the team home, `POST /api/campaign/:campaign_id/ops/return` (BP-8a-2, demo-only).
@@ -759,7 +780,7 @@ mod tests {
         let (status, body) = get(&state, Some("t"), c.campaign_id).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let keys: std::collections::BTreeSet<&str> = body.as_object().expect("an object").keys().map(|k| k.as_str()).collect();
-        assert_eq!(keys, ["active_op", "base", "campaign_id", "gateway", "now", "ore_banked", "sites"].into_iter().collect());
+        assert_eq!(keys, ["active_op", "base", "campaign_id", "credits_banked", "gateway", "now", "ore_banked", "sites"].into_iter().collect());
         assert_eq!(body["campaign_id"], c.campaign_id.to_string());
         assert_eq!(body["gateway"], serde_json::json!({"q": 5, "r": 0}));
         assert!(body["active_op"].is_null());
@@ -905,10 +926,11 @@ mod tests {
         let state = Arc::new(session_state());
         let c = campaign_with(&state, WALLET, true, Some(GATEWAY)).await;
         seed_sector(&state, &c).await;
+        seed_commander(&state, c.campaign_id).await;
         let (status, body, bytes) = start(&state, c.campaign_id, SITE).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let keys: std::collections::BTreeSet<&str> = body.as_object().expect("an object").keys().map(|k| k.as_str()).collect();
-        assert_eq!(keys, ["active_op", "base", "campaign_id", "gateway", "now", "ore_banked", "sites"].into_iter().collect());
+        assert_eq!(keys, ["active_op", "base", "campaign_id", "credits_banked", "gateway", "now", "ore_banked", "sites"].into_iter().collect());
         let op = &body["active_op"];
         let op_keys: std::collections::BTreeSet<&str> = op.as_object().expect("an op").keys().map(|k| k.as_str()).collect();
         assert_eq!(op_keys, ["arrive_at", "arrived", "depart_at", "kind", "leg", "site_id"].into_iter().collect());
@@ -935,6 +957,7 @@ mod tests {
         let state = Arc::new(session_state());
         let c = campaign_with(&state, WALLET, true, Some(GATEWAY)).await;
         seed_sector(&state, &c).await;
+        seed_commander(&state, c.campaign_id).await;
         assert_eq!(start(&state, c.campaign_id, SITE).await.0, StatusCode::OK);
         let (status, body, _) = start(&state, c.campaign_id, "contract:SUPPLY_RAID").await;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
@@ -989,6 +1012,8 @@ mod tests {
         seed_sector(&state, &first).await;
         let second = campaign_with(&state, WALLET, true, Some(GATEWAY)).await;
         seed_sector(&state, &second).await;
+        seed_commander(&state, first.campaign_id).await;
+        seed_commander(&state, second.campaign_id).await;
         assert_eq!(start(&state, first.campaign_id, SITE).await.0, StatusCode::OK);
         let (status, body, _) = start(&state, second.campaign_id, SITE).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
@@ -1020,6 +1045,7 @@ mod tests {
         seed_sector(&state, &c).await;
         let (status, body, _) = post(&state, c.campaign_id, "return", None).await;
         assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("no op under way")));
+        seed_commander(&state, c.campaign_id).await;
         let (status, started, _) = start(&state, c.campaign_id, SITE).await;
         assert_eq!(status, StatusCode::OK, "{started}");
         let (status, body, _) = post(&state, c.campaign_id, "return", None).await;
@@ -1042,6 +1068,7 @@ mod tests {
         let c = campaign_with(&state, WALLET, true, Some(GATEWAY)).await;
         seed_sector(&state, &c).await;
         assert_eq!(get(&state, Some("t"), c.campaign_id).await.0, StatusCode::OK);
+        seed_commander(&state, c.campaign_id).await;
         assert_eq!(start(&state, c.campaign_id, SITE).await.0, StatusCode::OK);
         state.membership_repo.assign_gateway_hex(&WALLET, c.campaign_id, 0, 5).await.unwrap();
         let (status, body) = get(&state, Some("t"), c.campaign_id).await;
@@ -1055,6 +1082,7 @@ mod tests {
         let state = Arc::new(session_state());
         let c = campaign_with(&state, WALLET, true, Some(GATEWAY)).await;
         seed_sector(&state, &c).await;
+        seed_commander(&state, c.campaign_id).await;
         let (_, started, _) = start(&state, c.campaign_id, SITE).await;
         let secs = site_secs(&started, SITE);
         state.demo_ops.store.rewind_op(c.campaign_id, secs);
@@ -1072,6 +1100,12 @@ mod tests {
 
     /// The member's Crew (8 heads), Foreman and Commander, as a join writes them; the Foreman is
     /// the Coolant-Jockey or, when `coolant` is false, the first other specialization. Returns the Crew.
+    /// A usable Commander for the member, as a join writes one (BP-11a-2: a contract needs one).
+    async fn seed_commander(state: &AppState, campaign: Uuid) {
+        let commander = crate::commander_gen::generate_commander(WALLET.to_vec(), campaign, 42);
+        state.commander_repo.create_commander(commander).await.expect("create_commander");
+    }
+
     async fn seed_crew(state: &AppState, campaign: Uuid, coolant: bool) -> Uuid {
         let mut foreman = crate::foreman_gen::generate_foreman(WALLET.to_vec(), campaign, 7);
         let other = ForemanSpecialization::ALL.iter().map(|s| s.as_str()).find(|s| *s != "Coolant-Jockey").unwrap();
@@ -1118,6 +1152,7 @@ mod tests {
         seed_sector(&state, &contract).await;
         let (status, body, _) = drill(&state, contract.campaign_id).await;
         assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("no op under way")));
+        seed_commander(&state, contract.campaign_id).await;
         assert_eq!(start(&state, contract.campaign_id, SITE).await.0, StatusCode::OK);
         let (status, body, _) = drill(&state, contract.campaign_id).await;
         assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("not a dig site")));
@@ -1315,17 +1350,28 @@ mod tests {
         state.section_repo.get_section(section).await.unwrap().expect("the Section").headcount
     }
 
-    /// A raid's fight as the mission route records it (BP-11a-1, spec check F2), started now
-    /// (after the trigger): the `session_start` logged with `seed`, a `GUARD_DUTY` request of
+    /// `fight_logged_at`, started now.
+    async fn fight_logged(
+        state: &AppState,
+        campaign: Uuid,
+        seed: (u32, usize),
+        record_as: Option<sim_engine::game_types::OutcomeType>,
+    ) -> (Uuid, Uuid) {
+        fight_logged_at(state, campaign, seed, record_as, chrono::Utc::now()).await
+    }
+
+    /// A raid's fight as the mission route records it (BP-11a-1, spec check F2), started at
+    /// `started_at`: the `session_start` logged with `seed`, a `GUARD_DUTY` request of
     /// `units` Rookies and the member's first Section; the report from `resolve_mission`; the
     /// deployment opened with that Section and resolved with the report's outcome and KIA count
     /// (a Wipeout also marks the Commander KIA), or with `record_as` to fake a mismatched record.
     /// Returns the Commander and the Section.
-    async fn fight_logged(
+    async fn fight_logged_at(
         state: &AppState,
         campaign: Uuid,
         (seed, units): (u32, usize),
         record_as: Option<sim_engine::game_types::OutcomeType>,
+        started_at: chrono::DateTime<chrono::Utc>,
     ) -> (Uuid, Uuid) {
         let commander = commander_of(state, campaign).await;
         let section = member_section(state, campaign).await;
@@ -1363,7 +1409,7 @@ mod tests {
             commander_id: commander,
             session_id,
             mission_id: "GUARD_DUTY".into(),
-            started_at: chrono::Utc::now(),
+            started_at,
             player_wallet: WALLET.to_vec(),
             campaign_id: campaign,
             section_ids: vec![section],
@@ -1501,6 +1547,7 @@ mod tests {
         seed_sector(&state, &contract).await;
         let (status, body, _) = pull(&state, contract.campaign_id).await;
         assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("no op under way")));
+        seed_commander(&state, contract.campaign_id).await;
         assert_eq!(start(&state, contract.campaign_id, SITE).await.0, StatusCode::OK);
         let (status, body, _) = pull(&state, contract.campaign_id).await;
         assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("not a dig site")));
@@ -1781,6 +1828,7 @@ mod tests {
         let c = campaign_with(&state, WALLET, true, Some(GATEWAY)).await;
         seed_sector(&state, &c).await;
         assert_eq!(get(&state, Some("t"), c.campaign_id).await.0, StatusCode::OK);
+        seed_commander(&state, c.campaign_id).await;
         assert_eq!(start(&state, c.campaign_id, SITE).await.0, StatusCode::OK);
         assert_eq!(post(&state, c.campaign_id, "return", None).await.0, StatusCode::TOO_MANY_REQUESTS);
     }
@@ -1830,6 +1878,7 @@ mod tests {
         seed_sector(&state, &c).await;
         let (status, body, _) = build(&state, c.campaign_id, "barracks").await;
         assert_eq!((status, body["error"].as_str()), (StatusCode::BAD_REQUEST, Some("unknown building")));
+        seed_commander(&state, c.campaign_id).await;
         assert_eq!(start(&state, c.campaign_id, SITE).await.0, StatusCode::OK);
         let (status, body, _) = build(&state, c.campaign_id, "radio_shack").await;
         assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("the team is out: build when they're home")));
@@ -1849,5 +1898,152 @@ mod tests {
         assert_eq!(post(&state, c, "build", Some("{")).await.0, StatusCode::BAD_REQUEST);
         assert_eq!(post(&state, c, "build", None).await.0, StatusCode::UNSUPPORTED_MEDIA_TYPE);
         assert_eq!(post(&state, c, "build", Some("{}")).await.0, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// BP-11a-2: a contract campaign (its Commander already seeded) with its sector and its first
+    /// Section (8 soldiers), the team sent to `SITE` and its arrival crossed. Returns the
+    /// campaign, its Section and the arrival instant as the store now holds it.
+    async fn contract_on_site(state: &Arc<AppState>, c: &CampaignInstance) -> (Uuid, Uuid, chrono::DateTime<chrono::Utc>) {
+        seed_sector(state, c).await;
+        let section = member_section(state, c.campaign_id).await;
+        let (status, started, _) = start(state, c.campaign_id, SITE).await;
+        assert_eq!(status, StatusCode::OK, "{started}");
+        let secs = site_secs(&started, SITE);
+        let arrive_at = chrono::DateTime::parse_from_rfc3339(started["active_op"]["arrive_at"].as_str().expect("arrive_at"))
+            .expect("rfc3339")
+            .with_timezone(&chrono::Utc);
+        state.demo_ops.store.rewind_op(c.campaign_id, secs);
+        (c.campaign_id, section, arrive_at - chrono::Duration::seconds(secs))
+    }
+
+    /// BP-11a-2: a contract start needs a usable Commander, as a dig does.
+    #[tokio::test]
+    async fn ops_contract_start_needs_a_commander() {
+        let state = Arc::new(session_state());
+        let c = campaign_with(&state, WALLET, true, Some(GATEWAY)).await;
+        seed_sector(&state, &c).await;
+        let (status, body, _) = start(&state, c.campaign_id, SITE).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("no Commander left to lead: start a new run")));
+        assert!(state.demo_ops.store.op_view(c.campaign_id, chrono::Utc::now()).is_none());
+        seed_commander(&state, c.campaign_id).await;
+        let (status, body, _) = start(&state, c.campaign_id, SITE).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// BP-11a-2: a won contract banks its pay (SUCCESS_SEED pays 400) and costs its losses
+    /// (1 KIA), once; the team stays on site with `fought: "won"`. A second fight changes nothing.
+    #[tokio::test]
+    async fn ops_contract_latch_banks_its_pay() {
+        let state = Arc::new(session_state());
+        let cc = campaign_with(&state, WALLET, true, Some(GATEWAY)).await;
+        seed_commander(&state, cc.campaign_id).await;
+        let (c, section, _) = contract_on_site(&state, &cc).await;
+        fight_logged(&state, c, SUCCESS_SEED, None).await;
+        let (status, body) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["credits_banked"], 400);
+        assert_eq!(section_headcount(&state, section).await, 7);
+        assert_eq!(body["active_op"]["leg"], "outbound");
+        assert_eq!(body["active_op"]["fought"], "won");
+        fight_logged(&state, c, SUCCESS_SEED, None).await;
+        let (status, body) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["credits_banked"], 400, "a second fight on site pays nothing");
+        assert_eq!(section_headcount(&state, section).await, 7, "and costs nothing");
+    }
+
+    /// BP-11a-2: a lost contract pays nothing, costs its loss, and leaves the team on site
+    /// (`fought: "lost"`) until it heads home.
+    #[tokio::test]
+    async fn ops_contract_defeat_stays_on_site_and_pays_nothing() {
+        let state = Arc::new(session_state());
+        let cc = campaign_with(&state, WALLET, true, Some(GATEWAY)).await;
+        seed_commander(&state, cc.campaign_id).await;
+        let (c, section, _) = contract_on_site(&state, &cc).await;
+        fight_logged(&state, c, DEFEAT_SEED, None).await;
+        let (status, body) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["credits_banked"], 0);
+        assert_eq!(section_headcount(&state, section).await, 7);
+        assert_eq!(body["active_op"]["fought"], "lost");
+        assert_eq!(body["active_op"]["leg"], "outbound");
+        let (status, body, _) = post(&state, c, "return", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["active_op"]["leg"], "homeward");
+    }
+
+    /// BP-11a-2: a wiped-out contract ends the op and pays nothing.
+    #[tokio::test]
+    async fn ops_contract_wipeout_ends_the_op() {
+        let state = Arc::new(session_state());
+        let cc = campaign_with(&state, WALLET, true, Some(GATEWAY)).await;
+        seed_commander(&state, cc.campaign_id).await;
+        let (c, section, _) = contract_on_site(&state, &cc).await;
+        fight_logged(&state, c, WIPEOUT_SEED, None).await;
+        let (status, body) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["active_op"].is_null(), "{body}");
+        assert_eq!(body["credits_banked"], 0);
+        assert_eq!(section_headcount(&state, section).await, 7);
+    }
+
+    /// BP-11a-2: a fight started before the arrival (the hub's list) is not the contract's; the
+    /// contract stays pending and its own fight, after the arrival, latches.
+    #[tokio::test]
+    async fn ops_contract_fight_before_arrival_is_not_its_fight() {
+        let state = Arc::new(session_state());
+        let cc = campaign_with(&state, WALLET, true, Some(GATEWAY)).await;
+        seed_commander(&state, cc.campaign_id).await;
+        let (c, section, arrival) = contract_on_site(&state, &cc).await;
+        fight_logged_at(&state, c, SUCCESS_SEED, None, arrival - chrono::Duration::seconds(60)).await;
+        let (status, body) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["credits_banked"], 0);
+        assert_eq!(section_headcount(&state, section).await, 8);
+        assert!(body["active_op"]["fought"].is_null(), "{body}");
+        assert_eq!(body["active_op"]["leg"], "outbound");
+        fight_logged(&state, c, SUCCESS_SEED, None).await;
+        let (status, body) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["credits_banked"], 400, "the contract was still pending");
+        assert_eq!(section_headcount(&state, section).await, 7);
+    }
+
+    /// BP-11a-2: a won raid banks its pay too (W1: every latched fight).
+    #[tokio::test]
+    async fn ops_raid_win_banks_its_pay() {
+        let state = Arc::new(session_state());
+        let (c, _) = dig_campaign(&state, false).await;
+        dig_on_site(&state, c, 7).await;
+        assert_eq!(drill(&state, c).await.0, StatusCode::OK);
+        fight(&state, c, sim_engine::game_types::OutcomeType::Success).await;
+        let (status, body) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["credits_banked"], 400);
+    }
+
+    /// Reviewer BP-11a-1 F1: two ops reads recompute the same contract fight and both park at the
+    /// latch seam; released together, one latch applies, so one loss and one pay land. The
+    /// test's own `AppState` reuses `WALLET` (no `[n; 32]` byte is free).
+    #[tokio::test]
+    async fn ops_contract_latch_applies_once_under_two_racers() {
+        let mut state = session_state();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        state.demo_ops.latch_seam = Some(Arc::new(move || { let barrier = Arc::clone(&barrier); Box::pin(async move { barrier.wait().await; }) }));
+        let state = Arc::new(state);
+        let cc = campaign_with(&state, WALLET, true, Some(GATEWAY)).await;
+        seed_commander(&state, cc.campaign_id).await;
+        let (c, section, _) = contract_on_site(&state, &cc).await;
+        fight_logged(&state, c, SUCCESS_SEED, None).await;
+        let raced = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(get(&state, Some("t"), c), get(&state, Some("t"), c))
+        })
+        .await;
+        let ((a, body_a), (b, body_b)) = raced.expect("both readers reached the seam");
+        assert_eq!(a, StatusCode::OK, "{body_a}");
+        assert_eq!(b, StatusCode::OK, "{body_b}");
+        assert_eq!(section_headcount(&state, section).await, 7, "one loss");
+        assert_eq!(state.demo_ops.store.ops_state(c, Utc::now()).credits_banked, 400, "one pay");
+        assert_eq!(state.launch_locks.len(), 0);
     }
 }
