@@ -8484,8 +8484,9 @@ async fn address_cap_refuses_then_admits_after_an_archive() {
 /// The only wallet the BP-8b-1a test uses.
 const CREW_LOSS_WALLET: [u8; 32] = [109u8; 32];
 
-/// BP-8b-1a — `PostgresCrewLoss::lose_heads` takes heads in one `UPDATE` and stops at 0
-/// (`GREATEST` keeps `crew_records_headcount_range`); an unknown Crew is `NotFound`.
+/// BP-8b-1a — `PostgresCrewLoss::meltdown_loss` (renamed by BP-11a-1) takes heads in one
+/// `UPDATE` and stops at 0 (`GREATEST` keeps `crew_records_headcount_range`); an unknown Crew
+/// is `NotFound`.
 #[tokio::test]
 async fn postgres_crew_loss_takes_heads_down_to_zero() {
     use mercs_server::demo_crew_loss::{CrewLoss, PostgresCrewLoss};
@@ -8500,14 +8501,57 @@ async fn postgres_crew_loss_takes_heads_down_to_zero() {
     crews.create_crew(crew.clone()).await.expect("create_crew failed");
     let loss = PostgresCrewLoss::new(pool.clone());
 
-    let first = loss.lose_heads(crew.crew_id, 3).await;
-    let second = loss.lose_heads(crew.crew_id, 8).await;
+    let first = loss.meltdown_loss(crew.crew_id, 3, 0).await.map(|(heads, _)| heads);
+    let second = loss.meltdown_loss(crew.crew_id, 8, 0).await.map(|(heads, _)| heads);
     let stored = crews.get_crew(crew.crew_id).await;
-    let unknown = loss.lose_heads(uuid::Uuid::new_v4(), 1).await;
+    let unknown = loss.meltdown_loss(uuid::Uuid::new_v4(), 1, 0).await;
     clean_wallet_4g1(&pool, &CREW_LOSS_WALLET).await;
 
     assert_eq!(first.expect("first loss"), 5, "8 - 3");
     assert_eq!(second.expect("second loss"), 0, "5 - 8 stops at 0");
     assert_eq!(stored.expect("get_crew").expect("the Crew").headcount, 0);
+    assert!(matches!(unknown, Err(RepositoryError::NotFound)), "{unknown:?}");
+}
+
+// ── BP-11a-1 (demo-only): the latch's Section loss ───────────────────────────
+
+/// The only wallet the BP-11a-1 test uses.
+const SECTION_LOSS_WALLET: [u8; 32] = [110u8; 32];
+
+/// BP-11a-1 — `PostgresSectionLoss::lose_soldiers` takes soldiers in one `UPDATE` and stops at 0
+/// (`GREATEST` keeps `section_records_headcount_range`); an unknown Section is `NotFound`.
+#[tokio::test]
+async fn postgres_section_loss_floors_at_zero_and_returns_the_headcount() {
+    use mercs_server::demo_section_loss::{PostgresSectionLoss, SectionLoss};
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    clean_wallet_4g1(&pool, &SECTION_LOSS_WALLET).await;
+    let campaign_id = seed_account_and_campaign(&pool, SECTION_LOSS_WALLET, 0x11A1_i64).await;
+    let sections = PostgresSectionRepository::new(pool.clone());
+    let section_id = uuid::Uuid::new_v4();
+    sections.create_section(SectionRecord {
+        section_id,
+        campaign_id,
+        player_wallet: SECTION_LOSS_WALLET.to_vec(),
+        name:          "1st Section".into(),
+        headcount:     8,
+        loadout:       serde_json::json!({}),
+        xp:            0,
+        created_at:    chrono::Utc::now(),
+        updated_at:    chrono::Utc::now(),
+    }).await.expect("create_section failed");
+    let loss = PostgresSectionLoss::new(pool.clone());
+
+    let first = loss.lose_soldiers(section_id, 3).await;
+    let second = loss.lose_soldiers(section_id, 9).await;
+    let stored = sections.get_section(section_id).await;
+    let unknown = loss.lose_soldiers(uuid::Uuid::new_v4(), 1).await;
+    clean_wallet_4g1(&pool, &SECTION_LOSS_WALLET).await;
+
+    assert_eq!(first.expect("first loss"), 5, "8 - 3");
+    assert_eq!(second.expect("second loss"), 0, "5 - 9 stops at 0");
+    assert_eq!(stored.expect("get_section").expect("the Section").headcount, 0);
     assert!(matches!(unknown, Err(RepositoryError::NotFound)), "{unknown:?}");
 }

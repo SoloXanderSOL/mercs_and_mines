@@ -13,6 +13,7 @@ pub mod demo_reaper;
 pub mod demo_address_cap;
 pub mod demo_ops;
 pub mod demo_crew_loss; // (BP-8b-1a, demo-only)
+pub mod demo_section_loss; // (BP-11a-1, demo-only)
 pub mod advisor_gen;
 pub mod augmentee_gen;
 pub mod api_types;

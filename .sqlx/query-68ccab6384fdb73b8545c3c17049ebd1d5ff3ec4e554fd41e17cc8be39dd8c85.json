@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "UPDATE crew_records SET headcount = GREATEST(headcount - $2, 0) WHERE crew_id = $1 RETURNING headcount",
+  "query": "UPDATE section_records SET headcount = GREATEST(headcount - $2, 0) WHERE section_id = $1 RETURNING headcount",
   "describe": {
     "columns": [
       {
@@ -19,5 +19,5 @@
       false
     ]
   },
-  "hash": "c85d062a3a6420e9deebf98e3eb3d8c0d58247a9dbbfeedfdc51e5b3d19cfcf4"
+  "hash": "68ccab6384fdb73b8545c3c17049ebd1d5ff3ec4e554fd41e17cc8be39dd8c85"
 }

@@ -21,16 +21,21 @@ use axum::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use shared::SessionToken;
+use sim_engine::game_types::{BattleReport, Squad};
+use sim_engine::missions::missions;
+use sim_engine::resolver::resolve_mission;
 use sim_engine::rng::generate_seed;
 use sim_engine::roster::ForemanSpecialization;
 use uuid::Uuid;
 
+use crate::api_types::MissionResolveRequest;
 use crate::auth::AuthSession;
 use crate::demo_ops::{
-    dig_threshold, ops_board, ops_time, raid_result, ActiveOpView, BaseBuilding, BuildRefusal, DigStart, DrillOutcome,
-    DrillRefusal, OpsBase, OpsBoard, OpsSite, PullRefusal, ReturnRefusal, StartRefusal,
+    dig_threshold, fight_losses, ops_board, ops_time, raid_fight, raid_result, ActiveOpView, BaseBuilding, BuildRefusal,
+    DigStart, DrillOutcome, DrillRefusal, OpsBase, OpsBoard, OpsSite, PullRefusal, RaidResult, ReturnRefusal,
+    StartRefusal, DEMO_MELTDOWN_MORALE_LOSS,
 };
-use crate::repository::{CampaignInstance, CampaignLifecycle, SectorState};
+use crate::repository::{outcome_db_str, CampaignInstance, CampaignLifecycle, DeploymentRecord, SectorState};
 use crate::state::AppState;
 
 use super::sector::GatewayHex;
@@ -203,23 +208,117 @@ fn ops_response(state: &AppState, campaign_id: Uuid, gw: (i32, i32), board: &Ops
     Json(view).into_response()
 }
 
+/// Rebuilds a fight's `BattleReport` from the server's own records (BP-11a-1, Linux Q2 (a)): the
+/// deployment's logged `session_start` (the request, the timestamp and `selection.section_ids`)
+/// and the seed in its session config, through `resolve_mission` exactly as the mission route
+/// called it (`routes/mod.rs:594-596`). Returns the report and the first logged Section, the one
+/// that fought. No store lock is held; any missing piece is a `500`. The route fills
+/// `commander_name` after its resolve, so the recompute's is `None`.
+async fn replay_report(state: &AppState, dep: &DeploymentRecord, route: &str) -> Result<(BattleReport, Uuid), AppError> {
+    let (deployment, session, commander) = (dep.deployment_id, dep.session_id, dep.commander_id);
+    let at = || format!("{route}: deployment {deployment} (session {session}) of commander {commander}");
+    let entries = state.input_log_repo.get_entries_by_session(&session).await.map_err(|e| {
+        internal_error(format!("{}: input log read failed: {e}", at()))
+    })?;
+    let start = entries
+        .iter()
+        .find(|e| e.event_type == "session_start")
+        .ok_or_else(|| internal_error(format!("{}: no session_start entry", at())))?;
+    let req: MissionResolveRequest = serde_json::from_value(start.payload["request"].clone())
+        .map_err(|e| internal_error(format!("{}: session_start is not a mission request: {e}", at())))?;
+    let timestamp = start.payload["timestamp"]
+        .as_str()
+        .ok_or_else(|| internal_error(format!("{}: session_start has no timestamp", at())))?
+        .to_string();
+    let section_id = start.payload["selection"]["section_ids"][0]
+        .as_str()
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .ok_or_else(|| internal_error(format!("{}: session_start has no first Section", at())))?;
+    let config = state
+        .input_log_repo
+        .get_session_config(&session)
+        .await
+        .map_err(|e| internal_error(format!("{}: session config read failed: {e}", at())))?
+        .ok_or_else(|| internal_error(format!("{}: no session config", at())))?;
+    let mission = missions()
+        .get(dep.mission_id.as_str())
+        .ok_or_else(|| internal_error(format!("{}: unknown mission {}", at(), dep.mission_id)))?;
+    let squad = Squad { units: req.squad.units, commander: None };
+    let report = resolve_mission(&squad, mission, &timestamp, Some(config.seed as u32), &state.config.sim);
+    Ok((report, section_id))
+}
+
+/// What a latched fight costs (BP-11a-1): the Section that fought and its soldiers lost.
+struct FightLoss {
+    section_id: Uuid,
+    losses: i16,
+}
+
+/// A fight's losses from the recompute (BP-11a-1). A recomputed outcome that differs from the
+/// deployment record's (by the database string the route writes) is a journalled `500`, and
+/// nothing is applied.
+async fn fight_result(state: &AppState, dep: &DeploymentRecord, route: &str) -> Result<FightLoss, AppError> {
+    let (report, section_id) = replay_report(state, dep, route).await?;
+    let replayed = outcome_db_str(&report.outcome);
+    if dep.outcome.as_deref() != Some(replayed) {
+        return Err(internal_error(format!(
+            "{route}: deployment {} of commander {} recomputes to {replayed} but its record says {:?}; nothing applied",
+            dep.deployment_id, dep.commander_id, dep.outcome
+        )));
+    }
+    Ok(FightLoss { section_id, losses: fight_losses(&report.unit_results) })
+}
+
 /// Latches a pending battle (a raid, BP-8b-1b, or a haul's ambush, BP-8b-2), run by every ops
-/// route right after `load_board`. Nothing pending: nothing is read. Otherwise the store names the dig's Commander and the trigger; the
-/// Commander's deployments are read with no store lock held (`list_deployments_by_commander`,
-/// one sequential scan, `500` on failure); and the store applies the fight's result only if the
-/// trigger is unchanged. A fight not yet started or still `active` leaves the battle pending.
+/// route right after `load_board`. Nothing pending: nothing is read. Otherwise the store names
+/// the dig's Commander, the trigger and the dig's Section, and:
+/// - **at 0** (BP-11a-1): a Section with no soldiers left can't fight, so the battle latches as a
+///   Wipeout without a fight: no deployment read, no loss write;
+/// - otherwise the Commander's deployments are read with no store lock held
+///   (`list_deployments_by_commander`, one sequential scan, `500` on failure). A fight not yet
+///   started or still `active` leaves the battle pending. A resolved one is recomputed first
+///   (`fight_result`, so a failed recompute leaves the battle pending for the next read), then
+///   the store applies it only if the trigger is unchanged;
+/// - **the losses** (BP-11a-1): only when that latch applied, under the launch lock as the
+///   meltdown's write, the Section that fought loses one soldier per KIA or MIA. A failed write is
+///   `500`, and the latch stands.
 async fn latch_pending_raid(state: &AppState, campaign_id: Uuid, now: DateTime<Utc>, route: &str) -> Result<(), AppError> {
     let Some(pending) = state.demo_ops.store.pending_raid(campaign_id, now) else {
         return Ok(());
     };
+    if let Some(section_id) = pending.section_id {
+        let section = state
+            .section_repo
+            .get_section(section_id)
+            .await
+            .map_err(|e| internal_error(format!("{route}: get_section failed for section {section_id} of campaign {campaign_id}: {e}")))?
+            .ok_or_else(|| internal_error(format!("{route}: section {section_id} of campaign {campaign_id} not found")))?;
+        if section.headcount == 0 {
+            state.demo_ops.store.latch_raid(campaign_id, &pending.trigger, RaidResult::Wiped, now);
+            return Ok(());
+        }
+    }
     let commander_id = pending.commander_id;
     let deps = state.commander_repo.list_deployments_by_commander(commander_id).await.map_err(|e| {
         internal_error(format!("{route}: list_deployments_by_commander failed for commander {commander_id} of campaign {campaign_id}: {e}"))
     })?;
     let result = raid_result(&deps, &pending.trigger)
         .map_err(|e| internal_error(format!("{route}: raid of campaign {campaign_id}: {e}")))?;
-    if let Some(result) = result {
-        state.demo_ops.store.latch_raid(campaign_id, &pending.trigger, result, now);
+    let Some(result) = result else {
+        return Ok(());
+    };
+    let fight = raid_fight(&deps, &pending.trigger)
+        .ok_or_else(|| internal_error(format!("{route}: raid of campaign {campaign_id} has a result but no fight")))?;
+    let loss = fight_result(state, fight, route).await?;
+    let applied = state.demo_ops.store.latch_raid(campaign_id, &pending.trigger, result, now);
+    if applied && loss.losses > 0 {
+        let _launch = state.launch_locks.lock(campaign_id).await;
+        if let Err(e) = state.section_loss.lose_soldiers(loss.section_id, loss.losses).await {
+            return Err(internal_error(format!(
+                "{route}: lose_soldiers({}) failed for section {} of campaign {campaign_id}: {e}",
+                loss.losses, loss.section_id
+            )));
+        }
     }
     Ok(())
 }
@@ -263,8 +362,9 @@ async fn get_ops_board(
 /// `Active` (entry dropped) → `409` no gateway → the board, a hit proven by `EXISTS` (a lost
 /// sector is repaired: `409` once retired, entry dropped) → a pending raid latched (`500` on a
 /// failed read) → `400` unknown site → for a dig only, the Crew, Foreman and Commander reads
-/// (`500` on failure), `409` no Crew left and `409` no Commander left → `409` an op is under
-/// way → `503` the store is full of ops → `200`, the whole state.
+/// (`500` on failure), `409` no Crew left and `409` no Commander left → for any site, the
+/// member's first Section read (`500` on failure) and `409` when it is at 0 (BP-11a-1) → `409`
+/// an op is under way → `503` the store is full of ops → `200`, the whole state.
 /// - The leg: `depart_at = now`, `arrive_at = now + the site's travel_secs`.
 /// - The op's seed is drawn here from OS entropy and handed to the store, which never sends it;
 ///   the drill rolls from it.
@@ -299,6 +399,17 @@ async fn post_ops_start(
         return Err(bad_request("unknown site"));
     };
     let dig = if site.kind == "dig" { Some(dig_start(&state, campaign_id, &wallet).await?) } else { None };
+    // BP-11a-1: the member's first Section (oldest first). At 0 it has no one to send, for any
+    // site; after the Commander check, so a KIA Commander still answers first. A member with no
+    // Section passes, and the dig then has no at-0 check.
+    let sections = state.section_repo.list_sections_for_member(campaign_id, &wallet).await.map_err(|e| {
+        internal_error(format!("post_ops_start: list_sections_for_member failed for campaign {campaign_id}: {e}"))
+    })?;
+    let first_section = sections.first();
+    if first_section.is_some_and(|s| s.headcount == 0) {
+        return Err(conflict("no soldiers left to send: start a new run"));
+    }
+    let dig = dig.map(|d| DigStart { section_id: first_section.map(|s| s.section_id), ..d });
     let op_seed = generate_seed();
     match state.demo_ops.store.start_op(campaign_id, gw, Arc::clone(&board), site, op_seed, dig, now) {
         Ok(()) => {}
@@ -332,7 +443,7 @@ async fn dig_start(state: &AppState, campaign_id: Uuid, wallet: &[u8]) -> Result
     let Some(commander) = commanders.iter().find(|c| !c.is_kia && !c.is_shattered) else {
         return Err(conflict("no Commander left to lead: start a new run"));
     };
-    Ok(DigStart { crew_id: crew.crew_id, commander_id: commander.commander_id, threshold: dig_threshold(coolant) })
+    Ok(DigStart { crew_id: crew.crew_id, commander_id: commander.commander_id, threshold: dig_threshold(coolant), section_id: None })
 }
 
 /// Brings the team home, `POST /api/campaign/:campaign_id/ops/return` (BP-8a-2, demo-only).
@@ -381,7 +492,8 @@ async fn post_ops_return(
 /// - **A meltdown** is committed in the store first (the team is already heading home, so a
 ///   second drill can't lose the heads twice). Then, with the store's lock released and after
 ///   `load_board` has returned (its sector repair takes the launch lock itself), the route takes
-///   the launch lock and writes the Crew's loss (`CrewLoss::lose_heads`; Reviewer BP-8a-2 CF5).
+///   the launch lock and writes the Crew's loss (`CrewLoss::meltdown_loss`: heads and, since
+///   BP-11a-1, morale; Reviewer BP-8a-2 CF5).
 ///   A failed write is `500` and the op stays melted: the team still goes home empty and the
 ///   Crew keeps its heads, which the journal records.
 async fn post_ops_drill(
@@ -405,9 +517,9 @@ async fn post_ops_drill(
         Ok(DrillOutcome::Drilled) => {}
         Ok(DrillOutcome::Meltdown { crew_id, heads }) => {
             let _launch = state.launch_locks.lock(campaign_id).await;
-            if let Err(e) = state.crew_loss.lose_heads(crew_id, heads).await {
+            if let Err(e) = state.crew_loss.meltdown_loss(crew_id, heads, DEMO_MELTDOWN_MORALE_LOSS).await {
                 return Err(internal_error(format!(
-                    "post_ops_drill: lose_heads({heads}) failed for crew {crew_id} of campaign {campaign_id}: {e}"
+                    "post_ops_drill: meltdown_loss({heads}, {DEMO_MELTDOWN_MORALE_LOSS}) failed for crew {crew_id} of campaign {campaign_id}: {e}"
                 )));
             }
         }
@@ -1062,6 +1174,7 @@ mod tests {
         assert_eq!((op["dig"]["heat"].as_u64(), op["dig"]["ore_on_site"].as_u64()), (Some(105), Some(0)));
         assert_eq!(op["dig"]["ended_by"], "meltdown");
         assert_eq!(headcount(&state, crew).await, 5);
+        assert_eq!(state.crew_repo.get_crew(crew).await.unwrap().expect("the Crew").morale, 50, "60 − 10 (BP-11a-1)");
         assert_eq!(state.launch_locks.len(), 0, "the launch lock is released");
         let (status, body, _) = drill(&state, c).await;
         assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("already heading home")));
@@ -1097,7 +1210,7 @@ mod tests {
         let (status, body, _) = start(&state, c.campaign_id, DIG).await;
         assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("no Crew left to dig: start a new run")));
         let crew = seed_crew(&state, c.campaign_id, false).await;
-        state.crew_loss.lose_heads(crew, 8).await.expect("lose_heads");
+        state.crew_loss.meltdown_loss(crew, 8, 0).await.expect("meltdown_loss");
         let (status, body, _) = start(&state, c.campaign_id, DIG).await;
         assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("no Crew left to dig: start a new run")));
         assert!(state.demo_ops.store.op_view(c.campaign_id, chrono::Utc::now()).is_none());
@@ -1107,7 +1220,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::demo_crew_loss::CrewLoss for FailingCrewLoss {
-        async fn lose_heads(&self, _: Uuid, _: i16) -> Result<i16, RepositoryError> {
+        async fn meltdown_loss(&self, _: Uuid, _: i16, _: i16) -> Result<(i16, i16), RepositoryError> {
             Err(RepositoryError::Internal("db down".into()))
         }
     }
@@ -1156,26 +1269,121 @@ mod tests {
         all[0].commander_id
     }
 
-    /// The raid's fight as the mission route records it, started now (after the trigger): the
-    /// deployment opened and resolved with `outcome`, which on a Wipeout also marks the Commander
-    /// KIA. The route can't choose an outcome (its seed is OS entropy), so the record is written
-    /// through the repository (spec check F1).
-    async fn fight(state: &AppState, campaign: Uuid, outcome: sim_engine::game_types::OutcomeType) -> Uuid {
+    /// The fixture's seeds (BP-11a-1), measured with `resolve_mission` on `GUARD_DUTY` before the
+    /// brick (the sim untouched) and pinned: `(seed, units sent) → outcome, KIA`. The client's
+    /// Rookies (`rookies`); with `Some(seed)` the timestamp moves no draw.
+    /// - seed 3, 8 units → Success, 1 KIA
+    /// - seed 4, 8 units → Defeat, 1 KIA
+    /// - seed 43, 8 units → Defeat, 4 KIA
+    /// - seed 3, 1 unit → Wipeout, 1 KIA
+    const SUCCESS_SEED: (u32, usize) = (3, 8);
+    const DEFEAT_SEED: (u32, usize) = (4, 8);
+    const DEFEAT_4_KIA_SEED: (u32, usize) = (43, 8);
+    const WIPEOUT_SEED: (u32, usize) = (3, 1);
+
+    /// `n` of the client's Rookies (`battle.js` `squad()`: the `GHOST_WIRE` stand-in, 10 HP).
+    fn rookies(n: usize) -> Vec<sim_engine::game_types::Unit> {
+        let def = sim_engine::units::unit_definitions().get("GHOST_WIRE").expect("GHOST_WIRE").clone();
+        (0..n)
+            .map(|i| sim_engine::game_types::Unit {
+                id: format!("r{}", i + 1),
+                name: format!("Rookie {}", i + 1),
+                skill: def.base_skill,
+                definition: def.clone(),
+                xp: 0,
+                current_hp: 10,
+                max_hp: 10,
+                status: sim_engine::game_types::UnitStatus::Ready,
+                equipment: vec![],
+            })
+            .collect()
+    }
+
+    /// The member's first Section, created as a join writes it (8 soldiers) when there is none.
+    async fn member_section(state: &AppState, campaign: Uuid) -> Uuid {
+        let sections = state.section_repo.list_sections_for_member(campaign, &WALLET).await.expect("list_sections_for_member");
+        if let Some(s) = sections.first() {
+            return s.section_id;
+        }
+        let s = crate::repository::section::starter_section(campaign, WALLET.to_vec());
+        let id = s.section_id;
+        state.section_repo.create_section(s).await.expect("create_section");
+        id
+    }
+
+    async fn section_headcount(state: &AppState, section: Uuid) -> i16 {
+        state.section_repo.get_section(section).await.unwrap().expect("the Section").headcount
+    }
+
+    /// A raid's fight as the mission route records it (BP-11a-1, spec check F2), started now
+    /// (after the trigger): the `session_start` logged with `seed`, a `GUARD_DUTY` request of
+    /// `units` Rookies and the member's first Section; the report from `resolve_mission`; the
+    /// deployment opened with that Section and resolved with the report's outcome and KIA count
+    /// (a Wipeout also marks the Commander KIA), or with `record_as` to fake a mismatched record.
+    /// Returns the Commander and the Section.
+    async fn fight_logged(
+        state: &AppState,
+        campaign: Uuid,
+        (seed, units): (u32, usize),
+        record_as: Option<sim_engine::game_types::OutcomeType>,
+    ) -> (Uuid, Uuid) {
         let commander = commander_of(state, campaign).await;
+        let section = member_section(state, campaign).await;
+        let req = crate::api_types::MissionResolveRequest {
+            squad: crate::api_types::MissionSquadRequest { units: rookies(units), commander: None },
+            mission_id: "GUARD_DUTY".into(),
+            commander_id: commander,
+            seed_override: None,
+        };
+        let timestamp = chrono::Utc::now().to_rfc3339();
+        let session_id = Uuid::new_v4();
+        let config = shared::SessionConfig {
+            session_id: session_id.to_string(),
+            build_version: env!("CARGO_PKG_VERSION").to_string(),
+            seed: seed as u64,
+            sector_id: Uuid::nil(),
+            campaign_id: campaign,
+            sector_tier: "Contested".into(),
+            ruleset: "standard_v1".into(),
+        };
+        let entry = shared::InputLogEntry {
+            tick: 0,
+            seq: 0,
+            event_type: "session_start".into(),
+            player_id: None,
+            payload: serde_json::json!({ "request": &req, "timestamp": timestamp, "selection": { "section_ids": [section] } }),
+            narrative_event: None,
+        };
+        state.input_log_repo.start_session(&config, &entry).await.expect("start_session");
+        let mission = missions().get("GUARD_DUTY").expect("GUARD_DUTY");
+        let report = resolve_mission(&Squad { units: req.squad.units, commander: None }, mission, &timestamp, Some(seed), &state.config.sim);
+        let kia = report.unit_results.iter().filter(|u| matches!(u.final_status, sim_engine::game_types::UnitStatus::Kia)).count() as u32;
         let d = crate::repository::NewDeployment {
             deployment_id: Uuid::new_v4(),
             commander_id: commander,
-            session_id: Uuid::new_v4(),
+            session_id,
             mission_id: "GUARD_DUTY".into(),
             started_at: chrono::Utc::now(),
             player_wallet: WALLET.to_vec(),
             campaign_id: campaign,
-            section_ids: vec![],
+            section_ids: vec![section],
         };
         assert_eq!(state.commander_repo.start_deployment(&d).await.expect("start"), crate::repository::DeploymentStart::Started);
-        let cfg = sim_engine::config::SimConfig::default();
-        state.commander_repo.resolve_deployment(d.deployment_id, commander, 0, 1, 0.0, &outcome, &cfg).await.expect("resolve");
-        commander
+        let outcome = record_as.unwrap_or(report.outcome);
+        state.commander_repo.resolve_deployment(d.deployment_id, commander, kia, 1, 0.0, &outcome, &state.config.sim).await.expect("resolve");
+        (commander, section)
+    }
+
+    /// The raid's fight with `outcome`, from the seed table (`fight_logged`). Returns the Commander.
+    async fn fight(state: &AppState, campaign: Uuid, outcome: sim_engine::game_types::OutcomeType) -> Uuid {
+        use sim_engine::game_types::OutcomeType;
+        let seed = match outcome {
+            OutcomeType::Success => SUCCESS_SEED,
+            OutcomeType::Defeat => DEFEAT_SEED,
+            OutcomeType::Wipeout => WIPEOUT_SEED,
+            OutcomeType::TacticalRetreat => unreachable!("never assigned on the mission path"),
+        };
+        fight_logged(state, campaign, seed, None).await.0
     }
 
     /// Seed 7 raids on drill 1. Drill and return are refused while the raid waits (a board read
@@ -1432,6 +1640,135 @@ mod tests {
         assert_eq!(body["ore_banked"], 0);
         let (status, body, _) = start(&state, c, DIG).await;
         assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("no Commander left to lead: start a new run")));
+    }
+
+    /// BP-11a-1: the recompute equals the mission route's own report. A real `POST
+    /// /api/mission/resolve` on a private in-memory state (the ops tests' `WALLET` byte, reused
+    /// inside it), then `replay_report` on its deployment. The route fills `commander_name` after
+    /// its resolve (`routes/mod.rs:610`), so the response's is set to `null` before comparing.
+    #[tokio::test]
+    async fn fight_result_replays_the_mission_route_report() {
+        let state = Arc::new(session_state());
+        let c = campaign_with(&state, WALLET, true, Some(GATEWAY)).await;
+        let commander = crate::commander_gen::generate_commander(WALLET.to_vec(), c.campaign_id, 42);
+        let commander_id = commander.commander_id;
+        state.commander_repo.create_commander(commander).await.expect("create_commander");
+        let section = member_section(&state, c.campaign_id).await;
+        let body = serde_json::json!({
+            "squad": { "units": rookies(8) },
+            "mission_id": "GUARD_DUTY",
+            "commander_id": commander_id,
+            "section_ids": [section],
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/mission/resolve")
+            .header("authorization", "Bearer t")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = with_test_peer(crate::routes::router(Arc::clone(&state)), TEST_PEER).oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let mut response: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON");
+        assert_eq!(status, StatusCode::OK, "{response}");
+        let deps = state.commander_repo.list_deployments_by_commander(commander_id).await.expect("deployments");
+        assert_eq!(deps.len(), 1);
+        let (report, fought) = replay_report(&state, &deps[0], "test").await.expect("replay_report");
+        assert_eq!(fought, section);
+        response["report"]["commander_name"] = serde_json::Value::Null;
+        assert_eq!(serde_json::to_value(&report).unwrap(), response["report"]);
+    }
+
+    /// BP-11a-1: seed 7 raids on drill 1; the fight (seed 3, 8 Rookies: Success, 1 KIA) costs the
+    /// Section 1 soldier on the read that latches it, and only once.
+    #[tokio::test]
+    async fn ops_raid_loss_lowers_the_section_headcount() {
+        let state = Arc::new(session_state());
+        let (c, _) = dig_campaign(&state, false).await;
+        let section = member_section(&state, c).await;
+        dig_on_site(&state, c, 7).await;
+        assert_eq!(drill(&state, c).await.0, StatusCode::OK);
+        fight_logged(&state, c, SUCCESS_SEED, None).await;
+        let (status, body) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["active_op"]["dig"]["raid"].is_null(), "latched: {body}");
+        assert_eq!(section_headcount(&state, section).await, 7, "8 − 1 KIA");
+        assert_eq!(get(&state, Some("t"), c).await.0, StatusCode::OK);
+        assert_eq!(section_headcount(&state, section).await, 7, "applied once");
+        assert_eq!(state.launch_locks.len(), 0, "the launch lock is released");
+    }
+
+    /// BP-11a-1: seed 14's ambush; the fight (seed 43, 8 Rookies: Defeat, 4 KIA) costs the Section
+    /// 4 soldiers on the read that latches it, and only once.
+    #[tokio::test]
+    async fn ops_ambush_loss_lowers_the_section_headcount() {
+        let state = Arc::new(session_state());
+        let (c, _) = dig_campaign(&state, false).await;
+        let section = member_section(&state, c).await;
+        dig_on_site(&state, c, 14).await;
+        assert_eq!(drill(&state, c).await.0, StatusCode::OK);
+        assert_eq!(drill(&state, c).await.0, StatusCode::OK);
+        let (status, body, _) = pull(&state, c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        state.demo_ops.store.rewind_op(c, site_secs(&body, DIG));
+        let (_, body) = get(&state, Some("t"), c).await;
+        assert_eq!(body["active_op"]["dig"]["ambush"]["mission_id"], "GUARD_DUTY");
+        fight_logged(&state, c, DEFEAT_4_KIA_SEED, None).await;
+        let (status, body) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["active_op"]["dig"]["ambush"].is_null(), "latched: {body}");
+        assert_eq!(section_headcount(&state, section).await, 4, "8 − 4 KIA");
+        assert_eq!(get(&state, Some("t"), c).await.0, StatusCode::OK);
+        assert_eq!(section_headcount(&state, section).await, 4, "applied once");
+    }
+
+    /// BP-11a-1: a Section at 0 can't fight, so seed 7's raid latches as a Wipeout on the next
+    /// read without any fight: the op is cleared and the Commander has no deployment.
+    #[tokio::test]
+    async fn ops_raid_with_the_section_at_zero_wipes_without_a_fight() {
+        let state = Arc::new(session_state());
+        let (c, _) = dig_campaign(&state, false).await;
+        let section = member_section(&state, c).await;
+        dig_on_site(&state, c, 7).await;
+        state.section_repo.update_headcount(section, 0).await.expect("update_headcount");
+        let (status, body, _) = drill(&state, c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["active_op"]["dig"]["raid"]["mission_id"], "GUARD_DUTY");
+        let (status, body) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["active_op"].is_null(), "wiped: {body}");
+        let commander = commander_of(&state, c).await;
+        assert!(state.commander_repo.list_deployments_by_commander(commander).await.expect("deployments").is_empty());
+    }
+
+    /// BP-11a-1: with the member's first Section at 0 and the Commander alive, `ops/start` refuses.
+    #[tokio::test]
+    async fn ops_start_refuses_while_the_section_is_at_zero() {
+        let state = Arc::new(session_state());
+        let (c, _) = dig_campaign(&state, false).await;
+        let section = member_section(&state, c).await;
+        state.section_repo.update_headcount(section, 0).await.expect("update_headcount");
+        let (status, body, _) = start(&state, c, DIG).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("no soldiers left to send: start a new run")));
+        assert!(state.demo_ops.store.op_view(c, chrono::Utc::now()).is_none());
+    }
+
+    /// BP-11a-1: a record whose outcome the recompute does not reproduce (seed 3 is a Success,
+    /// recorded as a Defeat) is a `500`; nothing is applied and the raid stays pending.
+    #[tokio::test]
+    async fn fight_result_refuses_an_outcome_that_does_not_match_the_record() {
+        let state = Arc::new(session_state());
+        let (c, _) = dig_campaign(&state, false).await;
+        let section = member_section(&state, c).await;
+        dig_on_site(&state, c, 7).await;
+        assert_eq!(drill(&state, c).await.0, StatusCode::OK);
+        fight_logged(&state, c, SUCCESS_SEED, Some(sim_engine::game_types::OutcomeType::Defeat)).await;
+        let (status, body) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert_eq!(section_headcount(&state, section).await, 8, "nothing applied");
+        let op = state.demo_ops.store.op_view(c, chrono::Utc::now()).expect("op");
+        assert!(op.dig.expect("a dig").raid.is_some(), "the raid stays pending");
     }
 
     /// One `ops_wallet` budget for every ops route: a board read and a start spend it, so the

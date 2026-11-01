@@ -39,6 +39,7 @@ use std::time::Instant;
 
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde::Serialize;
+use sim_engine::game_types::{UnitBattleResult, UnitStatus};
 use sim_engine::missions::missions;
 use sim_engine::rng::Rng;
 use uuid::Uuid;
@@ -79,6 +80,8 @@ pub const DEMO_TIER3_ORE_MULTIPLIER: u32 = 2;
 /// Heads a meltdown costs the Crew, inclusive.
 pub const DEMO_MELTDOWN_HEADS_MIN: u32 = 1;
 pub const DEMO_MELTDOWN_HEADS_MAX: u32 = 3;
+/// Morale a meltdown costs the Crew (BP-11a-1), in the same statement as its heads.
+pub const DEMO_MELTDOWN_MORALE_LOSS: i16 = 10;
 /// Draws each drill takes from the op's roll stream: the raid d100 (read from BP-8b-1b), then
 /// the meltdown's heads. Both are drawn on every drill, so the raid changes no meltdown.
 pub const DEMO_ROLLS_PER_DRILL: u32 = 2;
@@ -291,12 +294,14 @@ pub enum OpEnd {
 }
 
 /// What `ops/start` reads for a dig: the Crew that digs, the Commander who fights its raids
-/// (BP-8b-1b) and the meltdown threshold.
+/// (BP-8b-1b) and the meltdown threshold. `section_id` (BP-11a-1) is the member's first Section,
+/// whose headcount the at-0 check reads before a battle; `None` when the member has none.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DigStart {
     pub crew_id: Uuid,
     pub commander_id: Uuid,
     pub threshold: u32,
+    pub section_id: Option<Uuid>,
 }
 
 /// Which battle a trigger waits for: raiders at the site (BP-8b-1b) or an ambush on the haul
@@ -315,11 +320,13 @@ pub struct RaidTrigger {
     pub kind: BattleKind,
 }
 
-/// What a route needs to latch a raid: the Commander whose deployments to read, and the trigger.
+/// What a route needs to latch a raid: the Commander whose deployments to read, the trigger, and
+/// the dig's Section for the at-0 check (BP-11a-1; `None` when the member had none at start).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PendingRaid {
     pub commander_id: Uuid,
     pub trigger: RaidTrigger,
+    pub section_id: Option<Uuid>,
 }
 
 /// A fought raid: Success holds the site, Defeat or TacticalRetreat is a retreat, Wipeout ends the op.
@@ -336,6 +343,8 @@ struct DigState {
     threshold: u32,
     crew_id: Uuid,
     commander_id: Uuid,
+    /// The member's first Section at `ops/start` (BP-11a-1), for the at-0 check.
+    section_id: Option<Uuid>,
     drills: u32,
     heat: u32,
     ore_on_site: u32,
@@ -520,6 +529,21 @@ impl OpsBase {
     }
 }
 
+/// The raid's fight record among the Commander's deployments (BP-11a-1, extracted from
+/// `raid_result`): the earliest one that is not `aborted`, is the trigger's mission and started
+/// strictly after the trigger. `None` while there is none, whatever its status.
+pub fn raid_fight<'a>(deps: &'a [DeploymentRecord], trigger: &RaidTrigger) -> Option<&'a DeploymentRecord> {
+    deps.iter()
+        .filter(|d| d.status != "aborted" && d.mission_id == trigger.mission_id && d.started_at > trigger.trigger_at)
+        .min_by_key(|d| d.started_at)
+}
+
+/// A fight's losses in the demo (BP-11a-1): one soldier per `Kia` or `Mia` (MIA counts as lost);
+/// `Wounded`, `Ready` and `OnMission` cost nothing.
+pub fn fight_losses(units: &[UnitBattleResult]) -> i16 {
+    units.iter().filter(|u| matches!(u.final_status, UnitStatus::Kia | UnitStatus::Mia)).count() as i16
+}
+
 /// The raid's fight among the Commander's deployments: the earliest one that is not `aborted`,
 /// is the trigger's mission and started strictly after the trigger (`started_at` is the app's
 /// clock, as `trigger_at` is). `None` while there is none or it is still `active` (a later
@@ -527,11 +551,7 @@ impl OpsBase {
 /// TacticalRetreat → `Retreat`, Wipeout → `Wiped`. Any other outcome on a resolved record is
 /// impossible by the schema's checks, so it is an error, never a raid left pending in silence.
 pub fn raid_result(deps: &[DeploymentRecord], trigger: &RaidTrigger) -> Result<Option<RaidResult>, String> {
-    let fight = deps
-        .iter()
-        .filter(|d| d.status != "aborted" && d.mission_id == trigger.mission_id && d.started_at > trigger.trigger_at)
-        .min_by_key(|d| d.started_at);
-    let Some(d) = fight else {
+    let Some(d) = raid_fight(deps, trigger) else {
         return Ok(None);
     };
     if d.status != "resolved" {
@@ -875,6 +895,7 @@ impl DemoOpsStore {
                 threshold: d.threshold,
                 crew_id: d.crew_id,
                 commander_id: d.commander_id,
+                section_id: d.section_id,
                 drills: 0,
                 heat: 0,
                 ore_on_site: 0,
@@ -1028,7 +1049,7 @@ impl DemoOpsStore {
         let e = inner.get_mut(&campaign_id)?;
         e.settle_arrival(now);
         let dig = e.op.as_ref()?.dig.as_ref()?;
-        dig.raid.map(|trigger| PendingRaid { commander_id: dig.commander_id, trigger })
+        dig.raid.map(|trigger| PendingRaid { commander_id: dig.commander_id, trigger, section_id: dig.section_id })
     }
 
     /// Applies a fought battle, only if `trigger` is still the dig's pending one (`false`, and no
@@ -1516,7 +1537,7 @@ mod tests {
 
     /// A dig on a tier-`tier` vein, started at 0 s and on site from 10 s, its seed `seed`.
     fn on_site(store: &DemoOpsStore, a: Uuid, tier: u8, threshold: u32, seed: u32) {
-        let crew = DigStart { crew_id: CREW, commander_id: COMMANDER, threshold };
+        let crew = DigStart { crew_id: CREW, commander_id: COMMANDER, threshold, section_id: None };
         store.start_op(a, (5, 0), board(), &dig(tier), seed, Some(crew), at(0)).expect("start");
     }
 
@@ -1663,7 +1684,7 @@ mod tests {
         let d = dig_view(&store, a, at(12));
         assert_eq!((d.heat, d.ore_on_site, d.next_raid_pct), (15, 10, None));
         assert_eq!(d.raid, Some(RaidView { mission_id: "GUARD_DUTY" }));
-        assert_eq!(store.pending_raid(a, at(12)), Some(PendingRaid { commander_id: COMMANDER, trigger: trigger(11) }));
+        assert_eq!(store.pending_raid(a, at(12)), Some(PendingRaid { commander_id: COMMANDER, trigger: trigger(11), section_id: None }));
         on_site(&store, b, 1, 100, 5);
         store.drill_op(b, at(11)).expect("drill 1");
         store.drill_op(b, at(12)).expect("drill 2");
@@ -1725,6 +1746,24 @@ mod tests {
         assert_eq!((d.carried, d.ore_on_site, d.ended_by, d.raid, d.next_raid_pct), (5, 0, Some(OpEnd::Retreat), None, None));
         assert!(store.latch_raid(c, &trigger(11), RaidResult::Wiped, at(20)));
         assert!(store.op_view(c, at(21)).is_none(), "the op is cleared");
+    }
+
+    /// BP-11a-1: KIA and MIA each cost one soldier; Wounded and Ready cost nothing. Nothing in
+    /// the sim emits `Mia` today (`resolver.rs:1379`), so the slice is built by hand.
+    #[test]
+    fn fight_losses_counts_kia_and_mia_not_wounded() {
+        let unit = |s: UnitStatus| UnitBattleResult {
+            unit_id: "u".into(),
+            unit_name: "u".into(),
+            unit_type: "u".into(),
+            emoji: String::new(),
+            hp_lost: 0,
+            hp_remaining: 10,
+            final_status: s,
+            status_note: String::new(),
+        };
+        let units = [unit(UnitStatus::Kia), unit(UnitStatus::Mia), unit(UnitStatus::Wounded), unit(UnitStatus::Ready)];
+        assert_eq!(fight_losses(&units), 2);
     }
 
     fn record(started: i64, mission: &str, status: &str, outcome: Option<&str>) -> DeploymentRecord {
@@ -1887,7 +1926,7 @@ mod tests {
         assert_eq!(store.ops_snapshot(a, at(30)), (None, 60, OpsBase::default()));
         assert_eq!(store.ops_snapshot(a, at(31)), (None, 60, OpsBase::default()), "banked once");
         assert!(store.moved_since(a, at(30), at(31)), "the arrival is the last movement");
-        let crew = DigStart { crew_id: CREW, commander_id: COMMANDER, threshold: 100 };
+        let crew = DigStart { crew_id: CREW, commander_id: COMMANDER, threshold: 100, section_id: None };
         store.start_op(a, (5, 0), board(), &dig(1), 2, Some(crew), at(40)).expect("start");
         store.drill_op(a, at(51)).expect("drill");
         store.pull_op(a, at(52)).expect("pull");
@@ -1938,7 +1977,7 @@ mod tests {
         pulled(&store, b, 2, 2);
         assert_eq!(store.op_view(a, at(24)), store.op_view(b, at(24)));
         assert_eq!(store.pending_raid(a, at(24)), None);
-        assert_eq!(store.pending_raid(a, at(26)), Some(PendingRaid { commander_id: COMMANDER, trigger: ambush_trigger(26) }));
+        assert_eq!(store.pending_raid(a, at(26)), Some(PendingRaid { commander_id: COMMANDER, trigger: ambush_trigger(26), section_id: None }));
         assert_eq!(store.pending_raid(b, at(26)), None);
         let op = store.op_view(a, at(40)).expect("the ambushed team is still on the road");
         assert_eq!((op.leg, op.arrived), (OpLeg::Homeward, false));

@@ -82,6 +82,8 @@ async fn main() {
     state.live_campaigns  = Arc::new(mercs_server::demo_address_cap::PostgresLiveCampaigns::new(pool.clone()));
     // BP-8b-1a (demo-only): the meltdown's Crew loss.
     state.crew_loss       = Arc::new(mercs_server::demo_crew_loss::PostgresCrewLoss::new(pool.clone()));
+    // (BP-11a-1, demo-only): the latch's Section loss.
+    state.section_loss = Arc::new(mercs_server::demo_section_loss::PostgresSectionLoss::new(pool.clone()));
     state.pool  = Some(pool);
     state.redis = Some(redis_mgr);
     let state = Arc::new(state);

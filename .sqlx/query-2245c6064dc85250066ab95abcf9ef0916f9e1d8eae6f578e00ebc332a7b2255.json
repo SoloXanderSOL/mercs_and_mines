@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE crew_records SET headcount = GREATEST(headcount - $2, 0), morale = GREATEST(morale - $3, 0) WHERE crew_id = $1 RETURNING headcount, morale",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "headcount",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 1,
+        "name": "morale",
+        "type_info": "Int2"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int2",
+        "Int2"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "2245c6064dc85250066ab95abcf9ef0916f9e1d8eae6f578e00ebc332a7b2255"
+}

@@ -128,6 +128,8 @@ pub struct AppState {
     /// The meltdown's Crew loss (BP-8b-1a, demo-only). In memory it writes the same store as
     /// `crew_repo`; `main.rs` sets the Postgres one. A test that swaps `crew_repo` swaps this too.
     pub crew_loss: Arc<dyn crate::demo_crew_loss::CrewLoss>,
+    /// The latch's Section loss (BP-11a-1, demo-only).
+    pub section_loss: Arc<dyn crate::demo_section_loss::SectionLoss>,
 }
 
 impl AppState {
@@ -155,6 +157,7 @@ impl AppState {
             crew_repo:           crews.clone(),
             live_campaigns:      Arc::new(crate::demo_address_cap::InMemoryLiveCampaigns::new(campaigns.clone())),
             crew_loss:           Arc::new(crate::demo_crew_loss::InMemoryCrewLoss::new(crews.clone())), // (BP-8b-1a, demo-only)
+            section_loss: Arc::new(crate::demo_section_loss::InMemorySectionLoss::new(sections.clone())), // (BP-11a-1, demo-only)
             campaign_join_repo:  Arc::new(InMemoryCampaignJoinRepository::new(
                 campaigns, memberships, commanders, foremen, sections, crews,
             )),
