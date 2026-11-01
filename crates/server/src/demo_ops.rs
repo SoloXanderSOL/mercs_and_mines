@@ -692,6 +692,21 @@ pub enum ReturnRefusal {
     RaidPending,
 }
 
+/// Why `next_op` refused (BP-11a-4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NextRefusal {
+    /// No op, or its homeward leg has arrived and been cleared.
+    NoOp,
+    /// The team is already on its way home.
+    AlreadyHomeward,
+    /// The outbound leg has not arrived yet.
+    NotArrived,
+    /// Raiders are at the dig: the raid must be fought first.
+    RaidPending,
+    /// The target stands on the team's own hex.
+    SameSite,
+}
+
 /// Why `pull_op` refused (BP-8b-2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PullRefusal {
@@ -784,14 +799,14 @@ impl OpsEntry {
     /// never on another contract's hex, its own old hex or the op's hex. With no hex free it
     /// stays off the board and the next settle tries again. A clock test under the lock: it
     /// reads nothing outside the entry, writes no `moved_at`, and never touches the op or
-    /// anything banked.
+    /// anything banked. Due slots are visited in board order (`OPS_CONTRACT_MISSIONS`,
+    /// BP-11a-4), so which contract picks first never depends on `HashMap` order.
     fn settle_contracts(&mut self, now: DateTime<Utc>) {
         let wait = Duration::seconds(DEMO_SITE_REFRESH_SECS);
-        let due: Vec<&'static str> = self
-            .contracts
+        let due: Vec<&'static str> = OPS_CONTRACT_MISSIONS
             .iter()
-            .filter(|(_, s)| s.finished_at.is_some_and(|t| now >= t + wait))
-            .map(|(m, _)| *m)
+            .copied()
+            .filter(|m| self.contracts.get(m).is_some_and(|s| s.finished_at.is_some_and(|t| now >= t + wait)))
             .collect();
         for mission in due {
             let own = self.contract_hex(mission);
@@ -909,6 +924,38 @@ pub struct OpsSnapshot {
     pub base: OpsBase,
 }
 
+/// A new op (BP-11a-4), built for a start (`start_op`) and for a next (`next_op`): outbound to
+/// `site`, standing at the site's hex (`at`) once there. The leg takes `leg_secs`; home from the
+/// site takes its own `travel_secs`. A dig starts fresh and a contract gets a fresh
+/// `ContractState` with no result, so nothing carries over from an earlier op.
+fn new_op(site: &OpsSite, op_seed: u32, dig: Option<DigStart>, contract: Option<ContractStart>, leg_secs: u32, now: DateTime<Utc>) -> ActiveOp {
+    ActiveOp {
+        site_id: site.site_id.clone(),
+        at: (site.q, site.r),
+        kind: site.kind,
+        leg: OpLeg::Outbound,
+        depart_at: now,
+        arrive_at: now + Duration::seconds(i64::from(leg_secs)),
+        travel_secs: site.travel_secs,
+        op_seed,
+        dig: dig.map(|d| DigState {
+            tier: site.tier.unwrap_or(1),
+            threshold: d.threshold,
+            crew_id: d.crew_id,
+            commander_id: d.commander_id,
+            section_id: d.section_id,
+            drills: 0,
+            heat: 0,
+            ore_on_site: 0,
+            ended_by: None,
+            raid: None,
+            carried: 0,
+            ambush_at: None,
+        }),
+        contract: contract.and_then(|c| site.mission_id.map(|mission_id| ContractState { mission_id, commander_id: c.commander_id, section_id: c.section_id, result: None })),
+    }
+}
+
 /// Every campaign's ops state, in memory, bounded by `cap`.
 ///
 /// **Writes later bricks must keep:**
@@ -918,12 +965,13 @@ pub struct OpsSnapshot {
 /// - **the board refresh (BP-11a-3):** only `latch_raid`'s applied contract path finishes a
 ///   contract (one line); `settle_contracts`, run first by `settle_arrival`, returns it 45 s
 ///   later at another hex. The body's `sites` come from the entry (`OpsEntry::sites`), and
-///   `ops/start` looks its site up there (`site`), so a finished contract is unknown;
-/// - only `start_op`, `return_op`, `drill_op`, `pull_op`, `latch_raid` and `settle_arrival` (the
-///   ambush's reveal and the arrival, run first by every op read and write) write the op. The
-///   arrival adds to the banked ore and `build_op` debits it; only `build_op` writes the base,
-///   and never while an op is out. Each takes the lock, calls `settle_arrival` first and returns
-///   owned data; none is held across an `.await`;
+///   `ops/start` and `ops/next` look their site up there (`site`), so a finished contract is
+///   unknown;
+/// - only `start_op`, `next_op`, `return_op`, `drill_op`, `pull_op`, `latch_raid` and
+///   `settle_arrival` (the ambush's reveal and the arrival, run first by every op read and
+///   write) write the op. The arrival adds to the banked ore and `build_op` debits it; only
+///   `build_op` writes the base, and never while an op is out. Each takes the lock, calls
+///   `settle_arrival` first and returns owned data; none is held across an `.await`;
 /// - **the merc base (BP-10a):** the drill's heat, raid chance and ore, the view's `next_ore`,
 ///   melt check and `next_raid_pct`, and the pull's ambush chance all come from `OpsBase`'s
 ///   methods, never the plain constants;
@@ -943,7 +991,7 @@ pub struct OpsSnapshot {
 ///   `ore_banked`, before the op clears. `latch_raid` applies an ambush's fight like a raid's
 ///   (compare-and-set, `moved_at`): Held resumes the rest of the leg with the whole load,
 ///   Defeat or TacticalRetreat with half (floor), Wipeout clears the op and banks nothing;
-/// - **the keep list** (the reaper's `moved_since`): a departure (start, return, pull), a
+/// - **the keep list** (the reaper's `moved_since`): a departure (start, next, return, pull), a
 ///   homeward arrival, a drill, a latch and a build each write `moved_at`. Reading the board or the op
 ///   does not, nor does the ambush's reveal; a read that latches a battle does. While an
 ///   ambush waits, `moved_since` still counts the leg's passed `arrive_at`, at most
@@ -1060,31 +1108,7 @@ impl DemoOpsStore {
         if e.op.is_some() {
             return Err(StartRefusal::Busy);
         }
-        e.op = Some(ActiveOp {
-            site_id: site.site_id.clone(),
-            at: (site.q, site.r),
-            kind: site.kind,
-            leg: OpLeg::Outbound,
-            depart_at: now,
-            arrive_at: now + Duration::seconds(i64::from(site.travel_secs)),
-            travel_secs: site.travel_secs,
-            op_seed,
-            dig: dig.map(|d| DigState {
-                tier: site.tier.unwrap_or(1),
-                threshold: d.threshold,
-                crew_id: d.crew_id,
-                commander_id: d.commander_id,
-                section_id: d.section_id,
-                drills: 0,
-                heat: 0,
-                ore_on_site: 0,
-                ended_by: None,
-                raid: None,
-                carried: 0,
-                ambush_at: None,
-            }),
-            contract: contract.and_then(|c| site.mission_id.map(|mission_id| ContractState { mission_id, commander_id: c.commander_id, section_id: c.section_id, result: None })),
-        });
+        e.op = Some(new_op(site, op_seed, dig, contract, site.travel_secs, now));
         e.moved_at = Some(now);
         e.touched = now;
         Ok(())
@@ -1119,6 +1143,55 @@ impl DemoOpsStore {
         op.leg = OpLeg::Homeward;
         op.depart_at = now;
         op.arrive_at = now + Duration::seconds(i64::from(op.travel_secs));
+        e.moved_at = Some(now);
+        e.touched = now;
+        Ok(())
+    }
+
+    /// Moves the team from the site it stands on straight to `site` (BP-11a-4), as a new op
+    /// (`new_op`). It accepts what `return_op` accepts. Refusals in order: `NoOp` →
+    /// `AlreadyHomeward` → `NotArrived` → `RaidPending` (a dig's raid) → `SameSite` (the target's
+    /// hex is the team's `at`; hexes, not site ids, since a refreshed contract keeps its id).
+    /// - The leg runs from `op.at`, never from a board lookup: the hop's hexes at the target's
+    ///   seconds per hex (`travel_secs / distance`, distance at least 1), at least 1 s. Home from
+    ///   there is the target's own `travel_secs`.
+    /// - The old op goes whole: the ore on a dig's site is walked away from, as `return_op` (the
+    ///   body then shows no `ended_by`), and an unfought contract stays on the board unfinished.
+    /// - CF2: a new contract's trigger is the new leg's arrival (`contract_trigger` unchanged),
+    ///   so no fight started before it counts. Nothing banked is written.
+    /// - Writes `moved_at` (the keep list).
+    pub fn next_op(
+        &self,
+        campaign_id: Uuid,
+        site: &OpsSite,
+        op_seed: u32,
+        dig: Option<DigStart>,
+        contract: Option<ContractStart>,
+        now: DateTime<Utc>,
+    ) -> Result<(), NextRefusal> {
+        let mut inner = self.lock();
+        let Some(e) = inner.get_mut(&campaign_id) else {
+            return Err(NextRefusal::NoOp);
+        };
+        e.settle_arrival(now);
+        let Some(op) = e.op.as_ref() else {
+            return Err(NextRefusal::NoOp);
+        };
+        if op.leg == OpLeg::Homeward {
+            return Err(NextRefusal::AlreadyHomeward);
+        }
+        if now < op.arrive_at {
+            return Err(NextRefusal::NotArrived);
+        }
+        if op.dig.as_ref().is_some_and(|d| d.raid.is_some()) {
+            return Err(NextRefusal::RaidPending);
+        }
+        if (site.q, site.r) == op.at {
+            return Err(NextRefusal::SameSite);
+        }
+        let hop = hex_axial_distance(op.at.0, op.at.1, site.q, site.r);
+        let leg_secs = (site.travel_secs / site.distance.max(1) * hop).max(1);
+        e.op = Some(new_op(site, op_seed, dig, contract, leg_secs, now));
         e.moved_at = Some(now);
         e.touched = now;
         Ok(())
@@ -2648,5 +2721,189 @@ mod tests {
     #[test]
     fn ops_contract_missions_are_the_relic_list() {
         assert_eq!(OPS_CONTRACT_MISSIONS, ["GUARD_DUTY", "CRASHED_SHIP_RAID", "SUPPLY_RAID", "BLACK_SITE_RAID"]);
+    }
+
+    const LEAD: ContractStart = ContractStart { commander_id: COMMANDER, section_id: None };
+
+    /// BP-11a-4: a `SUPPLY_RAID` contract at (11, 0), 6 hexes and 12 s out (2 s per hex), so 3
+    /// hexes (6 s) from `site()`'s (8, 0).
+    fn supply_raid() -> OpsSite {
+        OpsSite {
+            site_id: "contract:SUPPLY_RAID".into(),
+            kind: "contract",
+            q: 11,
+            r: 0,
+            distance: 6,
+            travel_secs: 12,
+            tier: None,
+            mission_id: Some("SUPPLY_RAID"),
+            name: None,
+        }
+    }
+
+    /// `GUARD_DUTY` (`site()`) started at 0, fought and won (400) at 12, then the team sent on to
+    /// `supply_raid()` at 20: a 6 s leg, arriving at 26.
+    fn next_to_supply_raid(store: &DemoOpsStore, a: Uuid) {
+        store.start_op(a, (5, 0), board(), &site(), 7, None, Some(LEAD), at(0)).expect("start");
+        assert!(store.latch_raid(a, &guard_duty_arrival(), RaidResult::Held, 400, at(12)));
+        assert_eq!(store.next_op(a, &supply_raid(), 9, None, Some(LEAD), at(20)), Ok(()));
+    }
+
+    /// BP-11a-4: `next_op`'s refusals in its order, each from a fresh store, each writing
+    /// nothing; and an arrived, unfought contract is walked away from (Wiki Q1 (a)) and stays
+    /// on the board.
+    #[test]
+    fn ops_store_next_refusals() {
+        let a = Uuid::from_u128(1);
+        let refused = |store: &DemoOpsStore, now: DateTime<Utc>, target: &OpsSite, want: NextRefusal| {
+            let before = store.op_view(a, now);
+            assert_eq!(store.next_op(a, target, 9, None, Some(LEAD), now), Err(want));
+            assert_eq!(store.op_view(a, now), before, "{want:?} writes nothing");
+        };
+        let store = DemoOpsStore::new(2);
+        refused(&store, at(0), &supply_raid(), NextRefusal::NoOp);
+
+        let store = DemoOpsStore::new(2);
+        store.start_op(a, (5, 0), board(), &site(), 7, None, Some(LEAD), at(0)).expect("start");
+        store.return_op(a, at(11)).expect("return");
+        refused(&store, at(12), &supply_raid(), NextRefusal::AlreadyHomeward);
+
+        let store = DemoOpsStore::new(2);
+        store.start_op(a, (5, 0), board(), &site(), 7, None, Some(LEAD), at(0)).expect("start");
+        refused(&store, at(5), &supply_raid(), NextRefusal::NotArrived);
+
+        let store = DemoOpsStore::new(2);
+        on_site(&store, a, 1, 100, 7);
+        store.drill_op(a, at(11)).expect("drill");
+        refused(&store, at(12), &supply_raid(), NextRefusal::RaidPending);
+
+        let store = DemoOpsStore::new(2);
+        store.start_op(a, (5, 0), board(), &site(), 7, None, Some(LEAD), at(0)).expect("start");
+        refused(&store, at(11), &site(), NextRefusal::SameSite);
+
+        let store = DemoOpsStore::new(2);
+        let b = contract_board(&[]);
+        store.start_op(a, (5, 0), Arc::clone(&b), &b.sites[0], 7, None, Some(LEAD), at(0)).expect("start");
+        assert!(store.pending_raid(a, at(11)).is_some(), "on site, unfought");
+        assert_eq!(store.next_op(a, &b.sites[2], 9, None, Some(LEAD), at(11)), Ok(()));
+        let pin = guard_duty(&shown(&store, a, at(12))).cloned().expect("still on the board");
+        assert_eq!((pin.q, pin.r), (8, 0));
+        assert_eq!(store.op_view(a, at(12)).expect("op").site_id, "contract:SUPPLY_RAID");
+    }
+
+    /// BP-11a-4: the next leg is the hop (3 hexes at 2 s) from the team's hex, and home from
+    /// the new site is its own 12 s; nothing from the fought contract carries over.
+    #[test]
+    fn ops_store_next_leg_is_the_hop() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        next_to_supply_raid(&store, a);
+        let op = store.op_view(a, at(21)).expect("op");
+        assert_eq!((op.depart_at, op.arrive_at), (ops_time(at(20)), ops_time(at(26))));
+        assert_eq!((op.at, op.site_id.as_str(), op.fought), (OpHex { q: 11, r: 0 }, "contract:SUPPLY_RAID", None));
+        assert_eq!(store.ops_state(a, at(21)).credits_banked, 400);
+        store.return_op(a, at(27)).expect("return");
+        let op = store.op_view(a, at(28)).expect("op");
+        assert_eq!((op.leg, op.arrive_at), (OpLeg::Homeward, ops_time(at(39))));
+    }
+
+    /// BP-11a-4: a next is a departure for the reaper's keep list.
+    #[test]
+    fn ops_store_next_counts_as_moving() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        let b = contract_board(&[]);
+        fought_guard_duty(&store, a, &b);
+        assert_eq!(store.next_op(a, &supply_raid(), 9, None, Some(LEAD), at(500)), Ok(()));
+        assert!(store.moved_since(a, at(400), at(500)));
+    }
+
+    /// BP-11a-4, Reviewer BP-11a-2 CF2: the new contract's trigger is the new leg's arrival
+    /// (26), so neither its own mission fought between the two contracts (21) nor the old
+    /// contract's mission after the arrival (27) is its fight; its own mission after it (28) is.
+    #[test]
+    fn ops_store_next_contract_takes_no_fight_before_its_arrival() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        next_to_supply_raid(&store, a);
+        assert_eq!(store.ops_state(a, at(21)).credits_banked, 400);
+        assert_eq!(store.op_view(a, at(21)).expect("op").fought, None);
+        assert_eq!(store.pending_raid(a, at(25)), None, "not arrived");
+        let t = store.pending_raid(a, at(27)).expect("on site").trigger;
+        assert_eq!(t, RaidTrigger { trigger_at: at(26), mission_id: "SUPPLY_RAID", kind: BattleKind::Contract });
+        let between = record(21, "SUPPLY_RAID", "resolved", Some("Success"));
+        let old = record(27, "GUARD_DUTY", "resolved", Some("Success"));
+        assert_eq!(raid_result(std::slice::from_ref(&between), &t), Ok(None));
+        assert_eq!(raid_result(std::slice::from_ref(&old), &t), Ok(None));
+        let own = record(28, "SUPPLY_RAID", "resolved", Some("Success"));
+        assert_eq!(raid_result(&[between, old, own], &t), Ok(Some(RaidResult::Held)));
+    }
+
+    /// BP-11a-4 (W4): standing on the fought `GUARD_DUTY`'s old hex, the team may walk to the
+    /// same contract once it has returned elsewhere: `SameSite` compares hexes, not site ids.
+    #[test]
+    fn ops_store_next_to_the_refreshed_contract() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        let b = contract_board(&[(3, 4)]);
+        fought_guard_duty(&store, a, &b);
+        let back = store.site(a, &b, "contract:GUARD_DUTY", at(58)).expect("back at 57 s");
+        assert_eq!((back.q, back.r), (3, 4));
+        assert_eq!(store.next_op(a, &back, 9, None, Some(LEAD), at(58)), Ok(()));
+        let op = store.op_view(a, at(59)).expect("op");
+        assert_eq!((op.site_id.as_str(), op.at, op.fought), ("contract:GUARD_DUTY", OpHex { q: 3, r: 4 }, None));
+    }
+
+    fn mission_hex(sites: &[OpsSite], mission: &str) -> Option<(i32, i32)> {
+        sites.iter().find(|s| s.mission_id == Some(mission)).map(|s| (s.q, s.r))
+    }
+
+    /// BP-11a-4, Reviewer BP-11a-3 F1 (the op's hex alone decides). B (`CRASHED_SHIP_RAID`,
+    /// (9, 0)) is fought at 12 and the team comes home at 23; A (`GUARD_DUTY`, (8, 0)) is started
+    /// at 24 and fought at 34, the team still on site; nothing reads in between. At 80 both are
+    /// due: A, first in board order, takes the one free hex (3, 4); B's only candidate is A's old
+    /// hex under the team, so B stays off until the team is home. The fixture runs over 32 fresh
+    /// stores, so a settle in `HashMap` order (B first in about half of them) fails it except
+    /// with probability ≈ 2⁻³²: that negative is probabilistic.
+    #[test]
+    fn ops_store_refresh_in_board_order_never_lands_under_the_team() {
+        const ROUNDS: u32 = 32;
+        for round in 0..ROUNDS {
+            let store = DemoOpsStore::new(2);
+            let a = Uuid::from_u128(1);
+            let b = contract_board(&[(8, 0), (3, 4)]);
+            store.start_op(a, (5, 0), Arc::clone(&b), &b.sites[1], 7, None, Some(LEAD), at(0)).expect("start B");
+            let tb = RaidTrigger { trigger_at: at(10), mission_id: "CRASHED_SHIP_RAID", kind: BattleKind::Contract };
+            assert!(store.latch_raid(a, &tb, RaidResult::Held, 400, at(12)), "round {round}");
+            store.return_op(a, at(13)).expect("return");
+            store.start_op(a, (5, 0), Arc::clone(&b), &b.sites[0], 8, None, Some(LEAD), at(24)).expect("start A");
+            let ta = RaidTrigger { trigger_at: at(34), mission_id: "GUARD_DUTY", kind: BattleKind::Contract };
+            assert!(store.latch_raid(a, &ta, RaidResult::Held, 400, at(34)), "round {round}");
+            for t in [80, 200] {
+                let sites = shown(&store, a, at(t));
+                assert_eq!(mission_hex(&sites, "GUARD_DUTY"), Some((3, 4)), "round {round}, {t} s: A takes the free hex");
+                assert_eq!(mission_hex(&sites, "CRASHED_SHIP_RAID"), None, "round {round}, {t} s: B stays off");
+            }
+            store.return_op(a, at(201)).expect("return");
+            shown(&store, a, at(212));
+            let sites = shown(&store, a, at(213));
+            assert_eq!(mission_hex(&sites, "CRASHED_SHIP_RAID"), Some((8, 0)), "round {round}: the team home, B returns");
+        }
+    }
+
+    /// BP-11a-4 (the own hex alone decides): the team is home and the pool holds only the
+    /// contract's own old hex, so it stays off the board.
+    #[test]
+    fn ops_store_refresh_never_returns_to_its_own_hex() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        let b = contract_board(&[(8, 0)]);
+        fought_guard_duty(&store, a, &b);
+        store.return_op(a, at(13)).expect("return");
+        assert!(store.op_view(a, at(24)).is_none(), "home at 23");
+        for t in [57, 200] {
+            assert_eq!(guard_duty(&shown(&store, a, at(t))), None, "off at {t} s");
+        }
+        assert_eq!(shown(&store, a, at(200)).len(), 3);
     }
 }

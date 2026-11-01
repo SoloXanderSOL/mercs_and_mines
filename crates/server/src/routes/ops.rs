@@ -32,8 +32,8 @@ use crate::api_types::MissionResolveRequest;
 use crate::auth::AuthSession;
 use crate::demo_ops::{
     dig_threshold, fight_losses, ops_board, ops_time, raid_fight, raid_result, ActiveOpView, BaseBuilding, BuildRefusal,
-    ContractStart, DigStart, DrillOutcome, DrillRefusal, OpsBase, OpsBoard, OpsSite, PullRefusal, RaidResult, ReturnRefusal,
-    StartRefusal, DEMO_MELTDOWN_MORALE_LOSS,
+    ContractStart, DigStart, DrillOutcome, DrillRefusal, NextRefusal, OpsBase, OpsBoard, OpsSite, PullRefusal, RaidResult,
+    ReturnRefusal, StartRefusal, DEMO_MELTDOWN_MORALE_LOSS,
 };
 use crate::repository::{outcome_db_str, CampaignInstance, CampaignLifecycle, DeploymentRecord, SectorState};
 use crate::state::AppState;
@@ -44,9 +44,9 @@ use super::{
     unauthorized, AppError,
 };
 
-/// Request body cap for `ops/start` and `ops/build` (the two routes that read a body), layered on
-/// each route: the overflow reaches the handler as a `JsonRejection` after the limiters, so it is
-/// counted (`413`).
+/// Request body cap for `ops/start`, `ops/next` and `ops/build`
+/// (the three routes that read a body), layered on each route: the overflow reaches the handler
+/// as a `JsonRejection` after the limiters, so it is counted (`413`).
 pub const OPS_BODY_LIMIT: usize = 1024;
 
 pub fn router() -> Router<Arc<AppState>> {
@@ -54,6 +54,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/campaign/:campaign_id/ops", get(get_ops_board))
         .route("/api/campaign/:campaign_id/ops/start", post(post_ops_start).layer(DefaultBodyLimit::max(OPS_BODY_LIMIT)))
         .route("/api/campaign/:campaign_id/ops/return", post(post_ops_return))
+        .route("/api/campaign/:campaign_id/ops/next", post(post_ops_next).layer(DefaultBodyLimit::max(OPS_BODY_LIMIT)))
         .route("/api/campaign/:campaign_id/ops/drill", post(post_ops_drill))
         .route("/api/campaign/:campaign_id/ops/pull", post(post_ops_pull))
         .route("/api/campaign/:campaign_id/ops/build", post(post_ops_build).layer(DefaultBodyLimit::max(OPS_BODY_LIMIT)))
@@ -417,8 +418,8 @@ async fn post_ops_start(
     let Some(site) = state.demo_ops.store.site(campaign_id, &board, &req.site_id, now) else {
         return Err(bad_request("unknown site"));
     };
-    let dig = if site.kind == "dig" { Some(dig_start(&state, campaign_id, &wallet).await?) } else { None };
-    let lead = if site.kind == "contract" { Some(usable_commander(&state, campaign_id, &wallet).await?) } else { None };
+    let dig = if site.kind == "dig" { Some(dig_start(&state, campaign_id, &wallet, "post_ops_start").await?) } else { None };
+    let lead = if site.kind == "contract" { Some(usable_commander(&state, campaign_id, &wallet, "post_ops_start").await?) } else { None };
     // BP-11a-1: the member's first Section (oldest first). At 0 it has no one to send, for any
     // site; after the Commander check, so a KIA Commander still answers first. A member with no
     // Section passes, and the dig then has no at-0 check.
@@ -447,27 +448,27 @@ async fn post_ops_start(
 /// raids, is the first usable one (not KIA, not Shattered: the mission route's refusals); a
 /// member holds at most one, so the client's raid fight picks the same. `409` when none is
 /// usable. The Crew is checked first, so a member with neither hears about the Crew.
-async fn dig_start(state: &AppState, campaign_id: Uuid, wallet: &[u8]) -> Result<DigStart, AppError> {
+async fn dig_start(state: &AppState, campaign_id: Uuid, wallet: &[u8], route: &str) -> Result<DigStart, AppError> {
     let crews = state.crew_repo.list_crews_for_member(campaign_id, wallet).await.map_err(|e| {
-        internal_error(format!("post_ops_start: list_crews_for_member failed for campaign {campaign_id}: {e}"))
+        internal_error(format!("{route}: list_crews_for_member failed for campaign {campaign_id}: {e}"))
     })?;
     let Some(crew) = crews.first().filter(|c| c.headcount > 0) else {
         return Err(conflict("no Crew left to dig: start a new run"));
     };
     let foremen = state.foreman_repo.list_foremen_for_member(campaign_id, wallet).await.map_err(|e| {
-        internal_error(format!("post_ops_start: list_foremen_for_member failed for campaign {campaign_id}: {e}"))
+        internal_error(format!("{route}: list_foremen_for_member failed for campaign {campaign_id}: {e}"))
     })?;
     let coolant = foremen.first().is_some_and(|f| f.specialization == ForemanSpecialization::CoolantJockey.as_str());
-    let commander_id = usable_commander(state, campaign_id, wallet).await?;
+    let commander_id = usable_commander(state, campaign_id, wallet, route).await?;
     Ok(DigStart { crew_id: crew.crew_id, commander_id, threshold: dig_threshold(coolant), section_id: None })
 }
 
 /// The member's first usable Commander (BP-11a-2, extracted from `dig_start`): not KIA, not
 /// Shattered (the mission route's refusals). `409` when none is usable. A dig's raids and a
 /// contract's fight are both fought by this one.
-async fn usable_commander(state: &AppState, campaign_id: Uuid, wallet: &[u8]) -> Result<Uuid, AppError> {
+async fn usable_commander(state: &AppState, campaign_id: Uuid, wallet: &[u8], route: &str) -> Result<Uuid, AppError> {
     let commanders = state.commander_repo.list_commanders_for_member(campaign_id, wallet).await.map_err(|e| {
-        internal_error(format!("post_ops_start: list_commanders_for_member failed for campaign {campaign_id}: {e}"))
+        internal_error(format!("{route}: list_commanders_for_member failed for campaign {campaign_id}: {e}"))
     })?;
     let Some(commander) = commanders.iter().find(|c| !c.is_kia && !c.is_shattered) else {
         return Err(conflict("no Commander left to lead: start a new run"));
@@ -507,6 +508,72 @@ async fn post_ops_return(
         Err(ReturnRefusal::NotArrived) => return Err(conflict("still travelling")),
         Err(ReturnRefusal::AlreadyHomeward) => return Err(conflict("already heading home")),
         Err(ReturnRefusal::RaidPending) => return Err(conflict("raiders at the site")),
+    }
+    Ok(ops_response(&state, campaign_id, gw, &board, now))
+}
+
+/// Moves the team from the site it stands on straight to another, `POST
+/// /api/campaign/:campaign_id/ops/next {site_id}` (BP-11a-4, demo-only). Order: `401` → `429`
+/// `ops_ip` → `429` `ops_wallet` → axum's body rejection, counted (`413` over `OPS_BODY_LIMIT`;
+/// `400`, `415`, `422`) → `404` → `403` → `409` not `Active` (entry dropped) → `409` no op under
+/// way (also: no gateway) → the board, a hit proven by `EXISTS` → a pending battle latched →
+/// `400` unknown site → the lead reads as `ops/start` (a dig: Crew, Foreman and Commander; a
+/// contract: Commander; `500` on failure, `409` none left) → the member's first Section read
+/// (`500` on failure) and `409` when it is at 0 → `409` no op under way → `409` already heading
+/// home → `409` still travelling → `409` raiders at the site → `409` already there → `200`, the
+/// whole state.
+/// - A new op from the team's own hex (`next_op`): the hop's hexes at the target's seconds per
+///   hex, at least 1 s; home from there is the target's own time.
+/// - The ore on a dig's site is walked away from, as `ops/return`; an unfought contract stays on
+///   the board unfinished.
+/// - The site is looked up as it stands: a fought contract is `400 unknown site` for 45 s, as for
+///   `ops/start`. A return landing between the lookup and the next sends the team to the old pin
+///   (accepted, as `ops/start`).
+/// - No launch lock (as `ops/start`), and no `503`: the campaign's entry already holds the op.
+async fn post_ops_next(
+    AuthSession(token): AuthSession,
+    State(state): State<Arc<AppState>>,
+    ci: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    Path(campaign_id): Path<Uuid>,
+    body: Result<Json<OpsStartRequest>, JsonRejection>,
+) -> Result<Response, AppError> {
+    if let Some(r) = ops_limits(&state, &token, ci, &headers)? {
+        return Ok(r);
+    }
+    let Json(req) = match body {
+        Ok(j) => j,
+        Err(rej) => return Ok(rej.into_response()),
+    };
+    let now = Utc::now();
+    let (campaign, gateway, wallet) = ops_member(&state, &token, campaign_id, "post_ops_next").await?;
+    let Some(gw) = gateway else {
+        return Err(conflict("no op under way"));
+    };
+    let board = load_board(&state, &campaign, gw, now, true, "post_ops_next").await?;
+    latch_pending_raid(&state, campaign_id, now, "post_ops_next").await?;
+    let Some(site) = state.demo_ops.store.site(campaign_id, &board, &req.site_id, now) else {
+        return Err(bad_request("unknown site"));
+    };
+    let dig = if site.kind == "dig" { Some(dig_start(&state, campaign_id, &wallet, "post_ops_next").await?) } else { None };
+    let lead = if site.kind == "contract" { Some(usable_commander(&state, campaign_id, &wallet, "post_ops_next").await?) } else { None };
+    let sections = state.section_repo.list_sections_for_member(campaign_id, &wallet).await.map_err(|e| {
+        internal_error(format!("post_ops_next: list_sections_for_member failed for campaign {campaign_id}: {e}"))
+    })?;
+    let first_section = sections.first();
+    if first_section.is_some_and(|s| s.headcount == 0) {
+        return Err(conflict("no soldiers left to send: start a new run"));
+    }
+    let contract = lead.map(|commander_id| ContractStart { commander_id, section_id: first_section.map(|s| s.section_id) });
+    let dig = dig.map(|d| DigStart { section_id: first_section.map(|s| s.section_id), ..d });
+    let op_seed = generate_seed();
+    match state.demo_ops.store.next_op(campaign_id, &site, op_seed, dig, contract, now) {
+        Ok(()) => {}
+        Err(NextRefusal::NoOp) => return Err(conflict("no op under way")),
+        Err(NextRefusal::AlreadyHomeward) => return Err(conflict("already heading home")),
+        Err(NextRefusal::NotArrived) => return Err(conflict("still travelling")),
+        Err(NextRefusal::RaidPending) => return Err(conflict("raiders at the site")),
+        Err(NextRefusal::SameSite) => return Err(conflict("already there")),
     }
     Ok(ops_response(&state, campaign_id, gw, &board, now))
 }
@@ -2090,5 +2157,111 @@ mod tests {
         assert_eq!(body["active_op"]["at"], hex, "the op is unchanged");
         assert_eq!(body["active_op"]["fought"], "won");
         assert_eq!(body["credits_banked"], 400);
+    }
+
+    async fn next(state: &Arc<AppState>, campaign: Uuid, site_id: &str) -> (StatusCode, serde_json::Value, Vec<u8>) {
+        post(state, campaign, "next", Some(&serde_json::json!({ "site_id": site_id }).to_string())).await
+    }
+
+    const NEXT_SITE: &str = "contract:SUPPLY_RAID";
+
+    /// BP-11a-4: after a won contract (400 banked), `ops/next` sends the team on from its own hex
+    /// as a new op: the whole state, the leg at the target's seconds per hex for the hop, the
+    /// pay kept and no `fought`. The test's own `AppState` reuses `WALLET`.
+    #[tokio::test]
+    async fn ops_next_moves_the_team() {
+        let state = Arc::new(session_state());
+        let cc = campaign_with(&state, WALLET, true, Some(GATEWAY)).await;
+        seed_commander(&state, cc.campaign_id).await;
+        let (c, _, _) = contract_on_site(&state, &cc).await;
+        fight_logged(&state, c, SUCCESS_SEED, None).await;
+        let (status, fought) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{fought}");
+        assert_eq!(fought["credits_banked"], 400);
+        let from = fought["active_op"]["at"].clone();
+        let target = fought["sites"].as_array().expect("sites").iter().find(|s| s["site_id"] == NEXT_SITE).expect("on the board").clone();
+        let (status, body, _) = next(&state, c, NEXT_SITE).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let keys: std::collections::BTreeSet<&str> = body.as_object().expect("an object").keys().map(|k| k.as_str()).collect();
+        assert_eq!(keys, ["active_op", "base", "campaign_id", "credits_banked", "gateway", "now", "ore_banked", "sites"].into_iter().collect());
+        let op = &body["active_op"];
+        let op_keys: std::collections::BTreeSet<&str> = op.as_object().expect("an op").keys().map(|k| k.as_str()).collect();
+        assert_eq!(op_keys, ["arrive_at", "arrived", "at", "depart_at", "kind", "leg", "site_id"].into_iter().collect());
+        assert_eq!((op["site_id"].as_str(), op["leg"].as_str()), (Some(NEXT_SITE), Some("outbound")));
+        assert_eq!(op["at"], serde_json::json!({"q": target["q"], "r": target["r"]}));
+        let n = |v: &serde_json::Value| v.as_i64().expect("a number");
+        let hop = i64::from(crate::map_gen::hex_axial_distance(
+            n(&from["q"]) as i32,
+            n(&from["r"]) as i32,
+            n(&target["q"]) as i32,
+            n(&target["r"]) as i32,
+        ));
+        assert!(hop >= 1, "another hex");
+        assert_eq!(secs_between(op), (n(&target["travel_secs"]) / n(&target["distance"]).max(1) * hop).max(1));
+        assert_eq!(body["credits_banked"], 400);
+        assert!(op["fought"].is_null(), "{body}");
+    }
+
+    /// BP-11a-4: `ops/next`'s refusals: no gateway, no op, still travelling, already there, an
+    /// unknown or just-fought site, and already heading home. The test's own `AppState` reuses
+    /// `WALLET`.
+    #[tokio::test]
+    async fn ops_next_refusals() {
+        let state = Arc::new(session_state());
+        let none = campaign_with(&state, WALLET, true, None).await;
+        let (status, body, _) = next(&state, none.campaign_id, SITE).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("no op under way")));
+
+        let cc = campaign_with(&state, WALLET, true, Some(GATEWAY)).await;
+        let c = cc.campaign_id;
+        seed_sector(&state, &cc).await;
+        seed_commander(&state, c).await;
+        member_section(&state, c).await;
+        let (status, body, _) = next(&state, c, SITE).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("no op under way")));
+        let (status, started, _) = start(&state, c, SITE).await;
+        assert_eq!(status, StatusCode::OK, "{started}");
+        let (status, body, _) = next(&state, c, NEXT_SITE).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("still travelling")));
+        state.demo_ops.store.rewind_op(c, site_secs(&started, SITE));
+        let (status, body, _) = next(&state, c, SITE).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("already there")));
+        let (status, body, _) = next(&state, c, "dig:99,99").await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::BAD_REQUEST, Some("unknown site")));
+        fight_logged(&state, c, SUCCESS_SEED, None).await;
+        let (status, body, _) = next(&state, c, SITE).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::BAD_REQUEST, Some("unknown site")), "just fought");
+        assert_eq!(state.demo_ops.store.op_view(c, chrono::Utc::now()).expect("op").fought, Some("won"));
+        let (status, body, _) = post(&state, c, "return", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body, _) = next(&state, c, NEXT_SITE).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("already heading home")));
+    }
+
+    /// BP-11a-4: with the member's first Section at 0, `ops/next` refuses as `ops/start` does and
+    /// the op stays where it is.
+    #[tokio::test]
+    async fn ops_next_refuses_at_zero() {
+        let state = Arc::new(session_state());
+        let (c, _) = dig_campaign(&state, false).await;
+        let section = member_section(&state, c).await;
+        dig_on_site(&state, c, 2).await;
+        state.section_repo.update_headcount(section, 0).await.expect("update_headcount");
+        let (status, body, _) = next(&state, c, SITE).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("no soldiers left to send: start a new run")));
+        assert_eq!(state.demo_ops.store.op_view(c, chrono::Utc::now()).expect("op").site_id, DIG);
+    }
+
+    /// BP-11a-4: axum's rejections on `ops/next`, after the limiters and before the campaign is
+    /// read (the id is unknown, so anything past the body would be `404`).
+    #[tokio::test]
+    async fn ops_next_body_rejections() {
+        let state = Arc::new(session_state());
+        let c = Uuid::new_v4();
+        let big = format!("{{\"site_id\":\"{}\"}}", "x".repeat(2048));
+        assert_eq!(post(&state, c, "next", Some(&big)).await.0, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(post(&state, c, "next", Some("{")).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(post(&state, c, "next", None).await.0, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(post(&state, c, "next", Some("{}")).await.0, StatusCode::UNPROCESSABLE_ENTITY);
     }
 }
