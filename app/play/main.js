@@ -577,7 +577,7 @@ battle = createBattle({
   getRoster: () => lastRoster,
   setDebugExtra: text => { debugExtra = text; renderDebug(); },
 });
-mountOps({ $, show, handleError, staleCampaign, enterHub, openMission: (id, back) => battle.openMission(id, back) }); // demo-only (BP-9a)
+mountOps({ $, show, handleError, staleCampaign, enterHub, openMission: (id, back) => battle.openMission(id, back), setRoster: r => { lastRoster = r; } }); // demo-only (BP-9a)
 checkout = createCheckout({
   $, show, handleError, note, rateText,
   offlineText: COPY.offline,

@@ -16,16 +16,26 @@
 // BP-10b: the Base button opens demo_base.js's sheet, where banked ore buys the four buildings
 // (POST ops/build, one per tap). Nothing can be built while any op is out, so the sheet says so
 // rather than offering a build the server would refuse (Reviewer BP-10a CF2).
+//
+// BP-11b-1: the op is never looked up through the board (a fought contract leaves it and returns
+// elsewhere): the team stands at `active_op.at`, its title comes from a cache of every site seen,
+// and a leg after Next mission is drawn from the hex the team left (cached per departure). After a
+// fight on site the strip offers Next mission / Head home; Missions opens a list of the board's
+// contracts that hands off to their pins; a latched fight re-reads the roster (which the next
+// squad reads) and, after a contract, the board once more when it refreshes; the AAR names the
+// dead and the Section's count; no soldiers or no Commander left ends the run.
 
 import { request, ApiError, store, getMissions, getRoster } from './api.js';
 import { onMapCreated } from './hexmap.js';
-import { DIG_COPY, DIG_CSS, createDigPanel, renderDig, hideDig, homewardLines, flash } from './demo_dig.js';
+import { setAarNote } from './battle.js';
+import { DIG_COPY, DIG_CSS, createDigPanel, renderDig, hideDig, homewardLines, flash, bankedLine } from './demo_dig.js';
 import { BASE_COPY, BASE_CSS, createBase, renderBase, hideBase } from './demo_base.js';
 
-// Booth copy, verbatim from the BP-9a prompt.
+// Booth copy, verbatim from the BP-9a and BP-11b-1 prompts.
 const COPY = {
   digTitle: { 1: 'Thin vein', 3: 'Rich vein' },
   digTitleOther: 'Vein',
+  contractSite: 'Contract site',
   digReward: { 1: 'Poor ore, close to home', 3: 'Rich ore, double yield' },
   reward: '{credits} credits · {ore} ore',
   rewardNoOre: '{credits} credits',
@@ -33,14 +43,44 @@ const COPY = {
   travel: '{n} s each way',
   go: 'Go',
   close: 'Close',
+  cancel: 'Cancel',
   ret: 'Return',
   fight: 'Fight',
+  next: 'Next mission',
   outbound: 'Travelling to {title}. {n} s',
   onSite: 'On site at {title}.',
   atContract: 'At {title}. Fight, or head home.',
+  won: '{title} secured. +{credits} credits banked.',
+  lost: '{title} failed. The client is not paying.',
   homeward: 'Heading home. {n} s',
   noDig: 'No workable veins near your gateway. Take a contract.',
+  noCrew: 'No Crew left to dig. Contracts only.',
+  pick: 'Tap a site for the next job.',
+  hop: '{n} hexes from here',
+  hopSecs: '{s} s on foot',
+  leaveOre: 'Leave {ore} ore in the ground?',
+  leaveIt: 'Leave it',
+  stay: 'Stay',
+  listTitle: 'Contracts on offer',
+  listSub: 'Pick a contract. The team walks there first.',
+  listOut: 'The team is out.',
+  listMeta: '{n} hexes · {s} s',
+  aarLost: 'Lost: {names}.',
+  aarDead: '{name} ({status})',
+  aarNone: 'No losses. Command notes the anomaly.',
+  aarSection: '{name}: {a} → {b}',
 };
+
+// The end of run when the server says nobody is left to send (BP-11b-1).
+const END = {
+  soldiers: { title: 'Section lost', body: 'The 1st Section is gone to the last Rookie. Command has closed the file and opened a new one.' },
+  commander: { title: 'No one left to lead', body: 'There is no Commander left to sign the orders. The Company is already hiring.' },
+};
+const NO_SOLDIERS = 'no soldiers left to send: start a new run';
+const NO_COMMANDER = 'no Commander left to lead: start a new run';
+const NO_CREW = 'no Crew left to dig: start a new run';
+
+const REFRESH_READ_MS = 46000; // the server's DEMO_SITE_REFRESH_SECS 45 + 1
 
 const COLOUR = { dig: '#ff8c2a', ring: '#ffd27a', contract: '#6fd3ff', edge: '#0b0b0c', marker: '#ffffff', route: 'rgba(255, 255, 255, 0.7)' };
 
@@ -51,9 +91,15 @@ const CSS = `
 .ops-line { margin: 0; font-size: 3.9cqw; line-height: 1.35; }
 .ops-actions { display: flex; gap: 2cqw; margin-top: 1cqw; }
 .ops-actions .btn { flex: 1; width: auto; max-width: none; min-height: 11cqw; padding: 0 2cqw; font-size: 4.4cqw; }
+.ops-list[hidden] { display: none; }
+.ops-list-rows { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 1.5cqw; }
+.ops-list-row { width: 100%; max-width: none; display: flex; flex-direction: column; align-items: flex-start; gap: 0.6cqw; padding: 2cqw 2.5cqw; text-align: left; }
+.ops-list-name { font-family: var(--display); font-weight: 800; font-size: 4.4cqw; }
+.ops-list-meta { font-family: var(--mono); font-size: 3.4cqw; color: var(--muted); }
 `;
 
 const opsPath = id => '/api/campaign/' + encodeURIComponent(id) + '/ops';
+const walkKey = id => 'mm.demo.walk.' + id;
 const fill = (text, values) => text.replace(/\{(\w+)\}/g, (m, k) => (k in values ? String(values[k]) : m));
 
 let deps = null;
@@ -70,7 +116,9 @@ let busy = false;       // one ops call at a time
 let shownPhase = null;  // what the strip shows mid-leg, so it is rewritten only on a change
 let shownSecs = null;
 let banked = 0;         // the campaign's ore_banked, from the last adopted body
+let credits = 0;        // the campaign's credits_banked, from the last adopted body
 let bankNote = null;    // the one-off "ore banked" line after a laden leg lands
+let notice = '';        // a one-off refusal line (the Crew's), until the next adopted body
 let seenBattle = null;  // the raid or ambush whose briefing has opened once ('raid:<site>', 'ambush:<site>')
 let legKey = null;      // the site and leg the two reads below belong to
 let midAsked = false;   // the pulled haul's midpoint read has been sent
@@ -81,10 +129,21 @@ let hubWasShown = false;
 let base = {};          // the server's base: which buildings stand
 let baseOpen = false;   // the base sheet is showing
 let justBuilt = null;   // the building the last adopted POST put up, for its moment on the sheet
+let titles = new Map(); // site_id → { title, mission_id }, from every adopted board, kept for the campaign
+let walk = null;        // { depart_at, q, r }: where the leg leaving at depart_at set out from (after a Next)
+let nextFrom = null;    // the team's hex while an ops/next is in flight
+let picking = false;    // Next mission: choosing the next site
+let pickSite = null;    // the site chosen for Next
+let confirming = false; // the ore-on-site confirm is showing
+let wonCredits = 0;     // the pay banked by the contract fight the strip reports
+let opFight = false;    // the fight on the briefing was opened from here (the AAR note's guard)
+let refreshDue = 0;     // when the one refresh read after a contract latch is due, in browser ms
+let listOpen = false;   // the contracts list is showing
 
 let strip = null, titleNode = null, lineNodes = [], actions = null, buttons = [];
 let dig = null, bankChip = null, endNote = null, baseButton = null, baseSheet = null;
-const handlers = [null, null];
+let list = null;
+const handlers = [null, null, null];
 
 // ── time and progress ────────────────────────────────────────────────────────
 const serverNow = () => Date.now() + offset;
@@ -102,11 +161,43 @@ const hubShown = () => !deps.$('screen-hub').hidden;
 const held = () => busy || Date.now() < throttleUntil;
 const battleOf = o => (o && o.dig && (o.dig.raid || o.dig.ambush)) || null;
 const battleKey = o => (!battleOf(o) ? null : (o.dig.raid ? 'raid:' : 'ambush:') + o.site_id);
+// Next: an outbound, arrived op with no battle pending; a contract only once fought (Reviewer BP-11a-4 F1/F2).
+const canNext = o => Boolean(o && o.leg === 'outbound' && progress(o) >= 1 && !battleOf(o) && (o.kind === 'dig' || o.fought));
+const hexDistance = (a, b) => (Math.abs(a.q - b.q) + Math.abs(a.r - b.r) + Math.abs(a.q + a.r - b.q - b.r)) / 2;
+const sameHex = (a, b) => a.q === b.q && a.r === b.r;
 
 function titleOf(site) {
   if (!site) return COPY.digTitleOther;
   if (site.kind === 'contract') return site.name || site.mission_id || '';
   return COPY.digTitle[site.tier] || COPY.digTitleOther;
+}
+
+// The op's title from the cache, never the board (Reviewer BP-11a-3 F2).
+function opTitle(o) {
+  const t = titles.get(o.site_id);
+  if (t) return t.title;
+  return o.site_id.startsWith('contract:') ? COPY.contractSite : COPY.digTitleOther;
+}
+
+// Where the op's leg runs from and to: outbound from the hex the team left (the gateway unless a
+// Next set out from elsewhere), homeward from the site to the gateway.
+function legEnds(o) {
+  if (o.leg !== 'outbound') return [o.at, gateway];
+  return [walk && walk.depart_at === o.depart_at ? walk : gateway, o.at];
+}
+
+function saveWalk(departAt, from) {
+  walk = { depart_at: departAt, q: from.q, r: from.r };
+  try { sessionStorage.setItem(walkKey(campaignId), JSON.stringify(walk)); } catch { /* memory only */ }
+}
+
+function loadWalk(id) {
+  try {
+    const w = JSON.parse(sessionStorage.getItem(walkKey(id)) || 'null');
+    return w && typeof w.depart_at === 'string' ? w : null;
+  } catch {
+    return null;
+  }
 }
 
 // ── the strip ────────────────────────────────────────────────────────────────
@@ -117,7 +208,7 @@ function el(tag, className, text) {
   return node;
 }
 
-// `lines`: up to three strings; `acts`: up to two [text, onClick, disabled] buttons.
+// `lines`: up to three strings; `acts`: up to three [text, onClick, disabled] buttons.
 function setStrip(title, lines, acts, danger) {
   titleNode.hidden = !title;
   titleNode.textContent = title || '';
@@ -146,27 +237,39 @@ function refresh() {
   // While a raid or an ambush waits, the hub's own GUARD_DUTY would count as its fight
   // (Reviewer BP-8b-2 F1), so the mission list is shut until the dig's fight is fought.
   deps.$('btn-missions').disabled = Boolean(battleOf(op));
-  bankChip.textContent = fill(DIG_COPY.bankedChip, { total: banked });
-  bankChip.hidden = !(banked > 0);
+  bankChip.textContent = bankedLine(banked, credits);
+  bankChip.hidden = !(banked > 0 || credits > 0);
   shownPhase = null;
   shownSecs = null;
-  const rate = Date.now() < throttleUntil ? fill(DIG_COPY.rate, { n: throttleSecs }) : '';
+  const rate = Date.now() < throttleUntil ? fill(DIG_COPY.rate, { n: throttleSecs }) : notice;
   baseButton.hidden = !gateway;
-  if (baseOpen) {
-    // The sheet covers the strip; the phase is noted so a leg's frames don't redraw it each time.
+  if (baseOpen || listOpen) {
+    // A sheet covers the strip; the phase is noted so a leg's frames don't redraw it each time.
     hideStrip();
+    hideDig(dig);
     if (op) shownPhase = `${op.leg}:${progress(op) >= 1}`;
     if (op && progress(op) < 1) shownSecs = secsLeft(op);
-    renderBase(baseSheet, { base, banked, out: Boolean(op), held: held(), rate }, justBuilt);
-    justBuilt = null;
+    if (baseOpen) {
+      list.node.hidden = true;
+      renderBase(baseSheet, { base, banked, credits, out: Boolean(op), held: held(), rate }, justBuilt);
+      justBuilt = null;
+    } else {
+      hideBase(baseSheet);
+      renderList();
+    }
     return;
   }
   hideBase(baseSheet);
+  list.node.hidden = true;
+  if (op && picking && canNext(op)) {
+    hideDig(dig);
+    shownPhase = `${op.leg}:true`;
+    return showPick(rate);
+  }
   if (op && op.leg === 'outbound' && op.dig && progress(op) >= 1) return showDig(op);
   hideDig(dig);
   if (op) {
-    const site = siteOf(op.site_id);
-    const title = titleOf(site);
+    const title = opTitle(op);
     const p = progress(op);
     shownPhase = `${op.leg}:${p >= 1}`;
     if (op.leg === 'homeward') {
@@ -180,31 +283,39 @@ function refresh() {
       shownSecs = secsLeft(op);
       return setStrip('', [fill(COPY.outbound, { title, n: shownSecs }), rate], [[COPY.ret, null, true]]);
     }
-    if (site && site.kind === 'contract') {
-      return setStrip('', [fill(COPY.atContract, { title }), rate],
-        [[COPY.fight, () => deps.openMission(site.mission_id, () => deps.enterHub())], [COPY.ret, sendReturn]]);
+    if (op.kind === 'contract') {
+      // Fight while unfought; Next mission wherever canNext allows it; Head home always.
+      const acts = [];
+      if (!op.fought) acts.push([COPY.fight, fightContract]);
+      if (canNext(op)) acts.push([COPY.next, startPick]);
+      acts.push([DIG_COPY.home, sendReturn]);
+      const line = !op.fought ? fill(COPY.atContract, { title })
+        : op.fought === 'won' ? fill(COPY.won, { title, credits: wonCredits }) : fill(COPY.lost, { title });
+      return setStrip('', [line, rate], acts);
     }
     return setStrip('', [fill(COPY.onSite, { title }), rate], [[COPY.ret, sendReturn]]);
   }
   if (selected) return showSheet(selected);
   if (bankNote) return setStrip('', [bankNote, rate], [[BASE_COPY.button, openBase], [COPY.close, close]]);
   if (noDigOpen) return setStrip('', [COPY.noDig, rate], [[COPY.close, close]]);
-  if (rate) return setStrip('', [rate], []);
+  if (rate) return setStrip('', [rate], notice ? [[COPY.close, close]] : []);
   hideStrip();
 }
 
 // The Hold-or-Fold screen: the panel stays up for as long as the team is on site, so heat and ore
 // are never behind a tap. With ore on site the only way home is Pull out: walking away would
-// throw the pile away, so that button is offered only at 0 ore.
+// throw the pile away, so that button is offered only at 0 ore. Next mission joins them once the
+// dig can be left for another site.
 function showDig(o) {
-  const site = siteOf(o.site_id);
-  const title = titleOf(site);
-  const rate = Date.now() < throttleUntil ? fill(DIG_COPY.rate, { n: throttleSecs }) : '';
+  const title = opTitle(o);
+  const rate = Date.now() < throttleUntil ? fill(DIG_COPY.rate, { n: throttleSecs }) : notice;
   shownPhase = `${o.leg}:true`;
   renderDig(dig, o.dig, store.roster(campaignId));
-  if (o.dig.raid) return setStrip(title, [fill(DIG_COPY.raidWait, { title }), rate], [[DIG_COPY.fight, fight]]);
+  // Next mission joins wherever canNext allows it (never while raiders wait: canNext says so).
+  const next = canNext(o) ? [[COPY.next, startPick]] : [];
+  if (o.dig.raid) return setStrip(title, [fill(DIG_COPY.raidWait, { title }), rate], [[DIG_COPY.fight, fight], ...next]);
   const second = o.dig.ore_on_site > 0 ? [DIG_COPY.pull, sendPull] : [DIG_COPY.home, sendReturn];
-  return setStrip(title, [rate], [[DIG_COPY.drill, sendDrill], second]);
+  return setStrip(title, [rate], [[DIG_COPY.drill, sendDrill], second, ...next]);
 }
 
 function showSheet(site) {
@@ -226,16 +337,64 @@ function showSheet(site) {
   setStrip(titleOf(site), lines, [[COPY.go, sendStart], [COPY.close, close]]);
 }
 
+// Next mission's three steps: the prompt, the chosen site's hop, and the ore-on-site confirm.
+function showPick(rate) {
+  if (!pickSite) return setStrip('', [COPY.pick, rate], [[COPY.cancel, cancelPick]]);
+  if (confirming) {
+    return setStrip('', [fill(COPY.leaveOre, { ore: op.dig.ore_on_site }), rate],
+      [[COPY.leaveIt, () => sendNext(pickSite)], [COPY.stay, cancelPick]]);
+  }
+  const hop = hexDistance(op.at, pickSite);
+  // Display only: the server's leg is the site's seconds per hex times the hop, at least 1 s.
+  const secs = Math.max(1, Math.floor(pickSite.travel_secs / Math.max(1, pickSite.distance)) * hop);
+  return setStrip(titleOf(pickSite), [fill(COPY.hop, { n: hop }), fill(COPY.hopSecs, { s: secs }), rate],
+    [[COPY.go, goNext], [COPY.cancel, cancelPick]]);
+}
+
+function startPick() {
+  picking = true;
+  pickSite = null;
+  confirming = false;
+  refresh();
+}
+
+function cancelPick() {
+  picking = false;
+  pickSite = null;
+  confirming = false;
+  refresh();
+}
+
+// A site for Next: any board site but the one the team stands on (the server's "already there").
+function choose(site) {
+  if (!site || !op || sameHex(site, op.at)) return;
+  pickSite = site;
+  confirming = false;
+  refresh();
+}
+
+// Leaving a dig with ore on site walks away from it (BP-11a-4), so that asks first.
+function goNext() {
+  if (!pickSite) return;
+  if (op && op.dig && op.dig.ore_on_site > 0) {
+    confirming = true;
+    return refresh();
+  }
+  sendNext(pickSite);
+}
+
 function close() {
   selected = null;
   noDigOpen = false;
   bankNote = null;
+  notice = '';
   hideStrip();
 }
 
 // The Base button toggles the sheet; the bank note's Base opens it.
 function openBase() {
   baseOpen = true;
+  listOpen = false;
   selected = null;
   noDigOpen = false;
   bankNote = null;
@@ -247,16 +406,112 @@ function closeBase() {
   refresh();
 }
 
+// ── the contracts list (A2) ──────────────────────────────────────────────────
+// Missions opens the board's contracts, not the keeper list: a row hands off to its pin, so every
+// contract is walked to and fought on site.
+function openList() {
+  listOpen = true;
+  baseOpen = false;
+  noDigOpen = false;
+  bankNote = null;
+  refresh();
+}
+
+function closeList() {
+  listOpen = false;
+  refresh();
+}
+
+function renderList() {
+  const out = Boolean(op) && !picking;
+  list.sub.textContent = out ? COPY.listOut : COPY.listSub;
+  list.rows.replaceChildren();
+  for (const site of sites.filter(s => s.kind === 'contract')) {
+    const row = el('button', 'btn ops-list-row');
+    row.type = 'button';
+    row.disabled = out;
+    row.append(el('span', 'ops-list-name', titleOf(site)),
+      el('span', 'ops-list-meta', fill(COPY.listMeta, { n: Math.round(site.distance), s: Math.round(site.travel_secs) })));
+    row.addEventListener('click', () => listPick(site));
+    const item = el('li', null);
+    item.append(row);
+    list.rows.append(item);
+  }
+  list.node.hidden = false;
+}
+
+function listPick(site) {
+  listOpen = false;
+  centre(site);
+  if (op) {
+    if (picking) return choose(site);
+    return refresh();
+  }
+  selected = site;
+  noDigOpen = false;
+  bankNote = null;
+  refresh();
+}
+
+// Pans the map so the site sits in the middle of the canvas.
+function centre(site) {
+  if (!map) return;
+  const [sx, sy] = map.hexToScreen(site.q, site.r);
+  map.view.cx += (sx - map.w / 2) / map.view.s;
+  map.view.cy += (sy - map.h / 2) / map.view.s;
+  map.clamp();
+  map.requestFrame();
+}
+
+// ── fights ───────────────────────────────────────────────────────────────────
 // The raid's or the ambush's GUARD_DUTY briefing, with the dig's lead line over the mission's
 // own text. The Commander is the campaign's stored one, the one the dig start picked.
 async function fight() {
   const b = battleOf(op);
   if (!b) return;
   const lead = op.dig.raid
-    ? fill(DIG_COPY.raidLead, { title: titleOf(siteOf(op.site_id)) })
+    ? fill(DIG_COPY.raidLead, { title: opTitle(op) })
     : fill(DIG_COPY.ambushLead, { carried: op.dig.carried });
+  opFight = true;
   await deps.openMission(b.mission_id, () => deps.enterHub());
   if (!deps.$('screen-briefing').hidden) deps.$('briefing-text').textContent = lead;
+}
+
+// The contract's own briefing; its mission comes from the title cache, never the board.
+function fightContract() {
+  const t = op && titles.get(op.site_id);
+  if (!t || !t.mission_id) return;
+  opFight = true;
+  deps.openMission(t.mission_id, () => deps.enterHub());
+}
+
+// The AAR's loss lines for a fight opened from here: who died, and the Section's count after it
+// (the server takes one soldier per KIA or MIA when the fight latches).
+function aarNote({ report, section }) {
+  if (!opFight) return [];
+  opFight = false;
+  const dead = (report && report.unit_results || []).filter(u => u.final_status === 'KIA' || u.final_status === 'MIA');
+  const lines = [dead.length
+    ? fill(COPY.aarLost, { names: dead.map(u => fill(COPY.aarDead, { name: u.unit_name, status: u.final_status })).join(', ') })
+    : COPY.aarNone];
+  if (section) lines.push(fill(COPY.aarSection, { name: section.name, a: section.headcount, b: Math.max(0, section.headcount - dead.length) }));
+  return lines;
+}
+
+// The run is over: nobody is left to send. The keeper end screen's New run does the rest.
+function endOfRun(kind) {
+  const c = END[kind];
+  const roster = store.roster(campaignId);
+  const section = roster && Array.isArray(roster.sections) ? roster.sections[0] : null;
+  deps.$('end-title').textContent = c.title;
+  deps.$('end-name').textContent = kind === 'soldiers' && section ? section.name : '';
+  deps.$('end-grade').textContent = '';
+  deps.$('end-flaw').textContent = '';
+  deps.$('end-body').textContent = c.body;
+  deps.$('end-glorious').textContent = '';
+  deps.$('end-glorious').hidden = true;
+  deps.$('btn-new-run').disabled = false;
+  deps.show('screen-end');
 }
 
 // ── the overlay, drawn last in every map frame ───────────────────────────────
@@ -294,10 +549,10 @@ function draw(ctx, m) {
   const pad = r * 2;
   const onScreen = (x, y) => x > -pad && y > -pad && x < m.w + pad && y < m.h + pad;
   ctx.save();
-  const site = op && siteOf(op.site_id);
-  if (site && gateway) {
-    const [gx, gy] = m.hexToScreen(gateway.q, gateway.r);
-    const [sx, sy] = m.hexToScreen(site.q, site.r);
+  const ends = op && gateway ? legEnds(op) : null;
+  if (ends) {
+    const [gx, gy] = m.hexToScreen(ends[0].q, ends[0].r);
+    const [sx, sy] = m.hexToScreen(ends[1].q, ends[1].r);
     ctx.setLineDash([4, 4]);
     ctx.lineWidth = Math.max(1, s * 0.1);
     ctx.strokeStyle = COLOUR.route;
@@ -329,8 +584,8 @@ function draw(ctx, m) {
         midAsked = true; // an ambush on this haul reveals on the first read at or after the midpoint
         load();
       }
-      if (site && gateway) {
-        const [from, to] = op.leg === 'outbound' ? [gateway, site] : [site, gateway];
+      if (ends) {
+        const [from, to] = ends;
         const [x, y] = m.hexToScreen(from.q + (to.q - from.q) * p, from.r + (to.r - from.r) * p);
         ctx.beginPath();
         ctx.arc(x, y, Math.max(5, s * 0.45), 0, Math.PI * 2);
@@ -369,10 +624,15 @@ function pick(x, y) {
 }
 
 function tap(x, y) {
-  if (op || baseOpen) return; // the strip stays while the team is out; the sheet covers the map
+  if (baseOpen || listOpen) return; // a sheet covers the map
+  if (op) { // the strip stays while the team is out; Next mission's pick takes a pin
+    if (picking && !confirming) choose(pick(x, y));
+    return;
+  }
   selected = pick(x, y);
   noDigOpen = false;
   bankNote = null;
+  notice = '';
   if (selected) showSheet(selected);
   else refresh();
 }
@@ -383,25 +643,36 @@ function adopt(body, built) {
   if (!body || body.campaign_id !== campaignId) return;
   offset = Date.parse(body.now) - Date.now();
   sites = Array.isArray(body.sites) ? body.sites : [];
+  for (const s of sites) titles.set(s.site_id, { title: titleOf(s), mission_id: s.mission_id || null });
   gateway = body.gateway || null;
   const before = op;
   const was = banked;
+  const wasCredits = credits;
   op = body.active_op || null;
   banked = Number(body.ore_banked) || 0;
+  credits = Number(body.credits_banked) || 0;
   base = body.base || {};
   justBuilt = built && base[built] === true ? built : null;
+  notice = '';
   if (op) selected = null;
   else if (selected) selected = siteOf(selected.site_id); // the board may have moved on (Reviewer BP-9a F4)
-  const key = op ? `${op.site_id}:${op.leg}` : null;
+  if (!canNext(op)) { picking = false; pickSite = null; confirming = false; }
+  else if (pickSite) pickSite = siteOf(pickSite.site_id);
+  const key = op ? `${op.site_id}:${op.leg}:${op.depart_at}` : null;
   if (key !== legKey) { legKey = key; midAsked = false; landAsked = false; }
   if (op) bankNote = null;
   else if (banked > was && before && before.leg === 'homeward' && before.dig && before.dig.carried > 0) {
-    bankNote = fill(DIG_COPY.banked, { gained: banked - was, total: banked });
+    bankNote = fill(DIG_COPY.banked, { gained: banked - was });
   }
   if (!op && gateway && !noDigOffered && !sites.some(st => st.kind === 'dig')) {
     noDigOffered = true;
     noDigOpen = true;
   }
+  // A fight latched on this read: a raid's or an ambush's key went away, or the contract the team
+  // stood at unfought is now fought (or wiped out, which clears the op).
+  const raidLatched = Boolean(battleKey(before) && battleKey(before) !== battleKey(op));
+  const contractLatched = Boolean(before && before.kind === 'contract' && before.leg === 'outbound' && !before.fought && (!op || op.fought));
+  if (contractLatched) wonCredits = Math.max(0, credits - wasCredits);
   const endedNow = op && op.dig ? op.dig.ended_by : null;
   const endedBefore = before && before.dig ? before.dig.ended_by : null;
   const melted = endedNow === 'meltdown' && endedBefore !== 'meltdown';
@@ -413,19 +684,40 @@ function adopt(body, built) {
   if (map) map.requestFrame();
   refresh();
   if (melted) { flash(strip); rereadRoster(); }
+  if (raidLatched || contractLatched) rereadRoster();
+  if (contractLatched) armRefresh();
   if (opening) fight();
 }
 
-// A meltdown cost the Crew heads: the stored roster is read again once, so the Crew line and a
-// reload's reveal show the new headcount. Under the roster limiters, not the ops ones.
+// The stored roster is read again (a meltdown cost Crew heads; a fight cost soldiers), so the Crew
+// line, a reload's reveal and the next squad (main.js's roster, through deps.setRoster) all show
+// the new headcount. A Section at 0 ends the run. Under the roster limiters, not the ops ones.
 async function rereadRoster() {
   const id = campaignId;
   try {
     const body = await getRoster(id);
     if (id !== campaignId) return;
     store.setRoster(id, body);
+    deps.setRoster(body);
+    const section = Array.isArray(body.sections) ? body.sections[0] : null;
+    if (section && section.headcount === 0) return endOfRun('soldiers');
     refresh();
   } catch { /* the line keeps the old count; the next roster load corrects it */ }
+}
+
+// One board read after a contract's fight, once the server has put it back on the board (A3).
+function armRefresh() {
+  refreshDue = Date.now() + REFRESH_READ_MS;
+  setTimeout(refreshTick, REFRESH_READ_MS);
+}
+
+// A held moment (another call in flight, or a 429) retries on the next tick.
+function refreshTick() {
+  if (!refreshDue) return;
+  const wait = refreshDue - Date.now();
+  if (wait > 0) { setTimeout(refreshTick, wait); return; }
+  if (held() || !campaignId) { setTimeout(refreshTick, 500); return; }
+  refreshDue = 0; load();
 }
 
 const retry = () => { deps.enterHub(); load(); };
@@ -483,11 +775,29 @@ async function send(path, body, built) {
     err = e;
   }
   busy = false;
+  const from = nextFrom;
+  nextFrom = null;
   if (map) map.requestFrame();
   if (id !== campaignId) return;
-  if (!err) return adopt(res, built);
+  if (!err) {
+    if (from && res && res.active_op) saveWalk(res.active_op.depart_at, from);
+    return adopt(res, built);
+  }
   refresh();
   if (stale(err) || rated(err)) return;
+  if (err instanceof ApiError && err.kind === 'conflict') {
+    // Nobody left to send ends the run; no Crew only shuts the digs.
+    if (err.message === NO_SOLDIERS) return endOfRun('soldiers');
+    if (err.message === NO_COMMANDER) return endOfRun('commander');
+    if (err.message === NO_CREW) {
+      selected = null;
+      picking = false;
+      pickSite = null;
+      confirming = false;
+      notice = COPY.noCrew;
+      return refresh();
+    }
+  }
   if (err instanceof ApiError && (err.kind === 'conflict' || (err.kind === 'bad' && err.message === 'unknown site'))) return load();
   deps.handleError(err, retry);
 }
@@ -513,29 +823,43 @@ function sendBuild(id) {
   send(opsPath(campaignId) + '/build', { building: id }, id);
 }
 
+// The team leaves the hex it stands on (cached as the next leg's origin when the move lands).
+function sendNext(site) {
+  if (!site || !op || held() || !canNext(op)) return;
+  nextFrom = { q: op.at.q, r: op.at.r };
+  send(opsPath(campaignId) + '/next', { site_id: site.site_id });
+}
+
 // ── the hub's re-entry and the end screen ─────────────────────────────────────
 // Both are seen through their `hidden` attribute, which main.js's show() sets, so no keeper code
-// calls in here. Back on the hub with an op out, one read latches a fought raid or ambush (the
-// fight's AAR returns to the hub without one) and shows anything that moved while away.
+// calls in here. Back on the hub with an op out, one read latches a fought raid, ambush or
+// contract (the fight's AAR returns to the hub without one) and shows anything that moved while away.
 function watch() {
   const hub = deps.$('screen-hub'), end = deps.$('screen-end');
   hubWasShown = !hub.hidden;
   new MutationObserver(() => {
     const shown = !hub.hidden;
-    if (shown && !hubWasShown && op && op.dig) load(); // a contract has nothing to latch (Reviewer BP-9b F2)
+    if (shown && !hubWasShown && op) load(); // a contract latches on this read (Reviewer BP-11a-2 CF1); a laden haul still reads (BP-10b F3)
     hubWasShown = shown;
   }).observe(hub, { attributes: true, attributeFilter: ['hidden'] });
   new MutationObserver(() => { if (!end.hidden) writeEndNote(); }).observe(end, { attributes: true, attributeFilter: ['hidden'] });
+  // Missions opens the board's contracts (A2): taken before the keeper list's own listener.
+  hub.addEventListener('click', e => {
+    if (!(e.target instanceof Element) || !e.target.closest('#btn-missions')) return;
+    e.stopPropagation();
+    e.preventDefault();
+    openList();
+  }, true);
 }
 
-// New run starts a new campaign, and ore and buildings belong to the campaign: the end screen says
-// what stays behind.
+// New run starts a new campaign, and ore, credits and buildings belong to the campaign: the end
+// screen says what stays behind.
 function writeEndNote() {
   const camp = store.campaign();
   let text = '';
   if (camp && camp.campaign_id === campaignId) {
     const built = Object.keys(base).some(k => base[k] === true);
-    if (banked > 0) text = fill(built ? BASE_COPY.endBase : DIG_COPY.endBanked, { total: banked });
+    if (banked > 0 || credits > 0) text = built ? BASE_COPY.endBase : DIG_COPY.endBanked;
     else if (op && op.dig && op.dig.ore_on_site + op.dig.carried > 0) text = built ? BASE_COPY.endBaseOut : DIG_COPY.endOut;
     else if (built) text = BASE_COPY.endBaseOnly;
   }
@@ -557,7 +881,9 @@ function attach(m) {
   noDigOffered = false;
   busy = false;
   banked = 0;
+  credits = 0;
   bankNote = null;
+  notice = '';
   seenBattle = null;
   legKey = null;
   midAsked = false;
@@ -565,13 +891,36 @@ function attach(m) {
   base = {};
   baseOpen = false;
   justBuilt = null;
+  titles = new Map();
+  walk = campaignId ? loadWalk(campaignId) : null;
+  nextFrom = null;
+  picking = false;
+  pickSite = null;
+  confirming = false;
+  wonCredits = 0;
+  refreshDue = 0;
+  listOpen = false;
   refresh();
   m.overlay = draw;
   m.onTap = tap;
   load();
 }
 
-// `d`: main.js's $, show, handleError, staleCampaign, enterHub and the battle's single briefing.
+function createList() {
+  const node = el('section', 'base-sheet ops-list');
+  node.hidden = true;
+  const head = el('div', 'base-head');
+  const shut = el('button', 'btn base-close', COPY.close);
+  shut.type = 'button';
+  shut.addEventListener('click', closeList);
+  head.append(el('h2', 'ops-title', COPY.listTitle), shut);
+  const sub = el('p', 'base-note');
+  const rows = el('ul', 'ops-list-rows');
+  node.append(head, sub, rows);
+  return { node, sub, rows };
+}
+
+// `d`: main.js's $, show, handleError, staleCampaign, enterHub, setRoster and the battle's single briefing.
 export function mountOps(d) {
   deps = d;
   const style = document.createElement('style');
@@ -583,7 +932,7 @@ export function mountOps(d) {
   dig = createDigPanel();
   lineNodes = [el('p', 'ops-line'), el('p', 'ops-line'), el('p', 'ops-line')];
   actions = el('div', 'ops-actions');
-  buttons = [el('button', 'btn btn-primary'), el('button', 'btn')];
+  buttons = [el('button', 'btn btn-primary'), el('button', 'btn'), el('button', 'btn')];
   buttons.forEach((b, i) => {
     b.type = 'button';
     b.addEventListener('click', () => { if (handlers[i]) handlers[i](); });
@@ -597,10 +946,12 @@ export function mountOps(d) {
   baseButton.hidden = true;
   baseButton.addEventListener('click', () => (baseOpen ? closeBase() : openBase()));
   baseSheet = createBase(sendBuild, closeBase);
-  deps.$('screen-hub').append(strip, bankChip, baseButton, baseSheet.node);
+  list = createList();
+  deps.$('screen-hub').append(strip, bankChip, baseButton, baseSheet.node, list.node);
   endNote = el('p', 'end-ops');
   endNote.hidden = true;
   deps.$('btn-new-run').before(endNote);
+  setAarNote(aarNote);
   watch();
   onMapCreated(attach);
 }

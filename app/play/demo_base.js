@@ -1,10 +1,12 @@
-// demo-only (BP-10b): the merc base screen (Breakpoint §4d, stretch 1). Never ported to dev.
+// demo-only (BP-10b, BP-11b-1): the merc base screen (Breakpoint §4d, stretch 1). Never ported to dev.
 //
 // Pure rendering for demo_ops.js: the four building slots, their art, cost and effect lines, and
 // the moment a building goes up. It makes no calls and holds no state; demo_ops.js owns the
 // board, the bank and every POST. The server sends only which buildings stand (`base`, four
 // bools); the costs and the copy live here, and the harness pins the costs to the server's
 // (Reviewer BP-10a CF1). Every string goes in through textContent.
+
+import { bankedLine } from './demo_dig.js';
 
 // One row per building, in the order of the server's `base` keys.
 export const BASE = [
@@ -30,7 +32,6 @@ export const BASE = [
 export const BASE_COPY = {
   button: 'Base',
   title: 'Company Base',
-  holdings: 'Holdings: {total} ore',
   build: 'Build · {cost} ore',
   short: 'Need {n} more ore',
   out: "The team is out. Build when they're home.",
@@ -38,9 +39,9 @@ export const BASE_COPY = {
   operational: 'OPERATIONAL',
   pop: '−{n} ore',
   close: 'Close',
-  endBase: 'Holdings do not transfer. {total} ore and the base stay on the old books.',
-  endBaseOut: 'Holdings do not transfer. The base stays on the old books; ore on site and in transit is written off.',
-  endBaseOnly: 'Holdings do not transfer. The base stays on the old books.',
+  endBase: 'Banked ore and credits do not transfer. The base stays on the old books.',
+  endBaseOut: 'Banked ore and credits do not transfer. The base stays on the old books; ore on site and in transit is written off.',
+  endBaseOnly: 'Banked ore and credits do not transfer. The base stays on the old books.',
 };
 
 // Placeholder art (BP-10b): line drawings in the accent colour, one per building. Real sprites
@@ -112,7 +113,7 @@ export function createBase(onBuild, onClose) {
   close.type = 'button';
   close.addEventListener('click', () => onClose());
   head.append(el('h2', 'ops-title', BASE_COPY.title), close);
-  const holdings = el('p', 'base-line');
+  const bankedEl = el('p', 'base-line');
   const pop = el('span', 'base-pop');
   const note = el('p', 'base-note');
   const slots = BASE.map(b => {
@@ -128,14 +129,14 @@ export function createBase(onBuild, onClose) {
     slot.append(pic, text);
     return { b, slot, stamp, button };
   });
-  node.append(head, holdings, pop, note, ...slots.map(s => s.slot));
-  return { node, holdings, pop, note, slots };
+  node.append(head, bankedEl, pop, note, ...slots.map(s => s.slot));
+  return { node, bankedEl, pop, note, slots };
 }
 
-// `s`: { base, banked, out, held, rate } from demo_ops.js; `built`: the id this render's response
+// `s`: { base, banked, credits, out, held, rate } from demo_ops.js; `built`: the id this render's response
 // built, or null. A building is bought once; while the team is out nothing can be built.
 export function renderBase(v, s, built) {
-  v.holdings.textContent = fill(BASE_COPY.holdings, { total: s.banked });
+  v.bankedEl.textContent = bankedLine(s.banked, s.credits);
   let note = s.rate || (s.out ? BASE_COPY.out : '');
   for (const { b, slot, stamp, button } of v.slots) {
     const up = s.base[b.id] === true;

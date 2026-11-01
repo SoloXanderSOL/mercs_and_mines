@@ -1,4 +1,4 @@
-// demo-only (BP-9b, BP-10b): the dig site's panel, the Hold-or-Fold screen (Breakpoint §4d). Never ported to dev.
+// demo-only (BP-9b, BP-10b, BP-11b-1): the dig site's panel, the Hold-or-Fold screen (Breakpoint §4d). Never ported to dev.
 //
 // Pure rendering for demo_ops.js: the heat bar with its threshold tick, the status, risk and Crew
 // lines, and the copy for the dig's beats. It holds no state beyond the last ore figure it drew
@@ -29,11 +29,11 @@ export const DIG_COPY = {
   walkedAway: 'Site abandoned. The ore stays in the ground. {n} s',
   retreat: 'Fell back with {carried} ore. The rest is a write-off. {n} s',
   pulled: 'Hauling {carried} ore home. {n} s',
-  banked: '{gained} ore banked. Company holdings: {total}.',
-  bankedChip: 'Banked: {total} ore',
+  banked: '+{gained} ore banked.',
+  bankedLine: 'Banked: {ore} ore · {credits} credits',
   rate: 'Command is rationing requests. Try again in {n} s.',
-  endBanked: 'Holdings do not transfer. {total} ore stays on the old books.',
-  endOut: 'Holdings do not transfer. Ore on site and in transit is written off.',
+  endBanked: 'Banked ore and credits do not transfer. They stay on the old books.',
+  endOut: 'Banked ore and credits do not transfer. Ore on site and in transit is written off.',
 };
 
 // The bar runs from 0 to 1.2 × threshold, so the threshold tick sits at 1 / 1.2 of its width.
@@ -68,6 +68,9 @@ export const DIG_CSS = `
 `;
 
 export const fill = (text, values) => text.replace(/\{(\w+)\}/g, (m, k) => (k in values ? String(values[k]) : m));
+
+// A9 (BP-11b-1): the one banked figure, on the chip and the Base sheet alike.
+export const bankedLine = (ore, credits) => fill(DIG_COPY.bankedLine, { ore, credits });
 
 function el(tag, className) {
   const node = document.createElement(tag);
