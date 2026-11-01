@@ -36,7 +36,7 @@ const COPY = {
   missionDifficulty: 'Difficulty',
   missionReward: '{credits} credits · {ore} ore',
   missionRewardNoOre: '{credits} credits',
-  briefingSquad: '1st Section, 8 Rookies',
+  briefingSquad: '1st Section, {n} Rookies',
   briefingCommander: 'Commanding: {name}, stress {stress}',
   briefingDeploy: 'Deploy',
   briefingBack: 'Back',
@@ -95,6 +95,10 @@ function el(tag, className, text) {
 let beforeOffer = (ctx, next) => next();
 export function setBeforeOffer(fn) { beforeOffer = fn; }
 
+// Lines the AAR adds under the pay (the demo's losses and Section count). By default, none.
+let aarNote = () => [];
+export function setAarNote(fn) { aarNote = fn; }
+
 // `deps` is main.js's side of the client: screens, the error screen, the roster it keeps,
 // the one Audio element, and the flows the battle hands back to (hub, reveal, join).
 export function createBattle(deps) {
@@ -125,7 +129,7 @@ export function createBattle(deps) {
   function fillCopy() {
     $('missions-title').textContent = COPY.missionsTitle;
     $('btn-missions-back').textContent = COPY.missionsBack;
-    $('briefing-squad').textContent = COPY.briefingSquad;
+    $('briefing-squad').textContent = fill(COPY.briefingSquad, { n: SQUAD_SIZE });
     $('btn-deploy').textContent = COPY.briefingDeploy;
     $('btn-briefing-back').textContent = COPY.briefingBack;
     $('btn-skip').textContent = COPY.battleSkip;
@@ -237,15 +241,16 @@ export function createBattle(deps) {
     $('briefing-name').textContent = m.name;
     $('briefing-text').textContent = m.flavor_text;
     $('briefing-commander').textContent = fill(COPY.briefingCommander, { name: d.commander.name, stress: d.commander.stress });
+    $('briefing-squad').textContent = fill(COPY.briefingSquad, { n: Math.min(SQUAD_SIZE, d.section.headcount) });
     $('btn-deploy').disabled = false;
     deps.show('screen-briefing');
   }
 
   // ── Deploy ───────────────────────────────────────────────────────────────
-  function squad() {
+  function squad(d) {
     const def = units && units[STAND_IN];
     if (!def) return null;
-    const n = oneRookie && oneRookie.checked ? 1 : SQUAD_SIZE; // debug toggle only
+    const n = oneRookie && oneRookie.checked ? 1 : Math.min(SQUAD_SIZE, d.section.headcount); // the Section's headcount; debug sends 1
     return Array.from({ length: n }, (_, i) => ({
       id: `r${i + 1}`,
       name: fill(COPY.unitName, { n: i + 1 }),
@@ -262,7 +267,7 @@ export function createBattle(deps) {
   async function deploy() {
     if (busy || !mission) return;
     const d = deployed();
-    const rookies = squad();
+    const rookies = d && squad(d);
     if (!d || !rookies) return deps.showError(deps.genericText, () => deps.enterCampaign(0));
     busy = true;
     $('btn-deploy').disabled = true;
@@ -447,6 +452,7 @@ export function createBattle(deps) {
     }
     if (r.loot_drop) pay.append(el('p', 'pay-line', fill(COPY.aarLoot, { item: r.loot_drop.item_name })));
     if (!pay.childElementCount) pay.append(el('p', 'pay-line pay-none', COPY.aarNoRewards));
+    for (const line of aarNote({ report, section: deployed()?.section }) || []) pay.append(el('p', 'pay-line', line));
 
     const card = $('aar-commander');
     card.replaceChildren(
