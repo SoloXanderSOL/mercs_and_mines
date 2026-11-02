@@ -114,6 +114,11 @@ export function setDeployExtra(fn) { deployExtra = fn; }
 let stillFor = () => null;
 export function setStill(fn) { stillFor = fn; }
 
+// One step between the roll and the banner (the demo's fight log). It calls next() once to reveal
+// the banner; live() is false once the presentation has stopped. By default, nothing.
+let beforeOutcome = (ctx, next) => next();
+export function setBeforeOutcome(fn) { beforeOutcome = fn; }
+
 // `deps` is main.js's side of the client: screens, the error screen, the roster it keeps,
 // the one Audio element, and the flows the battle hands back to (hub, reveal, join).
 export function createBattle(deps) {
@@ -448,6 +453,7 @@ export function createBattle(deps) {
       roll.textContent = fill(COPY.battleRoll, { n: sb.raw_roll });
       revealThen(roll, next, id);
     });
+    steps.push(next => beforeOutcome({ report: result.report, live: () => id === run }, next));
     steps.push(next => {
       const outcome = result.report.outcome;
       banner.textContent = COPY.outcome[outcome] || outcome;
