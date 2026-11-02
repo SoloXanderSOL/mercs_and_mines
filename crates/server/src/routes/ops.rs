@@ -21,7 +21,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use shared::SessionToken;
-use sim_engine::game_types::{BattleReport, Squad};
+use sim_engine::game_types::{BattleReport, LootDrop, Squad};
 use sim_engine::missions::missions;
 use sim_engine::resolver::resolve_mission;
 use sim_engine::rng::generate_seed;
@@ -31,9 +31,9 @@ use uuid::Uuid;
 use crate::api_types::MissionResolveRequest;
 use crate::auth::AuthSession;
 use crate::demo_ops::{
-    dig_threshold, fight_losses, ops_board, ops_time, raid_fight, raid_result, ActiveOpView, BaseBuilding, BuildRefusal,
-    ContractStart, DigStart, DrillOutcome, DrillRefusal, NextRefusal, OpsBase, OpsBoard, OpsSite, PullRefusal, RaidResult,
-    ReturnRefusal, StartRefusal, DEMO_MELTDOWN_MORALE_LOSS,
+    dig_threshold, fight_losses, fight_wounded, ops_board, ops_time, raid_fight, raid_result, ActiveOpView, BaseBuilding,
+    BuildRefusal, CompanyView, ContractStart, DigStart, DrillOutcome, DrillRefusal, FightPay, HealRefusal, NextRefusal,
+    OpsBase, OpsBoard, OpsSite, PullRefusal, RaidResult, ReturnRefusal, StartRefusal, DEMO_MELTDOWN_MORALE_LOSS,
 };
 use crate::repository::{outcome_db_str, CampaignInstance, CampaignLifecycle, DeploymentRecord, SectorState};
 use crate::state::AppState;
@@ -44,8 +44,8 @@ use super::{
     unauthorized, AppError,
 };
 
-/// Request body cap for `ops/start`, `ops/next` and `ops/build`
-/// (the three routes that read a body), layered on each route: the overflow reaches the handler
+/// Request body cap for `ops/start`, `ops/next`, `ops/build` and `ops/heal`
+/// (the four routes that read a body), layered on each route: the overflow reaches the handler
 /// as a `JsonRejection` after the limiters, so it is counted (`413`).
 pub const OPS_BODY_LIMIT: usize = 1024;
 
@@ -58,12 +58,14 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/campaign/:campaign_id/ops/drill", post(post_ops_drill))
         .route("/api/campaign/:campaign_id/ops/pull", post(post_ops_pull))
         .route("/api/campaign/:campaign_id/ops/build", post(post_ops_build).layer(DefaultBodyLimit::max(OPS_BODY_LIMIT)))
+        .route("/api/campaign/:campaign_id/ops/heal", post(post_ops_heal).layer(DefaultBodyLimit::max(OPS_BODY_LIMIT)))
 }
 
 /// The ops state as the client sees it, from every route. `now` is the server's clock, so the
 /// client's crawl survives a phone whose clock is off. `ore_banked` is the campaign's banked ore
 /// (BP-8b-2), `credits_banked` its banked pay (BP-11a-2) and `base` its merc base's buildings
-/// (BP-10a), 0 and none built for a member with no gateway.
+/// (BP-10a), 0 and none built for a member with no gateway; and `company` the sickbays and the
+/// Trophy Shelf (BP-12a-1; empty for a member with no gateway).
 #[derive(Serialize)]
 pub struct OpsView<'a> {
     pub campaign_id: Uuid,
@@ -73,6 +75,7 @@ pub struct OpsView<'a> {
     pub ore_banked: u32,
     pub credits_banked: u32,
     pub base: OpsBase,
+    pub company: CompanyView,
     pub now: String,
 }
 
@@ -86,6 +89,13 @@ pub struct OpsStartRequest {
 #[derive(Deserialize)]
 pub struct OpsBuildRequest {
     pub building: String,
+}
+
+/// `section_id` is a string, parsed after the member checks, so a bad id is `400` as an
+/// unknown building is (BP-12a-1).
+#[derive(Deserialize)]
+pub struct OpsHealRequest {
+    pub section_id: String,
 }
 
 /// The shared budget: `429` per address (`ops_ip`), then per wallet (`ops_wallet`).
@@ -209,6 +219,7 @@ fn ops_response(state: &AppState, campaign_id: Uuid, gw: (i32, i32), board: &Ops
         ore_banked: s.ore_banked,
         credits_banked: s.credits_banked,
         base: s.base,
+        company: s.company,
         now: ops_time(now),
     };
     Json(view).into_response()
@@ -257,11 +268,14 @@ async fn replay_report(state: &AppState, dep: &DeploymentRecord, route: &str) ->
 /// What a latched fight costs and pays (BP-11a-1, BP-11a-2): the Section that fought, its
 /// soldiers lost, and the credits the recomputed report pays. The pay comes from the server's
 /// recompute of the logged fight, never from the client's copy of the report; the squad that
-/// fought is still the one the client sent (GAP-93, ODQ-63).
+/// fought is still the one the client sent (GAP-93, ODQ-63); and the soldiers wounded and the
+/// loot, from the same recompute (BP-12a-1).
 struct FightLoss {
     section_id: Uuid,
     losses: i16,
+    wounded: u8,
     credits: u32,
+    loot: Option<LootDrop>,
 }
 
 /// A fight's losses from the recompute (BP-11a-1). A recomputed outcome that differs from the
@@ -276,7 +290,9 @@ async fn fight_result(state: &AppState, dep: &DeploymentRecord, route: &str) -> 
             dep.deployment_id, dep.commander_id, dep.outcome
         )));
     }
-    Ok(FightLoss { section_id, losses: fight_losses(&report.unit_results), credits: report.rewards.credits })
+    let losses = fight_losses(&report.unit_results);
+    let wounded = fight_wounded(&report.unit_results);
+    Ok(FightLoss { section_id, losses, wounded, credits: report.rewards.credits, loot: report.rewards.loot_drop })
 }
 
 /// Latches a pending battle (a raid, BP-8b-1b, a haul's ambush, BP-8b-2, or a contract's fight,
@@ -293,11 +309,15 @@ async fn fight_result(state: &AppState, dep: &DeploymentRecord, route: &str) -> 
 ///   meltdown's write, the Section that fought loses one soldier per KIA or MIA. A failed write is
 ///   `500`, and the latch stands.
 /// - **the pay** (BP-11a-2): the recomputed report's credits are banked by the latch itself, so
-///   they land exactly when it applies.
+///   they land exactly when it applies; **the sickbay and the shelf** (BP-12a-1): the latch also
+///   takes the fight's wounded, cut to the survivors (the headcount this read saw, less the
+///   fight's losses: until BP-12a-2 nothing else writes headcount while an op is out, and
+///   replace will refuse while one is), and its loot.
 async fn latch_pending_raid(state: &AppState, campaign_id: Uuid, now: DateTime<Utc>, route: &str) -> Result<(), AppError> {
     let Some(pending) = state.demo_ops.store.pending_raid(campaign_id, now) else {
         return Ok(());
     };
+    let mut read_headcount: Option<(Uuid, i16)> = None;
     if let Some(section_id) = pending.section_id {
         let section = state
             .section_repo
@@ -306,9 +326,10 @@ async fn latch_pending_raid(state: &AppState, campaign_id: Uuid, now: DateTime<U
             .map_err(|e| internal_error(format!("{route}: get_section failed for section {section_id} of campaign {campaign_id}: {e}")))?
             .ok_or_else(|| internal_error(format!("{route}: section {section_id} of campaign {campaign_id} not found")))?;
         if section.headcount == 0 {
-            state.demo_ops.store.latch_raid(campaign_id, &pending.trigger, RaidResult::Wiped, 0, now);
+            state.demo_ops.store.latch_raid(campaign_id, &pending.trigger, RaidResult::Wiped, FightPay::credits(0), now);
             return Ok(());
         }
+        read_headcount = Some((section_id, section.headcount));
     }
     let commander_id = pending.commander_id;
     let deps = state.commander_repo.list_deployments_by_commander(commander_id).await.map_err(|e| {
@@ -325,7 +346,11 @@ async fn latch_pending_raid(state: &AppState, campaign_id: Uuid, now: DateTime<U
     if let Some(seam) = &state.demo_ops.latch_seam {
         seam().await;
     }
-    let applied = state.demo_ops.store.latch_raid(campaign_id, &pending.trigger, result, loss.credits, now);
+    let cap = read_headcount
+        .filter(|(id, _)| *id == loss.section_id)
+        .map(|(_, h)| (h - loss.losses).clamp(0, 8) as u8);
+    let pay = FightPay { credits: loss.credits, section_id: loss.section_id, wounded: loss.wounded, cap, loot: loss.loot };
+    let applied = state.demo_ops.store.latch_raid(campaign_id, &pending.trigger, result, pay, now);
     if applied && loss.losses > 0 {
         let _launch = state.launch_locks.lock(campaign_id).await;
         if let Err(e) = state.section_loss.lose_soldiers(loss.section_id, loss.losses).await {
@@ -363,7 +388,7 @@ async fn get_ops_board(
     let now = Utc::now();
     let (campaign, gateway, _) = ops_member(&state, &token, campaign_id, "get_ops_board").await?;
     let Some(gw) = gateway else {
-        let view = OpsView { campaign_id, gateway: None, sites: &[], active_op: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), now: ops_time(now) };
+        let view = OpsView { campaign_id, gateway: None, sites: &[], active_op: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), company: CompanyView::default(), now: ops_time(now) };
         return Ok(Json(view).into_response());
     };
     let board = load_board(&state, &campaign, gw, now, false, "get_ops_board").await?;
@@ -714,6 +739,51 @@ async fn post_ops_build(
     Ok(ops_response(&state, campaign_id, gw, &board, now))
 }
 
+/// Heals a Section's wounded, `POST /api/campaign/:campaign_id/ops/heal {section_id}` (BP-12a-1,
+/// demo-only, §4e B3). Order: `401` → `429` `ops_ip` → `429` `ops_wallet` → axum's body
+/// rejection, counted (`413` over `OPS_BODY_LIMIT`; `400`, `415`, `422`) → `404` → `403` → `409`
+/// not `Active` (entry dropped) → `409` no gateway → the board → a pending battle latched →
+/// `400` unknown section → `409` nobody to heal → `409` already healing → `409` not enough
+/// banked credits → `200`, the whole state.
+/// - Every wounded soldier of the Section at once, `DEMO_HEAL_CREDITS` each from `credits_banked`,
+///   back after `DEMO_HEAL_SECS`. Allowed while the team is out (the sickbay feeds nothing the
+///   server rolls).
+/// - Abuse bound: memory only, no DB write, so no launch lock; the shared ops limiter (40/min per
+///   wallet, 400 per address); at most one bay per Section a latch wrote.
+async fn post_ops_heal(
+    AuthSession(token): AuthSession,
+    State(state): State<Arc<AppState>>,
+    ci: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    Path(campaign_id): Path<Uuid>,
+    body: Result<Json<OpsHealRequest>, JsonRejection>,
+) -> Result<Response, AppError> {
+    if let Some(r) = ops_limits(&state, &token, ci, &headers)? {
+        return Ok(r);
+    }
+    let Json(req) = match body {
+        Ok(j) => j,
+        Err(rej) => return Ok(rej.into_response()),
+    };
+    let now = Utc::now();
+    let (campaign, gateway, _) = ops_member(&state, &token, campaign_id, "post_ops_heal").await?;
+    let Some(gw) = gateway else {
+        return Err(conflict("no gateway assigned"));
+    };
+    let board = load_board(&state, &campaign, gw, now, false, "post_ops_heal").await?;
+    latch_pending_raid(&state, campaign_id, now, "post_ops_heal").await?;
+    let Ok(section_id) = Uuid::parse_str(&req.section_id) else {
+        return Err(bad_request("unknown section"));
+    };
+    match state.demo_ops.store.heal_op(campaign_id, section_id, now) {
+        Ok(()) => {}
+        Err(HealRefusal::NobodyToHeal) => return Err(conflict("nobody to heal")),
+        Err(HealRefusal::AlreadyHealing) => return Err(conflict("already healing")),
+        Err(HealRefusal::NotEnoughCredits) => return Err(conflict("not enough banked credits")),
+    }
+    Ok(ops_response(&state, campaign_id, gw, &board, now))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -855,7 +925,7 @@ mod tests {
         let (status, body) = get(&state, Some("t"), c.campaign_id).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let keys: std::collections::BTreeSet<&str> = body.as_object().expect("an object").keys().map(|k| k.as_str()).collect();
-        assert_eq!(keys, ["active_op", "base", "campaign_id", "credits_banked", "gateway", "now", "ore_banked", "sites"].into_iter().collect());
+        assert_eq!(keys, ["active_op", "base", "campaign_id", "company", "credits_banked", "gateway", "now", "ore_banked", "sites"].into_iter().collect());
         assert_eq!(body["campaign_id"], c.campaign_id.to_string());
         assert_eq!(body["gateway"], serde_json::json!({"q": 5, "r": 0}));
         assert!(body["active_op"].is_null());
@@ -1005,7 +1075,7 @@ mod tests {
         let (status, body, bytes) = start(&state, c.campaign_id, SITE).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let keys: std::collections::BTreeSet<&str> = body.as_object().expect("an object").keys().map(|k| k.as_str()).collect();
-        assert_eq!(keys, ["active_op", "base", "campaign_id", "credits_banked", "gateway", "now", "ore_banked", "sites"].into_iter().collect());
+        assert_eq!(keys, ["active_op", "base", "campaign_id", "company", "credits_banked", "gateway", "now", "ore_banked", "sites"].into_iter().collect());
         let op = &body["active_op"];
         let op_keys: std::collections::BTreeSet<&str> = op.as_object().expect("an op").keys().map(|k| k.as_str()).collect();
         assert_eq!(op_keys, ["arrive_at", "arrived", "at", "depart_at", "kind", "leg", "site_id"].into_iter().collect());
@@ -1391,6 +1461,10 @@ mod tests {
     const DEFEAT_SEED: (u32, usize) = (4, 8);
     const DEFEAT_4_KIA_SEED: (u32, usize) = (43, 8);
     const WIPEOUT_SEED: (u32, usize) = (3, 1);
+    /// BP-12a-1, measured with `resolve_mission` on `GUARD_DUTY` before the tests were written
+    /// (seeds 0–39, 8 Rookies; the sim untouched): seed 6 → Success, 0 KIA, 3 wounded, 600
+    /// credits, no loot. Seed 4 (`DEFEAT_SEED`) → Defeat, 1 KIA, 1 wounded, 0 credits.
+    const HEAL_WIN_SEED: (u32, usize) = (6, 8);
 
     /// `n` of the client's Rookies (`battle.js` `squad()`: the `GHOST_WIRE` stand-in, 10 HP).
     fn rookies(n: usize) -> Vec<sim_engine::game_types::Unit> {
@@ -2121,6 +2195,97 @@ mod tests {
         assert_eq!(section_headcount(&state, section).await, 7, "one loss");
         assert_eq!(state.demo_ops.store.ops_state(c, Utc::now()).credits_banked, 400, "one pay");
         assert_eq!(state.launch_locks.len(), 0);
+        let (status, body) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["company"]["trophies"].as_array().expect("trophies").len(), 1, "one trophy");
+    }
+
+    async fn heal(state: &Arc<AppState>, campaign: Uuid, section_id: &str) -> (StatusCode, serde_json::Value, Vec<u8>) {
+        post(state, campaign, "heal", Some(&serde_json::json!({ "section_id": section_id }).to_string())).await
+    }
+
+    /// BP-12a-1: a lost contract (`DEFEAT_SEED`: 1 KIA, 1 wounded, pays 0) puts its wounded in the
+    /// Section's sickbay on the latching read, beside the loss; with nothing banked, the heal is
+    /// refused.
+    #[tokio::test]
+    async fn ops_defeat_wounds_one_and_heal_waits_for_credits() {
+        let state = Arc::new(session_state());
+        let cc = campaign_with(&state, WALLET, true, Some(GATEWAY)).await;
+        seed_commander(&state, cc.campaign_id).await;
+        let (c, section, _) = contract_on_site(&state, &cc).await;
+        fight_logged(&state, c, DEFEAT_SEED, None).await;
+        let (status, body) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["company"]["sections"],
+            serde_json::json!([{ "section_id": section, "wounded": 1, "healing": 0, "healed_at": null }])
+        );
+        assert_eq!(section_headcount(&state, section).await, 7);
+        let (status, body, _) = heal(&state, c, &section.to_string()).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("not enough banked credits")));
+    }
+
+    /// BP-12a-1: a won contract with wounded (`HEAL_WIN_SEED`: 3 wounded, 600 credits) heals all
+    /// three at once for 40 each; they are healing until 15 s after the heal's own `now`.
+    #[tokio::test]
+    async fn ops_heal_spends_credits() {
+        let state = Arc::new(session_state());
+        let cc = campaign_with(&state, WALLET, true, Some(GATEWAY)).await;
+        seed_commander(&state, cc.campaign_id).await;
+        let (c, section, _) = contract_on_site(&state, &cc).await;
+        fight_logged(&state, c, HEAL_WIN_SEED, None).await;
+        let (status, before) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{before}");
+        let wounded = before["company"]["sections"][0]["wounded"].as_u64().expect("wounded");
+        assert_eq!(wounded, 3, "HEAL_WIN_SEED's measured wounded: {before}");
+        let banked = before["credits_banked"].as_u64().expect("credits");
+        assert_eq!(banked, 600, "HEAL_WIN_SEED's measured pay: {before}");
+        let (status, body, _) = heal(&state, c, &section.to_string()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["credits_banked"].as_u64(), Some(banked - 40 * wounded));
+        let now = chrono::DateTime::parse_from_rfc3339(body["now"].as_str().expect("now")).expect("rfc3339").with_timezone(&chrono::Utc);
+        assert_eq!(
+            body["company"]["sections"][0],
+            serde_json::json!({ "section_id": section, "wounded": 0, "healing": wounded, "healed_at": ops_time(now + chrono::Duration::seconds(15)) })
+        );
+    }
+
+    /// BP-12a-1: a `section_id` that is not a UUID is `400`; a UUID with no wounded is `409`.
+    #[tokio::test]
+    async fn ops_heal_refusals() {
+        let state = Arc::new(session_state());
+        let c = campaign_with(&state, WALLET, true, Some(GATEWAY)).await;
+        seed_sector(&state, &c).await;
+        let (status, body, _) = heal(&state, c.campaign_id, "nope").await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::BAD_REQUEST, Some("unknown section")));
+        let (status, body, _) = heal(&state, c.campaign_id, &Uuid::new_v4().to_string()).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("nobody to heal")));
+    }
+
+    /// BP-12a-1, the twin of `ops_contract_latch_applies_once_under_two_racers` on `DEFEAT_SEED`
+    /// (1 KIA, 1 wounded): two readers park at the latch seam; one latch applies, so one loss and
+    /// one wounded land. The test's own `AppState` reuses `WALLET` (no `[n; 32]` byte is free).
+    #[tokio::test]
+    async fn ops_contract_defeat_latches_wounded_once_under_two_racers() {
+        let mut state = session_state();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        state.demo_ops.latch_seam = Some(Arc::new(move || { let barrier = Arc::clone(&barrier); Box::pin(async move { barrier.wait().await; }) }));
+        let state = Arc::new(state);
+        let cc = campaign_with(&state, WALLET, true, Some(GATEWAY)).await;
+        seed_commander(&state, cc.campaign_id).await;
+        let (c, section, _) = contract_on_site(&state, &cc).await;
+        fight_logged(&state, c, DEFEAT_SEED, None).await;
+        let raced = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(get(&state, Some("t"), c), get(&state, Some("t"), c))
+        })
+        .await;
+        let ((a, body_a), (b, body_b)) = raced.expect("both readers reached the seam");
+        assert_eq!(a, StatusCode::OK, "{body_a}");
+        assert_eq!(b, StatusCode::OK, "{body_b}");
+        assert_eq!(section_headcount(&state, section).await, 7, "one loss");
+        let company = state.demo_ops.store.ops_state(c, Utc::now()).company;
+        assert_eq!(company.sections.len(), 1);
+        assert_eq!((company.sections[0].section_id, company.sections[0].wounded), (section, 1), "one wounded, not 2");
     }
 
     /// BP-11a-3: a won contract leaves the board at its latch (a start of it is `400 unknown
@@ -2183,7 +2348,7 @@ mod tests {
         let (status, body, _) = next(&state, c, NEXT_SITE).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let keys: std::collections::BTreeSet<&str> = body.as_object().expect("an object").keys().map(|k| k.as_str()).collect();
-        assert_eq!(keys, ["active_op", "base", "campaign_id", "credits_banked", "gateway", "now", "ore_banked", "sites"].into_iter().collect());
+        assert_eq!(keys, ["active_op", "base", "campaign_id", "company", "credits_banked", "gateway", "now", "ore_banked", "sites"].into_iter().collect());
         let op = &body["active_op"];
         let op_keys: std::collections::BTreeSet<&str> = op.as_object().expect("an op").keys().map(|k| k.as_str()).collect();
         assert_eq!(op_keys, ["arrive_at", "arrived", "at", "depart_at", "kind", "leg", "site_id"].into_iter().collect());

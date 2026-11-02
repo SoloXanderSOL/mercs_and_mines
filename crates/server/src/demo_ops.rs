@@ -39,7 +39,7 @@ use std::time::Instant;
 
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde::Serialize;
-use sim_engine::game_types::{UnitBattleResult, UnitStatus};
+use sim_engine::game_types::{LootDrop, QualityGrade, UnitBattleResult, UnitStatus};
 use sim_engine::missions::missions;
 use sim_engine::rng::{generate_seed, Rng};
 use uuid::Uuid;
@@ -73,6 +73,12 @@ pub const DEMO_SECS_PER_HEX: u32 = 2;
 /// A fought contract is off the board for 45 s, then returns at another hex of its ring
 /// (BP-11a-3).
 pub const DEMO_SITE_REFRESH_SECS: i64 = 45;
+/// Credits per wounded soldier healed (BP-12a-1, §4e B3). C1's Hobbyist Benches will cut it.
+pub const DEMO_HEAL_CREDITS: u32 = 40;
+/// Seconds until a healed batch is back on its feet (BP-12a-1). C1's Hobbyist Benches will cut it.
+pub const DEMO_HEAL_SECS: i64 = 15;
+/// The Trophy Shelf keeps the newest this many items (BP-12a-1); the oldest is dropped.
+pub const DEMO_TROPHY_CAP: usize = 20;
 /// Heat each drill adds, and the meltdown threshold (§4d: the 7th drill melts down).
 pub const DEMO_HEAT_PER_DRILL: u32 = 15;
 pub const DEMO_HEAT_THRESHOLD: u32 = 100;
@@ -571,6 +577,101 @@ pub fn fight_losses(units: &[UnitBattleResult]) -> i16 {
     units.iter().filter(|u| matches!(u.final_status, UnitStatus::Kia | UnitStatus::Mia)).count() as i16
 }
 
+/// How many of a recomputed fight's units came back wounded (BP-12a-1). They hold their bunk:
+/// `fight_losses` counts only KIA and MIA, and the sim never makes one unit both.
+pub fn fight_wounded(units: &[UnitBattleResult]) -> u8 {
+    units.iter().filter(|u| matches!(u.final_status, UnitStatus::Wounded)).count() as u8
+}
+
+/// What an applied latch banks (BP-12a-1): the fight's pay; its wounded, into `section_id`'s
+/// sickbay cut to `cap` survivors (`None`: no sickbay write); and its loot, onto the Trophy
+/// Shelf. `latch_raid` applies all of it on its applied path only.
+#[derive(Clone, Debug, Default)]
+pub struct FightPay {
+    pub credits: u32,
+    pub section_id: Uuid,
+    pub wounded: u8,
+    pub cap: Option<u8>,
+    pub loot: Option<LootDrop>,
+}
+
+impl FightPay {
+    /// Pay only: no wounded, no loot (the at-0 Wipeout's shape, and the store tests').
+    pub fn credits(credits: u32) -> Self {
+        FightPay { credits, ..FightPay::default() }
+    }
+}
+
+/// One Section's sickbay (BP-12a-1): soldiers `wounded` and not yet healed, and a batch
+/// `healing` until `healed_at`. Both hold a bunk and neither deploys. An id the store has
+/// never seen reads as the default, and a bay back at the default is dropped at the next settle.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SickBay {
+    wounded: u8,
+    healing: u8,
+    healed_at: Option<DateTime<Utc>>,
+}
+
+impl SickBay {
+    /// A latched fight's wounded join the bay, and then the bay is cut to the Section's `cap`
+    /// survivors, wounded first, then healing. The dead are never in the sickbay (Linux C1).
+    fn take_wounded(&mut self, wounded: u8, cap: u8) {
+        self.wounded = self.wounded.saturating_add(wounded);
+        let mut over = self.wounded.saturating_add(self.healing).saturating_sub(cap);
+        let w = over.min(self.wounded);
+        self.wounded -= w;
+        over -= w;
+        self.healing -= over.min(self.healing);
+        if self.healing == 0 {
+            self.healed_at = None;
+        }
+    }
+}
+
+/// One item on the Trophy Shelf (BP-12a-1): the loot's grade and name, all the server knows
+/// about it (Linux C4). The flavour text is the client's, keyed by `item_name` (BP-12b).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Trophy {
+    pub quality_grade: QualityGrade,
+    pub item_name: String,
+}
+
+/// Puts `loot` on the shelf, newest last, keeping the newest `DEMO_TROPHY_CAP`.
+fn shelve(trophies: &mut Vec<Trophy>, loot: LootDrop) {
+    trophies.push(Trophy { quality_grade: loot.quality_grade, item_name: loot.item_name });
+    if trophies.len() > DEMO_TROPHY_CAP {
+        trophies.remove(0);
+    }
+}
+
+/// A Section's sickbay as the client sees it (BP-12a-1); `healed_at` in the format of the body's `now`.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SickBayView {
+    pub section_id: Uuid,
+    pub wounded: u8,
+    pub healing: u8,
+    pub healed_at: Option<String>,
+}
+
+/// The store's half of the Company (BP-12a-1): the sickbays, sorted by `section_id`, and the
+/// Trophy Shelf. Headcount, morale and XP stay on the roster read.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct CompanyView {
+    pub sections: Vec<SickBayView>,
+    pub trophies: Vec<Trophy>,
+}
+
+/// Why `heal_op` refused (BP-12a-1), in the order it checks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HealRefusal {
+    /// No wounded in the Section's bay (also an id the store has never seen, or no entry).
+    NobodyToHeal,
+    /// A batch is still healing: one batch per Section at a time.
+    AlreadyHealing,
+    /// Fewer banked credits than `DEMO_HEAL_CREDITS` × the wounded.
+    NotEnoughCredits,
+}
+
 /// The raid's fight among the Commander's deployments: the earliest one that is not `aborted`,
 /// is the trigger's mission and started strictly after the trigger (`started_at` is the app's
 /// clock, as `trigger_at` is). `None` while there is none or it is still `active` (a later
@@ -766,17 +867,58 @@ struct OpsEntry {
     /// The contracts' own state, by mission id (BP-11a-3): finished by an applied latch, moved
     /// by the refresh, cleared with a new gateway.
     contracts: HashMap<&'static str, ContractSlot>,
+    /// By Section id (BP-12a-1): written by an applied latch and by a heal; settled by
+    /// `settle_sickbay`; leaves only with the entry.
+    sickbay: HashMap<Uuid, SickBay>,
+    /// The Trophy Shelf (BP-12a-1): an applied latch's loot, newest last, at most
+    /// `DEMO_TROPHY_CAP`; leaves only with the entry.
+    trophies: Vec<Trophy>,
 }
 
 impl OpsEntry {
+    /// Takes `cost` from the banked credits, or refuses (`false`) when short, never saturating
+    /// (BP-12a-1, the first credit debit). Callers hold the store lock.
+    fn debit_credits(&mut self, cost: u32) -> bool {
+        if self.credits_banked < cost {
+            return false;
+        }
+        self.credits_banked -= cost;
+        true
+    }
+
+    /// Brings back every batch whose `healed_at` has come, then drops the bays back at the
+    /// default (BP-12a-1). A clock test under the lock: it reads nothing outside the entry.
+    fn settle_sickbay(&mut self, now: DateTime<Utc>) {
+        for bay in self.sickbay.values_mut() {
+            if bay.healed_at.is_some_and(|t| now >= t) {
+                bay.healing = 0;
+                bay.healed_at = None;
+            }
+        }
+        self.sickbay.retain(|_, b| *b != SickBay::default());
+    }
+
+    /// The Company as the client sees it (BP-12a-1), sickbays sorted by `section_id`.
+    fn company(&self) -> CompanyView {
+        let mut sections: Vec<SickBayView> = self
+            .sickbay
+            .iter()
+            .map(|(id, b)| SickBayView { section_id: *id, wounded: b.wounded, healing: b.healing, healed_at: b.healed_at.map(ops_time) })
+            .collect();
+        sections.sort_by_key(|s| s.section_id);
+        CompanyView { sections, trophies: self.trophies.clone() }
+    }
+
     /// First fires a haul's ambush once its time has come (BP-8b-2): the trigger is set at
     /// `now`, the reveal, so no fight started before the player could know of it is latched, and
     /// the team waits on the road. Then clears a homeward leg that has arrived with no battle
     /// waiting and none to come, banking what it carried and recording the arrival (not the
     /// read) as the last movement. Every read and write of the op calls it first, under the lock.
-    /// It first runs the board refresh (`settle_contracts`, BP-11a-3).
+    /// It first runs the board refresh (`settle_contracts`, BP-11a-3), then the sickbay
+    /// (`settle_sickbay`, BP-12a-1).
     fn settle_arrival(&mut self, now: DateTime<Utc>) {
         self.settle_contracts(now);
+        self.settle_sickbay(now);
         let Some(op) = self.op.as_mut() else {
             return;
         };
@@ -922,6 +1064,8 @@ pub struct OpsSnapshot {
     pub ore_banked: u32,
     pub credits_banked: u32,
     pub base: OpsBase,
+    /// and the Company's store half (BP-12a-1).
+    pub company: CompanyView,
 }
 
 /// A new op (BP-11a-4), built for a start (`start_op`) and for a next (`next_op`): outbound to
@@ -992,11 +1136,12 @@ fn new_op(site: &OpsSite, op_seed: u32, dig: Option<DigStart>, contract: Option<
 ///   (compare-and-set, `moved_at`): Held resumes the rest of the leg with the whole load,
 ///   Defeat or TacticalRetreat with half (floor), Wipeout clears the op and banks nothing;
 /// - **the keep list** (the reaper's `moved_since`): a departure (start, next, return, pull), a
-///   homeward arrival, a drill, a latch and a build each write `moved_at`. Reading the board or the op
+///   homeward arrival, a drill, a latch, a build and a heal each write `moved_at`. Reading the board or the op
 ///   does not, nor does the ambush's reveal; a read that latches a battle does. While an
 ///   ambush waits, `moved_since` still counts the leg's passed `arrive_at`, at most
 ///   `travel_secs` (≤ 48 s) after the pull: an accepted overcount;
-/// - the eviction skips any entry holding an op, banked ore, banked credits or a building;
+/// - the eviction takes only an entry with no op, no banked ore, no banked credits, no
+///   building, no sickbay and no trophy (BP-12a-1);
 /// - an entry is dropped only by `remove` (a read of a campaign that is no longer `Active`,
 ///   the reaper's retire) and the reaper's prune (`retain_campaigns`).
 ///
@@ -1024,9 +1169,9 @@ impl DemoOpsStore {
     }
 
     /// Makes room for a new entry: below the cap, nothing; at it, evicts the least recently
-    /// touched entry that holds no op, no banked ore, no banked credits and no building, and
-    /// journals (first, then at most hourly). `false` when every entry holds an op, banked ore,
-    /// banked credits or a building. An entry whose only state is a finished contract can go
+    /// touched entry that holds no op, no banked ore, no banked credits, no building, no sickbay
+    /// and no trophy (BP-12a-1), and journals (first, then at most hourly). `false` when every
+    /// entry holds an op, banked ore, banked credits, a building, a sickbay or a trophy. An entry whose only state is a finished contract can go
     /// (BP-11a-3, accepted): its next read recomputes the board and the contract is back early. A
     /// won contract banked its pay, so it is never the victim.
     fn make_room(&self, inner: &mut HashMap<Uuid, OpsEntry>) -> bool {
@@ -1035,7 +1180,7 @@ impl DemoOpsStore {
         }
         let victim = inner
             .iter()
-            .filter(|(_, e)| e.op.is_none() && e.ore_banked == 0 && e.credits_banked == 0 && e.base == OpsBase::default())
+            .filter(|(_, e)| e.op.is_none() && e.ore_banked == 0 && e.credits_banked == 0 && e.base == OpsBase::default() && e.sickbay.is_empty() && e.trophies.is_empty())
             .min_by_key(|(_, e)| e.touched)
             .map(|(id, _)| *id);
         let Some(id) = victim else {
@@ -1075,7 +1220,7 @@ impl DemoOpsStore {
         if !self.make_room(&mut inner) {
             return false;
         }
-        inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, op: None, moved_at: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), contracts: HashMap::new() });
+        inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, op: None, moved_at: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), contracts: HashMap::new(), sickbay: HashMap::new(), trophies: Vec::new() });
         true
     }
 
@@ -1099,7 +1244,7 @@ impl DemoOpsStore {
             if !self.make_room(&mut inner) {
                 return Err(StartRefusal::Full);
             }
-            inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, op: None, moved_at: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), contracts: HashMap::new() });
+            inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, op: None, moved_at: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), contracts: HashMap::new(), sickbay: HashMap::new(), trophies: Vec::new() });
         }
         let Some(e) = inner.get_mut(&campaign_id) else {
             return Err(StartRefusal::Full);
@@ -1323,8 +1468,10 @@ impl DemoOpsStore {
     /// soldiers (BP-11a-1), with no fight and no death. Each writes `moved_at` (the keep list).
     /// An applied contract latch, whatever its result, also finishes the contract (BP-11a-3): it
     /// leaves the board, and the refresh brings it back 45 s later. A refused latch finishes
-    /// nothing.
-    pub fn latch_raid(&self, campaign_id: Uuid, trigger: &RaidTrigger, result: RaidResult, credits: u32, now: DateTime<Utc>) -> bool {
+    /// nothing. On the applied path only, beside the pay (BP-12a-1, one writer): the fight's
+    /// wounded join the Section's sickbay, cut to `pay.cap` survivors, and its loot goes on the
+    /// Trophy Shelf. A refused latch writes neither.
+    pub fn latch_raid(&self, campaign_id: Uuid, trigger: &RaidTrigger, result: RaidResult, pay: FightPay, now: DateTime<Utc>) -> bool {
         let mut inner = self.lock();
         let Some(e) = inner.get_mut(&campaign_id) else {
             return false;
@@ -1378,7 +1525,13 @@ impl DemoOpsStore {
                 (_, RaidResult::Wiped) => e.op = None,
             }
         }
-        e.credits_banked = e.credits_banked.saturating_add(credits);
+        e.credits_banked = e.credits_banked.saturating_add(pay.credits);
+        if let Some(cap) = pay.cap {
+            e.sickbay.entry(pay.section_id).or_default().take_wounded(pay.wounded, cap);
+        }
+        if let Some(loot) = pay.loot {
+            shelve(&mut e.trophies, loot);
+        }
         e.moved_at = Some(now);
         e.touched = now;
         true
@@ -1405,7 +1558,7 @@ impl DemoOpsStore {
     pub fn ops_state(&self, campaign_id: Uuid, now: DateTime<Utc>) -> OpsSnapshot {
         let mut inner = self.lock();
         let Some(e) = inner.get_mut(&campaign_id) else {
-            return OpsSnapshot { sites: None, op: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default() };
+            return OpsSnapshot { sites: None, op: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), company: CompanyView::default() };
         };
         e.settle_arrival(now);
         OpsSnapshot {
@@ -1414,6 +1567,7 @@ impl DemoOpsStore {
             ore_banked: e.ore_banked,
             credits_banked: e.credits_banked,
             base: e.base,
+            company: e.company(),
         }
     }
 
@@ -1455,6 +1609,33 @@ impl DemoOpsStore {
         }
         e.ore_banked -= cost;
         e.base.set(building);
+        e.moved_at = Some(now);
+        e.touched = now;
+        Ok(())
+    }
+
+    /// Heals every wounded soldier of `section_id` at once (BP-12a-1, §4e B3), for
+    /// `DEMO_HEAL_CREDITS` each: they move to `healing` and are back at `now + DEMO_HEAL_SECS`.
+    /// Allowed while the team is out (Linux C3): the sickbay feeds nothing the server rolls.
+    /// Writes `moved_at` (the keep list). Refusals in order: `NobodyToHeal` (also no entry) →
+    /// `AlreadyHealing` → `NotEnoughCredits`. Check and debit are one critical section, no await.
+    pub fn heal_op(&self, campaign_id: Uuid, section_id: Uuid, now: DateTime<Utc>) -> Result<(), HealRefusal> {
+        let mut inner = self.lock();
+        let Some(e) = inner.get_mut(&campaign_id) else {
+            return Err(HealRefusal::NobodyToHeal);
+        };
+        e.settle_arrival(now);
+        let bay = e.sickbay.get(&section_id).copied().unwrap_or_default();
+        if bay.wounded == 0 {
+            return Err(HealRefusal::NobodyToHeal);
+        }
+        if bay.healing > 0 {
+            return Err(HealRefusal::AlreadyHealing);
+        }
+        if !e.debit_credits(DEMO_HEAL_CREDITS * u32::from(bay.wounded)) {
+            return Err(HealRefusal::NotEnoughCredits);
+        }
+        e.sickbay.insert(section_id, SickBay { wounded: 0, healing: bay.wounded, healed_at: Some(now + Duration::seconds(DEMO_HEAL_SECS)) });
         e.moved_at = Some(now);
         e.touched = now;
         Ok(())
@@ -2056,16 +2237,16 @@ mod tests {
             on_site(&store, id, 1, 100, 7);
             store.drill_op(id, at(11)).expect("drill");
         }
-        assert!(store.latch_raid(a, &trigger(11), RaidResult::Held, 0, at(20)));
+        assert!(store.latch_raid(a, &trigger(11), RaidResult::Held, FightPay::credits(0), at(20)));
         let d = dig_view(&store, a, at(20));
         assert_eq!((d.raid, d.next_raid_pct, d.ore_on_site, d.carried, d.ended_by), (None, Some(10), 10, 0, None));
         assert_eq!(store.drill_op(a, at(21)), Ok(DrillOutcome::Drilled), "seed 7's drill 2 (d100 98) digs on");
-        assert!(store.latch_raid(b, &trigger(11), RaidResult::Retreat, 0, at(20)));
+        assert!(store.latch_raid(b, &trigger(11), RaidResult::Retreat, FightPay::credits(0), at(20)));
         let op = store.op_view(b, at(21)).expect("op");
         assert_eq!((op.leg, op.depart_at, op.arrive_at), (OpLeg::Homeward, ops_time(at(20)), ops_time(at(30))));
         let d = op.dig.expect("a dig");
         assert_eq!((d.carried, d.ore_on_site, d.ended_by, d.raid, d.next_raid_pct), (5, 0, Some(OpEnd::Retreat), None, None));
-        assert!(store.latch_raid(c, &trigger(11), RaidResult::Wiped, 0, at(20)));
+        assert!(store.latch_raid(c, &trigger(11), RaidResult::Wiped, FightPay::credits(0), at(20)));
         assert!(store.op_view(c, at(21)).is_none(), "the op is cleared");
     }
 
@@ -2132,9 +2313,9 @@ mod tests {
         store.drill_op(a, at(11)).expect("drill 1");
         store.drill_op(a, at(12)).expect("drill 2");
         assert_eq!(store.pending_raid(a, at(12)).map(|p| p.trigger), Some(trigger(12)));
-        assert!(store.latch_raid(a, &trigger(12), RaidResult::Held, 0, at(13)));
+        assert!(store.latch_raid(a, &trigger(12), RaidResult::Held, FightPay::credits(0), at(13)));
         store.drill_op(a, at(14)).expect("drill 3");
-        assert!(!store.latch_raid(a, &trigger(12), RaidResult::Retreat, 0, at(15)), "the trigger has changed");
+        assert!(!store.latch_raid(a, &trigger(12), RaidResult::Retreat, FightPay::credits(0), at(15)), "the trigger has changed");
         let op = store.op_view(a, at(15)).expect("op");
         assert_eq!(op.leg, OpLeg::Outbound);
         let d = op.dig.expect("a dig");
@@ -2150,7 +2331,7 @@ mod tests {
         on_site(&store, a, 1, 100, 7);
         store.drill_op(a, at(11)).expect("drill");
         assert!(!store.moved_since(a, at(400), at(600)), "drilled at 11 s, nothing since");
-        assert!(store.latch_raid(a, &trigger(11), RaidResult::Held, 0, at(500)));
+        assert!(store.latch_raid(a, &trigger(11), RaidResult::Held, FightPay::credits(0), at(500)));
         assert!(store.moved_since(a, at(400), at(600)));
     }
 
@@ -2261,7 +2442,7 @@ mod tests {
         let a = Uuid::from_u128(1);
         on_site(&store, a, 1, 100, 7);
         store.drill_op(a, at(11)).expect("drill");
-        assert!(store.latch_raid(a, &trigger(11), RaidResult::Retreat, 0, at(20)));
+        assert!(store.latch_raid(a, &trigger(11), RaidResult::Retreat, FightPay::credits(0), at(20)));
         assert_eq!(store.ops_snapshot(a, at(29)).1, 0);
         assert_eq!(store.ops_snapshot(a, at(30)), (None, 5, OpsBase::default()));
     }
@@ -2319,15 +2500,15 @@ mod tests {
             pulled(&store, id, 14, 2);
             assert_eq!(store.pending_raid(id, at(25)).map(|p| p.trigger), Some(ambush_trigger(25)));
         }
-        assert!(store.latch_raid(a, &ambush_trigger(25), RaidResult::Held, 0, at(28)));
+        assert!(store.latch_raid(a, &ambush_trigger(25), RaidResult::Held, FightPay::credits(0), at(28)));
         let op = store.op_view(a, at(32)).expect("op");
         assert_eq!((op.depart_at, op.arrive_at, op.arrived), (ops_time(at(23)), ops_time(at(33)), false));
         let d = op.dig.expect("a dig");
         assert_eq!((d.carried, d.ended_by, d.ambush), (30, Some(OpEnd::Pulled), None));
-        assert!(store.latch_raid(b, &ambush_trigger(25), RaidResult::Retreat, 0, at(28)));
+        assert!(store.latch_raid(b, &ambush_trigger(25), RaidResult::Retreat, FightPay::credits(0), at(28)));
         let d = dig_view(&store, b, at(32));
         assert_eq!((d.carried, d.ended_by, d.ambush), (15, Some(OpEnd::Retreat), None));
-        assert!(store.latch_raid(c, &ambush_trigger(25), RaidResult::Wiped, 0, at(28)));
+        assert!(store.latch_raid(c, &ambush_trigger(25), RaidResult::Wiped, FightPay::credits(0), at(28)));
         assert_eq!(store.ops_snapshot(c, at(28)), (None, 0, OpsBase::default()));
         assert_eq!(store.ops_snapshot(a, at(33)), (None, 30, OpsBase::default()));
         assert_eq!(store.ops_snapshot(b, at(33)), (None, 15, OpsBase::default()));
@@ -2342,8 +2523,8 @@ mod tests {
         let a = Uuid::from_u128(1);
         pulled(&store, a, 14, 2);
         store.pending_raid(a, at(25)).expect("the ambush fires");
-        assert!(store.latch_raid(a, &ambush_trigger(25), RaidResult::Retreat, 0, at(28)));
-        assert!(!store.latch_raid(a, &ambush_trigger(25), RaidResult::Retreat, 0, at(29)), "already latched");
+        assert!(store.latch_raid(a, &ambush_trigger(25), RaidResult::Retreat, FightPay::credits(0), at(28)));
+        assert!(!store.latch_raid(a, &ambush_trigger(25), RaidResult::Retreat, FightPay::credits(0), at(29)), "already latched");
         assert_eq!(dig_view(&store, a, at(30)).carried, 15);
     }
 
@@ -2361,7 +2542,7 @@ mod tests {
         assert!(store.moved_since(a, at(500), at(501)), "the pull");
         store.pending_raid(a, at(505)).expect("the ambush fires at 505 s");
         assert!(!store.moved_since(a, at(502), at(506)), "the reveal is not movement");
-        assert!(store.latch_raid(a, &ambush_trigger(505), RaidResult::Held, 0, at(507)));
+        assert!(store.latch_raid(a, &ambush_trigger(505), RaidResult::Held, FightPay::credits(0), at(507)));
         assert!(store.moved_since(a, at(507), at(508)), "the latch");
     }
 
@@ -2580,9 +2761,9 @@ mod tests {
             })
         );
         let t = RaidTrigger { trigger_at: at(10), mission_id: "GUARD_DUTY", kind: BattleKind::Contract };
-        assert!(store.latch_raid(a, &t, RaidResult::Held, 400, at(12)));
+        assert!(store.latch_raid(a, &t, RaidResult::Held, FightPay::credits(400), at(12)));
         assert_eq!(store.pending_raid(a, at(13)), None, "fought");
-        assert!(!store.latch_raid(a, &t, RaidResult::Held, 400, at(14)), "already latched");
+        assert!(!store.latch_raid(a, &t, RaidResult::Held, FightPay::credits(400), at(14)), "already latched");
         assert_eq!(store.ops_state(a, at(15)).credits_banked, 400);
         assert_eq!(store.op_view(a, at(15)).expect("op").fought, Some("won"));
     }
@@ -2596,16 +2777,145 @@ mod tests {
         let lead = ContractStart { commander_id: COMMANDER, section_id: None };
         store.start_op(a, (5, 0), board(), &site(), 7, None, Some(lead), at(0)).expect("start");
         let t = RaidTrigger { trigger_at: at(10), mission_id: "GUARD_DUTY", kind: BattleKind::Contract };
-        assert!(store.latch_raid(a, &t, RaidResult::Held, 400, at(12)));
+        assert!(store.latch_raid(a, &t, RaidResult::Held, FightPay::credits(400), at(12)));
         store.return_op(a, at(13)).expect("return");
         assert_eq!(
             store.ops_state(a, at(30)),
-            OpsSnapshot { sites: Some(vec![]), op: None, ore_banked: 0, credits_banked: 400, base: OpsBase::default() }
+            OpsSnapshot { sites: Some(vec![]), op: None, ore_banked: 0, credits_banked: 400, base: OpsBase::default(), company: CompanyView::default() }
         );
         assert!(!store.put_board(b, (5, 0), board(), at(31)), "not cached");
         assert_eq!(store.len(), 1);
         assert!(store.board(a, (5, 0), at(32)).is_some(), "the banked entry is kept");
         assert!(store.board(b, (5, 0), at(32)).is_none());
+    }
+
+    /// BP-12a-1: the Section the store tests' sickbays belong to.
+    const SECTION: Uuid = Uuid::from_u128(0x5EC);
+
+    /// BP-12a-1: `GUARD_DUTY` (`site()`) started at 0 and its fight latched at 12 with `result`
+    /// and `pay`.
+    fn contract_latched(store: &DemoOpsStore, a: Uuid, result: RaidResult, pay: FightPay) {
+        store.start_op(a, (5, 0), board(), &site(), 7, None, Some(LEAD), at(0)).expect("start");
+        assert!(store.latch_raid(a, &guard_duty_arrival(), result, pay, at(12)));
+    }
+
+    /// A pay of `credits` with `wounded` into `SECTION`'s bay, cut to 8, and no loot.
+    fn wounded_pay(credits: u32, wounded: u8) -> FightPay {
+        FightPay { credits, section_id: SECTION, wounded, cap: Some(8), loot: None }
+    }
+
+    fn bay(wounded: u8, healing: u8, healed_at: Option<DateTime<Utc>>) -> SickBayView {
+        SickBayView { section_id: SECTION, wounded, healing, healed_at: healed_at.map(ops_time) }
+    }
+
+    /// BP-12a-1 (Linux C1): a latch's wounded join the bay, then the bay is cut to the
+    /// survivors, wounded first, then healing; a bay with nobody healing has no `healed_at`.
+    #[test]
+    fn take_wounded_cuts_the_bay_to_the_survivors() {
+        let t = Some(at(15));
+        let cases = [
+            (SickBay { wounded: 0, healing: 0, healed_at: None }, 2, 8, SickBay { wounded: 2, healing: 0, healed_at: None }),
+            (SickBay { wounded: 6, healing: 0, healed_at: None }, 1, 3, SickBay { wounded: 3, healing: 0, healed_at: None }),
+            (SickBay { wounded: 1, healing: 4, healed_at: t }, 2, 4, SickBay { wounded: 0, healing: 4, healed_at: t }),
+            (SickBay { wounded: 0, healing: 4, healed_at: t }, 0, 2, SickBay { wounded: 0, healing: 2, healed_at: t }),
+            (SickBay { wounded: 0, healing: 2, healed_at: t }, 0, 0, SickBay { wounded: 0, healing: 0, healed_at: None }),
+        ];
+        for (before, w, cap, after) in cases {
+            let mut got = before;
+            got.take_wounded(w, cap);
+            assert_eq!(got, after, "{before:?}.take_wounded({w}, {cap})");
+        }
+    }
+
+    /// BP-12a-1: one applied latch puts its wounded in the Section's bay and its loot on the
+    /// shelf; a refused latch with the same pay writes neither.
+    #[test]
+    fn latch_records_wounded_and_shelves_loot() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        let jammer = LootDrop { quality_grade: QualityGrade::Standard, item_name: "Signal Jammer Module".into() };
+        let pay = FightPay { credits: 0, section_id: SECTION, wounded: 1, cap: Some(7), loot: Some(jammer) };
+        contract_latched(&store, a, RaidResult::Retreat, pay.clone());
+        let want = CompanyView {
+            sections: vec![bay(1, 0, None)],
+            trophies: vec![Trophy { quality_grade: QualityGrade::Standard, item_name: "Signal Jammer Module".into() }],
+        };
+        assert_eq!(store.ops_state(a, at(13)).company, want);
+        assert!(!store.latch_raid(a, &guard_duty_arrival(), RaidResult::Retreat, pay, at(14)), "already latched");
+        assert_eq!(store.ops_state(a, at(15)).company, want, "a refused latch writes neither");
+    }
+
+    /// BP-12a-1: a heal takes 40 a head from the bank and moves the wounded to healing until 15 s
+    /// after the heal; with nobody left wounded, a second heal is refused.
+    #[test]
+    fn heal_debits_40_a_head() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        contract_latched(&store, a, RaidResult::Held, wounded_pay(400, 3));
+        assert_eq!(store.heal_op(a, SECTION, at(12)), Ok(()));
+        let s = store.ops_state(a, at(12));
+        assert_eq!(s.credits_banked, 280);
+        assert_eq!(s.company.sections, vec![bay(0, 3, Some(at(27)))]);
+        assert_eq!(store.heal_op(a, SECTION, at(12)), Err(HealRefusal::NobodyToHeal));
+    }
+
+    /// BP-12a-1: short of 40 a head, the heal is refused and writes nothing.
+    #[test]
+    fn heal_refuses_when_credits_are_short() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        contract_latched(&store, a, RaidResult::Held, wounded_pay(80, 3));
+        assert_eq!(store.heal_op(a, SECTION, at(12)), Err(HealRefusal::NotEnoughCredits));
+        let s = store.ops_state(a, at(13));
+        assert_eq!(s.credits_banked, 80);
+        assert_eq!(s.company.sections, vec![bay(3, 0, None)]);
+    }
+
+    /// BP-12a-1: a batch healed at 12 is back at 27. A second contract's latch at 26 (the team
+    /// sent on at 20, arriving at 26) wounds one more, who can't be healed while the batch is
+    /// healing; at 26 the bay holds both, at 27 only the new wounded.
+    #[test]
+    fn heal_returns_after_15_s_and_takes_one_batch_at_a_time() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        contract_latched(&store, a, RaidResult::Held, wounded_pay(400, 2));
+        assert_eq!(store.heal_op(a, SECTION, at(12)), Ok(()));
+        assert_eq!(store.next_op(a, &supply_raid(), 9, None, Some(LEAD), at(20)), Ok(()));
+        let second = RaidTrigger { trigger_at: at(26), mission_id: "SUPPLY_RAID", kind: BattleKind::Contract };
+        assert!(store.latch_raid(a, &second, RaidResult::Held, wounded_pay(0, 1), at(26)));
+        assert_eq!(store.heal_op(a, SECTION, at(26)), Err(HealRefusal::AlreadyHealing));
+        assert_eq!(store.ops_state(a, at(26)).company.sections, vec![bay(1, 2, Some(at(27)))]);
+        assert_eq!(store.ops_state(a, at(27)).company.sections, vec![bay(1, 0, None)]);
+    }
+
+    /// BP-12a-1: the shelf keeps the newest 20, newest last.
+    #[test]
+    fn trophy_shelf_keeps_the_newest_20() {
+        let mut shelf = Vec::new();
+        for i in 0..21 {
+            shelve(&mut shelf, LootDrop { quality_grade: QualityGrade::Basic, item_name: format!("t{i}") });
+        }
+        assert_eq!(shelf.len(), 20);
+        assert_eq!(shelf[0].item_name, "t1");
+        assert_eq!(shelf[19].item_name, "t20");
+    }
+
+    /// BP-12a-1 (Linux Q5), mirroring `ops_store_eviction_skips_banked_credits`: at the cap, an
+    /// entry whose only state is a trophy (A) or a sickbay (B) is never evicted. Both ops were
+    /// cleared by a wiped contract, with no pay, ore or building.
+    #[test]
+    fn make_room_keeps_a_sickbay_or_a_shelf() {
+        let store = DemoOpsStore::new(2);
+        let (a, b, c) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
+        let visor = LootDrop { quality_grade: QualityGrade::Basic, item_name: "Cracked Visor Helmet".into() };
+        contract_latched(&store, a, RaidResult::Wiped, FightPay { loot: Some(visor), ..FightPay::default() });
+        contract_latched(&store, b, RaidResult::Wiped, wounded_pay(0, 1));
+        assert_eq!(store.op_view(a, at(20)), None);
+        assert_eq!(store.op_view(b, at(20)), None);
+        assert!(!store.put_board(c, (5, 0), board(), at(30)), "not cached");
+        assert_eq!(store.len(), 2);
+        assert!(store.board(a, (5, 0), at(31)).is_some(), "the shelf is kept");
+        assert!(store.board(b, (5, 0), at(31)).is_some(), "the sickbay is kept");
     }
 
     /// BP-11a-3: the four contracts in `OPS_CONTRACT_MISSIONS` order at (8, 0) … (11, 0), each
@@ -2639,7 +2949,7 @@ mod tests {
     fn fought_guard_duty(store: &DemoOpsStore, a: Uuid, b: &Arc<OpsBoard>) {
         let lead = ContractStart { commander_id: COMMANDER, section_id: None };
         store.start_op(a, (5, 0), Arc::clone(b), &b.sites[0], 7, None, Some(lead), at(0)).expect("start");
-        assert!(store.latch_raid(a, &guard_duty_arrival(), RaidResult::Held, 400, at(12)));
+        assert!(store.latch_raid(a, &guard_duty_arrival(), RaidResult::Held, FightPay::credits(400), at(12)));
     }
 
     fn shown(store: &DemoOpsStore, a: Uuid, now: DateTime<Utc>) -> Vec<OpsSite> {
@@ -2697,7 +3007,7 @@ mod tests {
         fought_guard_duty(&store, a, &b);
         assert_eq!(guard_duty(&shown(&store, a, at(13))), None);
         assert!(guard_duty(&shown(&store, a, at(57))).is_some(), "back at 57 s");
-        assert!(!store.latch_raid(a, &guard_duty_arrival(), RaidResult::Held, 400, at(58)), "already fought");
+        assert!(!store.latch_raid(a, &guard_duty_arrival(), RaidResult::Held, FightPay::credits(400), at(58)), "already fought");
         let back = guard_duty(&shown(&store, a, at(58))).cloned().expect("still on the board");
         assert_eq!((back.q, back.r), (3, 4));
         assert_eq!(store.ops_state(a, at(58)).credits_banked, 400);
@@ -2745,7 +3055,7 @@ mod tests {
     /// `supply_raid()` at 20: a 6 s leg, arriving at 26.
     fn next_to_supply_raid(store: &DemoOpsStore, a: Uuid) {
         store.start_op(a, (5, 0), board(), &site(), 7, None, Some(LEAD), at(0)).expect("start");
-        assert!(store.latch_raid(a, &guard_duty_arrival(), RaidResult::Held, 400, at(12)));
+        assert!(store.latch_raid(a, &guard_duty_arrival(), RaidResult::Held, FightPay::credits(400), at(12)));
         assert_eq!(store.next_op(a, &supply_raid(), 9, None, Some(LEAD), at(20)), Ok(()));
     }
 
@@ -2874,11 +3184,11 @@ mod tests {
             let b = contract_board(&[(8, 0), (3, 4)]);
             store.start_op(a, (5, 0), Arc::clone(&b), &b.sites[1], 7, None, Some(LEAD), at(0)).expect("start B");
             let tb = RaidTrigger { trigger_at: at(10), mission_id: "CRASHED_SHIP_RAID", kind: BattleKind::Contract };
-            assert!(store.latch_raid(a, &tb, RaidResult::Held, 400, at(12)), "round {round}");
+            assert!(store.latch_raid(a, &tb, RaidResult::Held, FightPay::credits(400), at(12)), "round {round}");
             store.return_op(a, at(13)).expect("return");
             store.start_op(a, (5, 0), Arc::clone(&b), &b.sites[0], 8, None, Some(LEAD), at(24)).expect("start A");
             let ta = RaidTrigger { trigger_at: at(34), mission_id: "GUARD_DUTY", kind: BattleKind::Contract };
-            assert!(store.latch_raid(a, &ta, RaidResult::Held, 400, at(34)), "round {round}");
+            assert!(store.latch_raid(a, &ta, RaidResult::Held, FightPay::credits(400), at(34)), "round {round}");
             for t in [80, 200] {
                 let sites = shown(&store, a, at(t));
                 assert_eq!(mission_hex(&sites, "GUARD_DUTY"), Some((3, 4)), "round {round}, {t} s: A takes the free hex");
