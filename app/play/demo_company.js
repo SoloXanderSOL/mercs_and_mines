@@ -8,10 +8,20 @@
 // "Your Company" with a stats card for the Section and the Crew, and the combat screen's factor
 // labels say where each number comes from. It reads the roster the client already holds and makes
 // no network call. Every string goes in through textContent.
+//
+// BP-12b: "Your Company" is the Company screen. Once demo_ops.js has adopted an ops body for the
+// campaign, the Section card shows its bunks, its sickbay, Heal and Replace, the Crew card shows
+// Replace, and a Trophy Shelf chip lists the recovered loot. The state and every request are
+// demo_ops.js's, read through the view it registers; this file renders, keeps the costs and the
+// shelf's lines, and ticks the heal countdown (no network call) while the card is open.
 
 import { store } from './api.js';
 
 const RANK_XP = [100, 400, 1100, 2600]; // commander_gen.rs:132 RANK_THRESHOLDS (ranks 2..=5); harness k3 holds its own copy
+export const HEAL_CREDITS = 40;           // demo_ops.rs DEMO_HEAL_CREDITS; harness y14 holds its own copy
+export const HEAL_SECS = 15;              // demo_ops.rs DEMO_HEAL_SECS (copy only: the body's healed_at decides)
+export const REPLACE_MERC_CREDITS = 120;  // demo_ops.rs DEMO_REPLACE_MERC_CREDITS
+export const REPLACE_MINER_CREDITS = 80;  // demo_ops.rs DEMO_REPLACE_MINER_CREDITS
 
 // A7: what a rank really changes in this build (the roll sees no Commander until B5).
 const RANK_LINES = {
@@ -79,7 +89,73 @@ const COMPANY_COPY = {
   crewMorale: 'Morale: {m} / 100. A meltdown costs miners and 10 morale.',
   crewForeman: 'Foreman: {name}, {spec}',
   close: 'Close',
+  // BP-12b (Wiki copy)
+  atBase: 'The sickbay and the Trophy Shelf are kept at base. Open the map to see them.',
+  bunks: '{f} fit, {w} wounded, {n} healing, {e} empty bunks',
+  fit: 'Fit to fight: {f}',
+  bay: 'In the sickbay: {w} wounded.',
+  healing: '{n} on their feet in {s} s.',
+  back: 'Back on the roster.',
+  led: 'Led by {name}. XP {xp}. Stress {n} / 100.',
+  kit: 'Kit: standard issue.',
+  bank: 'Banked: {n} credits',
+  heal: 'Patch up {n} · {cost} credits',
+  healNote: '{each} credits a soldier. On their feet {secs} s after payment.',
+  short: 'Not enough banked credits. {each} each.',
+  requisition: 'Requisition {n} · {cost} credits',
+  requisitionNote: '{each} credits a Rookie. They arrive with no history and no complaints yet.',
+  hire: 'Hire {n} · {cost} credits',
+  hireNote: '{each} credits a miner. Morale stays where it is.',
+  out: 'The team is out. Replacements report at base.',
+  full: 'Full strength: 8 / 8.',
+  sectionFull: 'The Section is already full.',
+  crewFull: 'The Crew is already full.',
+  shelfKind: 'Loot',
+  shelfChip: 'Trophy Shelf',
+  shelfTitle: 'Trophy Shelf',
+  shelfSub: 'Recovered in the field. Catalogued, polished, not issued. Logistics is still writing the forms.',
+  shelfEmpty: 'Nothing recovered yet. Win a fight and something may come home with the team.',
 };
+
+// Replace: offered on the player's own rows below 8; one tap buys what the bank covers (BP-12b).
+const replaceOffer = (h, each, bank) => h >= 8 ? null : { n: Math.max(1, Math.min(8 - h, Math.floor(bank / each))), afford: bank >= each };
+
+// The heal countdown, against the server's clock (demo_ops.js's serverNow), never the phone's.
+const healSecs = (b, now) => Math.max(0, Math.ceil((Date.parse(b.healed_at) - now()) / 1000));
+
+// A5: one line per item the loot roll can produce (loot_roller.rs:20-47, byte for byte). Flavour only: no trophy acts in this build.
+const TROPHY_LINES = new Map([
+  ["Salvaged Ammo Cache", "Half of it fits our rifles. The other half is evidence."],
+  ["Dented Flak Vest", "The dent is where it worked. The previous owner was unavailable for comment."],
+  ["Cracked Visor Helmet", "Visibility reduced to a vague sense of optimism."],
+  ["Busted Stimpack", "Empty. Someone needed it more, and briefly."],
+  ["Scrap Plating", "Logistics lists it as armour. Logistics has never been shot."],
+  ["Low-Grade Ore Sample", "Assayed at low grade. Kept for morale, which is also low grade."],
+  ["Refurbished Laser Pistol", "Refurbished means it fired once in testing. Twice would be a record."],
+  ["Corporate Assault Vest", "Branded on the front, so the enemy knows who to invoice."],
+  ["Signal Jammer Module", "Jams signals. Also the kettle, for reasons nobody can explain."],
+  ["Pre-Severance Medkit", "Older than the Severance and better stocked than ours."],
+  ["Tactical Webbing Rig", "Twelve pouches. Eleven of them hold snacks."],
+  ["Gunmetal Iron Ingot (×5)", "Five ingots of the good stuff. Accounting wants them back."],
+  ["Military-Grade Laser Carbine", "Military grade. The military would like a word about that."],
+  ["Void-Treated Combat Plate", "Hums at night. The Rookies have stopped asking why."],
+  ["Cogsmith's Multi-Tool", "Forty functions. The manual covers three of them."],
+  ["Psionic Dampener Helm", "Keeps the whispers out. Results vary by whisper."],
+  ["Star-Silt Ore Sample", "Glitters in the dark. Do not lick it. There is a form about that."],
+  ["Encrypted Corpo Datapad", "Password protected. The password is not 'password'. We tried."],
+  ["Pre-Severance Plasma Cutter", "Cuts through hull plate, bedrock and the safety briefing."],
+  ['Exo-Frame Shoulder Guard "Bastion"', "One shoulder of a very expensive suit. The rest is still on its owner, somewhere."],
+  ["Experimental Breach Charge", "Experimental. The last experiment is now a crater with a name."],
+  ["Dark-Core Ore Shard", "Heavier than it looks, darker than it should be. Insured separately."],
+  ['Tactical HUD "Ironveil Mk.IV"', "Shows ammo, heading and a performance review. You are underperforming."],
+  ["Rogue AI Comms Module", "It says it is not rogue. It says so a lot."],
+  ["Sunspear Laser Rifle Mk.V", "Mark Five. Nobody lasted long enough to file feedback on the first four."],
+  ['Void-Weave Exosuit "Relic"', "Woven from something that should not take thread. It fits everyone, which is the worrying part."],
+  ["Emperor's Ore Pendant (smells faintly of bin chicken)", "Possibly holy. Certainly fragrant. Kept in a sealed bag, for everyone's sake."],
+  ["Pre-Severance Jump Drive Fragment", "A piece of a ship that went somewhere fast. The rest of it is still going."],
+  ["Squeaker's Signed Biscuit (DO NOT EAT)", "Signed in what we hope is icing. Under armed guard. Do not eat."],
+]);
+const TROPHY_UNKNOWN = "Catalogued. Nobody is sure what it does.";
 
 const CSS = `
 .company-trait { grid-column: 1 / -1; margin: -0.6cqw 0 0.6cqw 30cqw; font-size: 3.5cqw; line-height: 1.3; color: var(--muted); }
@@ -95,6 +171,14 @@ const CSS = `
 .company-card-line { margin: 0; font-size: 4.2cqw; line-height: 1.35; }
 .company-card-line.muted { font-size: 3.8cqw; color: var(--muted); }
 .company-card .btn { margin-top: 1.5cqw; }
+.company-card-lines { display: flex; flex-direction: column; gap: 2cqw; max-height: 100cqw; overflow-y: auto; }
+.company-card-lines[hidden], .company-card-line[hidden], .company-act[hidden], .company-trophy[hidden] { display: none; }
+.company-bunks { font-size: 5cqw; letter-spacing: 0.6cqw; }
+.company-card .company-act { width: 100%; max-width: none; margin-top: 0; min-height: 11cqw; font-size: 4.4cqw; }
+.company-trophy { display: flex; flex-direction: column; gap: 0.6cqw; padding: 1.6cqw 0; border-top: 0.3cqw solid var(--panel-edge); }
+.company-trophy-name { margin: 0; font-family: var(--display); font-weight: 800; font-size: 4.2cqw; line-height: 1.2; overflow-wrap: anywhere; }
+.company-trophy-grade { margin: 0; font-family: var(--mono); font-size: 3.2cqw; text-transform: uppercase; color: var(--accent); }
+.company-trophy-line { margin: 0; font-size: 3.6cqw; line-height: 1.35; color: var(--muted); }
 `;
 
 const fill = (text, values) => text.replace(/\{(\w+)\}/g, (m, k) => (k in values ? String(values[k]) : m));
@@ -107,9 +191,12 @@ function el(tag, className, text) {
 }
 
 let deps = null;
+let view = null;      // demo_ops.js's state and requests (BP-12b), registered at the mount
 let fromHub = false;  // the reveal about to render was opened by the hub's Your Company
 let card = null;      // the stats card: { node, title, lines }
 let traitsLine = null; // the briefing's trait lines, created on the first briefing
+let shown = null;     // the card on screen: { kind, index }, or null
+let tick = null;      // the heal countdown's display timer (no network call)
 
 // ── the roster the client holds ────────────────────────────────────────────────
 function roster() {
@@ -156,6 +243,7 @@ function dressReveal(container) {
   if (!cardNode || cardNode.dataset.company === '1') return;
   cardNode.dataset.company = '1';
   hideCard();
+  const opened = fromHub;
   if (fromHub) {
     fromHub = false;
     const heading = container.querySelector('.reveal-heading');
@@ -189,6 +277,17 @@ function dressReveal(container) {
     chip.setAttribute('role', 'button');
     chip.setAttribute('tabindex', '0');
   }
+  // A5: the Trophy Shelf's chip, from the hub only, once an ops body has been adopted (BP-12b).
+  const list = container.querySelector('ul.chips');
+  if (opened && list && view && view.adopted()) {
+    const shelf = el('li', 'chip');
+    shelf.append(el('span', 'chip-kind', COMPANY_COPY.shelfKind), el('span', 'chip-main', COMPANY_COPY.shelfChip));
+    shelf.dataset.company = 'shelf';
+    shelf.dataset.index = '0';
+    shelf.setAttribute('role', 'button');
+    shelf.setAttribute('tabindex', '0');
+    list.append(shelf);
+  }
 }
 
 // ── A10: the stats card ────────────────────────────────────────────────────────
@@ -204,31 +303,163 @@ function createCard() {
   return { node, title, lines };
 }
 
+function stopTick() {
+  if (tick !== null) clearTimeout(tick);
+  tick = null;
+}
+
 function hideCard() {
+  stopTick();
+  shown = null;
   if (card) card.node.hidden = true;
+}
+
+const line = (text, muted) => el('p', muted ? 'company-card-line muted' : 'company-card-line', text);
+
+// A heal or replace button: `onTap` runs only while it is enabled.
+function act(text, disabled, onTap) {
+  const b = el('button', 'btn company-act', text);
+  b.type = 'button';
+  b.disabled = Boolean(disabled);
+  b.addEventListener('click', () => { if (!b.disabled) onTap(); });
+  return b;
+}
+
+// The last refusal's line for this card and action, if demo_ops.js holds one (BP-12b).
+function noticeLine(target, action, each) {
+  const n = view.notice();
+  if (!n || n.target !== target || n.action !== action) return null;
+  if (n.kind === 'short') return fill(COMPANY_COPY.short, { each });
+  if (n.kind === 'out') return COMPANY_COPY.out;
+  if (n.kind === 'full') return target === 'section' ? COMPANY_COPY.sectionFull : COMPANY_COPY.crewFull;
+  return null;
+}
+
+// Replace (B2's offer): full, or one button with its note, the short line and the out line.
+function replaceRows(target, id, h, each, label, note) {
+  const offer = replaceOffer(h, each, view.credits());
+  if (offer === null) {
+    const full = noticeLine(target, 'replace', each); // a "no room" refusal, after its roster re-read
+    return full ? [line(COMPANY_COPY.full), line(full)] : [line(COMPANY_COPY.full)];
+  }
+  const out = view.out();
+  const isHeld = view.held();
+  const btn = act(fill(label, { n: offer.n, cost: offer.n * each }), false, () => view.replace(target, id, offer.n, each));
+  btn.disabled = !offer.afford || out || isHeld;
+  const rows = [btn, line(fill(note, { each }), true)];
+  const texts = [];
+  if (!offer.afford) texts.push(fill(COMPANY_COPY.short, { each }));
+  if (out) texts.push(COMPANY_COPY.out);
+  const extra = noticeLine(target, 'replace', each);
+  if (extra && !texts.includes(extra)) texts.push(extra);
+  return rows.concat(texts.map(t => line(t)));
+}
+
+// The Section card once an ops body is adopted: bunks, sickbay, the leader, kit, the bank, Heal, Replace.
+function sectionRows(s) {
+  const h = Math.min(8, Math.max(0, Number(s.headcount) || 0));
+  const raw = view.bay(s.section_id);   // the body's own entry
+  const b = view.bayOf(s.section_id);   // a batch past healed_at counts as back
+  const fit = Math.max(0, h - b.wounded - b.healing);
+  const credits = view.credits();
+  const rows = [line(fill(COMPANY_COPY.sectionRookies, { n: s.headcount }))];
+  const bunks = line('🪖'.repeat(fit) + '⏳'.repeat(b.healing) + '🩹'.repeat(b.wounded) + '·'.repeat(Math.max(0, 8 - h)));
+  bunks.classList.add('company-bunks');
+  bunks.setAttribute('aria-label', fill(COMPANY_COPY.bunks, { f: fit, w: b.wounded, n: b.healing, e: Math.max(0, 8 - h) }));
+  rows.push(bunks);
+  if (fit !== h) rows.push(line(fill(COMPANY_COPY.fit, { f: fit })));
+  if (b.wounded > 0) rows.push(line(fill(COMPANY_COPY.bay, { w: b.wounded })));
+  let ticking = false;
+  const batch = Number(raw.healing) || 0;
+  if (batch > 0 && raw.healed_at) {
+    const secs = healSecs(raw, view.serverNow);
+    if (secs > 0) {
+      rows.push(line(fill(COMPANY_COPY.healing, { n: batch, s: secs })));
+      ticking = true;
+    } else {
+      rows.push(line(COMPANY_COPY.back));
+    }
+  }
+  const c = campaignCommander();
+  if (c) rows.push(line(fill(COMPANY_COPY.led, { name: c.name, xp: xpLine(c.xp, c.rank), n: c.stress }), true));
+  rows.push(line(COMPANY_COPY.kit, true), line(fill(COMPANY_COPY.bank, { n: credits })));
+  if (b.wounded > 0 && b.healing === 0) {
+    const cost = b.wounded * HEAL_CREDITS;
+    rows.push(act(fill(COMPANY_COPY.heal, { n: b.wounded, cost }), credits < cost || view.held(), () => view.heal(s.section_id)));
+    rows.push(line(fill(COMPANY_COPY.healNote, { each: HEAL_CREDITS, secs: HEAL_SECS }), true));
+    const texts = credits < cost ? [fill(COMPANY_COPY.short, { each: HEAL_CREDITS })] : [];
+    const extra = noticeLine('section', 'heal', HEAL_CREDITS);
+    if (extra && !texts.includes(extra)) texts.push(extra);
+    rows.push(...texts.map(t => line(t)));
+  }
+  rows.push(...replaceRows('section', s.section_id, h, REPLACE_MERC_CREDITS, COMPANY_COPY.requisition, COMPANY_COPY.requisitionNote));
+  return { rows, ticking };
+}
+
+function crewRows(w, r) {
+  const rows = [line(fill(COMPANY_COPY.crewMiners, { n: w.headcount })), line(fill(COMPANY_COPY.crewMorale, { m: w.morale }))];
+  const f = Array.isArray(r.foremen) ? r.foremen[0] : null;
+  if (f) rows.push(line(fill(COMPANY_COPY.crewForeman, { name: f.name, spec: f.specialization }), true));
+  if (!view || !view.adopted()) return rows;
+  rows.push(line(fill(COMPANY_COPY.bank, { n: view.credits() })));
+  const h = Math.min(8, Math.max(0, Number(w.headcount) || 0));
+  return rows.concat(replaceRows('crew', w.crew_id, h, REPLACE_MINER_CREDITS, COMPANY_COPY.hire, COMPANY_COPY.hireNote));
+}
+
+// A5: newest first (the body lists newest last), each with its grade and its line.
+function shelfRows() {
+  const items = Array.isArray(view.trophies()) ? view.trophies().slice().reverse() : [];
+  const rows = [line(COMPANY_COPY.shelfSub, true)];
+  if (items.length === 0) return rows.concat(line(COMPANY_COPY.shelfEmpty));
+  for (const t of items) {
+    const row = el('div', 'company-trophy');
+    row.append(el('p', 'company-trophy-name', String(t.item_name)), el('p', 'company-trophy-grade', String(t.quality_grade)),
+      el('p', 'company-trophy-line', TROPHY_LINES.get(t.item_name) || TROPHY_UNKNOWN));
+    rows.push(row);
+  }
+  return rows;
 }
 
 function openCard(kind, index) {
   const r = roster();
   if (!r) return;
-  const rows = [];
+  if (!shown || shown.kind !== kind || shown.index !== index) view.clearNotice();
+  stopTick();
+  let rows = [];
   let title = '';
+  let ticking = false;
   if (kind === 'section') {
     const s = Array.isArray(r.sections) ? r.sections[index] : null;
     if (!s) return;
     title = s.name;
-    rows.push([fill(COMPANY_COPY.sectionRookies, { n: s.headcount }), false], [COMPANY_COPY.sectionHow, true], [COMPANY_COPY.sectionLoss, true]);
-  } else {
+    if (view && view.adopted()) {
+      ({ rows, ticking } = sectionRows(s));
+    } else {
+      rows = [line(fill(COMPANY_COPY.sectionRookies, { n: s.headcount })), line(COMPANY_COPY.sectionHow, true), line(COMPANY_COPY.sectionLoss, true), line(COMPANY_COPY.atBase, true)];
+    }
+  } else if (kind === 'crew') {
     const w = Array.isArray(r.crews) ? r.crews[index] : null;
     if (!w) return;
     title = COMPANY_COPY.crewTitle;
-    rows.push([fill(COMPANY_COPY.crewMiners, { n: w.headcount }), false], [fill(COMPANY_COPY.crewMorale, { m: w.morale }), false]);
-    const f = Array.isArray(r.foremen) ? r.foremen[0] : null;
-    if (f) rows.push([fill(COMPANY_COPY.crewForeman, { name: f.name, spec: f.specialization }), true]);
+    rows = crewRows(w, r);
+  } else if (kind === 'shelf') {
+    if (!view || !view.adopted()) return;
+    title = COMPANY_COPY.shelfTitle;
+    rows = shelfRows();
+  } else {
+    return;
   }
   card.title.textContent = title;
-  card.lines.replaceChildren(...rows.map(([text, muted]) => el('p', muted ? 'company-card-line muted' : 'company-card-line', text)));
+  card.lines.replaceChildren(...rows);
   card.node.hidden = false;
+  shown = { kind, index };
+  if (ticking) tick = setTimeout(() => { tick = null; if (shown) openCard(shown.kind, shown.index); }, 1000);
+}
+
+// demo_ops.js calls this after every adopted body and every refresh, so the buttons follow held()
+// (BP-12b spec check H3): the open card is drawn again from the state it now holds.
+export function renderCompany() {
+  if (card && shown && !card.node.hidden) openCard(shown.kind, shown.index);
 }
 
 function chipAction(e) {
@@ -270,7 +501,7 @@ function dressAar(box) {
 // Only the label's text changes: no row is hidden, moved or restyled, so the presentation runs as before.
 function dressScore(lines) {
   const s = firstSection();
-  const n = s ? Math.min(8, s.headcount) : 0;
+  const n = s ? view.squadOf(s) : 0; // the squad sent (BP-12b: the headcount less the sickbay)
   for (const label of lines.querySelectorAll('li.score-row .score-label')) {
     const key = label.textContent;
     if (Object.prototype.hasOwnProperty.call(SCORE_LABELS, key)) label.textContent = fill(SCORE_LABELS[key], { n });
@@ -295,9 +526,12 @@ export function dressBriefing() {
   traitsLine.hidden = parts.length === 0;
 }
 
-// `d`: demo_ops.js's deps (main.js's $, getRoster, ...).
-export function mountCompany(d) {
+// `d`: demo_ops.js's deps (main.js's $, getRoster, ...); `v`: demo_ops.js's view of its state
+// (adopted, credits, out, held, serverNow, bay, bayOf, squadOf, trophies, notice, clearNotice,
+// heal, replace).
+export function mountCompany(d, v) {
   deps = d;
+  view = v;
   const style = document.createElement('style');
   style.textContent = CSS;
   document.head.append(style);
@@ -307,8 +541,14 @@ export function mountCompany(d) {
     if (e.target instanceof Element && e.target.closest('#btn-back')) fromHub = true;
   }, true);
   const reveal = deps.$('reveal-content');
+  const screen = deps.$('screen-reveal');
   card = createCard();
-  deps.$('screen-reveal').append(card.node);
+  screen.append(card.node);
+  // Reviewer BP-11b-2 F1: whenever the reveal is hidden (main.js's show() sets every screen's
+  // hidden on every call), a Back that rendered no reveal leaves no stale fromHub, and the card
+  // (with its tick) closes. Created before the content observer, so a Back's own render, which
+  // shows the reveal before this runs, keeps the flag.
+  new MutationObserver(() => { if (screen.hidden) { fromHub = false; hideCard(); } }).observe(screen, { attributes: true, attributeFilter: ['hidden'] });
   new MutationObserver(() => dressReveal(reveal)).observe(reveal, { childList: true, subtree: true });
   reveal.addEventListener('click', chipAction);
   reveal.addEventListener('keydown', chipAction);

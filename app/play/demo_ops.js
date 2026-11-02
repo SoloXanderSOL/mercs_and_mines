@@ -24,12 +24,17 @@
 // contracts that hands off to their pins; a latched fight re-reads the roster (which the next
 // squad reads) and, after a contract, the board once more when it refreshes; the AAR names the
 // dead and the Section's count; no soldiers or no Commander left ends the run.
+//
+// BP-12b: every ops body's `company` (the sickbays and the Trophy Shelf) is kept with the rest,
+// heal and replace are two more POSTs, the squad a fight sends leaves the sickbay at base
+// (battle.js's setSquadSize), the AAR names the wounded, and demo_company.js renders the Company
+// screen from the view registered at the mount.
 
 import { request, ApiError, store, getMissions, getRoster } from './api.js';
 import { onMapCreated } from './hexmap.js';
-import { setAarNote, setBeforeOffer } from './battle.js';
+import { setAarNote, setBeforeOffer, setSquadSize } from './battle.js';
 import { showCard, cardSeen } from './demo_card.js';
-import { mountCompany, dressBriefing } from './demo_company.js';
+import { mountCompany, dressBriefing, renderCompany, HEAL_CREDITS } from './demo_company.js';
 import { DIG_COPY, DIG_CSS, createDigPanel, renderDig, hideDig, homewardLines, flash, bankedLine } from './demo_dig.js';
 import { BASE_COPY, BASE_CSS, createBase, renderBase, hideBase } from './demo_base.js';
 
@@ -73,6 +78,18 @@ const COPY = {
   aarNone: 'No losses. Command notes the anomaly.',
   aarSection: '{name}: {a} → {b}',
   shop: 'Demo Shop',
+  // BP-12b (Wiki copy)
+  aarWounded: 'Wounded: {n}, in the sickbay. Patch them up at Your Company.',
+  zeroFit: 'Everyone fit to fight is in the sickbay. Patch them up first.',
+  walkingWounded: 'Nobody is fit to fight. The walking wounded are going anyway.',
+};
+
+// Refusals the client keys on by exact text (routes/ops.rs; a server reword changes this block in the same brick).
+const REFUSAL = {
+  short: 'not enough banked credits',
+  out: 'the team is out: replacements report at base',
+  sectionFull: 'no room: a Section holds 8',
+  crewFull: 'no room: a Crew holds 8',
 };
 
 // A12: the relic contract reads as a relic dig (Wiki copy, BP-11b-2). The server's name stays.
@@ -109,6 +126,8 @@ const CSS = `
 .ops-list-row { width: 100%; max-width: none; display: flex; flex-direction: column; align-items: flex-start; gap: 0.6cqw; padding: 2cqw 2.5cqw; text-align: left; }
 .ops-list-name { font-family: var(--display); font-weight: 800; font-size: 4.4cqw; }
 .ops-list-meta { font-family: var(--mono); font-size: 3.4cqw; color: var(--muted); }
+.briefing-fit[hidden] { display: none; }
+.briefing-fit { margin: 0; font-size: 3.8cqw; line-height: 1.35; color: var(--accent); }
 .ops-shop { position: absolute; top: 1.5cqw; left: 3cqw; padding: 1cqw 2.5cqw; font-family: var(--mono); font-size: 3.6cqw; color: var(--accent); background: rgba(11, 11, 12, 0.94); border: 0.3cqw solid var(--accent); border-radius: 1.5cqw; cursor: pointer; }
 `;
 
@@ -131,6 +150,27 @@ let shownPhase = null;  // what the strip shows mid-leg, so it is rewritten only
 let shownSecs = null;
 let banked = 0;         // the campaign's ore_banked, from the last adopted body
 let credits = 0;        // the campaign's credits_banked, from the last adopted body
+let company = { sections: [], trophies: [] }; // the last adopted body's company (BP-12a-1)
+// A Section's sickbay from the last adopted body (absent = 0 and 0); healing counts as back once the server's clock passes healed_at.
+const bayOf = id => {
+  const b = company.sections.find(s => s.section_id === id) || { wounded: 0, healing: 0, healed_at: null };
+  const back = Boolean(b.healed_at) && serverNow() >= Date.parse(b.healed_at);
+  return { wounded: Number(b.wounded) || 0, healing: back ? 0 : Number(b.healing) || 0, healed_at: back ? null : b.healed_at };
+};
+// The squad a fight sends: the Section's headcount less its sickbay (Reviewer BP-12a-1 F3). With nobody fit and no heal
+// affordable or under way, the wounded go anyway, so a pending raid can never strand the team.
+const fitToFight = d => {
+  const h = Math.min(8, d.section.headcount);
+  const b = bayOf(d.section.section_id);
+  const fit = Math.max(0, h - b.wounded - b.healing);
+  if (fit > 0 || h === 0) return fit;
+  return b.healing > 0 || credits >= HEAL_CREDITS * b.wounded ? 0 : h;
+};
+let adoptedFor = null;  // the campaign whose ops body has been adopted (the Company screen needs one, BP-12b)
+let companyAsk = null;  // the heal or replace in flight: { action, target }
+let companyNotice = null; // its refusal's line on the card: { action, target, kind }
+let fightDress = null;  // the demo fight's own briefing dressing, { name, lead }, re-applied on every show (Reviewer BP-11b-2 F2)
+let fitNote = null;     // the briefing's 0-fit line
 let bankNote = null;    // the one-off "ore banked" line after a laden leg lands
 let notice = '';        // a one-off refusal line (the Crew's), until the next adopted body
 let seenBattle = null;  // the raid or ambush whose briefing has opened once ('raid:<site>', 'ambush:<site>')
@@ -250,6 +290,7 @@ function hideStrip() {
 
 function refresh() {
   if (!strip) return;
+  renderCompany(); // the Company card's buttons follow held() and the last body (BP-12b, H3)
   // While a raid or an ambush waits, the hub's own GUARD_DUTY would count as its fight
   // (Reviewer BP-8b-2 F1), so the mission list is shut until the dig's fight is fought.
   deps.$('btn-missions').disabled = Boolean(battleOf(op));
@@ -446,6 +487,13 @@ function closeList() {
   refresh();
 }
 
+// Both sheets shut with one refresh (Reviewer BP-11b-2 F3).
+function closeSheets() {
+  baseOpen = false;
+  listOpen = false;
+  refresh();
+}
+
 function renderList() {
   const out = Boolean(op) && !picking;
   list.sub.textContent = out ? COPY.listOut : COPY.listSub;
@@ -498,11 +546,9 @@ async function fight() {
     : fill(DIG_COPY.ambushLead, { carried: op.dig.carried });
   opFight = true;
   fightHead = sectionHead();
+  fightDress = { name: null, lead };
   await deps.openMission(b.mission_id, () => deps.enterHub());
-  if (!deps.$('screen-briefing').hidden) {
-    deps.$('briefing-text').textContent = lead;
-    dressBriefing();
-  }
+  if (!deps.$('screen-briefing').hidden) dressFight();
 }
 
 // The contract's own briefing; its mission comes from the title cache, never the board. The relic
@@ -512,13 +558,38 @@ async function fightContract() {
   if (!t || !t.mission_id) return;
   opFight = true;
   fightHead = sectionHead();
+  fightDress = t.mission_id === RELIC.mission_id ? { name: RELIC.name, lead: RELIC.lead } : { name: null, lead: null };
   await deps.openMission(t.mission_id, () => deps.enterHub());
-  if (deps.$('screen-briefing').hidden) return;
-  if (t.mission_id === RELIC.mission_id) {
-    deps.$('briefing-name').textContent = RELIC.name;
-    deps.$('briefing-text').textContent = RELIC.lead;
-  }
+  if (!deps.$('screen-briefing').hidden) dressFight();
+}
+
+// The demo fight's dressing over the keeper's briefing: the stress and trait lines, the fight's
+// own name and lead, and the 0-fit lines. Run after the fight opens it and on every later show
+// (a deploy 429's Back, openMission's static-GET retry: Reviewer BP-11b-2 F2), so nothing is lost.
+function dressFight() {
   dressBriefing();
+  if (fightDress && fightDress.name) deps.$('briefing-name').textContent = fightDress.name;
+  if (fightDress && fightDress.lead) deps.$('briefing-text').textContent = fightDress.lead;
+  const roster = deps.getRoster();
+  const section = roster && Array.isArray(roster.sections) ? roster.sections[0] : null;
+  let text = '';
+  if (section) {
+    const d = { section };
+    const squad = fitToFight(d);
+    const b = bayOf(section.section_id);
+    if (squad === 0 && section.headcount > 0) {
+      deps.$('btn-deploy').disabled = true; // after the keeper's disabled = false (showBriefing runs before show)
+      text = COPY.zeroFit;
+    } else if (squad === Math.min(8, section.headcount) && b.wounded > 0 && b.healing === 0) {
+      text = COPY.walkingWounded;
+    }
+  }
+  if (!fitNote) {
+    fitNote = el('p', 'briefing-fit');
+    deps.$('briefing-squad').after(fitNote);
+  }
+  fitNote.textContent = text;
+  fitNote.hidden = !text;
 }
 
 // The campaign Commander's name from main.js's roster, for the card's opening line.
@@ -551,6 +622,9 @@ function aarNote({ report, section }) {
   // in the meantime would already have lowered the roster's (Reviewer BP-11b-1 F1).
   const a = before ?? (section && section.headcount);
   if (section) lines.push(fill(COPY.aarSection, { name: section.name, a, b: Math.max(0, a - dead.length) }));
+  // BP-12b: the wounded go to the sickbay when the fight latches.
+  const wounded = (report && report.unit_results || []).filter(u => u.final_status === 'Wounded').length;
+  if (wounded > 0) lines.push(fill(COPY.aarWounded, { n: wounded }));
   return lines;
 }
 
@@ -695,8 +769,12 @@ function tap(x, y) {
 
 // ── calls ────────────────────────────────────────────────────────────────────
 // `built`: the building id when this body answers that building's POST, else undefined.
-function adopt(body, built) {
+// `spent`: what this body's own request cost from the bank (a heal or a replace), so a contract it
+// latches still reports the full pay (BP-12b, H4).
+function adopt(body, built, spent = 0) {
   if (!body || body.campaign_id !== campaignId) return;
+  company = body.company || { sections: [], trophies: [] };
+  adoptedFor = campaignId;
   offset = Date.parse(body.now) - Date.now();
   sites = Array.isArray(body.sites) ? body.sites : [];
   for (const s of sites) titles.set(s.site_id, { title: titleOf(s), mission_id: s.mission_id || null });
@@ -728,7 +806,7 @@ function adopt(body, built) {
   // stood at unfought is now fought (or wiped out, which clears the op).
   const raidLatched = Boolean(battleKey(before) && battleKey(before) !== battleKey(op));
   const contractLatched = Boolean(before && before.kind === 'contract' && before.leg === 'outbound' && !before.fought && (!op || op.fought));
-  if (contractLatched) wonCredits = Math.max(0, credits - wasCredits);
+  if (contractLatched) wonCredits = Math.max(0, credits - wasCredits + spent); // a heal or replace body that latches pays for itself first (H4)
   const endedNow = op && op.dig ? op.dig.ended_by : null;
   const endedBefore = before && before.dig ? before.dig.ended_by : null;
   const melted = endedNow === 'meltdown' && endedBefore !== 'meltdown';
@@ -825,7 +903,9 @@ async function load() {
 
 // One POST; a refusal other than a stale campaign re-reads the board once and shows its state.
 // `built`: the building a build POST asks for, so its success gets the sheet's moment.
-async function send(path, body, built) {
+// `spentOf(res)`: what a heal or replace spent, from its own body (H4). `beforeAdopt(res)`: run
+// on a 200 before the body is adopted (replace patches the kept roster there, BP-12b).
+async function send(path, body, built, spentOf, beforeAdopt) {
   const id = campaignId;
   if (held() || !id) return;
   busy = true;
@@ -841,12 +921,27 @@ async function send(path, body, built) {
   nextFrom = null;
   if (map) map.requestFrame();
   if (id !== campaignId) return;
+  const ask = companyAsk;
+  companyAsk = null;
   if (!err) {
     if (from && res && res.active_op) saveWalk(res.active_op.depart_at, from);
-    return adopt(res, built);
+    if (beforeAdopt) beforeAdopt(res);
+    return adopt(res, built, spentOf ? spentOf(res) : 0);
   }
   refresh();
   if (stale(err) || rated(err)) return;
+  if (err instanceof ApiError && err.kind === 'conflict' && ask) {
+    // BP-12b: heal's and replace's refusals by exact text; the bank comes from the re-read, never from here.
+    if (err.message === REFUSAL.short || err.message === REFUSAL.out) {
+      companyNotice = { ...ask, kind: err.message === REFUSAL.short ? 'short' : 'out' };
+      return load();
+    }
+    if (err.message === REFUSAL.sectionFull || err.message === REFUSAL.crewFull) {
+      companyNotice = { ...ask, kind: 'full' };
+      refresh();
+      return rereadRoster(); // our ids only, so "no room" means the kept count is stale
+    }
+  }
   if (err instanceof ApiError && err.kind === 'conflict') {
     // Nobody left to send ends the run; no Crew only shuts the digs.
     if (err.message === NO_SOLDIERS) return endOfRun('soldiers');
@@ -885,6 +980,45 @@ function sendBuild(id) {
   send(opsPath(campaignId) + '/build', { building: id }, id);
 }
 
+// That Section's healing in a body's company, absent = 0: what a heal spent, since the server heals
+// everyone wounded after its own latch (H4).
+const healingIn = (res, id) => {
+  const s = res && res.company && Array.isArray(res.company.sections) ? res.company.sections.find(x => x.section_id === id) : null;
+  return s ? Number(s.healing) || 0 : 0;
+};
+
+// Heal a Section's wounded (BP-12b): the card's Patch up.
+function sendHeal(sectionId) {
+  if (held() || !campaignId) return;
+  companyNotice = null;
+  companyAsk = { action: 'heal', target: 'section' };
+  send(opsPath(campaignId) + '/heal', { section_id: sectionId }, false, res => HEAL_CREDITS * healingIn(res, sectionId));
+}
+
+// The kept roster after a replace's 200: the row the server added to gains `count` (never past
+// 8). Done before the body is adopted, so a roster re-read that the body starts (a latch) lands
+// after it and wins.
+function patchHeads(target, id, count) {
+  const r = deps.getRoster();
+  if (!r) return;
+  const rows = target === 'section' ? r.sections : r.crews;
+  const key = target === 'section' ? 'section_id' : 'crew_id';
+  const row = Array.isArray(rows) ? rows.find(x => x[key] === id) : null;
+  if (!row) return;
+  row.headcount = Math.min(8, (Number(row.headcount) || 0) + count);
+  store.setRoster(campaignId, r);
+  deps.setRoster(r);
+}
+
+// Replace (BP-12b): `count` heads on one of the player's own rows, `each` credits a head.
+function sendReplace(target, id, count, each) {
+  if (held() || !campaignId) return;
+  companyNotice = null;
+  companyAsk = { action: 'replace', target };
+  const body = target === 'section' ? { section_id: id, count } : { crew_id: id, count };
+  send(opsPath(campaignId) + '/replace', body, false, () => count * each, () => patchHeads(target, id, count));
+}
+
 // The team leaves the hex it stands on (cached as the next leg's origin when the move lands).
 function sendNext(site) {
   if (!site || !op || held() || !canNext(op)) return;
@@ -921,10 +1055,12 @@ function watch() {
   // The legend shuts any open sheet first; the keeper toggle then opens it (Reviewer BP-10b F2).
   hub.addEventListener('click', e => {
     if (!(e.target instanceof Element) || !e.target.closest('#btn-legend') || !(baseOpen || listOpen)) return;
-    baseOpen = false;
-    listOpen = false;
-    refresh();
+    closeSheets();
   }, true);
+  // Reviewer BP-11b-2 F2: every show of the briefing during a demo fight gets its dressing again
+  // (the keeper re-renders it on a deploy 429's Back and on openMission's static-GET retry).
+  const briefing = deps.$('screen-briefing');
+  new MutationObserver(() => { if (!briefing.hidden && opFight) dressFight(); }).observe(briefing, { attributes: true, attributeFilter: ['hidden'] });
 }
 
 // New run starts a new campaign, and ore, credits and buildings belong to the campaign: the end
@@ -957,6 +1093,10 @@ function attach(m) {
   busy = false;
   banked = 0;
   credits = 0;
+  company = { sections: [], trophies: [] };
+  adoptedFor = null;
+  companyAsk = null;
+  companyNotice = null;
   bankNote = null;
   notice = '';
   seenBattle = null;
@@ -1033,8 +1173,24 @@ export function mountOps(d) {
   endNote.hidden = true;
   deps.$('btn-new-run').before(endNote);
   setAarNote(aarNote);
+  setSquadSize(fitToFight);
   setBeforeOffer(() => deps.enterHub()); // A13: no checkout after a mission in the demo; the Demo Shop button opens it
-  mountCompany(deps);
+  // BP-12b: the Company screen's view of this file's state and requests.
+  mountCompany(deps, {
+    adopted: () => Boolean(campaignId) && adoptedFor === campaignId && Boolean(store.campaign()) && store.campaign().campaign_id === campaignId,
+    credits: () => credits,
+    out: () => Boolean(op),
+    held,
+    serverNow,
+    bay: id => company.sections.find(s => s.section_id === id) || { wounded: 0, healing: 0, healed_at: null },
+    bayOf,
+    squadOf: section => fitToFight({ section }),
+    trophies: () => company.trophies,
+    notice: () => companyNotice,
+    clearNotice: () => { companyNotice = null; },
+    heal: sendHeal,
+    replace: sendReplace,
+  });
   watch();
   onMapCreated(attach);
 }
