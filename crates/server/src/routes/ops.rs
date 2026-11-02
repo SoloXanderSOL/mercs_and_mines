@@ -33,7 +33,8 @@ use crate::auth::AuthSession;
 use crate::demo_ops::{
     dig_threshold, fight_losses, fight_wounded, ops_board, ops_time, raid_fight, raid_result, ActiveOpView, BaseBuilding,
     BuildRefusal, CompanyView, ContractStart, DigStart, DrillOutcome, DrillRefusal, FightPay, HealRefusal, NextRefusal,
-    OpsBase, OpsBoard, OpsSite, PullRefusal, RaidResult, ReturnRefusal, StartRefusal, DEMO_MELTDOWN_MORALE_LOSS,
+    OpsBase, OpsBoard, OpsSite, PullRefusal, RaidResult, ReplaceHold, ReplaceRefusal, ReturnRefusal, StartRefusal,
+    DEMO_MELTDOWN_MORALE_LOSS, DEMO_REPLACE_MERC_CREDITS, DEMO_REPLACE_MINER_CREDITS,
 };
 use crate::repository::{outcome_db_str, CampaignInstance, CampaignLifecycle, DeploymentRecord, SectorState};
 use crate::state::AppState;
@@ -44,8 +45,8 @@ use super::{
     unauthorized, AppError,
 };
 
-/// Request body cap for `ops/start`, `ops/next`, `ops/build` and `ops/heal`
-/// (the four routes that read a body), layered on each route: the overflow reaches the handler
+/// Request body cap for `ops/start`, `ops/next`, `ops/build`, `ops/heal` and `ops/replace`
+/// (the five routes that read a body), layered on each route: the overflow reaches the handler
 /// as a `JsonRejection` after the limiters, so it is counted (`413`).
 pub const OPS_BODY_LIMIT: usize = 1024;
 
@@ -59,6 +60,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/campaign/:campaign_id/ops/pull", post(post_ops_pull))
         .route("/api/campaign/:campaign_id/ops/build", post(post_ops_build).layer(DefaultBodyLimit::max(OPS_BODY_LIMIT)))
         .route("/api/campaign/:campaign_id/ops/heal", post(post_ops_heal).layer(DefaultBodyLimit::max(OPS_BODY_LIMIT)))
+        .route("/api/campaign/:campaign_id/ops/replace", post(post_ops_replace).layer(DefaultBodyLimit::max(OPS_BODY_LIMIT)))
 }
 
 /// The ops state as the client sees it, from every route. `now` is the server's clock, so the
@@ -96,6 +98,23 @@ pub struct OpsBuildRequest {
 #[derive(Deserialize)]
 pub struct OpsHealRequest {
     pub section_id: String,
+}
+
+/// `ops/replace`'s body (BP-12a-2): exactly one of `section_id` / `crew_id`, strings parsed after
+/// the member checks (as heal's); `count` an `i64`, so every out-of-range number is our `400`,
+/// never axum's `422`.
+#[derive(Deserialize)]
+pub struct OpsReplaceRequest {
+    pub section_id: Option<String>,
+    pub crew_id: Option<String>,
+    pub count: i64,
+}
+
+/// The row a replace adds to (BP-12a-2).
+#[derive(Clone, Copy, Debug)]
+enum ReplaceTarget {
+    Section(Uuid),
+    Crew(Uuid),
 }
 
 /// The shared budget: `429` per address (`ops_ip`), then per wallet (`ops_wallet`).
@@ -311,8 +330,12 @@ async fn fight_result(state: &AppState, dep: &DeploymentRecord, route: &str) -> 
 /// - **the pay** (BP-11a-2): the recomputed report's credits are banked by the latch itself, so
 ///   they land exactly when it applies; **the sickbay and the shelf** (BP-12a-1): the latch also
 ///   takes the fight's wounded, cut to the survivors (the headcount this read saw, less the
-///   fight's losses: until BP-12a-2 nothing else writes headcount while an op is out, and
-///   replace will refuse while one is), and its loot.
+///   fight's losses). The latch's own `lose_soldiers` lands after `latch_raid`, so a second latch
+///   read in that gap sees the old headcount: over the cap only, and unreachable, because a
+///   second fight needs a new trigger. Replace (BP-12a-2) adds heads only after `begin_replace`
+///   found no op out; an add that lands after a later `ops/start` can only make the next
+///   latch's cap too low, never too high. So the cap reads are sound while replace refuses at
+///   its begin. Its loot goes on the shelf.
 async fn latch_pending_raid(state: &AppState, campaign_id: Uuid, now: DateTime<Utc>, route: &str) -> Result<(), AppError> {
     let Some(pending) = state.demo_ops.store.pending_raid(campaign_id, now) else {
         return Ok(());
@@ -782,6 +805,113 @@ async fn post_ops_heal(
         Err(HealRefusal::NotEnoughCredits) => return Err(conflict("not enough banked credits")),
     }
     Ok(ops_response(&state, campaign_id, gw, &board, now))
+}
+
+/// Replaces a Section's soldiers or a Crew's miners, `POST /api/campaign/:campaign_id/ops/replace
+/// {section_id | crew_id, count}` (BP-12a-2, demo-only, §4e). Order: `401` → `429` `ops_ip` →
+/// `429` `ops_wallet` → axum's body rejection, counted (`413` over `OPS_BODY_LIMIT`; `400`, `415`,
+/// `422`) → `404` → `403` → `409` not `Active` (entry dropped) → `409` no gateway → the board →
+/// a pending battle latched → `400` name one of section_id or crew_id → `400` unknown section /
+/// unknown crew → `400` count must be 1 to 8 → `409` the team is out → `409` not enough banked
+/// credits → the write → `409` no room (credits refunded) or the journalled `500` (refunded) →
+/// `200`, the whole state.
+/// - `DEMO_REPLACE_MERC_CREDITS` a soldier, `DEMO_REPLACE_MINER_CREDITS` a miner, charged for the
+///   heads added, on the same row: never an insert, so a first Section at 0 is lifted (Reviewer
+///   BP-11a-1 F2). A Crew replace moves no morale.
+/// - The write runs in its own task, so a client that goes away can't cancel it between the debit
+///   and `finish_replace`: dropping the `JoinHandle` detaches the task, and the route never calls
+///   `abort()`, so the only `JoinError` is a panic.
+/// - Abuse bound: one owner-scoped `UPDATE` of one row on the demo's Postgres per accepted
+///   replace, at most one per 80 banked credits, under the shared ops limiter (40/min per wallet,
+///   400 per address). It holds the store lock for the check and debit (no await), then the
+///   campaign's launch lock and one row lock for one statement.
+async fn post_ops_replace(
+    AuthSession(token): AuthSession,
+    State(state): State<Arc<AppState>>,
+    ci: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    Path(campaign_id): Path<Uuid>,
+    body: Result<Json<OpsReplaceRequest>, JsonRejection>,
+) -> Result<Response, AppError> {
+    if let Some(r) = ops_limits(&state, &token, ci, &headers)? {
+        return Ok(r);
+    }
+    let Json(req) = match body {
+        Ok(j) => j,
+        Err(rej) => return Ok(rej.into_response()),
+    };
+    let now = Utc::now();
+    let (campaign, gateway, wallet) = ops_member(&state, &token, campaign_id, "post_ops_replace").await?;
+    let Some(gw) = gateway else {
+        return Err(conflict("no gateway assigned"));
+    };
+    let board = load_board(&state, &campaign, gw, now, false, "post_ops_replace").await?;
+    latch_pending_raid(&state, campaign_id, now, "post_ops_replace").await?;
+    let target = match (req.section_id.as_deref(), req.crew_id.as_deref()) {
+        (Some(s), None) => match Uuid::parse_str(s) {
+            Ok(id) => ReplaceTarget::Section(id),
+            Err(_) => return Err(bad_request("unknown section")),
+        },
+        (None, Some(c)) => match Uuid::parse_str(c) {
+            Ok(id) => ReplaceTarget::Crew(id),
+            Err(_) => return Err(bad_request("unknown crew")),
+        },
+        _ => return Err(bad_request("name one of section_id or crew_id")),
+    };
+    if !(1..=8).contains(&req.count) {
+        return Err(bad_request("count must be 1 to 8"));
+    }
+    let n = req.count as u8;
+    let each = match target {
+        ReplaceTarget::Section(_) => DEMO_REPLACE_MERC_CREDITS,
+        ReplaceTarget::Crew(_) => DEMO_REPLACE_MINER_CREDITS,
+    };
+    let hold = match state.demo_ops.store.begin_replace(campaign_id, each * u32::from(n), now) {
+        Ok(h) => h,
+        Err(ReplaceRefusal::OpOut) => return Err(conflict("the team is out: replacements report at base")),
+        Err(ReplaceRefusal::NotEnoughCredits) => return Err(conflict("not enough banked credits")),
+    };
+    let task_state = state.clone();
+    let handle = tokio::spawn(async move { replace_write(task_state, campaign_id, wallet, target, n, hold).await });
+    match handle.await {
+        Ok(result) => result?,
+        Err(e) => return Err(internal_error(format!("post_ops_replace: task failed for campaign {campaign_id}: {e}"))),
+    }
+    Ok(ops_response(&state, campaign_id, gw, &board, now))
+}
+
+/// Replace's durable write (BP-12a-2), run in the task `post_ops_replace` starts, so it always
+/// reaches `finish_replace`: kept on an add, refunded on no room or a failed write.
+async fn replace_write(
+    state: Arc<AppState>,
+    campaign_id: Uuid,
+    wallet: Vec<u8>,
+    target: ReplaceTarget,
+    n: u8,
+    hold: ReplaceHold,
+) -> Result<(), AppError> {
+    let _launch = state.launch_locks.lock(campaign_id).await;
+    let added = match target {
+        ReplaceTarget::Section(id) => state.section_loss.add_soldiers(id, campaign_id, &wallet, i16::from(n)).await,
+        ReplaceTarget::Crew(id) => state.crew_loss.add_heads(id, campaign_id, &wallet, i16::from(n)).await,
+    };
+    match added {
+        Ok(Some(_)) => {
+            state.demo_ops.store.finish_replace(hold, false);
+            Ok(())
+        }
+        Ok(None) => {
+            state.demo_ops.store.finish_replace(hold, true);
+            Err(conflict(match target {
+                ReplaceTarget::Section(_) => "no room: a Section holds 8",
+                ReplaceTarget::Crew(_) => "no room: a Crew holds 8",
+            }))
+        }
+        Err(e) => {
+            state.demo_ops.store.finish_replace(hold, true);
+            Err(internal_error(format!("post_ops_replace: {target:?} +{n} failed for campaign {campaign_id}: {e}")))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1402,6 +1532,23 @@ mod tests {
     #[async_trait::async_trait]
     impl crate::demo_crew_loss::CrewLoss for FailingCrewLoss {
         async fn meltdown_loss(&self, _: Uuid, _: i16, _: i16) -> Result<(i16, i16), RepositoryError> {
+            Err(RepositoryError::Internal("db down".into()))
+        }
+
+        async fn add_heads(&self, _: Uuid, _: Uuid, _: &[u8], _: i16) -> Result<Option<i16>, RepositoryError> {
+            Err(RepositoryError::Internal("db down".into()))
+        }
+    }
+
+    struct FailingSectionLoss;
+
+    #[async_trait::async_trait]
+    impl crate::demo_section_loss::SectionLoss for FailingSectionLoss {
+        async fn lose_soldiers(&self, _: Uuid, _: i16) -> Result<i16, RepositoryError> {
+            Err(RepositoryError::Internal("db down".into()))
+        }
+
+        async fn add_soldiers(&self, _: Uuid, _: Uuid, _: &[u8], _: i16) -> Result<Option<i16>, RepositoryError> {
             Err(RepositoryError::Internal("db down".into()))
         }
     }
@@ -2260,6 +2407,183 @@ mod tests {
         assert_eq!((status, body["error"].as_str()), (StatusCode::BAD_REQUEST, Some("unknown section")));
         let (status, body, _) = heal(&state, c.campaign_id, &Uuid::new_v4().to_string()).await;
         assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("nobody to heal")));
+    }
+
+    async fn replace(state: &Arc<AppState>, campaign: Uuid, body: serde_json::Value) -> (StatusCode, serde_json::Value, Vec<u8>) {
+        post(state, campaign, "replace", Some(&body.to_string())).await
+    }
+
+    /// The campaign's banked credits, from a `GET` (BP-12a-2).
+    async fn banked(state: &Arc<AppState>, campaign: Uuid) -> u64 {
+        let (status, body) = get(state, Some("t"), campaign).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body["credits_banked"].as_u64().expect("credits_banked")
+    }
+
+    /// BP-12a-2: an `Active` campaign of `WALLET` with its sector, its entry made by a first `GET`,
+    /// and `credits` banked.
+    async fn replace_campaign(state: &Arc<AppState>, credits: u32) -> Uuid {
+        let c = campaign_with(state, WALLET, true, Some(GATEWAY)).await;
+        seed_sector(state, &c).await;
+        let (status, body) = get(state, Some("t"), c.campaign_id).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        state.demo_ops.store.set_credits(c.campaign_id, credits);
+        c.campaign_id
+    }
+
+    /// BP-12a-2: three soldiers for 120 each, onto the same Section row.
+    #[tokio::test]
+    async fn ops_replace_adds_soldiers_for_120_a_head() {
+        let state = Arc::new(session_state());
+        let c = replace_campaign(&state, 400).await;
+        let section = member_section(&state, c).await;
+        state.section_loss.lose_soldiers(section, 3).await.expect("lose_soldiers");
+        let (status, body, _) = replace(&state, c, serde_json::json!({ "section_id": section, "count": 3 })).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["credits_banked"], 40);
+        assert_eq!(section_headcount(&state, section).await, 8);
+    }
+
+    /// BP-12a-2: a Section at 8 has no room, and neither has an unknown id (Wiki Q2): `409`, and
+    /// the credits come back.
+    #[tokio::test]
+    async fn ops_replace_at_8_refunds_and_is_409() {
+        let state = Arc::new(session_state());
+        let c = replace_campaign(&state, 400).await;
+        let section = member_section(&state, c).await;
+        let (status, body, _) = replace(&state, c, serde_json::json!({ "section_id": section, "count": 1 })).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("no room: a Section holds 8")));
+        assert_eq!(banked(&state, c).await, 400, "refunded");
+        let (status, body, _) = replace(&state, c, serde_json::json!({ "section_id": Uuid::new_v4(), "count": 1 })).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("no room: a Section holds 8")));
+        assert_eq!(banked(&state, c).await, 400, "refunded");
+        assert_eq!(section_headcount(&state, section).await, 8);
+    }
+
+    /// BP-12a-2: refused while the team is out (a contract won with `SUCCESS_SEED`, still on
+    /// site: 400 banked, the Section at 7, so only the out check stands in the way), and when the
+    /// bank is short (a second campaign of `WALLET`, at home with 0 banked).
+    #[tokio::test]
+    async fn ops_replace_refusals() {
+        let state = Arc::new(session_state());
+        let cc = campaign_with(&state, WALLET, true, Some(GATEWAY)).await;
+        seed_commander(&state, cc.campaign_id).await;
+        let (c, section, _) = contract_on_site(&state, &cc).await;
+        fight_logged(&state, c, SUCCESS_SEED, None).await;
+        assert_eq!(banked(&state, c).await, 400);
+        assert_eq!(section_headcount(&state, section).await, 7);
+        let (status, body, _) = replace(&state, c, serde_json::json!({ "section_id": section, "count": 1 })).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("the team is out: replacements report at base")));
+        assert_eq!(banked(&state, c).await, 400);
+        assert_eq!(section_headcount(&state, section).await, 7);
+        let home = replace_campaign(&state, 0).await;
+        let home_section = member_section(&state, home).await;
+        state.section_loss.lose_soldiers(home_section, 1).await.expect("lose_soldiers");
+        let (status, body, _) = replace(&state, home, serde_json::json!({ "section_id": home_section, "count": 1 })).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("not enough banked credits")));
+        assert_eq!(section_headcount(&state, home_section).await, 7);
+    }
+
+    /// Reviewer BP-11a-1 F2 (BP-12a-2): replace writes the same Section row, so a first Section at
+    /// 0 is lifted. With a second Section at 8 the start refuses; replacing into the second
+    /// changes nothing for the start (it reads the first); replacing into the first frees it.
+    #[tokio::test]
+    async fn ops_replace_lifts_the_first_section_at_0() {
+        let state = Arc::new(session_state());
+        let c = replace_campaign(&state, 1000).await;
+        seed_commander(&state, c).await;
+        let first = member_section(&state, c).await;
+        let created = state.section_repo.get_section(first).await.unwrap().expect("the first").created_at;
+        let mut s = crate::repository::section::starter_section(c, WALLET.to_vec());
+        s.created_at = created + chrono::Duration::seconds(1);
+        let second = s.section_id;
+        state.section_repo.create_section(s).await.expect("create_section");
+        state.section_loss.lose_soldiers(first, 8).await.expect("lose_soldiers");
+        let (status, body, _) = start(&state, c, SITE).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("no soldiers left to send: start a new run")));
+        let (status, body, _) = replace(&state, c, serde_json::json!({ "section_id": second, "count": 1 })).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("no room: a Section holds 8")));
+        assert_eq!(banked(&state, c).await, 1000, "refunded");
+        state.section_loss.lose_soldiers(second, 4).await.expect("lose_soldiers");
+        let (status, body, _) = replace(&state, c, serde_json::json!({ "section_id": second, "count": 4 })).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["credits_banked"], 520);
+        assert_eq!(section_headcount(&state, second).await, 8);
+        let (status, body, _) = start(&state, c, SITE).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("no soldiers left to send: start a new run")));
+        let (status, body, _) = replace(&state, c, serde_json::json!({ "section_id": first, "count": 3 })).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["credits_banked"], 160);
+        assert_eq!(section_headcount(&state, first).await, 3);
+        let (status, body, _) = start(&state, c, SITE).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// BP-12a-2: a Crew at 0 can't dig; three miners for 80 each lift it, with morale unchanged
+    /// (Wiki Q3); past 8 there is no room, and the credits come back.
+    #[tokio::test]
+    async fn ops_replace_crew_lifts_the_dig_at_0() {
+        let state = Arc::new(session_state());
+        let c = replace_campaign(&state, 1000).await;
+        let crew = seed_crew(&state, c, false).await;
+        state.crew_loss.meltdown_loss(crew, 8, 0).await.expect("meltdown_loss");
+        let (status, body, _) = start(&state, c, DIG).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("no Crew left to dig: start a new run")));
+        let morale = state.crew_repo.get_crew(crew).await.unwrap().expect("the Crew").morale;
+        let (status, body, _) = replace(&state, c, serde_json::json!({ "crew_id": crew, "count": 3 })).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["credits_banked"], 760);
+        assert_eq!(headcount(&state, crew).await, 3);
+        assert_eq!(state.crew_repo.get_crew(crew).await.unwrap().expect("the Crew").morale, morale, "no morale moves");
+        let (status, body, _) = replace(&state, c, serde_json::json!({ "crew_id": crew, "count": 6 })).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("no room: a Crew holds 8")));
+        assert_eq!(banked(&state, c).await, 760, "refunded");
+        let (status, body, _) = start(&state, c, DIG).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// BP-12a-2: a failed write is the journalled `500`, and the credits come back.
+    #[tokio::test]
+    async fn ops_replace_write_failure_refunds_and_is_500() {
+        let mut state = session_state();
+        state.section_loss = Arc::new(FailingSectionLoss);
+        let state = Arc::new(state);
+        let c = replace_campaign(&state, 400).await;
+        let section = member_section(&state, c).await;
+        let (status, body, _) = replace(&state, c, serde_json::json!({ "section_id": section, "count": 1 })).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert_eq!(banked(&state, c).await, 400, "refunded");
+        assert_eq!(state.launch_locks.len(), 0);
+    }
+
+    /// BP-12a-2: the body's refusals, ours (`400`, after the member checks) and axum's (`422`);
+    /// none spends a credit.
+    #[tokio::test]
+    async fn ops_replace_body_rejections() {
+        let state = Arc::new(session_state());
+        let c = replace_campaign(&state, 1000).await;
+        let section = member_section(&state, c).await.to_string();
+        let crew = Uuid::new_v4().to_string();
+        let cases: Vec<(String, StatusCode, Option<&str>)> = vec![
+            (serde_json::json!({ "section_id": section, "count": 9 }).to_string(), StatusCode::BAD_REQUEST, Some("count must be 1 to 8")),
+            (serde_json::json!({ "section_id": section, "count": 0 }).to_string(), StatusCode::BAD_REQUEST, Some("count must be 1 to 8")),
+            (serde_json::json!({ "section_id": section, "count": -1 }).to_string(), StatusCode::BAD_REQUEST, Some("count must be 1 to 8")),
+            (serde_json::json!({ "section_id": section, "count": 300 }).to_string(), StatusCode::BAD_REQUEST, Some("count must be 1 to 8")),
+            (serde_json::json!({ "section_id": section, "crew_id": crew, "count": 1 }).to_string(), StatusCode::BAD_REQUEST, Some("name one of section_id or crew_id")),
+            (serde_json::json!({ "count": 1 }).to_string(), StatusCode::BAD_REQUEST, Some("name one of section_id or crew_id")),
+            (serde_json::json!({ "section_id": "nope", "count": 1 }).to_string(), StatusCode::BAD_REQUEST, Some("unknown section")),
+            (serde_json::json!({ "crew_id": "nope", "count": 1 }).to_string(), StatusCode::BAD_REQUEST, Some("unknown crew")),
+            (serde_json::json!({ "section_id": section, "count": "3" }).to_string(), StatusCode::UNPROCESSABLE_ENTITY, None),
+            (serde_json::json!({ "section_id": section }).to_string(), StatusCode::UNPROCESSABLE_ENTITY, None),
+        ];
+        for (body, want, error) in cases {
+            let (status, got, _) = post(&state, c, "replace", Some(&body)).await;
+            assert_eq!(status, want, "{body} → {got}");
+            if let Some(e) = error {
+                assert_eq!(got["error"].as_str(), Some(e), "{body}");
+            }
+            assert_eq!(banked(&state, c).await, 1000, "{body} spends nothing");
+        }
     }
 
     /// BP-12a-1, the twin of `ops_contract_latch_applies_once_under_two_racers` on `DEFEAT_SEED`

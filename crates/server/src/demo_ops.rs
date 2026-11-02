@@ -79,6 +79,10 @@ pub const DEMO_HEAL_CREDITS: u32 = 40;
 pub const DEMO_HEAL_SECS: i64 = 15;
 /// The Trophy Shelf keeps the newest this many items (BP-12a-1); the oldest is dropped.
 pub const DEMO_TROPHY_CAP: usize = 20;
+/// Credits per soldier replaced (BP-12a-2, §4e): a fresh merc for a Section, up to 8.
+pub const DEMO_REPLACE_MERC_CREDITS: u32 = 120;
+/// Credits per miner replaced (BP-12a-2, §4e): a fresh head for a Crew, up to 8.
+pub const DEMO_REPLACE_MINER_CREDITS: u32 = 80;
 /// Heat each drill adds, and the meltdown threshold (§4d: the 7th drill melts down).
 pub const DEMO_HEAT_PER_DRILL: u32 = 15;
 pub const DEMO_HEAT_THRESHOLD: u32 = 100;
@@ -672,6 +676,24 @@ pub enum HealRefusal {
     NotEnoughCredits,
 }
 
+/// Why `begin_replace` refused (BP-12a-2), in the order it checks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplaceRefusal {
+    /// An op is out: replacements report at base.
+    OpOut,
+    /// Fewer banked credits than the replace costs (also a campaign with no entry).
+    NotEnoughCredits,
+}
+
+/// A replace's debit, held until its write lands (BP-12a-2). Only `finish_replace` consumes it,
+/// so the refund is always the amount debited.
+#[must_use]
+#[derive(Debug, PartialEq, Eq)]
+pub struct ReplaceHold {
+    campaign_id: Uuid,
+    credits: u32,
+}
+
 /// The raid's fight among the Commander's deployments: the earliest one that is not `aborted`,
 /// is the trigger's mission and started strictly after the trigger (`started_at` is the app's
 /// clock, as `trigger_at` is). `None` while there is none or it is still `active` (a later
@@ -873,6 +895,9 @@ struct OpsEntry {
     /// The Trophy Shelf (BP-12a-1): an applied latch's loot, newest last, at most
     /// `DEMO_TROPHY_CAP`; leaves only with the entry.
     trophies: Vec<Trophy>,
+    /// Credits a replace has debited and not yet finished (BP-12a-2): set by `begin_replace`,
+    /// cleared by `finish_replace`. `make_room` keeps an entry while it is not 0.
+    credits_in_flight: u32,
 }
 
 impl OpsEntry {
@@ -1136,12 +1161,13 @@ fn new_op(site: &OpsSite, op_seed: u32, dig: Option<DigStart>, contract: Option<
 ///   (compare-and-set, `moved_at`): Held resumes the rest of the leg with the whole load,
 ///   Defeat or TacticalRetreat with half (floor), Wipeout clears the op and banks nothing;
 /// - **the keep list** (the reaper's `moved_since`): a departure (start, next, return, pull), a
-///   homeward arrival, a drill, a latch, a build and a heal each write `moved_at`. Reading the board or the op
+///   homeward arrival, a drill, a latch, a build, a heal and a replace each write `moved_at`. Reading the board or the op
 ///   does not, nor does the ambush's reveal; a read that latches a battle does. While an
 ///   ambush waits, `moved_since` still counts the leg's passed `arrive_at`, at most
 ///   `travel_secs` (≤ 48 s) after the pull: an accepted overcount;
 /// - the eviction takes only an entry with no op, no banked ore, no banked credits, no
-///   building, no sickbay and no trophy (BP-12a-1);
+///   building, no sickbay off the default, no trophy and no replace in flight (BP-12a-1,
+///   BP-12a-2);
 /// - an entry is dropped only by `remove` (a read of a campaign that is no longer `Active`,
 ///   the reaper's retire) and the reaper's prune (`retain_campaigns`).
 ///
@@ -1170,8 +1196,10 @@ impl DemoOpsStore {
 
     /// Makes room for a new entry: below the cap, nothing; at it, evicts the least recently
     /// touched entry that holds no op, no banked ore, no banked credits, no building, no sickbay
-    /// and no trophy (BP-12a-1), and journals (first, then at most hourly). `false` when every
-    /// entry holds an op, banked ore, banked credits, a building, a sickbay or a trophy. An entry whose only state is a finished contract can go
+    /// off the default, no trophy and no replace in flight (BP-12a-1, BP-12a-2), and journals
+    /// (first, then at most hourly). The sickbay is tested by value, never by presence: a latch
+    /// can leave a bay at the default until the entry's next settle (Reviewer BP-12a-1 F1).
+    /// `false` when every entry holds one of them. An entry whose only state is a finished contract can go
     /// (BP-11a-3, accepted): its next read recomputes the board and the contract is back early. A
     /// won contract banked its pay, so it is never the victim.
     fn make_room(&self, inner: &mut HashMap<Uuid, OpsEntry>) -> bool {
@@ -1180,7 +1208,7 @@ impl DemoOpsStore {
         }
         let victim = inner
             .iter()
-            .filter(|(_, e)| e.op.is_none() && e.ore_banked == 0 && e.credits_banked == 0 && e.base == OpsBase::default() && e.sickbay.is_empty() && e.trophies.is_empty())
+            .filter(|(_, e)| e.op.is_none() && e.ore_banked == 0 && e.credits_banked == 0 && e.base == OpsBase::default() && e.sickbay.values().all(|b| *b == SickBay::default()) && e.trophies.is_empty() && e.credits_in_flight == 0)
             .min_by_key(|(_, e)| e.touched)
             .map(|(id, _)| *id);
         let Some(id) = victim else {
@@ -1220,7 +1248,7 @@ impl DemoOpsStore {
         if !self.make_room(&mut inner) {
             return false;
         }
-        inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, op: None, moved_at: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), contracts: HashMap::new(), sickbay: HashMap::new(), trophies: Vec::new() });
+        inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, op: None, moved_at: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), contracts: HashMap::new(), sickbay: HashMap::new(), trophies: Vec::new(), credits_in_flight: 0 });
         true
     }
 
@@ -1244,7 +1272,7 @@ impl DemoOpsStore {
             if !self.make_room(&mut inner) {
                 return Err(StartRefusal::Full);
             }
-            inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, op: None, moved_at: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), contracts: HashMap::new(), sickbay: HashMap::new(), trophies: Vec::new() });
+            inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, op: None, moved_at: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), contracts: HashMap::new(), sickbay: HashMap::new(), trophies: Vec::new(), credits_in_flight: 0 });
         }
         let Some(e) = inner.get_mut(&campaign_id) else {
             return Err(StartRefusal::Full);
@@ -1641,6 +1669,42 @@ impl DemoOpsStore {
         Ok(())
     }
 
+    /// Debits `cost` for a replace (BP-12a-2) and holds it in flight, so `make_room` keeps the
+    /// entry until `finish_replace`. Settles first, so a team that has just come home can replace
+    /// on the same call. Writes `moved_at` (the keep list). Refusals in order: `OpOut` →
+    /// `NotEnoughCredits` (also no entry). Check and debit are one critical section, no await.
+    pub fn begin_replace(&self, campaign_id: Uuid, cost: u32, now: DateTime<Utc>) -> Result<ReplaceHold, ReplaceRefusal> {
+        let mut inner = self.lock();
+        let Some(e) = inner.get_mut(&campaign_id) else {
+            return Err(ReplaceRefusal::NotEnoughCredits);
+        };
+        e.settle_arrival(now);
+        if e.op.is_some() {
+            return Err(ReplaceRefusal::OpOut);
+        }
+        if !e.debit_credits(cost) {
+            return Err(ReplaceRefusal::NotEnoughCredits);
+        }
+        e.credits_in_flight = e.credits_in_flight.saturating_add(cost);
+        e.moved_at = Some(now);
+        e.touched = now;
+        Ok(ReplaceHold { campaign_id, credits: cost })
+    }
+
+    /// Ends a replace (BP-12a-2): the hold leaves flight and, with `refund`, goes back to the
+    /// bank. An entry gone by now went with its campaign (only a retire removes an entry a hold
+    /// protects), so the credits leave with the campaign and nothing is recreated.
+    pub fn finish_replace(&self, hold: ReplaceHold, refund: bool) {
+        let mut inner = self.lock();
+        let Some(e) = inner.get_mut(&hold.campaign_id) else {
+            return;
+        };
+        e.credits_in_flight = e.credits_in_flight.saturating_sub(hold.credits);
+        if refund {
+            e.credits_banked = e.credits_banked.saturating_add(hold.credits);
+        }
+    }
+
     /// The reaper's keep check: the team departed, drilled, latched a battle or came home at or after `cutoff` (a leg
     /// that has arrived by `now` counts at its arrival, also while a haul's ambush waits: an
     /// accepted overcount of at most `travel_secs`). Reading the board is not moving.
@@ -1705,6 +1769,15 @@ impl DemoOpsStore {
     pub(crate) fn set_base(&self, campaign_id: Uuid, base: OpsBase) {
         if let Some(e) = self.lock().get_mut(&campaign_id) {
             e.base = base;
+        }
+    }
+
+    /// Sets the banked credits at the campaign's entry, so a test can replace without winning a
+    /// fight first (BP-12a-2: a Section at 0 can't start the op that would earn them).
+    #[cfg(test)]
+    pub(crate) fn set_credits(&self, campaign_id: Uuid, credits: u32) {
+        if let Some(e) = self.lock().get_mut(&campaign_id) {
+            e.credits_banked = credits;
         }
     }
 
@@ -2900,22 +2973,89 @@ mod tests {
         assert_eq!(shelf[19].item_name, "t20");
     }
 
-    /// BP-12a-1 (Linux Q5), mirroring `ops_store_eviction_skips_banked_credits`: at the cap, an
-    /// entry whose only state is a trophy (A) or a sickbay (B) is never evicted. Both ops were
-    /// cleared by a wiped contract, with no pay, ore or building.
+    /// BP-12a-1 (Linux Q5), mirroring `ops_store_eviction_skips_banked_credits`, and BP-12a-2
+    /// (Reviewer BP-12a-1 F1): at the cap, each case's entry is kept or evicted by another
+    /// campaign's first `put_board` at 30 s. Every op is cleared by a wiped contract, with no pay,
+    /// ore or building. A, a trophy: kept. B, a bay `{1, 0}`: kept. C, a default bay reached by
+    /// insert (wounded 0, cap 8): evictable. D, a bay written back to the default (`{0, 2}`
+    /// trimmed by a cap-0 latch): evictable. No read that settles runs between a case's last
+    /// latch and the `put_board`, since a settle would drop C's and D's bays and void them. D is
+    /// the case that tells the value test from a guard on the insert: its bay existed before
+    /// the trim.
     #[test]
     fn make_room_keeps_a_sickbay_or_a_shelf() {
+        let (x, y) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let a = |store: &DemoOpsStore| {
+            let visor = LootDrop { quality_grade: QualityGrade::Basic, item_name: "Cracked Visor Helmet".into() };
+            contract_latched(store, x, RaidResult::Wiped, FightPay { loot: Some(visor), ..FightPay::default() });
+        };
+        let b = |store: &DemoOpsStore| contract_latched(store, x, RaidResult::Wiped, wounded_pay(0, 1));
+        let c = |store: &DemoOpsStore| contract_latched(store, x, RaidResult::Wiped, wounded_pay(0, 0));
+        let d = |store: &DemoOpsStore| {
+            contract_latched(store, x, RaidResult::Held, wounded_pay(80, 2));
+            assert_eq!(store.heal_op(x, SECTION, at(12)), Ok(()));
+            assert_eq!(store.next_op(x, &supply_raid(), 9, None, Some(LEAD), at(20)), Ok(()));
+            let second = RaidTrigger { trigger_at: at(26), mission_id: "SUPPLY_RAID", kind: BattleKind::Contract };
+            let cap0 = FightPay { section_id: SECTION, cap: Some(0), ..FightPay::default() };
+            assert!(store.latch_raid(x, &second, RaidResult::Wiped, cap0, at(26)));
+        };
+        let cases: [(&str, &dyn Fn(&DemoOpsStore), bool); 4] = [("A", &a, true), ("B", &b, true), ("C", &c, false), ("D", &d, false)];
+        let mut wrong = Vec::new();
+        for (name, setup, kept) in cases {
+            let store = DemoOpsStore::new(1);
+            setup(&store);
+            store.put_board(y, (5, 0), board(), at(30));
+            if store.board(x, (5, 0), at(31)).is_some() != kept {
+                wrong.push(name);
+            }
+        }
+        assert!(wrong.is_empty(), "wrong cases: {wrong:?}");
+    }
+
+    /// BP-12a-2: a replace is refused while the op is out (400 banked, credits untouched), then
+    /// when the bank is short (80 < 120), and for a campaign with no entry.
+    #[test]
+    fn begin_replace_refuses_while_out_then_when_short() {
+        let store = DemoOpsStore::new(3);
+        let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        contract_latched(&store, a, RaidResult::Held, wounded_pay(400, 0));
+        assert_eq!(store.begin_replace(a, 120, at(13)), Err(ReplaceRefusal::OpOut));
+        assert_eq!(store.ops_state(a, at(13)).credits_banked, 400);
+        contract_latched(&store, b, RaidResult::Wiped, FightPay::credits(80));
+        assert_eq!(store.begin_replace(b, 120, at(13)), Err(ReplaceRefusal::NotEnoughCredits));
+        assert_eq!(store.ops_state(b, at(13)).credits_banked, 80);
+        assert_eq!(store.begin_replace(Uuid::from_u128(9), 120, at(13)), Err(ReplaceRefusal::NotEnoughCredits));
+    }
+
+    /// BP-12a-2: a refunded hold goes back to the bank; a kept one stays spent.
+    #[test]
+    fn finish_replace_refunds_or_keeps_the_debit() {
         let store = DemoOpsStore::new(2);
-        let (a, b, c) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
-        let visor = LootDrop { quality_grade: QualityGrade::Basic, item_name: "Cracked Visor Helmet".into() };
-        contract_latched(&store, a, RaidResult::Wiped, FightPay { loot: Some(visor), ..FightPay::default() });
-        contract_latched(&store, b, RaidResult::Wiped, wounded_pay(0, 1));
-        assert_eq!(store.op_view(a, at(20)), None);
-        assert_eq!(store.op_view(b, at(20)), None);
-        assert!(!store.put_board(c, (5, 0), board(), at(30)), "not cached");
-        assert_eq!(store.len(), 2);
-        assert!(store.board(a, (5, 0), at(31)).is_some(), "the shelf is kept");
-        assert!(store.board(b, (5, 0), at(31)).is_some(), "the sickbay is kept");
+        let a = Uuid::from_u128(1);
+        contract_latched(&store, a, RaidResult::Wiped, FightPay::credits(300));
+        let hold = store.begin_replace(a, 120, at(13)).expect("begin");
+        assert_eq!(store.ops_state(a, at(13)).credits_banked, 180);
+        store.finish_replace(hold, true);
+        assert_eq!(store.ops_state(a, at(14)).credits_banked, 300);
+        let hold = store.begin_replace(a, 240, at(15)).expect("begin");
+        assert_eq!(store.ops_state(a, at(15)).credits_banked, 60);
+        store.finish_replace(hold, false);
+        assert_eq!(store.ops_state(a, at(16)).credits_banked, 60);
+    }
+
+    /// BP-12a-2 (Linux item 13): a replace that debits the bank to 0 holds its entry against
+    /// eviction until it finishes; once it has, the empty entry is the victim.
+    #[test]
+    fn make_room_skips_a_replace_in_flight() {
+        let store = DemoOpsStore::new(1);
+        let (x, y) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        contract_latched(&store, x, RaidResult::Wiped, FightPay::credits(120));
+        let hold = store.begin_replace(x, 120, at(13)).expect("begin");
+        assert!(!store.put_board(y, (5, 0), board(), at(30)), "not cached: x holds a replace");
+        assert!(store.board(x, (5, 0), at(30)).is_some(), "x is kept");
+        store.finish_replace(hold, false);
+        assert!(store.put_board(y, (5, 0), board(), at(31)), "cached: x is now empty");
+        assert!(store.board(x, (5, 0), at(31)).is_none(), "x was the victim");
     }
 
     /// BP-11a-3: the four contracts in `OPS_CONTRACT_MISSIONS` order at (8, 0) … (11, 0), each

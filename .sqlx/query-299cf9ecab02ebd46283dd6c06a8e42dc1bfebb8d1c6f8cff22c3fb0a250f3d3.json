@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE section_records SET headcount = headcount + $2 WHERE section_id = $1 AND campaign_id = $3 AND player_wallet = $4 AND headcount + $2 <= 8 RETURNING headcount",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "headcount",
+        "type_info": "Int2"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int2",
+        "Uuid",
+        "Bytea"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "299cf9ecab02ebd46283dd6c06a8e42dc1bfebb8d1c6f8cff22c3fb0a250f3d3"
+}

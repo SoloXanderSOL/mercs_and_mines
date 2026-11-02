@@ -8555,3 +8555,89 @@ async fn postgres_section_loss_floors_at_zero_and_returns_the_headcount() {
     assert_eq!(stored.expect("get_section").expect("the Section").headcount, 0);
     assert!(matches!(unknown, Err(RepositoryError::NotFound)), "{unknown:?}");
 }
+
+// ── BP-12a-2 (demo-only): replace's adds ────────────────────────────────────
+
+/// The only DB wallet the BP-12a-2 Section test uses.
+const SECTION_ADD_WALLET: [u8; 32] = [111u8; 32];
+/// The only DB wallet the BP-12a-2 Crew test uses.
+const CREW_ADD_WALLET: [u8; 32] = [112u8; 32];
+
+/// BP-12a-2 — `PostgresSectionLoss::add_soldiers` adds in one conditional `UPDATE`, and each
+/// `WHERE` term decides alone: room (7 + 2 > 8), the campaign (the wallet's second campaign), the
+/// wallet (bytes that own nothing; no account row needed) and the id. Each call is read back.
+#[tokio::test]
+async fn postgres_add_soldiers_decides_on_each_term() {
+    use mercs_server::demo_section_loss::{PostgresSectionLoss, SectionLoss};
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    clean_wallet_4g1(&pool, &SECTION_ADD_WALLET).await;
+    let a = seed_account_and_campaign(&pool, SECTION_ADD_WALLET, 0x12A2_i64).await;
+    let b = seed_account_and_campaign(&pool, SECTION_ADD_WALLET, 0x12A3_i64).await;
+    let sections = PostgresSectionRepository::new(pool.clone());
+    let s = uuid::Uuid::new_v4();
+    sections.create_section(SectionRecord {
+        section_id:    s,
+        campaign_id:   a,
+        player_wallet: SECTION_ADD_WALLET.to_vec(),
+        name:          "1st Section".into(),
+        headcount:     6,
+        loadout:       serde_json::json!({}),
+        xp:            0,
+        created_at:    chrono::Utc::now(),
+        updated_at:    chrono::Utc::now(),
+    }).await.expect("create_section failed");
+    let loss = PostgresSectionLoss::new(pool.clone());
+    let stored = || async { sections.get_section(s).await.map(|r| r.map(|r| r.headcount)) };
+
+    let mut got = Vec::new();
+    got.push((loss.add_soldiers(s, a, &SECTION_ADD_WALLET, 1).await, stored().await));
+    got.push((loss.add_soldiers(s, a, &SECTION_ADD_WALLET, 2).await, stored().await));
+    got.push((loss.add_soldiers(s, b, &SECTION_ADD_WALLET, 1).await, stored().await));
+    got.push((loss.add_soldiers(s, a, &[0xEEu8; 32], 1).await, stored().await));
+    got.push((loss.add_soldiers(uuid::Uuid::new_v4(), a, &SECTION_ADD_WALLET, 1).await, stored().await));
+    clean_wallet_4g1(&pool, &SECTION_ADD_WALLET).await;
+
+    let want = [(Some(7), "the add"), (None, "7 + 2 > 8"), (None, "another campaign"), (None, "another wallet"), (None, "an unknown id")];
+    for ((added, read), (expect, why)) in got.into_iter().zip(want) {
+        assert_eq!(added.expect(why), expect, "{why}");
+        assert_eq!(read.expect("get_section"), Some(7), "{why}: stored");
+    }
+}
+
+/// BP-12a-2 — `PostgresCrewLoss::add_heads`, the same five calls on `crew_records`; morale never
+/// moves (Wiki Q3).
+#[tokio::test]
+async fn postgres_add_heads_decides_on_each_term() {
+    use mercs_server::demo_crew_loss::{CrewLoss, PostgresCrewLoss};
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    clean_wallet_4g1(&pool, &CREW_ADD_WALLET).await;
+    let a = seed_account_and_campaign(&pool, CREW_ADD_WALLET, 0x12A4_i64).await;
+    let b = seed_account_and_campaign(&pool, CREW_ADD_WALLET, 0x12A5_i64).await;
+    let crews = PostgresCrewRepository::new(pool.clone());
+    let mut crew = CrewRecord::new_hire(a, CREW_ADD_WALLET.to_vec());
+    crew.headcount = 6;
+    let (id, morale) = (crew.crew_id, crew.morale);
+    crews.create_crew(crew).await.expect("create_crew failed");
+    let loss = PostgresCrewLoss::new(pool.clone());
+    let stored = || async { crews.get_crew(id).await.map(|r| r.map(|r| (r.headcount, r.morale))) };
+
+    let mut got = Vec::new();
+    got.push((loss.add_heads(id, a, &CREW_ADD_WALLET, 1).await, stored().await));
+    got.push((loss.add_heads(id, a, &CREW_ADD_WALLET, 2).await, stored().await));
+    got.push((loss.add_heads(id, b, &CREW_ADD_WALLET, 1).await, stored().await));
+    got.push((loss.add_heads(id, a, &[0xEEu8; 32], 1).await, stored().await));
+    got.push((loss.add_heads(uuid::Uuid::new_v4(), a, &CREW_ADD_WALLET, 1).await, stored().await));
+    clean_wallet_4g1(&pool, &CREW_ADD_WALLET).await;
+
+    let want = [(Some(7), "the add"), (None, "7 + 2 > 8"), (None, "another campaign"), (None, "another wallet"), (None, "an unknown id")];
+    for ((added, read), (expect, why)) in got.into_iter().zip(want) {
+        assert_eq!(added.expect(why), expect, "{why}");
+        assert_eq!(read.expect("get_crew"), Some((7, morale)), "{why}: stored");
+    }
+}
