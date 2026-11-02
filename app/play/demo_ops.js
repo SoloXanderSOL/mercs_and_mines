@@ -33,6 +33,7 @@
 import { request, ApiError, store, getMissions, getRoster } from './api.js';
 import { onMapCreated } from './hexmap.js';
 import { setAarNote, setBeforeOffer, setSquadSize, setDeployExtra, setStill } from './battle.js';
+import { mountStory, writeAar } from './demo_story.js';
 import { showCard, cardSeen } from './demo_card.js';
 import { mountCompany, dressBriefing, renderCompany, HEAL_CREDITS } from './demo_company.js';
 import { DIG_COPY, DIG_CSS, createDigPanel, renderDig, hideDig, homewardLines, flash, bankedLine } from './demo_dig.js';
@@ -745,8 +746,8 @@ function sectionHead() {
 // The AAR's loss lines for a fight opened from here: who died, and the Section's count after it
 // (the server takes one soldier per KIA or MIA when the fight latches).
 function aarNote({ report, section }) {
-  const verdict = verdictLine(report); // B5: the verdict on the pick comes first
-  if (!opFight) return verdict ? [verdict] : [];
+  writeAar(report, verdictLine(report)); // B4 + B5 (BP-15b): the write-up, then the verdict on the pick, under the banner
+  if (!opFight) return [];
   opFight = false;
   const before = fightHead;
   fightHead = null;
@@ -761,7 +762,7 @@ function aarNote({ report, section }) {
   // BP-12b: the wounded go to the sickbay when the fight latches.
   const wounded = (report && report.unit_results || []).filter(u => u.final_status === 'Wounded').length;
   if (wounded > 0) lines.push(fill(COPY.aarWounded, { n: wounded }));
-  return verdict ? [verdict, ...lines] : lines;
+  return lines;
 }
 
 // The run is over: nobody is left to send. The keeper end screen's New run does the rest.
@@ -1313,6 +1314,7 @@ export function mountOps(d) {
   setSquadSize(fitToFight);
   setDeployExtra(() => { sentApproach = pendingApproach; return pendingApproach ? { approach: pendingApproach } : {}; });
   setStill(sceneFor);
+  mountStory(deps, { family: () => (opFight && fightDress ? fightDress.family : null) }); // B4 (BP-15b): the fight log
   const ms = store.missions(); if (ms && Object.values(ms).some(m => !('stance' in m))) store.setMissions(null);
   createApproaches();
   setBeforeOffer(() => deps.enterHub()); // A13: no checkout after a mission in the demo; the Demo Shop button opens it
