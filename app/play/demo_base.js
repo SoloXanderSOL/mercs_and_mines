@@ -1,8 +1,8 @@
 // demo-only (BP-10b, BP-11b-1): the merc base screen (Breakpoint §4d, stretch 1). Never ported to dev.
 //
-// Pure rendering for demo_ops.js: the four building slots, their art, cost and effect lines, and
+// Pure rendering for demo_ops.js: the five building slots, their art, cost and effect lines, and
 // the moment a building goes up. It makes no calls and holds no state; demo_ops.js owns the
-// board, the bank and every POST. The server sends only which buildings stand (`base`, four
+// board, the bank and every POST. The server sends only which buildings stand (`base`, five
 // bools); the costs and the copy live here, and the harness pins the costs to the server's
 // (Reviewer BP-10a CF1). Every string goes in through textContent.
 
@@ -15,17 +15,21 @@ export const BASE = [
     flavour: 'A scrap dish on a leaning pipe mast. It hears raiders coming.',
     done: "Radio Shack operational. Raiders get heard before they're seen." },
   { id: 'hobbyist_benches', name: 'Hobbyist Benches', cost: 120,
-    effect: 'Drill heat tops out 5 lower.',
-    flavour: 'Scout drones and utility kits, mostly assembled. The drill head runs cooler.',
-    done: 'Benches operational. The drill head runs cooler.' },
+    effect: 'Patch up 20 credits a head, done in 8 s.',
+    flavour: 'Scout drones and utility medkits, mostly assembled. Stitches by the numbers.',
+    done: 'Benches operational. Patch-ups at half price.' },
   { id: 'grease_pit', name: 'The Grease-Pit', cost: 80,
-    effect: 'Ambush odds on the haul halved.',
+    effect: 'A lost ambush costs a quarter of the haul.',
     flavour: 'Light vehicles, slow manual repairs. Armoured enough to argue with an ambush.',
     done: 'Grease-Pit operational. Hauls ride armoured.' },
-  { id: 'gunsmith', name: 'Gunsmith', cost: 80,
+  { id: 'gunsmith', name: 'Gunsmith', cost: 100,
+    effect: '+10 on every fight your mercs take.',
+    flavour: 'Slug-rifles, re-bored and re-blessed. The mercs hit harder.',
+    done: 'Gunsmith operational. The mercs hit harder.' },
+  { id: 'basic_smelter', name: 'Basic Smelter', cost: 80,
     effect: 'Ore per drill up a quarter.',
-    flavour: 'Slug-rifles for the Crew. An armed Crew digs with conviction.',
-    done: 'Gunsmith operational. The Crew digs harder.' },
+    flavour: 'A furnace, a chute and a man with tongs. More of every load comes out as ore.',
+    done: 'Smelter operational. Every drill yields more.' },
 ];
 
 // Booth copy, verbatim from the BP-10b prompt.
@@ -46,13 +50,14 @@ export const BASE_COPY = {
 
 // Placeholder art (BP-10b): line drawings in the accent colour, one per building. Real sprites
 // replace one url() each (and join the service worker's SHELL). The Radio Shack follows
-// Building_Art_Style_Guide's T1 Intelligence Hub; the other three have no design yet.
+// Building_Art_Style_Guide's T1 Intelligence Hub; the other four have no design yet.
 const SVG_HEAD = "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64' fill='none' stroke='%23d9a441' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'>";
 const ART = {
   radio_shack: "<path d='M6 58h52'/><rect x='40' y='48' width='14' height='10'/><path d='M22 58l6-40M30 58l2-40'/><path d='M23 51h8M25 39h7M27 27h5'/><path d='M14 20a14 14 0 0 0 22-14'/><path d='M25 13l6 6'/><path d='M32 18l26 40' stroke-width='1'/>",
   hobbyist_benches: "<path d='M6 58h52'/><path d='M8 46h48M14 46v12M49 46v12'/><path d='M18 46v-6M40 46v-4'/><rect x='26' y='20' width='12' height='6'/><path d='M20 16l6 6M44 16l-6 6M20 30l6-4M44 30l-6-4'/><circle cx='20' cy='16' r='4'/><circle cx='44' cy='16' r='4'/><circle cx='20' cy='30' r='4'/><circle cx='44' cy='30' r='4'/>",
   grease_pit: "<path d='M6 58h52'/><path d='M6 26l26-14 26 14'/><path d='M10 24v34M54 24v34'/><path d='M18 48h28l-4-8H24z'/><circle cx='22' cy='52' r='4'/><circle cx='42' cy='52' r='4'/>",
   gunsmith: "<path d='M6 58h52'/><path d='M10 40h44M14 40v18M49 40v18'/><path d='M16 12v28M48 12v28'/><path d='M10 22h44M36 22l-4 6M20 22v-3'/><path d='M22 40v-5h8v5'/>",
+  basic_smelter: "<path d='M6 58h52'/><path d='M14 58V32h26v26'/><path d='M21 32V18h12v14'/><path d='M24 18v-6M30 18v-9'/><path d='M21 52a6 6 0 0 1 12 0'/><path d='M40 38l14 9v11'/>",
 };
 const artCss = id => `.base-art-${id} { background-image: url("${SVG_HEAD}${ART[id]}</svg>"); }`;
 
@@ -60,7 +65,7 @@ export const BASE_CSS = `
 .ops-base { position: absolute; top: 11.5cqw; left: 3cqw; padding: 1cqw 2.5cqw; font-family: var(--mono); font-size: 3.6cqw; color: var(--accent); background: rgba(11, 11, 12, 0.94); border: 0.3cqw solid var(--accent); border-radius: 1.5cqw; cursor: pointer; }
 .ops-base[hidden], .base-sheet[hidden], .base-note[hidden], .base-build[hidden] { display: none; }
 .base-sheet { position: absolute; left: 3cqw; right: 3cqw; top: 20cqw; bottom: 17cqw; padding: 3cqw; display: flex; flex-direction: column; gap: 1.5cqw; text-align: left; overflow-y: auto; background: rgba(11, 11, 12, 0.96); border: 0.4cqw solid var(--panel-edge); border-radius: 2cqw; }
-.base-head { position: relative; display: flex; align-items: baseline; justify-content: space-between; gap: 2cqw; }
+.base-head { position: sticky; top: calc(-3cqw - 1px); z-index: 1; display: flex; align-items: baseline; justify-content: space-between; gap: 2cqw; background: rgb(11, 11, 12); }
 .base-line { margin: 0; font-family: var(--mono); font-size: 3.8cqw; color: var(--accent); }
 .base-note { margin: 0; font-size: 3.6cqw; line-height: 1.35; }
 .base-pop { position: absolute; right: 0; top: 6cqw; font-family: var(--display); font-weight: 800; font-size: 4.6cqw; color: var(--accent); opacity: 0; pointer-events: none; }

@@ -13,7 +13,7 @@
 // player's taps the client reads the board three times: on the hub's re-entry with an op out, at a
 // pulled haul's midpoint (where an ambush reveals) and when a laden leg lands (where the ore banks).
 //
-// BP-10b: the Base button opens demo_base.js's sheet, where banked ore buys the four buildings
+// BP-10b: the Base button opens demo_base.js's sheet, where banked ore buys the five buildings
 // (POST ops/build, one per tap). Nothing can be built while any op is out, so the sheet says so
 // rather than offering a build the server would refuse (Reviewer BP-10a CF2).
 //
@@ -35,7 +35,7 @@ import { onMapCreated } from './hexmap.js';
 import { setAarNote, setBeforeOffer, setSquadSize, setDeployExtra, setStill } from './battle.js';
 import { mountStory, writeAar } from './demo_story.js';
 import { showCard, cardSeen } from './demo_card.js';
-import { mountCompany, dressBriefing, renderCompany, HEAL_CREDITS } from './demo_company.js';
+import { mountCompany, dressBriefing, renderCompany, healPrice } from './demo_company.js';
 import { DIG_COPY, DIG_CSS, createDigPanel, renderDig, hideDig, homewardLines, flash, bankedLine } from './demo_dig.js';
 import { BASE_COPY, BASE_CSS, createBase, renderBase, hideBase } from './demo_base.js';
 
@@ -174,6 +174,8 @@ const CSS = `
 #screen-battle .score-rule { margin-top: 0.8cqw; border-top: 0.4cqw solid var(--accent); }
 #screen-battle .score-modifier .score-label { color: var(--text); }
 #screen-battle .score-note { font-size: 3.6cqw; color: var(--muted); background: none; }
+#screen-battle:has(#battle-lines > li:nth-child(10)) .still { height: 16cqw; }
+#screen-battle:has(#battle-lines > li:nth-child(10)) .score-modifier .score-label { font-size: 3.8cqw; line-height: 1.2; }
 .still[src$="scene_defence_briefing.jpg"] { object-position: 50% 70%; }
 .still[src$="scene_defence_fight.jpg"] { object-position: 50% 45%; }
 .still[src$="scene_assault_briefing.jpg"] { object-position: 50% 80%; }
@@ -249,7 +251,7 @@ const fitToFight = d => {
   const b = bayOf(d.section.section_id);
   const fit = Math.max(0, h - b.wounded - b.healing);
   if (fit > 0 || h === 0) return fit;
-  return b.healing > 0 || credits >= HEAL_CREDITS * b.wounded ? 0 : h;
+  return b.healing > 0 || credits >= healPrice(base).each * b.wounded ? 0 : h;
 };
 let adoptedFor = null;  // the campaign whose ops body has been adopted (the Company screen needs one, BP-12b)
 let companyAsk = null;  // the heal or replace in flight: { action, target }
@@ -1129,7 +1131,7 @@ function sendHeal(sectionId) {
   if (held() || !campaignId) return;
   companyNotice = null;
   companyAsk = { action: 'heal', target: 'section' };
-  send(opsPath(campaignId) + '/heal', { section_id: sectionId }, false, res => HEAL_CREDITS * healingIn(res, sectionId));
+  send(opsPath(campaignId) + '/heal', { section_id: sectionId }, false, res => healPrice(res.base).each * healingIn(res, sectionId)); // the price of the base the charge came with
 }
 
 // The kept roster after a replace's 200: the row the server added to gains `count` (never past
@@ -1322,6 +1324,7 @@ export function mountOps(d) {
   mountCompany(deps, {
     adopted: () => Boolean(campaignId) && adoptedFor === campaignId && Boolean(store.campaign()) && store.campaign().campaign_id === campaignId,
     credits: () => credits,
+    base: () => base,
     out: () => Boolean(op),
     held,
     serverNow,

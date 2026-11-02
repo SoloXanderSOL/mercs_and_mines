@@ -20,6 +20,12 @@ import { store } from './api.js';
 const RANK_XP = [100, 400, 1100, 2600]; // commander_gen.rs:132 RANK_THRESHOLDS (ranks 2..=5); harness k3 holds its own copy
 export const HEAL_CREDITS = 40;           // demo_ops.rs DEMO_HEAL_CREDITS; harness y14 holds its own copy
 export const HEAL_SECS = 15;              // demo_ops.rs DEMO_HEAL_SECS (copy only: the body's healed_at decides)
+export const BENCHES_HEAL_CREDITS = 20;   // demo_ops.rs DEMO_BENCHES_HEAL_CREDITS (BP-16a)
+export const BENCHES_HEAL_SECS = 8;       // demo_ops.rs DEMO_BENCHES_HEAL_SECS (copy only: the body's healed_at decides)
+// The Patch-up price for a base, by the server's rule (OpsBase::heal_credits / heal_secs, BP-16a): the Benches halve it.
+export function healPrice(base) {
+  return base && base.hobbyist_benches ? { each: BENCHES_HEAL_CREDITS, secs: BENCHES_HEAL_SECS } : { each: HEAL_CREDITS, secs: HEAL_SECS };
+}
 export const REPLACE_MERC_CREDITS = 120;  // demo_ops.rs DEMO_REPLACE_MERC_CREDITS
 export const REPLACE_MINER_CREDITS = 80;  // demo_ops.rs DEMO_REPLACE_MINER_CREDITS
 
@@ -70,6 +76,8 @@ const SCORE_LABELS = {
   'Mission fit': 'Mission type: drills pay off on digs only',
   'Difficulty': 'Difficulty: set by the contract',
 };
+const GUNSMITH_ROW = 'Gunsmith (your base)'; // demo_roll.rs's row label, shown as sent (Reviewer BP-16a CF (d))
+const GEAR_HINT = 'Gear: standard. Gunsmith adds 10.'; // A11 (BP-16b): only when this fight's roll had no Gunsmith row
 
 const COMPANY_COPY = {
   hubButton: 'Your Company',
@@ -393,11 +401,12 @@ function sectionRows(s) {
   if (c) rows.push(line(fill(COMPANY_COPY.led, { name: c.name, xp: xpLine(c.xp, c.rank), n: c.stress }), true));
   rows.push(line(COMPANY_COPY.kit, true), line(fill(COMPANY_COPY.bank, { n: credits })));
   if (b.wounded > 0 && b.healing === 0) {
-    const cost = b.wounded * HEAL_CREDITS;
+    const p = healPrice(view.base());
+    const cost = b.wounded * p.each;
     rows.push(act(fill(COMPANY_COPY.heal, { n: b.wounded, cost }), credits < cost || view.held(), () => view.heal(s.section_id)));
-    rows.push(line(fill(COMPANY_COPY.healNote, { each: HEAL_CREDITS, secs: HEAL_SECS }), true));
-    const texts = credits < cost ? [fill(COMPANY_COPY.short, { each: HEAL_CREDITS })] : [];
-    const extra = noticeLine('section', 'heal', HEAL_CREDITS);
+    rows.push(line(fill(COMPANY_COPY.healNote, { each: p.each, secs: p.secs }), true));
+    const texts = credits < cost ? [fill(COMPANY_COPY.short, { each: p.each })] : [];
+    const extra = noticeLine('section', 'heal', p.each);
     if (extra && !texts.includes(extra)) texts.push(extra);
     rows.push(...texts.map(t => line(t)));
   }
@@ -524,9 +533,13 @@ function dressAar(box) {
 function dressScore(lines) {
   const s = firstSection();
   const n = s ? view.squadOf(s) : 0; // the squad sent (BP-12b: the headcount less the sickbay)
-  for (const label of lines.querySelectorAll('li.score-row .score-label')) {
+  const labels = [...lines.querySelectorAll('li.score-row .score-label')];
+  // The roll's own rows say whether the Gunsmith stood (roll_inputs.gunsmith, read once by the server): no base read.
+  const gun = labels.some(l => l.textContent === GUNSMITH_ROW);
+  for (const label of labels) {
     const key = label.textContent;
-    if (Object.prototype.hasOwnProperty.call(SCORE_LABELS, key)) label.textContent = fill(SCORE_LABELS[key], { n });
+    if (key === 'Gear' && !gun) label.textContent = GEAR_HINT;
+    else if (Object.prototype.hasOwnProperty.call(SCORE_LABELS, key)) label.textContent = fill(SCORE_LABELS[key], { n });
   }
 }
 
