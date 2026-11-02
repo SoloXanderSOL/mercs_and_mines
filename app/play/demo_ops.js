@@ -32,7 +32,7 @@
 
 import { request, ApiError, store, getMissions, getRoster } from './api.js';
 import { onMapCreated } from './hexmap.js';
-import { setAarNote, setBeforeOffer, setSquadSize } from './battle.js';
+import { setAarNote, setBeforeOffer, setSquadSize, setDeployExtra } from './battle.js';
 import { showCard, cardSeen } from './demo_card.js';
 import { mountCompany, dressBriefing, renderCompany, HEAL_CREDITS } from './demo_company.js';
 import { DIG_COPY, DIG_CSS, createDigPanel, renderDig, hideDig, homewardLines, flash, bankedLine } from './demo_dig.js';
@@ -130,11 +130,60 @@ const CSS = `
 .briefing-fit[hidden] { display: none; }
 .briefing-fit { margin: 0; font-size: 3.8cqw; line-height: 1.35; color: var(--accent); }
 .ops-shop { position: absolute; top: 1.5cqw; left: 3cqw; padding: 1cqw 2.5cqw; font-family: var(--mono); font-size: 3.6cqw; color: var(--accent); background: rgba(11, 11, 12, 0.94); border: 0.3cqw solid var(--accent); border-radius: 1.5cqw; cursor: pointer; }
+#screen-briefing .briefing-stance[hidden], #screen-briefing #btn-deploy[hidden] { display: none; }
+#screen-briefing { gap: 2cqw; }
+#screen-briefing .still { height: 24cqw; }
+#screen-briefing .briefing-text { font-size: 3.9cqw; line-height: 1.3; }
+#screen-briefing .briefing-line { font-size: 3.9cqw; }
+#screen-briefing .briefing-traits { font-size: 3.4cqw; line-height: 1.3; }
+#screen-briefing .briefing-actions { gap: 1.5cqw; }
+#screen-briefing #btn-briefing-back { min-height: 11cqw; padding: 2cqw 6cqw; font-size: 4.8cqw; }
+#screen-briefing .briefing-stance { margin: 0; font-family: var(--display); font-weight: 700; font-size: 4.6cqw; line-height: 1.25; color: var(--accent); }
+#screen-briefing .briefing-rule { margin: 0; font-size: 3.5cqw; line-height: 1.3; color: var(--muted); }
+#screen-briefing .briefing-approaches { display: flex; gap: 2cqw; width: 100%; max-width: 84cqw; }
+#screen-briefing .briefing-approaches .btn { flex: 1; width: auto; max-width: none; min-height: 11cqw; padding: 0 2cqw; font-size: 4.4cqw; }
+#screen-battle .still { height: 24cqw; }
+#screen-battle .score-lines { gap: 0.8cqw; }
+#screen-battle .score-row { padding: 0.8cqw 3cqw; }
+#screen-battle .score-rule { margin-top: 0.8cqw; border-top: 0.4cqw solid var(--accent); }
+#screen-battle .score-modifier .score-label { color: var(--text); }
+#screen-battle .score-note { font-size: 3.6cqw; color: var(--muted); background: none; }
 `;
 
 const opsPath = id => '/api/campaign/' + encodeURIComponent(id) + '/ops';
 const walkKey = id => 'mm.demo.walk.' + id;
 const fill = (text, values) => text.replace(/\{(\w+)\}/g, (m, k) => (k in values ? String(values[k]) : m));
+
+// B5 on the briefing (BP-14b): the stance hint, the rule and the three approaches. The wire values are
+// demo_roll.rs MissionApproach's, byte for byte. The client computes no row: the battle screen draws the server's.
+const STANCE_LINES = {
+  DugIn: 'Intel: the enemy is dug in.',
+  Aggressive: 'Intel: the enemy is on the attack.',
+  SpreadOut: 'Intel: the enemy is spread out.',
+};
+const APPROACH_RULE = 'Flank beats dug in. Dig in beats an attack. Assault beats spread out. Your pick deploys.';
+const APPROACHES = [['Assault', 'Assault'], ['Flank', 'Flank'], ['DigIn', 'Dig in']]; // [wire value, button label]
+const VERDICT = {
+  good: 'Good call: {p} on the odds.',
+  bad: 'Bad call: {p} on the odds.',
+  even: 'Your call made no difference. The enemy hardly noticed.',
+};
+let pendingApproach = null; // set only inside one approach button's click dispatch (deploy() builds its body synchronously)
+let sentApproach = null;    // what the last mission POST carried, recorded where the body is built
+let approachButtons = [];   // the three approach buttons, created once at the mount
+let stanceNode = null;      // the briefing's stance hint (hidden when the cached body has none)
+let fightMission = null;    // the mission id of the demo fight on the briefing, for its stance
+// The cached /api/missions body's stance for a mission, or null (a body cached before BP-14a has none: no hint).
+const stanceLine = id => { const m = (store.missions() || {})[id]; return m && STANCE_LINES[m.stance] ? STANCE_LINES[m.stance] : null; };
+// The AAR's verdict on the pick, keyed only on the server's approach row (absent: the pick was a draw).
+const verdictLine = report => {
+  if (!sentApproach) return null;
+  const row = ((report && report.score_breakdown) || {}).modifiers?.find(m => m.key === 'approach');
+  if (!row) return VERDICT.even;
+  return fill(row.points > 0 ? VERDICT.good : VERDICT.bad, { p: row.points > 0 ? `+${row.points}` : String(row.points) });
+};
+// The three buttons follow #btn-deploy's disabled state (every keeper and demo rule, present and future).
+const mirrorDeploy = () => { const off = deps.$('btn-deploy').disabled; for (const b of approachButtons) b.disabled = off; };
 
 let deps = null;
 let map = null;         // the map the pins are drawn on
@@ -549,6 +598,7 @@ async function fight() {
     : fill(DIG_COPY.ambushLead, { carried: op.dig.carried });
   opFight = true;
   reopen = fight;
+  fightMission = b.mission_id;
   fightHead = sectionHead();
   fightDress = { name: null, lead };
   await deps.openMission(b.mission_id, () => deps.enterHub());
@@ -562,6 +612,7 @@ async function fightContract() {
   if (!t || !t.mission_id) return;
   opFight = true;
   reopen = fightContract;
+  fightMission = t.mission_id;
   fightHead = sectionHead();
   fightDress = t.mission_id === RELIC.mission_id ? { name: RELIC.name, lead: RELIC.lead } : { name: null, lead: null };
   await deps.openMission(t.mission_id, () => deps.enterHub());
@@ -606,6 +657,38 @@ function dressFight() {
   }
   fitNote.textContent = text;
   fitNote.hidden = !text;
+  dressApproach();
+}
+
+// B5: on every briefing show, after the keeper's disabled = false (and dressFight's 0-fit rule), the keeper
+// Deploy is hidden behind the three approach buttons, the stance hint is set and the buttons follow its state.
+function dressApproach() {
+  deps.$('btn-deploy').hidden = true;
+  const line = opFight && fightMission ? stanceLine(fightMission) : null;
+  stanceNode.textContent = line || '';
+  stanceNode.hidden = !line;
+  mirrorDeploy();
+}
+
+// The stance line, the rule and the row of three, above the keeper Deploy (the ?debug=1 checkbox stays above them).
+function createApproaches() {
+  const deploy = deps.$('btn-deploy');
+  stanceNode = el('p', 'briefing-stance');
+  stanceNode.hidden = true;
+  const rule = el('p', 'briefing-rule', APPROACH_RULE);
+  const row = el('div', 'briefing-approaches');
+  approachButtons = APPROACHES.map(([wire, label]) => {
+    const b = el('button', 'btn btn-primary briefing-approach', label);
+    b.type = 'button';
+    b.dataset.approach = wire;
+    b.addEventListener('click', () => {
+      pendingApproach = wire; deps.$('btn-deploy').click(); pendingApproach = null;
+    });
+    return b;
+  });
+  row.append(...approachButtons);
+  deploy.before(stanceNode, rule, row);
+  new MutationObserver(mirrorDeploy).observe(deploy, { attributes: true, attributeFilter: ['disabled'] });
 }
 
 // The campaign Commander's name from main.js's roster, for the card's opening line.
@@ -626,7 +709,8 @@ function sectionHead() {
 // The AAR's loss lines for a fight opened from here: who died, and the Section's count after it
 // (the server takes one soldier per KIA or MIA when the fight latches).
 function aarNote({ report, section }) {
-  if (!opFight) return [];
+  const verdict = verdictLine(report); // B5: the verdict on the pick comes first
+  if (!opFight) return verdict ? [verdict] : [];
   opFight = false;
   const before = fightHead;
   fightHead = null;
@@ -641,7 +725,7 @@ function aarNote({ report, section }) {
   // BP-12b: the wounded go to the sickbay when the fight latches.
   const wounded = (report && report.unit_results || []).filter(u => u.final_status === 'Wounded').length;
   if (wounded > 0) lines.push(fill(COPY.aarWounded, { n: wounded }));
-  return lines;
+  return verdict ? [verdict, ...lines] : lines;
 }
 
 // The run is over: nobody is left to send. The keeper end screen's New run does the rest.
@@ -1076,7 +1160,7 @@ function watch() {
   // Reviewer BP-11b-2 F2: every show of the briefing during a demo fight gets its dressing again
   // (the keeper re-renders it on a deploy 429's Back and on openMission's static-GET retry).
   const briefing = deps.$('screen-briefing');
-  new MutationObserver(() => { if (briefing.hidden) clearFitTimer(); else if (opFight) dressFight(); }).observe(briefing, { attributes: true, attributeFilter: ['hidden'] });
+  new MutationObserver(() => { if (briefing.hidden) clearFitTimer(); else if (opFight) dressFight(); else dressApproach(); }).observe(briefing, { attributes: true, attributeFilter: ['hidden'] });
 }
 
 // New run starts a new campaign, and ore, credits and buildings belong to the campaign: the end
@@ -1109,6 +1193,7 @@ function attach(m) {
   busy = false;
   banked = 0;
   credits = 0;
+  sentApproach = null;
   company = { sections: [], trophies: [] };
   adoptedFor = null;
   companyAsk = null;
@@ -1190,6 +1275,9 @@ export function mountOps(d) {
   deps.$('btn-new-run').before(endNote);
   setAarNote(aarNote);
   setSquadSize(fitToFight);
+  setDeployExtra(() => { sentApproach = pendingApproach; return pendingApproach ? { approach: pendingApproach } : {}; });
+  const ms = store.missions(); if (ms && Object.values(ms).some(m => !('stance' in m))) store.setMissions(null);
+  createApproaches();
   setBeforeOffer(() => deps.enterHub()); // A13: no checkout after a mission in the demo; the Demo Shop button opens it
   // BP-12b: the Company screen's view of this file's state and requests.
   mountCompany(deps, {

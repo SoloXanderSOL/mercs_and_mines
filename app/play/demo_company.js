@@ -23,49 +23,51 @@ export const HEAL_SECS = 15;              // demo_ops.rs DEMO_HEAL_SECS (copy on
 export const REPLACE_MERC_CREDITS = 120;  // demo_ops.rs DEMO_REPLACE_MERC_CREDITS
 export const REPLACE_MINER_CREDITS = 80;  // demo_ops.rs DEMO_REPLACE_MINER_CREDITS
 
-// A7: what a rank really changes in this build (the roll sees no Commander until B5).
+// A7: what a rank really changes in this build (since B5, each rank above 1 is also +2 on every roll).
 const RANK_LINES = {
-  2: 'Rank 2. Cleared to command 4 Sections. You have one. The paperwork is very impressive.',
-  3: 'Rank 3. A death on the relic dig or the Black Site now goes down as glorious.',
-  4: 'Rank 4. Cleared for 64 Sections. Command admires the optimism.',
-  5: 'Rank 5. Top rank. Any death now goes down as glorious.',
+  2: 'Rank 2. +2 on every roll. Cleared to command 4 Sections. You have one. The paperwork is very impressive.',
+  3: 'Rank 3. +4 on every roll. A death on the relic dig or the Black Site now goes down as glorious.',
+  4: 'Rank 4. +6 on every roll. Cleared for 64 Sections. Command admires the optimism.',
+  5: 'Rank 5. Top rank, +8 on every roll. Any death now goes down as glorious.',
 };
 
-// A8: one plain line per trait, keyed by the wire string. Character notes only: no trait acts on the demo's roll.
+// A8: one plain line per trait, keyed by the wire string. Since B5 every trait moves the roll (demo_roll.rs), and
+// each line says where in words; the battle screen shows the server's points.
 const TRAITS = {
-  "Trench-Sweeper": "Clears trenches with a shotgun and a short temper.",
-  "Armor-Adept": "Talks to tanks. The tanks, reportedly, listen.",
-  "Night-Stalker": "Prefers to work at night, in an ash-storm, or ideally both.",
-  "Cannoneer": "Believes most problems are solved by heavy artillery. Rarely proved wrong.",
-  "Marksman's Eye": "Trusts a sniper rifle more than people. Fair.",
-  "Breacher": "Loves a fortified door. Less keen on open fields.",
-  "Quartermaster's Ghost": "Haunts the stores. Nothing leaves without a signature.",
-  "Corpseman's Touch": "A field medic at heart. Carries more bandages than ammunition.",
-  "Suppression Doctrine": "Keeps the enemy's heads down. Hitting them is a secondary concern.",
-  "Veteran's Instinct": "Has seen worse, and mentions it often.",
-  "Anti-Armor Adept": "Hates vehicles. Carries something for every one of them.",
-  "Battlefield Engineer": "Can dig a fortification out of anything, given a shovel and an argument.",
-  "Embezzler": "Good in a fight. Counts the payroll more often than strictly necessary.",
-  "Bloodthirsty": "Treats the Retreat order as a suggestion.",
-  "Cowardly": "Superb at logistics. Less superb once the armour comes off.",
-  "Paranoid": "Always watching. Mostly the wrong direction.",
-  "Cult of Bob": "Devoted to Bob. Finds lunch in bins and takes the scenic route.",
-  "The Informant": "Someone else pays them a retainer. Nobody knows who. Nobody asks.",
-  "Glory Hound": "Writes their own after-action reports, in the third person.",
-  "The Gambler": "Puts a cut of every payout on the Colosseum tables. Sometimes it comes back.",
-  "Chrome-Chaser": "Buys their own augmentations. Do not ask where from.",
-  "Martinet": "Drills the Section to a mirror shine. Nobody is allowed to relax.",
-  "Squeak-Touched": "Leaves offerings at the Hamster Shrines. The hamsters know things.",
-  "Doomsayer": "Announces everyone's death at every muster. Occasionally right.",
+  "Trench-Sweeper": "Clears trenches with a shotgun and a short temper. Suits the Supply Raid and the Black Site.",
+  "Armor-Adept": "Talks to tanks. The tanks, reportedly, listen. Suits Guard Duty and holding the dig.",
+  "Night-Stalker": "Prefers to work at night, in an ash-storm, or ideally both. Suits the relic dig.",
+  "Cannoneer": "Believes most problems are solved by heavy artillery. Suits Guard Duty and holding the dig.",
+  "Marksman's Eye": "Trusts a sniper rifle more than people. Fair. Suits Guard Duty and holding the dig.",
+  "Breacher": "Loves a fortified door. Suits the Supply Raid and the Black Site.",
+  "Quartermaster's Ghost": "Haunts the stores. Nothing leaves without a signature. Suits the relic dig.",
+  "Corpseman's Touch": "A field medic at heart. Carries more bandages than ammunition. Suits the relic dig.",
+  "Suppression Doctrine": "Keeps the enemy's heads down. Suits the Supply Raid and the Black Site.",
+  "Veteran's Instinct": "Has seen worse, and mentions it often. Suits the relic dig.",
+  "Anti-Armor Adept": "Hates vehicles. Carries something for every one of them. Suits the Supply Raid and the Black Site.",
+  "Battlefield Engineer": "Can dig a fortification out of anything. Suits Guard Duty and holding the dig.",
+  "Embezzler": "Sold the good ammo. Every fight starts a little behind.",
+  "Bloodthirsty": "Treats the Retreat order as a suggestion. Better on an Assault, worse dug in.",
+  "Cowardly": "Superb at logistics. Better dug in, worse on an Assault.",
+  "Paranoid": "Always watching. Better dug in, and refuses to split the squad for a Flank.",
+  "Cult of Bob": "Devoted to Bob. Stops to bless the rifles before every fight.",
+  "The Informant": "Someone else pays them a retainer. The other side always seems to know we're coming.",
+  "Glory Hound": "Writes their own after-action reports. Shines on hard contracts, coasts on easy ones.",
+  "The Gambler": "Bets on every call. A good call pays double. So does a bad one.",
+  "Chrome-Chaser": "Buys their own augmentations. Do not ask where from. They help, mostly.",
+  "Martinet": "Drills the Section to a mirror shine. Better dug in, worse on a Flank.",
+  "Squeak-Touched": "Leaves offerings at the Hamster Shrines. The hamsters send word before every fight.",
+  "Doomsayer": "Announces everyone's death at every muster. The Section believes it, a little.",
 };
 
-// A11: the keeper's labels (battle.js:45) → where each factor comes from. Gear stays its own line (C1, C6 change it).
+// A11: the keeper's labels (battle.js:45) → where each factor comes from. The server's modifier rows (BP-14a) keep
+// their own labels and pass through untouched. Gear stays its own line (C1, C6 change it).
 const SCORE_LABELS = {
   'Squad skill': 'Squad: standard-issue Rookies',
   'Squad size': 'Headcount: {n} Rookies',
   'Training': 'Training: 8 per Rookie',
   'Gear': 'Gear: standard issue',
-  'Mission fit': 'Mission fit: drills pay off on digs only',
+  'Mission fit': 'Mission type: drills pay off on digs only',
   'Difficulty': 'Difficulty: set by the contract',
 };
 
@@ -76,7 +78,7 @@ const COMPANY_COPY = {
   xpTop: '{xp} · top rank',
   stress: '{n} / 100',
   stressNote: 'At 100 they crack. The run ends there.',
-  traitsNote: 'On file. In this build, traits colour the dossier, not the fight.',
+  traitsNote: 'On file. Every trait moves the odds in a fight. The battle screen shows by how much.',
   briefingCommander: 'Commanding: {name} · Stress {n} / 100',
   aarStress: 'Stress {n} / 100 (+{d})',
   aarXpNext: '+{g} XP · {xp} / {next} to Rank {r}',
@@ -196,8 +198,8 @@ let fromHub = false;  // the reveal about to render was opened by the hub's Your
 let card = null;      // the stats card: { node, title, lines }
 let traitsLine = null; // the briefing's trait lines, created on the first briefing
 let shown = null;     // the card on screen: { kind, index }, or null
-let tick = null;
-let drawnKey = null;  // the open card's drawn state, the countdown left out (Reviewer BP-12b F1)      // the heal countdown's display timer (no network call)
+let tick = null;      // the heal countdown's display timer (no network call)
+let drawnKey = null;  // the open card's drawn state, the countdown left out (Reviewer BP-12b F1)
 
 // ── the roster the client holds ────────────────────────────────────────────────
 function roster() {
