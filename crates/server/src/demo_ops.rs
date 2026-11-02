@@ -30,9 +30,11 @@
 //!   (`raid_result`), never from the phone.
 //! - **The haul (BP-8b-2):** a pull takes the ore on site home, where the arrival banks it for the
 //!   campaign. The haul may be ambushed halfway (`ambush_pct`), fought and read like a raid.
-//! - **The merc base (BP-10a):** banked ore buys four buildings (`BaseBuilding`), one copy each,
-//!   only while the team is home. What stands (`OpsBase`) changes the dig's numbers, and the drill,
-//!   the view and the pull all read them from `OpsBase`, so the panel never disagrees with the roll.
+//! - **The merc base (BP-10a, reworked by BP-16):** banked ore buys five buildings
+//!   (`BaseBuilding`), one copy each, only while the team is home. What stands (`OpsBase`)
+//!   changes the dig's numbers, what a lost ambush takes and the heal's price and time; every
+//!   reader goes through `OpsBase`, so the panel never disagrees with the roll. The Gunsmith's
+//!   +10 is read by the mission route (`DemoOpsStore::base_of`) and logged in `roll_inputs`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -74,9 +76,11 @@ pub const DEMO_SECS_PER_HEX: u32 = 2;
 /// A fought contract is off the board for 45 s, then returns at another hex of its ring
 /// (BP-11a-3).
 pub const DEMO_SITE_REFRESH_SECS: i64 = 45;
-/// Credits per wounded soldier healed (BP-12a-1, §4e B3). C1's Hobbyist Benches will cut it.
+/// Credits per wounded soldier healed (BP-12a-1, §4e B3); `DEMO_BENCHES_HEAL_CREDITS` with the
+/// Hobbyist Benches (BP-16). Read through `OpsBase::heal_credits`.
 pub const DEMO_HEAL_CREDITS: u32 = 40;
-/// Seconds until a healed batch is back on its feet (BP-12a-1). C1's Hobbyist Benches will cut it.
+/// Seconds until a healed batch is back on its feet (BP-12a-1); `DEMO_BENCHES_HEAL_SECS` with
+/// the Hobbyist Benches (BP-16). Read through `OpsBase::heal_secs`.
 pub const DEMO_HEAL_SECS: i64 = 15;
 /// The Trophy Shelf keeps the newest this many items (BP-12a-1); the oldest is dropped.
 pub const DEMO_TROPHY_CAP: usize = 20;
@@ -122,21 +126,34 @@ pub const DEMO_AMBUSH_SEED_OFFSET: u32 = 0x8000_0000;
 pub const DEMO_HEAT_SEED_OFFSET: u32 = 0x4000_0000;
 /// The mission an ambush is fought as (§4d: `GUARD_DUTY`'s numbers under ambush copy).
 pub const DEMO_AMBUSH_MISSION: &str = "GUARD_DUTY";
-/// The merc base (BP-10a): the four buildings' effects and costs in banked ore. T1 names from
-/// `Base_Infrastructure_Tech_Tree`; the numbers are demo-only, never canon.
+// The merc base (BP-10a, reworked by BP-16, §4e C1): the five buildings' effects and costs in
+// banked ore. T1 names from `Base_Infrastructure_Tech_Tree`; the numbers are demo-only, never
+// canon. Every effect is read through `OpsBase`'s methods, never these constants.
+
 /// The Radio Shack's raid chance per drill, in place of `DEMO_RAID_PCT_PER_DRILL`.
 pub const DEMO_SHACK_RAID_PCT_PER_DRILL: u32 = 3;
-/// The Hobbyist Benches take this off the top of each drill's heat range (BP-13, until BP-16's C1).
-pub const DEMO_BENCHES_HEAT_TOP_CUT: u32 = 5;
-/// The Gunsmith's ore per drill: `× NUM / DEN` (floor, per drill), after the tier multiplier.
-pub const DEMO_GUNSMITH_ORE_NUM: u32 = 5;
-pub const DEMO_GUNSMITH_ORE_DEN: u32 = 4;
-/// The Grease-Pit divides the haul's ambush chance by this (floor), after its cap.
-pub const DEMO_GREASE_PIT_AMBUSH_DIV: u32 = 2;
+/// The Basic Smelter's ore per drill: `× NUM / DEN` (floor, per drill), after the tier
+/// multiplier (the Gunsmith's rule until BP-16, moved whole).
+pub const DEMO_SMELTER_ORE_NUM: u32 = 5;
+/// The denominator of the Basic Smelter's ore multiplier.
+pub const DEMO_SMELTER_ORE_DEN: u32 = 4;
+/// With the Grease-Pit a lost haul ambush takes `carried / DIV` (floor) and the team keeps the
+/// rest, the odd ore included. Without it the team keeps half (floor).
+pub const DEMO_GREASE_PIT_LOSS_DIV: u32 = 4;
+/// The Hobbyist Benches' price per wounded soldier healed, in place of `DEMO_HEAL_CREDITS`.
+pub const DEMO_BENCHES_HEAL_CREDITS: u32 = 20;
+/// The Hobbyist Benches' seconds until a healed batch is back, in place of `DEMO_HEAL_SECS`.
+pub const DEMO_BENCHES_HEAL_SECS: i64 = 8;
+/// The Radio Shack's cost in banked ore.
 pub const DEMO_COST_RADIO_SHACK: u32 = 50;
-pub const DEMO_COST_GUNSMITH: u32 = 80;
+/// The Gunsmith's cost in banked ore (its +10: `demo_roll::DEMO_GUNSMITH_ROLL_POINTS`).
+pub const DEMO_COST_GUNSMITH: u32 = 100;
+/// The Grease-Pit's cost in banked ore.
 pub const DEMO_COST_GREASE_PIT: u32 = 80;
+/// The Hobbyist Benches' cost in banked ore.
 pub const DEMO_COST_HOBBYIST_BENCHES: u32 = 120;
+/// The Basic Smelter's cost in banked ore.
+pub const DEMO_COST_BASIC_SMELTER: u32 = 80;
 
 /// One pin on the board. A dig carries `tier`; a contract carries `mission_id` and `name`.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -489,13 +506,15 @@ fn drill_heat(op_seed: u32, n: u32, (lo, hi): (u32, u32)) -> u32 {
     rng.roll_int(lo, hi)
 }
 
-/// A merc-base building (BP-10a): the body's `building` id, its cost and its flag on `OpsBase`.
+/// A merc-base building (BP-10a; BP-16 adds the Basic Smelter): the body's `building` id, its
+/// cost and its flag on `OpsBase`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BaseBuilding {
     RadioShack,
     HobbyistBenches,
     GreasePit,
     Gunsmith,
+    BasicSmelter,
 }
 
 impl BaseBuilding {
@@ -506,6 +525,7 @@ impl BaseBuilding {
             "hobbyist_benches" => Some(Self::HobbyistBenches),
             "grease_pit" => Some(Self::GreasePit),
             "gunsmith" => Some(Self::Gunsmith),
+            "basic_smelter" => Some(Self::BasicSmelter),
             _ => None,
         }
     }
@@ -517,6 +537,7 @@ impl BaseBuilding {
             Self::HobbyistBenches => DEMO_COST_HOBBYIST_BENCHES,
             Self::GreasePit => DEMO_COST_GREASE_PIT,
             Self::Gunsmith => DEMO_COST_GUNSMITH,
+            Self::BasicSmelter => DEMO_COST_BASIC_SMELTER,
         }
     }
 }
@@ -530,17 +551,14 @@ pub struct OpsBase {
     pub hobbyist_benches: bool,
     pub grease_pit: bool,
     pub gunsmith: bool,
+    pub basic_smelter: bool,
 }
 
 impl OpsBase {
-    /// Drill `n`'s heat range, inclusive: 10 to 15 + 5n, the top 5 lower with the Hobbyist Benches.
+    /// Drill `n`'s heat range, inclusive: 10 to 15 + 5n. No building changes it since BP-16
+    /// (the Benches' cut is retired; B1's ranges and the Coolant-Jockey cover heat).
     fn heat_range(&self, n: u32) -> (u32, u32) {
-        let top = DEMO_HEAT_TOP_BASE + DEMO_HEAT_TOP_PER_DRILL * n;
-        if self.hobbyist_benches {
-            (DEMO_HEAT_MIN, top - DEMO_BENCHES_HEAT_TOP_CUT)
-        } else {
-            (DEMO_HEAT_MIN, top)
-        }
+        (DEMO_HEAT_MIN, DEMO_HEAT_TOP_BASE + DEMO_HEAT_TOP_PER_DRILL * n)
     }
 
     /// Drill `n`'s raid chance in percent: 3 × n with the Radio Shack, else §4d's 5 × n.
@@ -553,23 +571,47 @@ impl OpsBase {
         per * n
     }
 
-    /// The ore drill `n` yields on a vein of `tier`: × 5 / 4 (floor) with the Gunsmith.
+    /// The ore drill `n` yields on a vein of `tier`: × 5 / 4 (floor) with the Basic Smelter.
     fn ore(&self, n: u32, tier: u8) -> u32 {
         let plain = ore_for(n, tier);
-        if self.gunsmith {
-            plain * DEMO_GUNSMITH_ORE_NUM / DEMO_GUNSMITH_ORE_DEN
+        if self.basic_smelter {
+            plain * DEMO_SMELTER_ORE_NUM / DEMO_SMELTER_ORE_DEN
         } else {
             plain
         }
     }
 
-    /// The haul's ambush chance for a load of `load` ore: halved (floor) with the Grease-Pit.
+    /// The haul's ambush chance for a load of `load` ore. No building changes it since BP-16:
+    /// the Grease-Pit cuts what a lost ambush takes instead (`ambush_kept`).
     fn haul_ambush_pct(&self, load: u32) -> u32 {
-        let capped = ambush_pct(load);
+        ambush_pct(load)
+    }
+
+    /// What a lost haul ambush leaves of `carried` (BP-16): half (floor), or with the Grease-Pit
+    /// all but a quarter, the quarter floored so the odd ore is kept (30 → 23, 120 → 90).
+    fn ambush_kept(&self, carried: u32) -> u32 {
         if self.grease_pit {
-            capped / DEMO_GREASE_PIT_AMBUSH_DIV
+            carried - carried / DEMO_GREASE_PIT_LOSS_DIV
         } else {
-            capped
+            carried / 2
+        }
+    }
+
+    /// The price per wounded soldier healed: 20 with the Hobbyist Benches, else 40 (BP-16).
+    fn heal_credits(&self) -> u32 {
+        if self.hobbyist_benches {
+            DEMO_BENCHES_HEAL_CREDITS
+        } else {
+            DEMO_HEAL_CREDITS
+        }
+    }
+
+    /// Seconds until a healed batch is back: 8 with the Hobbyist Benches, else 15 (BP-16).
+    fn heal_secs(&self) -> i64 {
+        if self.hobbyist_benches {
+            DEMO_BENCHES_HEAL_SECS
+        } else {
+            DEMO_HEAL_SECS
         }
     }
 
@@ -579,6 +621,7 @@ impl OpsBase {
             BaseBuilding::HobbyistBenches => self.hobbyist_benches,
             BaseBuilding::GreasePit => self.grease_pit,
             BaseBuilding::Gunsmith => self.gunsmith,
+            BaseBuilding::BasicSmelter => self.basic_smelter,
         }
     }
 
@@ -588,6 +631,7 @@ impl OpsBase {
             BaseBuilding::HobbyistBenches => self.hobbyist_benches = true,
             BaseBuilding::GreasePit => self.grease_pit = true,
             BaseBuilding::Gunsmith => self.gunsmith = true,
+            BaseBuilding::BasicSmelter => self.basic_smelter = true,
         }
     }
 }
@@ -1456,8 +1500,8 @@ impl DemoOpsStore {
 
     /// Hauls the ore home from an arrived dig (BP-8b-2): the ore on site rides home as `carried`
     /// (`OpEnd::Pulled`) and the homeward leg starts at `now` with the site's time. The ambush is
-    /// rolled once, here: on `ambush_d100 ≤` the base's chance (`OpsBase::haul_ambush_pct`, so a
-    /// Grease-Pit counts only if it stood before the pull) only its fire time is stored, the
+    /// rolled once, here: on `ambush_d100 ≤` the base's chance (`OpsBase::haul_ambush_pct`) only
+    /// its fire time is stored, the
     /// leg's midpoint in milliseconds (an odd `travel_secs` is common), and nothing sends it.
     /// Writes `moved_at` (the keep list). Refusals in order: `NoOp` → `Contract` →
     /// `AlreadyHomeward` → `NotArrived` → `NothingToHaul` → `RaidPending`.
@@ -1523,7 +1567,8 @@ impl DemoOpsStore {
     /// resumes; `Retreat`, half the ore on site (floor) is `carried`, the rest is lost, and the
     /// homeward leg starts at `now` (`OpEnd::Retreat`). An ambush (BP-8b-2): `Held` resumes the
     /// leg, shifted by the wait so the team sets off from the midpoint, with the whole load;
-    /// `Retreat` the same with half of it (floor, `OpEnd::Retreat`). A contract (BP-11a-2): `Held`
+    /// `Retreat` the same with `OpsBase::ambush_kept` of it (half, or three quarters with the
+    /// Grease-Pit, BP-16; `OpEnd::Retreat`). A contract (BP-11a-2): `Held`
     /// or `Retreat` records the result and the team stays on site. `Wiped`, any kind: the op is
     /// cleared and its ore lost (the mission route has already marked the Commander KIA), or, at 0
     /// soldiers (BP-11a-1), with no fight and no death. Each writes `moved_at` (the keep list).
@@ -1576,7 +1621,7 @@ impl DemoOpsStore {
                 // keep the match exhaustive without a catch-all.
                 (BattleKind::Ambush | BattleKind::Contract, RaidResult::Held | RaidResult::Retreat) => {
                     if result == RaidResult::Retreat {
-                        dig.carried /= 2;
+                        dig.carried = e.base.ambush_kept(dig.carried);
                         dig.ended_by = Some(OpEnd::Retreat);
                     }
                     let wait = now - dig.ambush_at.take().unwrap_or(now);
@@ -1675,8 +1720,17 @@ impl DemoOpsStore {
         Ok(())
     }
 
+    /// The campaign's base as it stands (BP-16), for the mission route's Gunsmith row: a copy
+    /// taken under the lock, with no settle (settling never changes `base`); no entry reads as
+    /// no building.
+    pub fn base_of(&self, campaign_id: Uuid) -> OpsBase {
+        self.lock().get(&campaign_id).map_or_else(OpsBase::default, |e| e.base)
+    }
+
     /// Heals every wounded soldier of `section_id` at once (BP-12a-1, §4e B3), for
-    /// `DEMO_HEAL_CREDITS` each: they move to `healing` and are back at `now + DEMO_HEAL_SECS`.
+    /// `OpsBase::heal_credits` each (BP-16: 20 with the Hobbyist Benches, else 40): they move to
+    /// `healing` and are back after `OpsBase::heal_secs` (8 s, else 15 s). A batch already
+    /// healing keeps the price and time it was healed at.
     /// Allowed while the team is out (Linux C3): the sickbay feeds nothing the server rolls.
     /// Writes `moved_at` (the keep list). Refusals in order: `NobodyToHeal` (also no entry) →
     /// `AlreadyHealing` → `NotEnoughCredits`. Check and debit are one critical section, no await.
@@ -1686,6 +1740,7 @@ impl DemoOpsStore {
             return Err(HealRefusal::NobodyToHeal);
         };
         e.settle_arrival(now);
+        let base = e.base;
         let bay = e.sickbay.get(&section_id).copied().unwrap_or_default();
         if bay.wounded == 0 {
             return Err(HealRefusal::NobodyToHeal);
@@ -1693,10 +1748,10 @@ impl DemoOpsStore {
         if bay.healing > 0 {
             return Err(HealRefusal::AlreadyHealing);
         }
-        if !e.debit_credits(DEMO_HEAL_CREDITS * u32::from(bay.wounded)) {
+        if !e.debit_credits(base.heal_credits() * u32::from(bay.wounded)) {
             return Err(HealRefusal::NotEnoughCredits);
         }
-        e.sickbay.insert(section_id, SickBay { wounded: 0, healing: bay.wounded, healed_at: Some(now + Duration::seconds(DEMO_HEAL_SECS)) });
+        e.sickbay.insert(section_id, SickBay { wounded: 0, healing: bay.wounded, healed_at: Some(now + Duration::seconds(base.heal_secs())) });
         e.moved_at = Some(now);
         e.touched = now;
         Ok(())
@@ -2766,23 +2821,30 @@ mod tests {
         assert!(store.board(c, (5, 0), at(11)).is_none());
     }
 
-    /// The four buildings' numbers (Linux's oracle, BP-10a spec check): each flag moves only its
-    /// own number. The ids and the costs are pinned as literals.
+    /// The five buildings' numbers (Linux's oracle, BP-10a spec check; BP-16's rework): each flag
+    /// moves only its own number, and no building moves heat or the ambush chance any more. The
+    /// Gunsmith alone leaves ore as it is (its +10 is a roll row, `demo_roll`). The ids and the
+    /// costs are pinned as literals.
     #[test]
     fn ops_base_numbers_match_the_oracle() {
         let plain = OpsBase::default();
-        let all = OpsBase { radio_shack: true, hobbyist_benches: true, grease_pit: true, gunsmith: true };
+        let all = OpsBase { radio_shack: true, hobbyist_benches: true, grease_pit: true, gunsmith: true, basic_smelter: true };
+        let gun = OpsBase { gunsmith: true, ..OpsBase::default() };
         assert_eq!((plain.heat_range(1), plain.heat_range(2), plain.heat_range(3)), ((10, 20), (10, 25), (10, 30)));
-        assert_eq!((all.heat_range(1), all.heat_range(2), all.heat_range(3)), ((10, 15), (10, 20), (10, 25)));
+        assert_eq!((all.heat_range(1), all.heat_range(2), all.heat_range(3)), ((10, 20), (10, 25), (10, 30)));
         let raid: Vec<(u32, u32)> = (1..=3).map(|n| (plain.raid_pct(n), all.raid_pct(n))).collect();
         assert_eq!(raid, vec![(5, 3), (10, 6), (15, 9)]);
         let ore: Vec<(u32, u32, u32, u32)> = (1..=3).map(|n| (plain.ore(n, 1), all.ore(n, 1), plain.ore(n, 3), all.ore(n, 3))).collect();
         assert_eq!(ore, vec![(20, 25, 40, 50), (40, 50, 80, 100), (60, 75, 120, 150)]);
+        assert_eq!((gun.ore(3, 1), gun.ore(3, 3)), (60, 120));
         let ambush: Vec<(u32, u32)> = [30, 50, 60, 120, 450].into_iter().map(|l| (plain.haul_ambush_pct(l), all.haul_ambush_pct(l))).collect();
-        assert_eq!(ambush, vec![(10, 5), (15, 7), (15, 7), (20, 10), (50, 25)]);
-        let ids = ["radio_shack", "hobbyist_benches", "grease_pit", "gunsmith", "barracks", ""];
+        assert_eq!(ambush, vec![(10, 10), (15, 15), (15, 15), (20, 20), (50, 50)]);
+        let kept: Vec<(u32, u32)> = [30, 50, 60, 120].into_iter().map(|c| (plain.ambush_kept(c), all.ambush_kept(c))).collect();
+        assert_eq!(kept, vec![(15, 23), (25, 38), (30, 45), (60, 90)]);
+        assert_eq!((plain.heal_credits(), plain.heal_secs(), all.heal_credits(), all.heal_secs()), (40, 15, 20, 8));
+        let ids = ["radio_shack", "hobbyist_benches", "grease_pit", "gunsmith", "basic_smelter", "barracks", ""];
         let costs: Vec<Option<u32>> = ids.into_iter().map(|id| BaseBuilding::from_id(id).map(BaseBuilding::cost)).collect();
-        assert_eq!(costs, vec![Some(50), Some(120), Some(80), Some(80), None, None]);
+        assert_eq!(costs, vec![Some(50), Some(120), Some(80), Some(100), Some(80), None, None]);
     }
 
     /// Seed 2's three-drill haul (120 ore), banked by a read at 30 s.
@@ -2827,11 +2889,11 @@ mod tests {
     }
 
     /// The base feeds the drill and the view alike (sync 2026-10-31, claim 4). The Benches and
-    /// the Shack at the Coolant-Jockey's 115 on seed 2 (no raid on drills 1–6): the Benches'
-    /// heats 11, 14, 17, 19, 25, 18 (104 after six), the view's raid chance 3 × (drills + 1) while
-    /// even the bottom of the range is safe, and the 7th drill melts (116, 3 heads). Drill 6
-    /// tells the Benches from plain here: plain seed 2 is at 116 after six and melts. The
-    /// Gunsmith on tier 3: 50, 100, 150 a drill, so 50, 150, 300 on site, then `next_ore` 200.
+    /// the Shack at the Coolant-Jockey's 115 on seed 2 (no raid on drills 1–5): heats 12, 17, 19,
+    /// 21, 28 (97 after five, plain: BP-16 retired the Benches' cut), the view's raid chance
+    /// 3 × (drills + 1) while even the bottom of the range is safe, and the 6th drill melts (116,
+    /// 1 head; Linux's oracle). With the old cut the Benches stood at 86 after five. The Basic
+    /// Smelter on tier 3: 50, 100, 150 a drill, so 50, 150, 300 on site, then `next_ore` 200.
     #[test]
     fn ops_store_base_feeds_the_drill_and_the_view() {
         let store = DemoOpsStore::new(4);
@@ -2840,17 +2902,17 @@ mod tests {
         store.set_base(a, OpsBase { radio_shack: true, hobbyist_benches: true, ..OpsBase::default() });
         on_site(&store, a, 1, 115, 2);
         let mut seen = vec![dig_view(&store, a, at(11)).next_raid_pct];
-        for i in 1..=6 {
+        for i in 1..=5 {
             assert_eq!(store.drill_op(a, at(10 + i)), Ok(DrillOutcome::Drilled), "drill {i}");
             seen.push(dig_view(&store, a, at(30)).next_raid_pct);
         }
-        assert_eq!(seen, vec![Some(3), Some(6), Some(9), Some(12), Some(15), Some(18), Some(21)]);
+        assert_eq!(seen, vec![Some(3), Some(6), Some(9), Some(12), Some(15), Some(18)]);
         let d = dig_view(&store, a, at(30));
-        assert_eq!((d.heat, d.threshold, d.raid), (104, 115, None));
-        assert_eq!(store.drill_op(a, at(31)), Ok(DrillOutcome::Meltdown { crew_id: CREW, heads: 3 }));
+        assert_eq!((d.heat, d.threshold, d.raid), (97, 115, None));
+        assert_eq!(store.drill_op(a, at(31)), Ok(DrillOutcome::Meltdown { crew_id: CREW, heads: 1 }));
         assert_eq!(dig_view(&store, a, at(32)).heat, 116);
         store.put_board(b, (5, 0), board(), at(0));
-        store.set_base(b, OpsBase { gunsmith: true, ..OpsBase::default() });
+        store.set_base(b, OpsBase { basic_smelter: true, ..OpsBase::default() });
         on_site(&store, b, 3, 100, 2);
         let mut piles = vec![];
         for i in 1..=3 {
@@ -2878,10 +2940,11 @@ mod tests {
         assert_eq!(dig_view(&store, b, at(12)).raid, None);
     }
 
-    /// The Grease-Pit's flip on seed 57 (ambush d100 13) and a 120-ore haul: ambushed at 20 %, not
-    /// at 10 %, so the Pit's haul banks all 120.
+    /// The Grease-Pit (BP-16) on seed 57 (ambush d100 13) and a 120-ore haul: ambushed at 20 % with
+    /// or without it, and a lost ambush (Retreat at 28 s) leaves 60 without the Pit, 90 with it;
+    /// the arrivals at 33 s bank those.
     #[test]
-    fn ops_store_grease_pit_halves_the_ambush() {
+    fn ops_store_grease_pit_keeps_three_quarters_of_a_lost_haul() {
         let store = DemoOpsStore::new(4);
         let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
         let pit = OpsBase { grease_pit: true, ..OpsBase::default() };
@@ -2889,9 +2952,13 @@ mod tests {
         store.set_base(b, pit);
         pulled(&store, a, 57, 3);
         pulled(&store, b, 57, 3);
-        assert_eq!(store.pending_raid(a, at(25)).map(|p| p.trigger), Some(ambush_trigger(25)));
-        assert_eq!(store.pending_raid(b, at(25)), None);
-        assert_eq!(store.ops_snapshot(b, at(30)), (None, 120, pit));
+        for id in [a, b] {
+            assert_eq!(store.pending_raid(id, at(25)).map(|p| p.trigger), Some(ambush_trigger(25)));
+            assert!(store.latch_raid(id, &ambush_trigger(25), RaidResult::Retreat, FightPay::credits(0), at(28)));
+        }
+        assert_eq!((dig_view(&store, a, at(32)).carried, dig_view(&store, b, at(32)).carried), (60, 90));
+        assert_eq!(store.ops_snapshot(a, at(33)), (None, 60, OpsBase::default()));
+        assert_eq!(store.ops_snapshot(b, at(33)), (None, 90, pit));
     }
 
     /// Reviewer BP-8b-2 F5: cap 2, `a` holds only a building (no op, nothing banked) and is the
@@ -3036,6 +3103,20 @@ mod tests {
         assert_eq!(s.credits_banked, 280);
         assert_eq!(s.company.sections, vec![bay(0, 3, Some(at(27)))]);
         assert_eq!(store.heal_op(a, SECTION, at(12)), Err(HealRefusal::NobodyToHeal));
+    }
+
+    /// BP-16: with the Hobbyist Benches a heal takes 20 a head and the batch is back after 8 s
+    /// (healed at 12, back at 20).
+    #[test]
+    fn heal_with_the_benches_debits_20_a_head_for_8_s() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        contract_latched(&store, a, RaidResult::Held, wounded_pay(400, 3));
+        store.set_base(a, OpsBase { hobbyist_benches: true, ..OpsBase::default() });
+        assert_eq!(store.heal_op(a, SECTION, at(12)), Ok(()));
+        let s = store.ops_state(a, at(12));
+        assert_eq!(s.credits_banked, 340);
+        assert_eq!(s.company.sections, vec![bay(0, 3, Some(at(20)))]);
     }
 
     /// BP-12a-1: short of 40 a head, the heal is refused and writes nothing.

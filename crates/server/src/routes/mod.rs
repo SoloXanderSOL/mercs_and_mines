@@ -588,10 +588,13 @@ async fn post_mission_resolve(
     entry.payload["selection"] = json!({ "section_ids": section_ids });
     // (BP-14a, demo-only) The Commander's roll inputs as they are at fight time, logged so
     // the replay rebuilds the same rows (a later fight can rank the Commander up).
-    let Some(roll_inputs) = crate::demo_roll::RollInputs::from_record(&rec) else {
+    let Some(mut roll_inputs) = crate::demo_roll::RollInputs::from_record(&rec) else {
         abort_deployment_or_log(&state, deployment_id).await;
         return Err(internal_error("commander record is off the roll roster"));
     };
+    // (BP-16, demo-only) Whether the Gunsmith stands, read once here and logged with the rest:
+    // the replay reads the log, never the live base, so a later build can't change this fight.
+    roll_inputs.gunsmith = state.demo_ops.store.base_of(rec.campaign_id).gunsmith;
     entry.payload["roll_inputs"] = roll_inputs.to_json();
     if let Err(e) = state.input_log_repo.start_session(&config, &entry).await {
         abort_deployment_or_log(&state, deployment_id).await;

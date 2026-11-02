@@ -246,9 +246,9 @@ fn ops_response(state: &AppState, campaign_id: Uuid, gw: (i32, i32), board: &Ops
 
 /// Rebuilds a fight's `BattleReport` from the server's own records (BP-11a-1, Linux Q2 (a)): the
 /// deployment's logged `session_start` (the request, the timestamp and `selection.section_ids`)
-/// and the seed in its session config, with the logged approach and `roll_inputs` (BP-14a), through
-/// `resolve_mission_with_modifiers` exactly as the mission route
-/// called it (`routes/mod.rs:594-596`). Returns the report and the first logged Section, the one
+/// and the seed in its session config, with the logged approach and `roll_inputs` (BP-14a; their
+/// `gunsmith` key, BP-16), through `resolve_mission_with_modifiers` exactly as the mission route
+/// called it (`post_mission_resolve`). Returns the report and the first logged Section, the one
 /// that fought. No store lock is held; any missing piece is a `500`. The route fills
 /// `commander_name` after its resolve, so the recompute's is `None`.
 async fn replay_report(state: &AppState, dep: &DeploymentRecord, route: &str) -> Result<(BattleReport, Uuid), AppError> {
@@ -778,9 +778,10 @@ async fn post_ops_build(
 /// not `Active` (entry dropped) → `409` no gateway → the board → a pending battle latched →
 /// `400` unknown section → `409` nobody to heal → `409` already healing → `409` not enough
 /// banked credits → `200`, the whole state.
-/// - Every wounded soldier of the Section at once, `DEMO_HEAL_CREDITS` each from `credits_banked`,
-///   back after `DEMO_HEAL_SECS`. Allowed while the team is out (the sickbay feeds nothing the
-///   server rolls).
+/// - Every wounded soldier of the Section at once, `OpsBase::heal_credits` each from
+///   `credits_banked` (40, or 20 with the Hobbyist Benches, BP-16), back after
+///   `OpsBase::heal_secs` (15 s, or 8 s). Allowed while the team is out (the sickbay feeds
+///   nothing the server rolls).
 /// - Abuse bound: memory only, no DB write, so no launch lock; the shared ops limiter (40/min per
 ///   wallet, 400 per address); at most one bay per Section a latch wrote.
 async fn post_ops_heal(
@@ -1664,7 +1665,7 @@ mod tests {
         seed: (u32, usize),
         record_as: Option<sim_engine::game_types::OutcomeType>,
     ) -> (Uuid, Uuid) {
-        fight_logged_at(state, campaign, seed, record_as, chrono::Utc::now()).await
+        fight_logged_at(state, campaign, seed, record_as, chrono::Utc::now(), None).await
     }
 
     /// A raid's fight as the mission route records it (BP-11a-1, spec check F2), started at
@@ -1672,13 +1673,15 @@ mod tests {
     /// `units` Rookies and the member's first Section; the report from `resolve_mission`; the
     /// deployment opened with that Section and resolved with the report's outcome and KIA count
     /// (a Wipeout also marks the Commander KIA), or with `record_as` to fake a mismatched record.
-    /// Returns the Commander and the Section.
+    /// Returns the Commander and the Section. `roll_inputs`, when given, is logged as is (BP-16:
+    /// a payload no build writes); `None` plants a fight from before BP-14a.
     async fn fight_logged_at(
         state: &AppState,
         campaign: Uuid,
         (seed, units): (u32, usize),
         record_as: Option<sim_engine::game_types::OutcomeType>,
         started_at: chrono::DateTime<chrono::Utc>,
+        roll_inputs: Option<serde_json::Value>,
     ) -> (Uuid, Uuid) {
         let commander = commander_of(state, campaign).await;
         let section = member_section(state, campaign).await;
@@ -1700,7 +1703,7 @@ mod tests {
             sector_tier: "Contested".into(),
             ruleset: "standard_v1".into(),
         };
-        let entry = shared::InputLogEntry {
+        let mut entry = shared::InputLogEntry {
             tick: 0,
             seq: 0,
             event_type: "session_start".into(),
@@ -1708,6 +1711,9 @@ mod tests {
             payload: serde_json::json!({ "request": &req, "timestamp": timestamp, "selection": { "section_ids": [section] } }),
             narrative_event: None,
         };
+        if let Some(r) = roll_inputs {
+            entry.payload["roll_inputs"] = r;
+        }
         state.input_log_repo.start_session(&config, &entry).await.expect("start_session");
         let mission = missions().get("GUARD_DUTY").expect("GUARD_DUTY");
         let report = sim_engine::resolver::resolve_mission(&Squad { units: req.squad.units, commander: None }, mission, &timestamp, Some(seed), &state.config.sim);
@@ -2055,6 +2061,133 @@ mod tests {
         );
     }
 
+    /// BP-16: with the Gunsmith standing, the mission route adds its +10 row last and logs
+    /// `"gunsmith": true`. The replay reads the log: with the Gunsmith gone from the live base it
+    /// still rebuilds the route's report (a later build can't change what a fight paid).
+    #[tokio::test]
+    async fn mission_route_logs_the_gunsmith_and_the_replay_reads_the_log() {
+        let state = Arc::new(session_state());
+        let c = campaign_with(&state, WALLET, true, Some(GATEWAY)).await;
+        seed_sector(&state, &c).await;
+        assert_eq!(get(&state, Some("t"), c.campaign_id).await.0, StatusCode::OK);
+        state.demo_ops.store.set_base(c.campaign_id, OpsBase { gunsmith: true, ..OpsBase::default() });
+        let mut commander = crate::commander_gen::generate_commander(WALLET.to_vec(), c.campaign_id, 42);
+        commander.rank = 3;
+        let commander_id = commander.commander_id;
+        state.commander_repo.create_commander(commander).await.expect("create_commander");
+        let section = member_section(&state, c.campaign_id).await;
+        let body = serde_json::json!({
+            "squad": { "units": rookies(8) },
+            "mission_id": "GUARD_DUTY",
+            "commander_id": commander_id,
+            "section_ids": [section],
+            "approach": "Flank",
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/mission/resolve")
+            .header("authorization", "Bearer t")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = with_test_peer(crate::routes::router(Arc::clone(&state)), TEST_PEER).oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let mut response: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON");
+        assert_eq!(status, StatusCode::OK, "{response}");
+        let rows: Vec<(String, i64)> = response["report"]["score_breakdown"]["modifiers"]
+            .as_array()
+            .expect("modifiers")
+            .iter()
+            .map(|m| (m["key"].as_str().expect("key").to_string(), m["points"].as_i64().expect("points")))
+            .collect();
+        let want: Vec<(String, i64)> = [("approach", -15), ("commander_rank", 4), ("specialization", 5), ("fatal_flaw", -10), ("gunsmith", 10)]
+            .iter()
+            .map(|(k, p)| (k.to_string(), *p))
+            .collect();
+        assert_eq!(rows, want);
+        let deps = state.commander_repo.list_deployments_by_commander(commander_id).await.expect("deployments");
+        assert_eq!(deps.len(), 1);
+        let entries = state.input_log_repo.get_entries_by_session(&deps[0].session_id).await.expect("entries");
+        assert_eq!(
+            entries[0].payload["roll_inputs"],
+            serde_json::json!({ "rank": 3, "specialization": "Cannoneer", "fatal_flaw": "Paranoid", "gunsmith": true })
+        );
+        state.demo_ops.store.set_base(c.campaign_id, OpsBase::default());
+        let (report, _) = replay_report(&state, &deps[0], "test").await.expect("replay_report");
+        response["report"]["commander_name"] = serde_json::Value::Null;
+        assert_eq!(serde_json::to_value(&report).unwrap(), response["report"]);
+    }
+
+    /// BP-16 (Linux's spec check, on the real resolver): the Gunsmith's +10 alone flips seed 13
+    /// on `GUARD_DUTY` with 4 Rookies and the seed-42 Commander at rank 1 (one Specialisation
+    /// row). The roll's own draw stays 57; the total moves 56 → 66, Defeat → Success. The rows
+    /// come from `roll_modifiers`. `report_id` moves with the outcome, so it is not pinned.
+    #[test]
+    fn gunsmith_alone_flips_seed_13() {
+        use sim_engine::roster::{CommanderFlaw, CommanderSpecialization};
+        let mission = missions().get("GUARD_DUTY").expect("GUARD_DUTY");
+        let squad = Squad { units: rookies(4), commander: None };
+        let config = Config::default();
+        let got: Vec<(i32, i32, String)> = [false, true]
+            .into_iter()
+            .map(|gunsmith| {
+                let i = crate::demo_roll::RollInputs { rank: 1, specialization: CommanderSpecialization::Cannoneer, fatal_flaw: CommanderFlaw::Paranoid, gunsmith };
+                let rows = crate::demo_roll::roll_modifiers(Some(&i), None, mission);
+                let r = resolve_mission_with_modifiers(&squad, mission, &rows, "2026-11-02T00:00:00Z", Some(13), &config.sim);
+                (r.score_breakdown.raw_roll, r.score_breakdown.total_score, format!("{:?}", r.outcome))
+            })
+            .collect();
+        assert_eq!(got, vec![(57, 56, "Defeat".to_string()), (57, 66, "Success".to_string())]);
+    }
+
+    /// Reviewer BP-14a F3: a Commander whose record is off the roll roster (a Flaw no build
+    /// writes, rank 1 so the command cap passes) is refused with a `500` after its deployment
+    /// opened, and the deployment is aborted.
+    #[tokio::test]
+    async fn mission_route_aborts_a_commander_off_the_roll_roster() {
+        let state = Arc::new(session_state());
+        let c = campaign_with(&state, WALLET, true, Some(GATEWAY)).await;
+        let mut commander = crate::commander_gen::generate_commander(WALLET.to_vec(), c.campaign_id, 42);
+        commander.fatal_flaw = "ZZ".into();
+        let commander_id = commander.commander_id;
+        state.commander_repo.create_commander(commander).await.expect("create_commander");
+        let section = member_section(&state, c.campaign_id).await;
+        let body = serde_json::json!({
+            "squad": { "units": rookies(8) },
+            "mission_id": "GUARD_DUTY",
+            "commander_id": commander_id,
+            "section_ids": [section],
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/mission/resolve")
+            .header("authorization", "Bearer t")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = with_test_peer(crate::routes::router(Arc::clone(&state)), TEST_PEER).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let deps = state.commander_repo.list_deployments_by_commander(commander_id).await.expect("deployments");
+        assert_eq!(deps.iter().map(|d| d.status.as_str()).collect::<Vec<_>>(), ["aborted"]);
+    }
+
+    /// Reviewer BP-14a F3: a logged `roll_inputs` no build writes (rank 9) makes the replay a
+    /// `500`, never a fight with no Commander rows.
+    #[tokio::test]
+    async fn replay_refuses_roll_inputs_off_the_roster() {
+        let state = Arc::new(session_state());
+        let c = campaign_with(&state, WALLET, true, Some(GATEWAY)).await;
+        seed_commander(&state, c.campaign_id).await;
+        let bad = serde_json::json!({ "rank": 9, "specialization": "Cannoneer", "fatal_flaw": "Paranoid" });
+        let (commander, _) = fight_logged_at(&state, c.campaign_id, SUCCESS_SEED, None, chrono::Utc::now(), Some(bad)).await;
+        let deps = state.commander_repo.list_deployments_by_commander(commander).await.expect("deployments");
+        match replay_report(&state, &deps[0], "test").await {
+            Err((status, _)) => assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR),
+            Ok(_) => panic!("the replay rebuilt a fight from roll_inputs no build writes"),
+        }
+    }
+
     /// BP-14a: an approach off the list is a body rejection (`422`), before anything is opened.
     #[tokio::test]
     async fn mission_route_refuses_an_unknown_approach() {
@@ -2206,13 +2339,13 @@ mod tests {
         }
         let (status, body, _) = pull(&state, c).await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        let none = serde_json::json!({"radio_shack": false, "hobbyist_benches": false, "grease_pit": false, "gunsmith": false});
+        let none = serde_json::json!({"radio_shack": false, "hobbyist_benches": false, "grease_pit": false, "gunsmith": false, "basic_smelter": false});
         assert_eq!(body["base"], none);
         state.demo_ops.store.rewind_op(c, site_secs(&body, DIG));
         let (status, body, _) = build(&state, c, "radio_shack").await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(body["active_op"].is_null(), "home: {body}");
-        let shack = serde_json::json!({"radio_shack": true, "hobbyist_benches": false, "grease_pit": false, "gunsmith": false});
+        let shack = serde_json::json!({"radio_shack": true, "hobbyist_benches": false, "grease_pit": false, "gunsmith": false, "basic_smelter": false});
         assert_eq!((body["ore_banked"].as_u64(), &body["base"]), (Some(70), &shack));
         let (status, body, _) = build(&state, c, "radio_shack").await;
         assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("already built")));
@@ -2237,6 +2370,8 @@ mod tests {
         assert_eq!((status, body["error"].as_str()), (StatusCode::BAD_REQUEST, Some("unknown building")));
         seed_commander(&state, c.campaign_id).await;
         assert_eq!(start(&state, c.campaign_id, SITE).await.0, StatusCode::OK);
+        let (status, body, _) = build(&state, c.campaign_id, "barracks").await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::BAD_REQUEST, Some("unknown building")), "before the team is out");
         let (status, body, _) = build(&state, c.campaign_id, "radio_shack").await;
         assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("the team is out: build when they're home")));
         let (_, body) = get(&state, Some("t"), c.campaign_id).await;
@@ -2352,7 +2487,7 @@ mod tests {
         let cc = campaign_with(&state, WALLET, true, Some(GATEWAY)).await;
         seed_commander(&state, cc.campaign_id).await;
         let (c, section, arrival) = contract_on_site(&state, &cc).await;
-        fight_logged_at(&state, c, SUCCESS_SEED, None, arrival - chrono::Duration::seconds(60)).await;
+        fight_logged_at(&state, c, SUCCESS_SEED, None, arrival - chrono::Duration::seconds(60), None).await;
         let (status, body) = get(&state, Some("t"), c).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["credits_banked"], 0);

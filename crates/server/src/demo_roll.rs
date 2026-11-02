@@ -1,6 +1,7 @@
 //! The Breakpoint demo's roll rows (BP-14a, §4e rank 4, B5; **demo-only**). The approach the
 //! player picks against the mission's stance, and the record Commander's rank, Specialisation
-//! and Fatal Flaw, as flat points on the mission roll, added by
+//! and Fatal Flaw, and (BP-16) the Gunsmith at the merc base, as flat points on the mission
+//! roll, added by
 //! `resolve_mission_with_modifiers` before the 5–95 clamp. Breakpoint stand-ins: Section 8 owns
 //! canon combat, and the `dev` port never picks this file.
 //!
@@ -161,32 +162,49 @@ fn flaw_line(flaw: CommanderFlaw, points: i32) -> &'static str {
     }
 }
 
+/// The Gunsmith's points on the roll (BP-16, §4e C1: mercs hit harder), last of the rows.
+pub const DEMO_GUNSMITH_ROLL_POINTS: i32 = 10;
+
 /// The record Commander's roll inputs as they were at fight time (BP-14a), logged in
-/// `session_start` as `roll_inputs`.
+/// `session_start` as `roll_inputs`. `gunsmith` (BP-16): whether the Gunsmith stood at the
+/// campaign's base when the route read it; logged only when true (`"gunsmith": true`), so an
+/// absent key, every log before BP-16, reads as no Gunsmith and replays unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RollInputs {
     pub rank: i16,
     pub specialization: CommanderSpecialization,
     pub fatal_flaw: CommanderFlaw,
+    pub gunsmith: bool,
 }
 
 impl RollInputs {
-    /// `None` for a rank outside 1..=5 or a trait off the roster (the route answers `500`).
+    /// `None` for a rank outside 1..=5 or a trait off the roster (the route answers `500`). The
+    /// record knows nothing of the base: `gunsmith` is false, and the route sets it.
     pub fn from_record(rec: &CommanderRecord) -> Option<Self> {
         Self::parse(rec.rank as i64, &rec.specialization, &rec.fatal_flaw)
     }
 
     pub fn to_json(&self) -> Value {
-        json!({
+        let mut v = json!({
             "rank": self.rank,
             "specialization": self.specialization.as_str(),
             "fatal_flaw": self.fatal_flaw.as_str(),
-        })
+        });
+        if self.gunsmith {
+            v["gunsmith"] = json!(true);
+        }
+        v
     }
 
-    /// The logged form back. `None` for anything `to_json` can't have written.
+    /// The logged form back. `None` for anything `to_json` can't have written; an absent
+    /// `gunsmith` is false (a log from before BP-16), a present one must be a bool.
     pub fn from_json(v: &Value) -> Option<Self> {
-        Self::parse(v["rank"].as_i64()?, v["specialization"].as_str()?, v["fatal_flaw"].as_str()?)
+        let gunsmith = match v.get("gunsmith") {
+            None => false,
+            Some(g) => g.as_bool()?,
+        };
+        let inputs = Self::parse(v["rank"].as_i64()?, v["specialization"].as_str()?, v["fatal_flaw"].as_str()?)?;
+        Some(Self { gunsmith, ..inputs })
     }
 
     fn parse(rank: i64, specialization: &str, fatal_flaw: &str) -> Option<Self> {
@@ -197,11 +215,13 @@ impl RollInputs {
             rank: rank as i16,
             specialization: CommanderSpecialization::from_db_str(specialization)?,
             fatal_flaw: CommanderFlaw::from_db_str(fatal_flaw)?,
+            gunsmith: false,
         })
     }
 }
 
-/// The fight's rows, in a fixed order (approach, rank, Specialisation, Flaw); a 0-point row is
+/// The fight's rows, in a fixed order (approach, rank, Specialisation, Flaw, then the Gunsmith,
+/// BP-16); a 0-point row is
 /// left out. `inputs` is `None` for a fight logged before BP-14a: it resolved with no rows.
 pub fn roll_modifiers(inputs: Option<&RollInputs>, approach: Option<MissionApproach>, mission: &MissionDefinition) -> Vec<RollModifier> {
     let mut rows = Vec::new();
@@ -221,6 +241,8 @@ pub fn roll_modifiers(inputs: Option<&RollInputs>, approach: Option<MissionAppro
         push("specialization", format!("{}: suits this job", i.specialization.as_str()), spec);
         let flaw = flaw_points(i.fatal_flaw, approach, approach_row, mission.difficulty);
         push("fatal_flaw", format!("{}: {}", i.fatal_flaw.as_str(), flaw_line(i.fatal_flaw, flaw)), flaw);
+        let gunsmith = if i.gunsmith { DEMO_GUNSMITH_ROLL_POINTS } else { 0 };
+        push("gunsmith", "Gunsmith (your base)".to_string(), gunsmith);
     }
     rows
 }
@@ -349,7 +371,7 @@ mod tests {
     /// its category, no approach, and a fight logged before BP-14a.
     #[test]
     fn roll_modifiers_build_the_rows_in_order() {
-        let i = RollInputs { rank: 3, specialization: CommanderSpecialization::Cannoneer, fatal_flaw: F::Paranoid };
+        let i = RollInputs { rank: 3, specialization: CommanderSpecialization::Cannoneer, fatal_flaw: F::Paranoid, gunsmith: false };
         let got = roll_modifiers(Some(&i), Some(A::Flank), mission("GUARD_DUTY"));
         assert_eq!(rows(&got), [("approach", -15), ("commander_rank", 4), ("specialization", 5), ("fatal_flaw", -10)]);
         let labels: Vec<&str> = got.iter().map(|r| r.label.as_str()).collect();
@@ -359,10 +381,13 @@ mod tests {
             "Cannoneer: suits this job",
             "Paranoid: won't split the squad",
         ]);
+        let g = roll_modifiers(Some(&RollInputs { gunsmith: true, ..i }), Some(A::Flank), mission("GUARD_DUTY"));
+        assert_eq!(rows(&g), [("approach", -15), ("commander_rank", 4), ("specialization", 5), ("fatal_flaw", -10), ("gunsmith", 10)]);
+        assert_eq!(g[4].label, "Gunsmith (your base)");
 
-        let i = RollInputs { rank: 1, specialization: CommanderSpecialization::Cannoneer, fatal_flaw: F::Embezzler };
+        let i = RollInputs { rank: 1, specialization: CommanderSpecialization::Cannoneer, fatal_flaw: F::Embezzler, gunsmith: false };
         assert_eq!(rows(&roll_modifiers(Some(&i), None, mission("SUPPLY_RAID"))), [("fatal_flaw", -3)]);
-        let i = RollInputs { rank: 2, specialization: CommanderSpecialization::Breacher, fatal_flaw: F::TheGambler };
+        let i = RollInputs { rank: 2, specialization: CommanderSpecialization::Breacher, fatal_flaw: F::TheGambler, gunsmith: false };
         assert_eq!(rows(&roll_modifiers(Some(&i), Some(A::Flank), mission("BLACK_SITE_RAID"))),
                    [("approach", 15), ("commander_rank", 2), ("specialization", 5), ("fatal_flaw", 15)]);
         assert_eq!(rows(&roll_modifiers(None, Some(A::DigIn), mission("GUARD_DUTY"))), [("approach", 15)]);
@@ -373,9 +398,13 @@ mod tests {
     fn roll_inputs_round_trip_and_refuse_what_was_never_written() {
         let rec = crate::commander_gen::generate_commander(vec![7; 32], uuid::Uuid::nil(), 42);
         let i = RollInputs::from_record(&rec).expect("a generated Commander is on the roster");
-        assert_eq!(i, RollInputs { rank: 1, specialization: CommanderSpecialization::Cannoneer, fatal_flaw: F::Paranoid });
+        assert_eq!(i, RollInputs { rank: 1, specialization: CommanderSpecialization::Cannoneer, fatal_flaw: F::Paranoid, gunsmith: false });
         assert_eq!(i.to_json(), json!({ "rank": 1, "specialization": "Cannoneer", "fatal_flaw": "Paranoid" }));
-        assert_eq!(RollInputs::from_json(&i.to_json()), Some(i));
+        assert_eq!(RollInputs::from_json(&i.to_json()), Some(i), "a log from before BP-16 has no key");
+        let g = RollInputs { gunsmith: true, ..i };
+        assert_eq!(g.to_json(), json!({ "rank": 1, "specialization": "Cannoneer", "fatal_flaw": "Paranoid", "gunsmith": true }));
+        assert_eq!(RollInputs::from_json(&g.to_json()), Some(g));
+        assert_eq!(RollInputs::from_json(&json!({ "rank": 1, "specialization": "Cannoneer", "fatal_flaw": "Paranoid", "gunsmith": false })), Some(i));
         for bad in [
             json!({ "rank": 0, "specialization": "Cannoneer", "fatal_flaw": "Paranoid" }),
             json!({ "rank": 6, "specialization": "Cannoneer", "fatal_flaw": "Paranoid" }),
@@ -383,6 +412,7 @@ mod tests {
             json!({ "rank": 3, "specialization": "Pilot", "fatal_flaw": "Paranoid" }),
             json!({ "rank": 3, "specialization": "Cannoneer", "fatal_flaw": "Vain" }),
             json!({ "rank": 3, "specialization": "Cannoneer" }),
+            json!({ "rank": 3, "specialization": "Cannoneer", "fatal_flaw": "Paranoid", "gunsmith": 1 }),
         ] {
             assert_eq!(RollInputs::from_json(&bad), None, "{bad}");
         }

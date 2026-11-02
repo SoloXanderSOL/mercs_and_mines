@@ -4967,7 +4967,7 @@ async fn mission_resolve_end_to_end_writes_effects() {
 
     // The log: header with the version and the real campaign, and the request body.
     let config = logs.get_session_config(&sid).await.unwrap().expect("no session_configs header");
-    assert_eq!(config.build_version, "0.3.1", "R7 bump must reach the logged build_version");
+    assert_eq!(config.build_version, "0.3.2", "R7 bump must reach the logged build_version");
     assert_eq!(config.campaign_id, campaign_id);
     let entries = logs.get_entries_by_session(&sid).await.unwrap();
     assert_eq!(entries.len(), 1);

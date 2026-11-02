@@ -1136,7 +1136,7 @@ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
 name = "mercs-server"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -1844,7 +1844,7 @@ dependencies = [
 
 [[package]]
 name = "shared"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -1879,7 +1879,7 @@ dependencies = [
 
 [[package]]
 name = "sim-engine"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "getrandom 0.2.17",
  "serde",
