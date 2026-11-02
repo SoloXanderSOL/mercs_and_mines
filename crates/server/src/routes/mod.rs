@@ -227,8 +227,9 @@ struct VerifyRequest {
 // ── Static data endpoints ──────────────────────────────────────────────────
 
 async fn get_missions() -> Result<Json<Value>, AppError> {
-    let v = serde_json::to_value(missions())
+    let mut v = serde_json::to_value(missions())
         .map_err(|e| internal_error(format!("missions serialization failed: {e}")))?;
+    crate::demo_roll::add_stances(&mut v); // (BP-14a, demo-only) the briefing's hint
     Ok(Json(v))
 }
 
@@ -585,14 +586,22 @@ async fn post_mission_resolve(
     // The Sections are a player input, so the log holds them; additive beside `request`,
     // in request order (7b-2 R1, R5).
     entry.payload["selection"] = json!({ "section_ids": section_ids });
+    // (BP-14a, demo-only) The Commander's roll inputs as they are at fight time, logged so
+    // the replay rebuilds the same rows (a later fight can rank the Commander up).
+    let Some(roll_inputs) = crate::demo_roll::RollInputs::from_record(&rec) else {
+        abort_deployment_or_log(&state, deployment_id).await;
+        return Err(internal_error("commander record is off the roll roster"));
+    };
+    entry.payload["roll_inputs"] = roll_inputs.to_json();
     if let Err(e) = state.input_log_repo.start_session(&config, &entry).await {
         abort_deployment_or_log(&state, deployment_id).await;
         return Err(internal_error(format!("input log write failed: {e}")));
     }
 
-    // The sim sees no Commander (§4g item 3). The roll's server-computed rows (BP-14a): none here.
+    // The sim sees no Commander (§4g item 3); the record Commander and the approach count
+    // through the roll's rows (BP-14a, demo-only).
     let squad = Squad { units: req.squad.units, commander: None };
-    let modifiers: Vec<RollModifier> = Vec::new();
+    let modifiers: Vec<RollModifier> = crate::demo_roll::roll_modifiers(Some(&roll_inputs), req.approach, mission);
     let cfg = &state.config.sim;
     let mut report = resolve_mission_with_modifiers(&squad, mission, &modifiers, &timestamp, Some(seed), cfg);
 

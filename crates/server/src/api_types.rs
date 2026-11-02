@@ -35,6 +35,10 @@ pub struct MissionResolveRequest {
     /// Refused on this route: a client-chosen seed would let a player replay a proven win.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed_override: Option<serde_json::Value>,
+    /// (BP-14a, demo-only) The player's approach. Logged with the request, so its variants
+    /// are append-only; absent (every `.prev` fight) means no approach row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approach: Option<crate::demo_roll::MissionApproach>,
 }
 
 /// The HTTP body of `POST /api/mission/resolve` (7b-2 R1): the logged request plus the
