@@ -51,6 +51,7 @@ const COPY = {
   onSite: 'On site at {title}.',
   atContract: 'At {title}. Fight, or head home.',
   won: '{title} secured. +{credits} credits banked.',
+  wonNoPay: '{title} secured.',
   lost: '{title} failed. The client is not paying.',
   homeward: 'Heading home. {n} s',
   noDig: 'No workable veins near your gateway. Take a contract.',
@@ -138,6 +139,8 @@ let confirming = false; // the ore-on-site confirm is showing
 let wonCredits = 0;     // the pay banked by the contract fight the strip reports
 let opFight = false;    // the fight on the briefing was opened from here (the AAR note's guard)
 let refreshDue = 0;     // when the one refresh read after a contract latch is due, in browser ms
+let fightHead = null; // the first Section's headcount when the demo opened the fight (Reviewer BP-11b-1 F1)
+let endOnHub = null;   // a Section-at-0 end of run waiting for the hub, so it never cuts an AAR (Reviewer BP-11b-1 F1)
 let listOpen = false;   // the contracts list is showing
 
 let strip = null, titleNode = null, lineNodes = [], actions = null, buttons = [];
@@ -290,7 +293,7 @@ function refresh() {
       if (canNext(op)) acts.push([COPY.next, startPick]);
       acts.push([DIG_COPY.home, sendReturn]);
       const line = !op.fought ? fill(COPY.atContract, { title })
-        : op.fought === 'won' ? fill(COPY.won, { title, credits: wonCredits }) : fill(COPY.lost, { title });
+        : op.fought === 'won' ? fill(wonCredits > 0 ? COPY.won : COPY.wonNoPay, { title, credits: wonCredits }) : fill(COPY.lost, { title });
       return setStrip('', [line, rate], acts);
     }
     return setStrip('', [fill(COPY.onSite, { title }), rate], [[COPY.ret, sendReturn]]);
@@ -473,6 +476,7 @@ async function fight() {
     ? fill(DIG_COPY.raidLead, { title: opTitle(op) })
     : fill(DIG_COPY.ambushLead, { carried: op.dig.carried });
   opFight = true;
+  fightHead = sectionHead();
   await deps.openMission(b.mission_id, () => deps.enterHub());
   if (!deps.$('screen-briefing').hidden) deps.$('briefing-text').textContent = lead;
 }
@@ -482,7 +486,15 @@ function fightContract() {
   const t = op && titles.get(op.site_id);
   if (!t || !t.mission_id) return;
   opFight = true;
+  fightHead = sectionHead();
   deps.openMission(t.mission_id, () => deps.enterHub());
+}
+
+// The first Section's headcount in main.js's roster, the one battle.js's squad reads.
+function sectionHead() {
+  const roster = deps.getRoster();
+  const section = roster && Array.isArray(roster.sections) ? roster.sections[0] : null;
+  return section ? section.headcount : null;
 }
 
 // The AAR's loss lines for a fight opened from here: who died, and the Section's count after it
@@ -490,11 +502,16 @@ function fightContract() {
 function aarNote({ report, section }) {
   if (!opFight) return [];
   opFight = false;
+  const before = fightHead;
+  fightHead = null;
   const dead = (report && report.unit_results || []).filter(u => u.final_status === 'KIA' || u.final_status === 'MIA');
   const lines = [dead.length
     ? fill(COPY.aarLost, { names: dead.map(u => fill(COPY.aarDead, { name: u.unit_name, status: u.final_status })).join(', ') })
     : COPY.aarNone];
-  if (section) lines.push(fill(COPY.aarSection, { name: section.name, a: section.headcount, b: Math.max(0, section.headcount - dead.length) }));
+  // The count before the fight is the one taken when it was opened: a read that latched the fight
+  // in the meantime would already have lowered the roster's (Reviewer BP-11b-1 F1).
+  const a = before ?? (section && section.headcount);
+  if (section) lines.push(fill(COPY.aarSection, { name: section.name, a, b: Math.max(0, a - dead.length) }));
   return lines;
 }
 
@@ -700,7 +717,11 @@ async function rereadRoster() {
     store.setRoster(id, body);
     deps.setRoster(body);
     const section = Array.isArray(body.sections) ? body.sections[0] : null;
-    if (section && section.headcount === 0) return endOfRun('soldiers');
+    if (section && section.headcount === 0) {
+      if (hubShown()) return endOfRun('soldiers');
+      endOnHub = 'soldiers'; // off the hub (an AAR may be showing): the end of run waits for it
+      return;
+    }
     refresh();
   } catch { /* the line keeps the old count; the next roster load corrects it */ }
 }
@@ -716,7 +737,7 @@ function refreshTick() {
   if (!refreshDue) return;
   const wait = refreshDue - Date.now();
   if (wait > 0) { setTimeout(refreshTick, wait); return; }
-  if (held() || !campaignId) { setTimeout(refreshTick, 500); return; }
+  if (held() || !campaignId || !hubShown()) { setTimeout(refreshTick, 500); return; } // the read goes out only on the hub (Reviewer BP-11b-1 F1)
   refreshDue = 0; load();
 }
 
@@ -736,7 +757,7 @@ function rated(e) {
   throttleSecs = e.retryAfter || 60;
   throttleUntil = Date.now() + throttleSecs * 1000;
   refresh();
-  setTimeout(() => { throttleUntil = 0; refresh(); load(); }, throttleSecs * 1000);
+  setTimeout(() => { throttleUntil = 0; refresh(); if (hubShown()) load(); else { refreshDue = Date.now(); refreshTick(); } }, throttleSecs * 1000); // off the hub, the read waits for it (F1)
   return true;
 }
 
@@ -839,6 +860,12 @@ function watch() {
   hubWasShown = !hub.hidden;
   new MutationObserver(() => {
     const shown = !hub.hidden;
+    if (shown && !hubWasShown && endOnHub) { // a Section lost while away ends the run now, before any read
+      const kind = endOnHub;
+      endOnHub = null;
+      hubWasShown = shown;
+      return endOfRun(kind);
+    }
     if (shown && !hubWasShown && op) load(); // a contract latches on this read (Reviewer BP-11a-2 CF1); a laden haul still reads (BP-10b F3)
     hubWasShown = shown;
   }).observe(hub, { attributes: true, attributeFilter: ['hidden'] });
@@ -899,6 +926,8 @@ function attach(m) {
   confirming = false;
   wonCredits = 0;
   refreshDue = 0;
+  fightHead = null;
+  endOnHub = null;
   listOpen = false;
   refresh();
   m.overlay = draw;
@@ -920,7 +949,7 @@ function createList() {
   return { node, sub, rows };
 }
 
-// `d`: main.js's $, show, handleError, staleCampaign, enterHub, setRoster and the battle's single briefing.
+// `d`: main.js's $, show, handleError, staleCampaign, enterHub, getRoster, setRoster and the battle's single briefing.
 export function mountOps(d) {
   deps = d;
   const style = document.createElement('style');
