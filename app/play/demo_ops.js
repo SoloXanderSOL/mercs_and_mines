@@ -32,7 +32,7 @@
 
 import { request, ApiError, store, getMissions, getRoster } from './api.js';
 import { onMapCreated } from './hexmap.js';
-import { setAarNote, setBeforeOffer, setSquadSize, setDeployExtra } from './battle.js';
+import { setAarNote, setBeforeOffer, setSquadSize, setDeployExtra, setStill } from './battle.js';
 import { showCard, cardSeen } from './demo_card.js';
 import { mountCompany, dressBriefing, renderCompany, HEAL_CREDITS } from './demo_company.js';
 import { DIG_COPY, DIG_CSS, createDigPanel, renderDig, hideDig, homewardLines, flash, bankedLine } from './demo_dig.js';
@@ -101,6 +101,31 @@ const RELIC = {
 };
 const RELIC_SITE = 'contract:CRASHED_SHIP_RAID';
 const relicWon = o => Boolean(o && o.site_id === RELIC_SITE && o.fought === 'won');
+// B4 briefings (BP-15a, Wiki copy): a contract's own briefing over the server's flavour text. The relic keeps
+// RELIC.lead; the raid and the ambush keep DIG_COPY's leads, which carry the site and the ore at stake.
+const BRIEFING = {
+  GUARD_DUTY: 'A Capitalist Bloc drill rig needs minding while it chews through the slag. The dust on the horizon is raiders, and they are not here to talk. Hold the line and the Bloc pays in full. Lose the rig and the Bloc remembers your name, which is worse.',
+  SUPPLY_RAID: 'A Socialist Union supply convoy has stopped for the night outside a depot. A Capitalist Bloc procurement office wants the cargo and would rather not have been involved. Get in, get the crates, get paid. The guard is on his fourth coffee and has not looked up once.',
+  BLACK_SITE_RAID: 'Nobody is supposed to know this facility exists, so the client paid extra not to be named. The guards were promised a quiet posting and are dug in behind a great deal of concrete to keep it that way. Bring back the files. Do not read the files.',
+};
+// B4 scenes (BP-15a): one briefing and one fight picture per family, a defeat and a wipeout. A win keeps the keeper's
+// victory still, and a picture that fails to load falls back to the keeper's (battle.js stillFailed). The art is
+// cached per file name outside the shell, so a re-encoded scene gets a new name, never the old one.
+const SCENE = {
+  defence: { briefing: 'assets/art/scene_defence_briefing.jpg', battle: 'assets/art/scene_defence_fight.jpg' },
+  assault: { briefing: 'assets/art/scene_assault_briefing.jpg', battle: 'assets/art/scene_assault_fight.jpg' },
+  expedition: { briefing: 'assets/art/scene_expedition_briefing.jpg', battle: 'assets/art/scene_expedition_fight.jpg' },
+  ambush: { briefing: 'assets/art/scene_ambush_fight.jpg', battle: 'assets/art/scene_ambush_fight.jpg' }, // no ambush briefing art
+};
+const AAR_SCENE = { Defeat: 'assets/art/scene_defeat.jpg', Wipeout: 'assets/art/scene_wipeout.jpg' };
+const FAMILY = { GUARD_DUTY: 'defence', SUPPLY_RAID: 'assault', BLACK_SITE_RAID: 'assault', CRASHED_SHIP_RAID: 'expedition' };
+// The picture for a keeper screen: the AAR's by outcome, the briefing's and the fight's by the demo fight's own family
+// (three fights send GUARD_DUTY, so the family is set where the fight is opened, never read from mission_id).
+const sceneFor = (phase, { report }) => {
+  if (phase === 'aar') return AAR_SCENE[report && report.outcome] || null;
+  const family = opFight && fightDress ? fightDress.family : null;
+  return family && SCENE[family] ? SCENE[family][phase] || null : null;
+};
 
 // The end of run when the server says nobody is left to send (BP-11b-1).
 const END = {
@@ -148,6 +173,15 @@ const CSS = `
 #screen-battle .score-rule { margin-top: 0.8cqw; border-top: 0.4cqw solid var(--accent); }
 #screen-battle .score-modifier .score-label { color: var(--text); }
 #screen-battle .score-note { font-size: 3.6cqw; color: var(--muted); background: none; }
+.still[src$="scene_defence_briefing.jpg"] { object-position: 50% 70%; }
+.still[src$="scene_defence_fight.jpg"] { object-position: 50% 45%; }
+.still[src$="scene_assault_briefing.jpg"] { object-position: 50% 80%; }
+.still[src$="scene_assault_fight.jpg"] { object-position: 50% 40%; }
+.still[src$="scene_expedition_briefing.jpg"] { object-position: 50% 68%; }
+.still[src$="scene_expedition_fight.jpg"] { object-position: 50% 46%; }
+.still[src$="scene_ambush_fight.jpg"] { object-position: 50% 37%; }
+.still[src$="scene_defeat.jpg"] { object-position: 50% 62%; }
+.still[src$="scene_wipeout.jpg"] { object-position: 50% 28%; }
 `;
 
 const opsPath = id => '/api/campaign/' + encodeURIComponent(id) + '/ops';
@@ -166,7 +200,7 @@ const APPROACHES = [['Assault', 'Assault'], ['Flank', 'Flank'], ['DigIn', 'Dig i
 const VERDICT = {
   good: 'Good call: {p} on the odds.',
   bad: 'Bad call: {p} on the odds.',
-  even: 'Your call made no difference. The enemy hardly noticed.',
+  even: 'The enemy hardly noticed your approach.',
 };
 let pendingApproach = null; // set only inside one approach button's click dispatch (deploy() builds its body synchronously)
 let sentApproach = null;    // what the last mission POST carried, recorded where the body is built
@@ -219,7 +253,7 @@ const fitToFight = d => {
 let adoptedFor = null;  // the campaign whose ops body has been adopted (the Company screen needs one, BP-12b)
 let companyAsk = null;  // the heal or replace in flight: { action, target }
 let companyNotice = null; // its refusal's line on the card: { action, target, kind }
-let fightDress = null;  // the demo fight's own briefing dressing, { name, lead }, re-applied on every show (Reviewer BP-11b-2 F2)
+let fightDress = null;  // the demo fight's own briefing dressing, { name, lead, family }, re-applied on every show (Reviewer BP-11b-2 F2)
 let fitNote = null;     // the briefing's 0-fit line
 let bankNote = null;    // the one-off "ore banked" line after a laden leg lands
 let notice = '';        // a one-off refusal line (the Crew's), until the next adopted body
@@ -600,7 +634,7 @@ async function fight() {
   reopen = fight;
   fightMission = b.mission_id;
   fightHead = sectionHead();
-  fightDress = { name: null, lead };
+  fightDress = { name: null, lead, family: op.dig.raid ? 'defence' : 'ambush' };
   await deps.openMission(b.mission_id, () => deps.enterHub());
   if (!deps.$('screen-briefing').hidden) dressFight();
 }
@@ -614,7 +648,9 @@ async function fightContract() {
   reopen = fightContract;
   fightMission = t.mission_id;
   fightHead = sectionHead();
-  fightDress = t.mission_id === RELIC.mission_id ? { name: RELIC.name, lead: RELIC.lead } : { name: null, lead: null };
+  fightDress = t.mission_id === RELIC.mission_id
+    ? { name: RELIC.name, lead: RELIC.lead, family: FAMILY[t.mission_id] }
+    : { name: null, lead: BRIEFING[t.mission_id] || null, family: FAMILY[t.mission_id] || null };
   await deps.openMission(t.mission_id, () => deps.enterHub());
   if (!deps.$('screen-briefing').hidden) dressFight();
 }
@@ -1276,6 +1312,7 @@ export function mountOps(d) {
   setAarNote(aarNote);
   setSquadSize(fitToFight);
   setDeployExtra(() => { sentApproach = pendingApproach; return pendingApproach ? { approach: pendingApproach } : {}; });
+  setStill(sceneFor);
   const ms = store.missions(); if (ms && Object.values(ms).some(m => !('stance' in m))) store.setMissions(null);
   createApproaches();
   setBeforeOffer(() => deps.enterHub()); // A13: no checkout after a mission in the demo; the Demo Shop button opens it
