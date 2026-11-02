@@ -44,6 +44,8 @@ const COPY = {
   battleWorking: 'Deploying the 1st Section...',
   battleScore: { base: 'Squad skill', squad: 'Squad size', ability: 'Training', gear: 'Gear', mission: 'Mission fit', difficulty: 'Difficulty' },
   battleChance: 'Chance of success: {n}%',
+  battleCapped: 'Odds capped at {n}%. Command does not believe in sure things.',
+  battleFloored: 'Odds never drop below {n}%. Command calls this optimism.',
   battleRoll: 'Rolled {n}',
   battleSkip: 'Skip',
   battleContinue: 'Continue',
@@ -102,6 +104,10 @@ export function setAarNote(fn) { aarNote = fn; }
 // How many of the Section a fight sends (the demo leaves its wounded at base). By default, the headcount.
 let squadSize = d => Math.min(SQUAD_SIZE, d.section.headcount);
 export function setSquadSize(fn) { squadSize = fn; }
+
+// Extra keys the mission POST carries (the demo's approach). By default, none.
+let deployExtra = () => ({});
+export function setDeployExtra(fn) { deployExtra = fn; }
 
 // `deps` is main.js's side of the client: screens, the error screen, the roster it keeps,
 // the one Audio element, and the flows the battle hands back to (hub, reveal, join).
@@ -279,6 +285,7 @@ export function createBattle(deps) {
     deps.show('screen-working');
     counters.mission += 1;
     const body = {
+      ...deployExtra(),
       squad: { units: rookies },
       mission_id: mission.id,
       commander_id: d.commander.commander_id,
@@ -360,14 +367,14 @@ export function createBattle(deps) {
     node.classList.add('shown');
   }
 
-  function countUp(valueNode, target, next, id) {
+  function countUp(valueNode, target, next, id, format = String) {
     const ms = 450;
     let start = null;
     const step = now => {
       if (id !== run) return;
       if (start === null) start = now;
       const t = Math.min(1, (now - start) / ms);
-      valueNode.textContent = String(Math.round(target * t));
+      valueNode.textContent = format(Math.round(target * t));
       if (t < 1) requestAnimationFrame(step);
       else next();
     };
@@ -388,6 +395,23 @@ export function createBattle(deps) {
       lines.append(row);
       return { row, value, target: Number(sb[field]) || 0 };
     });
+    // The server's modifier rows (BP-14a: the approach and the Commander), after the six, with the
+    // server's own labels and a sign. On dev the list is always empty.
+    const signed = n => (n > 0 ? `+${n}` : String(n));
+    (Array.isArray(sb.modifiers) ? sb.modifiers : []).forEach((m, i) => {
+      const row = el('li', i === 0 ? 'score-row score-modifier score-rule' : 'score-row score-modifier');
+      const value = el('span', 'score-value', '0');
+      row.append(el('span', 'score-label', m.label), value);
+      lines.append(row);
+      rows.push({ row, value, target: Number(m.points) || 0, format: signed });
+    });
+    // The rows add up to the chance unless the 5 to 95 clamp cut it. Then one line says so, keyed on
+    // the server's total_score (the clamped chance) against the sum of what the rows show.
+    const sum = rows.reduce((s, r) => s + Math.round(r.target), 0);
+    const total = Number(sb.total_score);
+    const clamp = sum > total ? COPY.battleCapped : sum < total ? COPY.battleFloored : null;
+    const note = clamp ? el('li', 'score-row score-note', fill(clamp, { n: total })) : null;
+    if (note) lines.append(note);
     const chance = $('battle-chance');
     const roll = $('battle-roll');
     const banner = $('battle-outcome');
@@ -397,7 +421,8 @@ export function createBattle(deps) {
     deps.show('screen-battle');
 
     const steps = [];
-    rows.forEach(r => steps.push(next => revealThen(r.row, () => countUp(r.value, r.target, next, id), id)));
+    rows.forEach(r => steps.push(next => revealThen(r.row, () => countUp(r.value, r.target, next, id, r.format), id)));
+    if (note) steps.push(next => revealThen(note, next, id));
     steps.push(next => {
       chance.textContent = fill(COPY.battleChance, { n: sb.raw_roll + sb.margin });
       revealThen(chance, next, id);
