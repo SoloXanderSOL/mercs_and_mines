@@ -99,6 +99,10 @@ export function setBeforeOffer(fn) { beforeOffer = fn; }
 let aarNote = () => [];
 export function setAarNote(fn) { aarNote = fn; }
 
+// How many of the Section a fight sends (the demo leaves its wounded at base). By default, the headcount.
+let squadSize = d => Math.min(SQUAD_SIZE, d.section.headcount);
+export function setSquadSize(fn) { squadSize = fn; }
+
 // `deps` is main.js's side of the client: screens, the error screen, the roster it keeps,
 // the one Audio element, and the flows the battle hands back to (hub, reveal, join).
 export function createBattle(deps) {
@@ -241,7 +245,7 @@ export function createBattle(deps) {
     $('briefing-name').textContent = m.name;
     $('briefing-text').textContent = m.flavor_text;
     $('briefing-commander').textContent = fill(COPY.briefingCommander, { name: d.commander.name, stress: d.commander.stress });
-    $('briefing-squad').textContent = fill(COPY.briefingSquad, { n: Math.min(SQUAD_SIZE, d.section.headcount) });
+    $('briefing-squad').textContent = fill(COPY.briefingSquad, { n: squadSize(d) });
     $('btn-deploy').disabled = false;
     deps.show('screen-briefing');
   }
@@ -250,7 +254,7 @@ export function createBattle(deps) {
   function squad(d) {
     const def = units && units[STAND_IN];
     if (!def) return null;
-    const n = oneRookie && oneRookie.checked ? 1 : Math.min(SQUAD_SIZE, d.section.headcount); // the Section's headcount; debug sends 1
+    const n = oneRookie && oneRookie.checked ? 1 : squadSize(d); // the Section's fit headcount; debug sends 1
     return Array.from({ length: n }, (_, i) => ({
       id: `r${i + 1}`,
       name: fill(COPY.unitName, { n: i + 1 }),
