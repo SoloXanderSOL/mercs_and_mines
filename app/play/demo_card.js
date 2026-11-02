@@ -1,11 +1,10 @@
 // The DEMO-001 card for the Breakpoint demo (demo-only (ODQ-66): never merged to dev; the port
 // deletes this file). Public teaser text (`public: true`, Wiki/Story/DEMO-001_The_Seeker_Hoard.md),
-// shipped verbatim. It sits between the first non-death AAR and the checkout offer, once per
-// campaign: story → choice → outcome → the offer. Flavour only: nothing is stored or sent.
+// shipped verbatim. It opens on the hub after a relic contract win (A12, demo_ops.js), once per
+// campaign: story → choice → outcome → the hub. Flavour only: nothing is sent; the seen flag is stored.
 // Text-only frame (no illustration yet); every string goes in through textContent.
 
 import { store } from './api.js';
-import { setBeforeOffer } from './battle.js';
 
 // A paragraph is a list of segments: a string, or { b } for a bold word.
 const CARD = {
@@ -37,7 +36,13 @@ const CSS = `
 .card-sub { font-family: var(--body); font-weight: 400; font-size: 3.8cqw; color: var(--muted); }
 `;
 
-const seen = new Set(); // campaign ids whose card has opened, this page load only
+const seen = new Set(); // campaign ids whose card has opened, this page load (the fallback when storage throws)
+const seenKey = id => `mm.demo.card.${id}`; // sessionStorage: the card opened for this campaign (A12; survives a reload)
+
+export function cardSeen(id) {
+  if (seen.has(id)) return true;
+  try { return sessionStorage.getItem(seenKey(id)) === '1'; } catch { return false; }
+}
 let section = null;
 
 function el(tag, className, text) {
@@ -66,11 +71,12 @@ function page(...children) {
   section.replaceChildren(...children);
 }
 
-function showCard(ctx, next) {
+export function showCard(ctx, next) {
   const camp = store.campaign();
   const id = camp && camp.campaign_id;
-  if (!id || seen.has(id)) return next();
+  if (!id || cardSeen(id)) return next();
   seen.add(id);
+  try { sessionStorage.setItem(seenKey(id), '1'); } catch { /* private mode: the in-page Set still holds it */ }
   const name = typeof ctx.commander === 'string' ? ctx.commander.trim() : '';
   const opening = `${name ? `${name}'s` : 'Your'} ${CARD.opening}`;
   const done = () => { section.hidden = true; section.replaceChildren(); next(); };
@@ -98,5 +104,4 @@ export function mountCard() {
   section.id = 'screen-card';
   section.hidden = true;
   document.getElementById('stage').append(section);
-  setBeforeOffer(showCard);
 }

@@ -27,7 +27,9 @@
 
 import { request, ApiError, store, getMissions, getRoster } from './api.js';
 import { onMapCreated } from './hexmap.js';
-import { setAarNote } from './battle.js';
+import { setAarNote, setBeforeOffer } from './battle.js';
+import { showCard, cardSeen } from './demo_card.js';
+import { mountCompany, dressBriefing } from './demo_company.js';
 import { DIG_COPY, DIG_CSS, createDigPanel, renderDig, hideDig, homewardLines, flash, bankedLine } from './demo_dig.js';
 import { BASE_COPY, BASE_CSS, createBase, renderBase, hideBase } from './demo_base.js';
 
@@ -70,7 +72,17 @@ const COPY = {
   aarDead: '{name} ({status})',
   aarNone: 'No losses. Command notes the anomaly.',
   aarSection: '{name}: {a} → {b}',
+  shop: 'Demo Shop',
 };
+
+// A12: the relic contract reads as a relic dig (Wiki copy, BP-11b-2). The server's name stays.
+const RELIC = {
+  mission_id: 'CRASHED_SHIP_RAID',
+  name: 'Relic Dig: Crashed Frigate',
+  lead: 'A pre-collapse frigate went into the dirt in Sector 6 before anyone now alive was born. The hold is under three metres of soil and a great deal of competitive interest. Dig it out, see off whoever else turns up, and bring back anything that still hums.',
+};
+const RELIC_SITE = 'contract:CRASHED_SHIP_RAID';
+const relicWon = o => Boolean(o && o.site_id === RELIC_SITE && o.fought === 'won');
 
 // The end of run when the server says nobody is left to send (BP-11b-1).
 const END = {
@@ -97,6 +109,7 @@ const CSS = `
 .ops-list-row { width: 100%; max-width: none; display: flex; flex-direction: column; align-items: flex-start; gap: 0.6cqw; padding: 2cqw 2.5cqw; text-align: left; }
 .ops-list-name { font-family: var(--display); font-weight: 800; font-size: 4.4cqw; }
 .ops-list-meta { font-family: var(--mono); font-size: 3.4cqw; color: var(--muted); }
+.ops-shop { position: absolute; top: 1.5cqw; left: 3cqw; padding: 1cqw 2.5cqw; font-family: var(--mono); font-size: 3.6cqw; color: var(--accent); background: rgba(11, 11, 12, 0.94); border: 0.3cqw solid var(--accent); border-radius: 1.5cqw; cursor: pointer; }
 `;
 
 const opsPath = id => '/api/campaign/' + encodeURIComponent(id) + '/ops';
@@ -171,7 +184,7 @@ const sameHex = (a, b) => a.q === b.q && a.r === b.r;
 
 function titleOf(site) {
   if (!site) return COPY.digTitleOther;
-  if (site.kind === 'contract') return site.name || site.mission_id || '';
+  if (site.kind === 'contract') return site.mission_id === RELIC.mission_id ? RELIC.name : (site.name || site.mission_id || '');
   return COPY.digTitle[site.tier] || COPY.digTitleOther;
 }
 
@@ -396,6 +409,7 @@ function close() {
 
 // The Base button toggles the sheet; the bank note's Base opens it.
 function openBase() {
+  closeLegend();
   baseOpen = true;
   listOpen = false;
   selected = null;
@@ -409,10 +423,17 @@ function closeBase() {
   refresh();
 }
 
+// A sheet and the legend share the box over the bar, so only one is open at a time (Reviewer BP-10b F2).
+function closeLegend() {
+  deps.$('legend').hidden = true;
+  deps.$('btn-legend').setAttribute('aria-expanded', 'false');
+}
+
 // ── the contracts list (A2) ──────────────────────────────────────────────────
 // Missions opens the board's contracts, not the keeper list: a row hands off to its pin, so every
 // contract is walked to and fought on site.
 function openList() {
+  closeLegend();
   listOpen = true;
   baseOpen = false;
   noDigOpen = false;
@@ -478,16 +499,34 @@ async function fight() {
   opFight = true;
   fightHead = sectionHead();
   await deps.openMission(b.mission_id, () => deps.enterHub());
-  if (!deps.$('screen-briefing').hidden) deps.$('briefing-text').textContent = lead;
+  if (!deps.$('screen-briefing').hidden) {
+    deps.$('briefing-text').textContent = lead;
+    dressBriefing();
+  }
 }
 
-// The contract's own briefing; its mission comes from the title cache, never the board.
-function fightContract() {
+// The contract's own briefing; its mission comes from the title cache, never the board. The relic
+// contract's name and text are the demo's (A12); every briefing gets the stress and trait lines.
+async function fightContract() {
   const t = op && titles.get(op.site_id);
   if (!t || !t.mission_id) return;
   opFight = true;
   fightHead = sectionHead();
-  deps.openMission(t.mission_id, () => deps.enterHub());
+  await deps.openMission(t.mission_id, () => deps.enterHub());
+  if (deps.$('screen-briefing').hidden) return;
+  if (t.mission_id === RELIC.mission_id) {
+    deps.$('briefing-name').textContent = RELIC.name;
+    deps.$('briefing-text').textContent = RELIC.lead;
+  }
+  dressBriefing();
+}
+
+// The campaign Commander's name from main.js's roster, for the card's opening line.
+function commanderName() {
+  const camp = store.campaign();
+  const roster = deps.getRoster();
+  const c = camp && roster && Array.isArray(roster.commanders) ? roster.commanders.find(x => x.commander_id === camp.commander_id) : null;
+  return c && typeof c.name === 'string' ? c.name : '';
 }
 
 // The first Section's headcount in main.js's roster, the one battle.js's squad reads.
@@ -669,7 +708,7 @@ function adopt(body, built) {
   banked = Number(body.ore_banked) || 0;
   credits = Number(body.credits_banked) || 0;
   base = body.base || {};
-  justBuilt = built && base[built] === true ? built : null;
+  justBuilt = built && base[built] === true && baseOpen ? built : null; // a moment only for a sheet still open when the build lands (Reviewer BP-10b F1)
   notice = '';
   if (op) selected = null;
   else if (selected) selected = siteOf(selected.site_id); // the board may have moved on (Reviewer BP-9a F4)
@@ -703,6 +742,7 @@ function adopt(body, built) {
   if (melted) { flash(strip); rereadRoster(); }
   if (raidLatched || contractLatched) rereadRoster();
   if (contractLatched) armRefresh();
+  if (relicWon(op) && hubShown() && !cardSeen(campaignId)) showCard({ commander: commanderName() }, () => deps.enterHub()); // A12: DEMO-001 after a relic win, on the hub only
   if (opening) fight();
 }
 
@@ -757,13 +797,14 @@ function rated(e) {
   throttleSecs = e.retryAfter || 60;
   throttleUntil = Date.now() + throttleSecs * 1000;
   refresh();
-  setTimeout(() => { throttleUntil = 0; refresh(); if (hubShown()) load(); else { refreshDue = Date.now(); refreshTick(); } }, throttleSecs * 1000); // off the hub, the read waits for it (F1)
+  setTimeout(() => { throttleUntil = 0; refresh(); if (hubShown()) load(); else { if (!refreshDue) refreshDue = Date.now(); refreshTick(); } }, throttleSecs * 1000); // off the hub, the read waits for it; a pending refresh keeps its time (Reviewer BP-11b-1 rework F1)
   return true;
 }
 
 async function load() {
   const id = campaignId;
   if (!id || held()) return; // one read at a time (Reviewer BP-9a F3)
+  if (refreshDue && refreshDue <= Date.now()) refreshDue = 0; // a read after the due time is the refresh (Reviewer BP-11b-1 rework F2)
   busy = true;
   refresh();
   let body = null, err = null;
@@ -877,6 +918,13 @@ function watch() {
     e.preventDefault();
     openList();
   }, true);
+  // The legend shuts any open sheet first; the keeper toggle then opens it (Reviewer BP-10b F2).
+  hub.addEventListener('click', e => {
+    if (!(e.target instanceof Element) || !e.target.closest('#btn-legend') || !(baseOpen || listOpen)) return;
+    baseOpen = false;
+    listOpen = false;
+    refresh();
+  }, true);
 }
 
 // New run starts a new campaign, and ore, credits and buildings belong to the campaign: the end
@@ -976,11 +1024,17 @@ export function mountOps(d) {
   baseButton.addEventListener('click', () => (baseOpen ? closeBase() : openBase()));
   baseSheet = createBase(sendBuild, closeBase);
   list = createList();
-  deps.$('screen-hub').append(strip, bankChip, baseButton, baseSheet.node, list.node);
+  // A13: today's checkout from the hub at any time (no ops call). Leaving it returns to the hub.
+  const shopButton = el('button', 'ops-shop', COPY.shop);
+  shopButton.type = 'button';
+  shopButton.addEventListener('click', () => deps.offerCheckout(() => deps.enterHub()));
+  deps.$('screen-hub').append(strip, bankChip, baseButton, shopButton, baseSheet.node, list.node);
   endNote = el('p', 'end-ops');
   endNote.hidden = true;
   deps.$('btn-new-run').before(endNote);
   setAarNote(aarNote);
+  setBeforeOffer(() => deps.enterHub()); // A13: no checkout after a mission in the demo; the Demo Shop button opens it
+  mountCompany(deps);
   watch();
   onMapCreated(attach);
 }
