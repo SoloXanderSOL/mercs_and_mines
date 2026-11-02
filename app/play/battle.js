@@ -109,6 +109,11 @@ export function setSquadSize(fn) { squadSize = fn; }
 let deployExtra = () => ({});
 export function setDeployExtra(fn) { deployExtra = fn; }
 
+// Which picture a screen shows (the demo's scenes): a src for the phase ('briefing', 'battle', 'aar'),
+// or null for the keeper's own. By default, null everywhere.
+let stillFor = () => null;
+export function setStill(fn) { stillFor = fn; }
+
 // `deps` is main.js's side of the client: screens, the error screen, the roster it keeps,
 // the one Audio element, and the flows the battle hands back to (hub, reveal, join).
 export function createBattle(deps) {
@@ -130,10 +135,21 @@ export function createBattle(deps) {
     deps.music.play().catch(() => { /* audio blocked or failed: play on without it */ });
   }
 
-  // A still loads only when its screen opens (no preload).
-  function still(img, src, wipeout) {
-    img.classList.toggle('still-wipeout', Boolean(wipeout));
-    if (img.getAttribute('src') !== src) img.src = src;
+  // A still loads only when its screen opens (no preload). The hook may pick the picture; the keeper's
+  // own stays the fallback, shown (greyed for a Wipeout) if the picked one fails to load.
+  function still(img, src, wipeout, phase, report) {
+    const pick = stillFor(phase, { mission, report }) || src;
+    img.dataset.fallback = src;
+    img.dataset.fallbackGrey = wipeout ? '1' : '';
+    img.classList.toggle('still-wipeout', Boolean(wipeout) && pick === src);
+    if (img.getAttribute('src') !== pick) img.src = pick;
+  }
+
+  function stillFailed(img) {
+    const src = img.dataset.fallback;
+    if (!src || img.getAttribute('src') === src) return; // the keeper's own failed: nothing left to fall to
+    img.classList.toggle('still-wipeout', img.dataset.fallbackGrey === '1');
+    img.src = src;
   }
 
   function fillCopy() {
@@ -165,6 +181,7 @@ export function createBattle(deps) {
     $('btn-skip').addEventListener('click', () => { if (result) showAar(); });
     $('btn-aar-continue').addEventListener('click', afterAar);
     $('btn-new-run').addEventListener('click', newRun);
+    for (const id of ['briefing-still', 'battle-still', 'aar-still']) $(id).addEventListener('error', e => stillFailed(e.currentTarget));
   }
 
   // ── Missions ─────────────────────────────────────────────────────────────
@@ -247,7 +264,7 @@ export function createBattle(deps) {
     mission = m;
     const d = deployed();
     if (!d) return deps.enterCampaign(0);
-    still($('briefing-still'), ART.briefing, false);
+    still($('briefing-still'), ART.briefing, false, 'briefing', null);
     $('briefing-name').textContent = m.name;
     $('briefing-text').textContent = m.flavor_text;
     $('briefing-commander').textContent = fill(COPY.briefingCommander, { name: d.commander.name, stress: d.commander.stress });
@@ -384,7 +401,7 @@ export function createBattle(deps) {
   function present() {
     const id = ++run;
     const sb = result.report.score_breakdown;
-    still($('battle-still'), ART.battle, false);
+    still($('battle-still'), ART.battle, false, 'battle', result.report);
     music(MUSIC.battle);
     const lines = $('battle-lines');
     lines.replaceChildren();
@@ -457,7 +474,7 @@ export function createBattle(deps) {
     run += 1; // stops the presentation, whichever step it is on
     const { report, commander: c } = result;
     const outcome = report.outcome;
-    still($('aar-still'), ART[outcome] || ART.Defeat, outcome === 'Wipeout');
+    still($('aar-still'), ART[outcome] || ART.Defeat, outcome === 'Wipeout', 'aar', report);
     music(MUSIC[outcome] || MUSIC.Defeat, false);
     const banner = $('aar-outcome');
     banner.className = `aar-outcome outcome-${outcome}`;
