@@ -35,11 +35,11 @@ use uuid::Uuid;
 
 use sim_engine::{
     equipment::equipment,
-    game_types::{Squad, UnitStatus},
+    game_types::{RollModifier, Squad, UnitStatus},
     missions::missions,
     ore_run::run_ore_run,
     resolver::{
-        apply_commander_buffs, resolve_combat, resolve_mission,
+        apply_commander_buffs, resolve_combat, resolve_mission_with_modifiers,
     },
     rng::generate_seed,
     scenario::Approach,
@@ -590,10 +590,11 @@ async fn post_mission_resolve(
         return Err(internal_error(format!("input log write failed: {e}")));
     }
 
-    // A record Commander adds 0 to the roll (§4g item 3): the sim sees no Commander.
+    // The sim sees no Commander (§4g item 3). The roll's server-computed rows (BP-14a): none here.
     let squad = Squad { units: req.squad.units, commander: None };
+    let modifiers: Vec<RollModifier> = Vec::new();
     let cfg = &state.config.sim;
-    let mut report = resolve_mission(&squad, mission, &timestamp, Some(seed), cfg);
+    let mut report = resolve_mission_with_modifiers(&squad, mission, &modifiers, &timestamp, Some(seed), cfg);
 
     // The repository computes the effects from the Commander row it locks (4g-2); the
     // route supplies only what the mission determined.

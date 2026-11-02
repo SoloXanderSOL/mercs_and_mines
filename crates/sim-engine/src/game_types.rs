@@ -324,6 +324,19 @@ pub struct ScoreBreakdown {
     pub success_threshold: i32,
     pub raw_roll: i32,
     pub margin: i32,
+    /// Server-computed rows added to the roll before the 5–95 clamp (BP-14a), in the order
+    /// they were added. Empty unless the caller passes some. Derived, never logged.
+    #[serde(default)]
+    pub modifiers: Vec<RollModifier>,
+}
+
+/// One labelled row of the mission roll (BP-14a): `points` are flat percentage points.
+/// `key` is stable for clients; `label` is display copy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RollModifier {
+    pub key: String,
+    pub label: String,
+    pub points: i32,
 }
 
 /// Taxonomy is agency and survival, not roll margin. Canon_Type_Reference.md §9.

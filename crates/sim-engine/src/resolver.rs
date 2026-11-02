@@ -29,7 +29,7 @@ use crate::loot_roller::roll_loot;
 use crate::game_types::{
     BattleReport, Commander, Coordinates, ConvoyRecord,
     DepartureRejected, MissionCategory, MissionDefinition, MissionEnvironment, OutcomeType,
-    Rewards, ScoreBreakdown, Squad, StressTier, Unit, UnitBattleResult,
+    Rewards, RollModifier, ScoreBreakdown, Squad, StressTier, Unit, UnitBattleResult,
     UnitArchetype, UnitStatus,
 };
 use crate::rng::{generate_report_id, Rng};
@@ -353,9 +353,25 @@ pub(crate) fn classify_outcome(is_success: bool, unit_results: &[UnitBattleResul
 
 // ── Mission resolver ───────────────────────────────────────────────────────
 
+/// `resolve_mission_with_modifiers` with no rows: the callers that add nothing to the roll.
 pub fn resolve_mission(
     squad: &Squad,
     mission: &MissionDefinition,
+    timestamp: &str,
+    seed_override: Option<u32>,
+    cfg: &SimConfig,
+) -> BattleReport {
+    resolve_mission_with_modifiers(squad, mission, &[], timestamp, seed_override, cfg)
+}
+
+/// The mission roll (BP-14a). `modifiers` are server-computed rows, summed into the total
+/// before the 5–95 clamp and reported in `score_breakdown.modifiers`. They draw nothing and
+/// the roll's draw doesn't move, but a row that flips the outcome changes the later damage and
+/// loot draws. A replay of a logged fight passes the rows that fight had.
+pub fn resolve_mission_with_modifiers(
+    squad: &Squad,
+    mission: &MissionDefinition,
+    modifiers: &[RollModifier],
     timestamp: &str,
     seed_override: Option<u32>,
     cfg: &SimConfig,
@@ -381,7 +397,8 @@ pub fn resolve_mission(
         + commander_bonus as f64
         + biscuit_coefficient as f64
         + mission_type_modifier as f64
-        - difficulty_penalty as f64;
+        - difficulty_penalty as f64
+        + modifiers.iter().map(|m| m.points as f64).sum::<f64>();
 
     let success_probability = raw_total.clamp(MIN_CHANCE, MAX_CHANCE);
     let raw_roll            = rng.roll_d100() as i32;
@@ -423,6 +440,7 @@ pub fn resolve_mission(
         success_threshold:    raw_roll,
         raw_roll,
         margin:               margin.round() as i32,
+        modifiers:            modifiers.to_vec(),
     };
 
     BattleReport {
@@ -1483,6 +1501,27 @@ mod tests {
             STRESS_BREAKING_POINT_MIN..=STRESS_BREAKING_POINT_MAX => StressTier::BreakingPoint,
             STRESS_STRAINED_MIN..=STRESS_STRAINED_MAX              => StressTier::Strained,
             _                                                      => StressTier::Rested,
+        }
+    }
+
+    /// BP-14a: the rows join the total before the 5–95 clamp and are reported in order. The
+    /// fixture lands on 50.0, so +10 and +5 give 65 and −60 clamps to 5. The roll's own draw
+    /// doesn't move; the later damage and loot draws follow the outcome, as they always have.
+    #[test]
+    fn mission_modifiers_add_before_the_clamp() {
+        let (squad, mission, cfg) = fixture();
+        let row = |points: i32| RollModifier { key: "k".to_string(), label: "K".to_string(), points };
+        for seed in [1u32, 2, 3] {
+            let none = resolve_mission(&squad, &mission, "2026-11-02T00:00:00Z", Some(seed), &cfg);
+            let up = resolve_mission_with_modifiers(&squad, &mission, &[row(10), row(5)], "2026-11-02T00:00:00Z", Some(seed), &cfg);
+            let down = resolve_mission_with_modifiers(&squad, &mission, &[row(-60)], "2026-11-02T00:00:00Z", Some(seed), &cfg);
+            assert_eq!(none.score_breakdown.total_score, 50, "seed {}", seed);
+            assert_eq!(up.score_breakdown.total_score, 65, "seed {}", seed);
+            assert_eq!(down.score_breakdown.total_score, 5, "seed {}", seed);
+            assert!(none.score_breakdown.modifiers.is_empty());
+            assert_eq!(up.score_breakdown.modifiers, vec![row(10), row(5)]);
+            assert_eq!(none.score_breakdown.raw_roll, up.score_breakdown.raw_roll, "seed {}", seed);
+            assert_eq!(none.score_breakdown.raw_roll, down.score_breakdown.raw_roll, "seed {}", seed);
         }
     }
 
