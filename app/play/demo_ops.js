@@ -81,6 +81,7 @@ const COPY = {
   // BP-12b (Wiki copy)
   aarWounded: 'Wounded: {n}, in the sickbay. Patch them up at Your Company.',
   zeroFit: 'Everyone fit to fight is in the sickbay. Patch them up first.',
+  zeroFitHealing: 'Nobody is fit to fight yet. Deploy opens when the sickbay lets them go.',
   walkingWounded: 'Nobody is fit to fight. The walking wounded are going anyway.',
 };
 
@@ -191,6 +192,8 @@ let pickSite = null;    // the site chosen for Next
 let confirming = false; // the ore-on-site confirm is showing
 let wonCredits = 0;     // the pay banked by the contract fight the strip reports
 let opFight = false;    // the fight on the briefing was opened from here (the AAR note's guard)
+let reopen = null;      // the opener that showed the demo fight's briefing: fight or fightContract (Reviewer BP-12b F2)
+let fitTimer = null;    // the 0-fit briefing's re-dress at healed_at (Reviewer BP-12b F2)
 let refreshDue = 0;     // when the one refresh read after a contract latch is due, in browser ms
 let fightHead = null; // the first Section's headcount when the demo opened the fight (Reviewer BP-11b-1 F1)
 let endOnHub = null;   // a Section-at-0 end of run waiting for the hub, so it never cuts an AAR (Reviewer BP-11b-1 F1)
@@ -545,6 +548,7 @@ async function fight() {
     ? fill(DIG_COPY.raidLead, { title: opTitle(op) })
     : fill(DIG_COPY.ambushLead, { carried: op.dig.carried });
   opFight = true;
+  reopen = fight;
   fightHead = sectionHead();
   fightDress = { name: null, lead };
   await deps.openMission(b.mission_id, () => deps.enterHub());
@@ -557,16 +561,27 @@ async function fightContract() {
   const t = op && titles.get(op.site_id);
   if (!t || !t.mission_id) return;
   opFight = true;
+  reopen = fightContract;
   fightHead = sectionHead();
   fightDress = t.mission_id === RELIC.mission_id ? { name: RELIC.name, lead: RELIC.lead } : { name: null, lead: null };
   await deps.openMission(t.mission_id, () => deps.enterHub());
   if (!deps.$('screen-briefing').hidden) dressFight();
 }
 
+function clearFitTimer() { if (fitTimer !== null) clearTimeout(fitTimer); fitTimer = null; }
+
+// F2: at healed_at the briefing is opened again by its own opener (openMission's cache, no network),
+// so the keeper redraws the squad line and Deploy, then dressFight runs on the new state.
+function redress() {
+  fitTimer = null;
+  if (opFight && reopen && !deps.$('screen-briefing').hidden) reopen();
+}
+
 // The demo fight's dressing over the keeper's briefing: the stress and trait lines, the fight's
 // own name and lead, and the 0-fit lines. Run after the fight opens it and on every later show
 // (a deploy 429's Back, openMission's static-GET retry: Reviewer BP-11b-2 F2), so nothing is lost.
 function dressFight() {
+  clearFitTimer();
   dressBriefing();
   if (fightDress && fightDress.name) deps.$('briefing-name').textContent = fightDress.name;
   if (fightDress && fightDress.lead) deps.$('briefing-text').textContent = fightDress.lead;
@@ -579,7 +594,8 @@ function dressFight() {
     const b = bayOf(section.section_id);
     if (squad === 0 && section.headcount > 0) {
       deps.$('btn-deploy').disabled = true; // after the keeper's disabled = false (showBriefing runs before show)
-      text = COPY.zeroFit;
+      text = b.healing > 0 ? COPY.zeroFitHealing : COPY.zeroFit;
+      if (b.healing > 0 && b.healed_at) fitTimer = setTimeout(redress, Math.max(0, Date.parse(b.healed_at) - serverNow()) + 100);
     } else if (squad === Math.min(8, section.headcount) && b.wounded > 0 && b.healing === 0) {
       text = COPY.walkingWounded;
     }
@@ -1060,7 +1076,7 @@ function watch() {
   // Reviewer BP-11b-2 F2: every show of the briefing during a demo fight gets its dressing again
   // (the keeper re-renders it on a deploy 429's Back and on openMission's static-GET retry).
   const briefing = deps.$('screen-briefing');
-  new MutationObserver(() => { if (!briefing.hidden && opFight) dressFight(); }).observe(briefing, { attributes: true, attributeFilter: ['hidden'] });
+  new MutationObserver(() => { if (briefing.hidden) clearFitTimer(); else if (opFight) dressFight(); }).observe(briefing, { attributes: true, attributeFilter: ['hidden'] });
 }
 
 // New run starts a new campaign, and ore, credits and buildings belong to the campaign: the end

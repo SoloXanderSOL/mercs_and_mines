@@ -83,7 +83,7 @@ const COMPANY_COPY = {
   aarXpTop: '+{g} XP · top rank',
   sectionRookies: 'Rookies: {n} / 8',
   sectionHow: 'Each Rookie adds 8 Training. Up to five, each extra one adds 3 Headcount.',
-  sectionLoss: 'Losses come off this number. None come back.',
+  sectionLoss: 'Losses come off this number. Replacements cost credits.',
   crewTitle: 'Mining Crew',
   crewMiners: 'Miners: {n} / 8',
   crewMorale: 'Morale: {m} / 100. A meltdown costs miners and 10 morale.',
@@ -196,7 +196,8 @@ let fromHub = false;  // the reveal about to render was opened by the hub's Your
 let card = null;      // the stats card: { node, title, lines }
 let traitsLine = null; // the briefing's trait lines, created on the first briefing
 let shown = null;     // the card on screen: { kind, index }, or null
-let tick = null;      // the heal countdown's display timer (no network call)
+let tick = null;
+let drawnKey = null;  // the open card's drawn state, the countdown left out (Reviewer BP-12b F1)      // the heal countdown's display timer (no network call)
 
 // ── the roster the client holds ────────────────────────────────────────────────
 function roster() {
@@ -311,10 +312,14 @@ function stopTick() {
 function hideCard() {
   stopTick();
   shown = null;
+  drawnKey = null;
   if (card) card.node.hidden = true;
 }
 
 const line = (text, muted) => el('p', muted ? 'company-card-line muted' : 'company-card-line', text);
+
+// A row's drawn state: its text (the countdown row's seconds left out) and each button's enabled flag.
+const drawn = n => (n.dataset.tick ? 'tick' : n.textContent) + '|' + [n, ...n.querySelectorAll('button')].filter(b => b.tagName === 'BUTTON').map(b => (b.disabled ? 0 : 1)).join('');
 
 // A heal or replace button: `onTap` runs only while it is enabled.
 function act(text, disabled, onTap) {
@@ -374,7 +379,9 @@ function sectionRows(s) {
   if (batch > 0 && raw.healed_at) {
     const secs = healSecs(raw, view.serverNow);
     if (secs > 0) {
-      rows.push(line(fill(COMPANY_COPY.healing, { n: batch, s: secs })));
+      const t = line(fill(COMPANY_COPY.healing, { n: batch, s: secs }));
+      t.dataset.tick = '1';
+      rows.push(t);
       ticking = true;
     } else {
       rows.push(line(COMPANY_COPY.back));
@@ -428,10 +435,12 @@ function openCard(kind, index) {
   let rows = [];
   let title = '';
   let ticking = false;
+  let id = '';
   if (kind === 'section') {
     const s = Array.isArray(r.sections) ? r.sections[index] : null;
     if (!s) return;
     title = s.name;
+    id = String(s.section_id);
     if (view && view.adopted()) {
       ({ rows, ticking } = sectionRows(s));
     } else {
@@ -441,6 +450,7 @@ function openCard(kind, index) {
     const w = Array.isArray(r.crews) ? r.crews[index] : null;
     if (!w) return;
     title = COMPANY_COPY.crewTitle;
+    id = String(w.crew_id);
     rows = crewRows(w, r);
   } else if (kind === 'shelf') {
     if (!view || !view.adopted()) return;
@@ -449,8 +459,18 @@ function openCard(kind, index) {
   } else {
     return;
   }
-  card.title.textContent = title;
-  card.lines.replaceChildren(...rows);
+  // F1: redraw only when what the card draws changes; a tick alone rewrites the countdown in place.
+  const key = [kind, index, id, title].concat(rows.map(drawn)).join('\n');
+  const same = shown && shown.kind === kind && shown.index === index && key === drawnKey && !card.node.hidden;
+  if (same) {
+    const fresh = rows.find(n => n.dataset.tick);
+    const live = card.lines.querySelector('[data-tick]');
+    if (fresh && live) live.textContent = fresh.textContent;
+  } else {
+    card.title.textContent = title;
+    card.lines.replaceChildren(...rows);
+    drawnKey = key;
+  }
   card.node.hidden = false;
   shown = { kind, index };
   if (ticking) tick = setTimeout(() => { tick = null; if (shown) openCard(shown.kind, shown.index); }, 1000);

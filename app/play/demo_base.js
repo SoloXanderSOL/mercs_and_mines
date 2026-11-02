@@ -15,7 +15,7 @@ export const BASE = [
     flavour: 'A scrap dish on a leaning pipe mast. It hears raiders coming.',
     done: "Radio Shack operational. Raiders get heard before they're seen." },
   { id: 'hobbyist_benches', name: 'Hobbyist Benches', cost: 120,
-    effect: 'Heat 10 a drill, down from 15.',
+    effect: 'Drill heat tops out 5 lower.',
     flavour: 'Scout drones and utility kits, mostly assembled. The drill head runs cooler.',
     done: 'Benches operational. The drill head runs cooler.' },
   { id: 'grease_pit', name: 'The Grease-Pit', cost: 80,

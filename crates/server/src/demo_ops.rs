@@ -19,7 +19,8 @@
 //!   returns owned data. In memory only: a restart empties it.
 //! - **The dig (BP-8b-1a):** each drill adds heat and ore on site; at the threshold the site
 //!   melts down, the ore on site is lost and the Crew loses heads (`drill_op`, §4d's numbers).
-//!   A drill's rolls depend on the op's seed and the drill's number alone (`drill_roll`).
+//!   A drill's rolls depend on the op's seed and the drill's number alone (`drill_roll`), and so
+//!   does its heat, a seeded 10 to 15 + 5n from a stream of its own (`drill_heat`, BP-13).
 //! - **The meltdown is the layer's one durable effect:** the route writes the Crew's heads
 //!   through `demo_crew_loss::CrewLoss` after the store has committed the meltdown. No replay
 //!   rebuilds it, which is acceptable only because the layer is demo-only.
@@ -83,13 +84,16 @@ pub const DEMO_TROPHY_CAP: usize = 20;
 pub const DEMO_REPLACE_MERC_CREDITS: u32 = 120;
 /// Credits per miner replaced (BP-12a-2, §4e): a fresh head for a Crew, up to 8.
 pub const DEMO_REPLACE_MINER_CREDITS: u32 = 80;
-/// Heat each drill adds, and the meltdown threshold (§4d: the 7th drill melts down).
-pub const DEMO_HEAT_PER_DRILL: u32 = 15;
+/// Drill *n* adds a seeded heat from `DEMO_HEAT_MIN` to `DEMO_HEAT_TOP_BASE + DEMO_HEAT_TOP_PER_DRILL × n`
+/// inclusive (§4e B1, BP-13: drill 1 10–20, drill 2 10–25, …); the site melts down at the threshold.
+pub const DEMO_HEAT_MIN: u32 = 10;
+pub const DEMO_HEAT_TOP_BASE: u32 = 15;
+pub const DEMO_HEAT_TOP_PER_DRILL: u32 = 5;
 pub const DEMO_HEAT_THRESHOLD: u32 = 100;
 /// A Coolant-Jockey Foreman's threshold, in percent of `DEMO_HEAT_THRESHOLD` (×1.15 → 115).
 pub const DEMO_COOLANT_THRESHOLD_PCT: u32 = 115;
 /// Drill *n* yields `n ×` this on a tier-1 vein, and `DEMO_TIER3_ORE_MULTIPLIER` times that on tier 3.
-pub const DEMO_ORE_PER_DRILL: u32 = 10;
+pub const DEMO_ORE_PER_DRILL: u32 = 20;
 pub const DEMO_TIER3_ORE_MULTIPLIER: u32 = 2;
 /// Heads a meltdown costs the Crew, inclusive.
 pub const DEMO_MELTDOWN_HEADS_MIN: u32 = 1;
@@ -110,16 +114,20 @@ pub const DEMO_AMBUSH_PCT_PER_50: u32 = 5;
 pub const DEMO_AMBUSH_CAP_PCT: u32 = 50;
 /// The ambush rolls from `Rng::new(op_seed + this)` (wrapping). Draw k of `Rng::new(s)` runs on
 /// state `s + k × 0x6D2B_79F5`, so a drill's stream would reach this one only at its 2³¹st draw; a
-/// dig reads at most 16.
+/// dig reads at most 24 there (12 drills × 2: heat 10 at least, threshold 115 at most).
 pub const DEMO_AMBUSH_SEED_OFFSET: u32 = 0x8000_0000;
+/// Each drill's heat rolls from `Rng::new(op_seed + this)` (wrapping), draw n − 1 for drill n: 2³⁰
+/// draws from both the drill stream and the ambush stream (BP-13 spec check), and a dig reads at
+/// most 12 here, so no drill's raid or heads roll moves.
+pub const DEMO_HEAT_SEED_OFFSET: u32 = 0x4000_0000;
 /// The mission an ambush is fought as (§4d: `GUARD_DUTY`'s numbers under ambush copy).
 pub const DEMO_AMBUSH_MISSION: &str = "GUARD_DUTY";
 /// The merc base (BP-10a): the four buildings' effects and costs in banked ore. T1 names from
 /// `Base_Infrastructure_Tech_Tree`; the numbers are demo-only, never canon.
 /// The Radio Shack's raid chance per drill, in place of `DEMO_RAID_PCT_PER_DRILL`.
 pub const DEMO_SHACK_RAID_PCT_PER_DRILL: u32 = 3;
-/// The Hobbyist Benches' heat per drill, in place of `DEMO_HEAT_PER_DRILL`.
-pub const DEMO_BENCHES_HEAT_PER_DRILL: u32 = 10;
+/// The Hobbyist Benches take this off the top of each drill's heat range (BP-13, until BP-16's C1).
+pub const DEMO_BENCHES_HEAT_TOP_CUT: u32 = 5;
 /// The Gunsmith's ore per drill: `× NUM / DEN` (floor, per drill), after the tier multiplier.
 pub const DEMO_GUNSMITH_ORE_NUM: u32 = 5;
 pub const DEMO_GUNSMITH_ORE_DEN: u32 = 4;
@@ -412,9 +420,15 @@ pub struct DigView {
     pub ore_on_site: u32,
     /// The ore the next drill would add; 0 once the team is heading home.
     pub next_ore: u32,
+    /// The next drill's heat range, inclusive (BP-13); 0 and 0 once the team is heading home.
+    pub next_heat_min: u32,
+    pub next_heat_max: u32,
+    /// The top of the next drill's range would reach the threshold; false once heading home.
+    pub might_overheat: bool,
     pub ended_by: Option<OpEnd>,
     /// The next drill's raid chance in percent; `null` once heading home, while a raid is
-    /// pending, or when the next drill melts down (a meltdown rolls no raid).
+    /// pending, or when even the bottom of the next drill's range melts the site down (a
+    /// meltdown rolls no raid; BP-13).
     pub next_raid_pct: Option<u32>,
     /// The raid waiting for its fight, or `null`.
     pub raid: Option<RaidView>,
@@ -464,6 +478,17 @@ fn ambush_d100(op_seed: u32) -> u32 {
     Rng::new(op_seed.wrapping_add(DEMO_AMBUSH_SEED_OFFSET)).roll_d100()
 }
 
+/// Drill `n`'s heat (1-based) within `(lo, hi)` inclusive: `Rng::new(op_seed + DEMO_HEAT_SEED_OFFSET)`
+/// skips `n − 1` draws, then draws once. The range sets only the width, so a base that moves the
+/// range never moves the draw (BP-13).
+fn drill_heat(op_seed: u32, n: u32, (lo, hi): (u32, u32)) -> u32 {
+    let mut rng = Rng::new(op_seed.wrapping_add(DEMO_HEAT_SEED_OFFSET));
+    for _ in 0..n.saturating_sub(1) {
+        rng.next_u32();
+    }
+    rng.roll_int(lo, hi)
+}
+
 /// A merc-base building (BP-10a): the body's `building` id, its cost and its flag on `OpsBase`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BaseBuilding {
@@ -508,12 +533,13 @@ pub struct OpsBase {
 }
 
 impl OpsBase {
-    /// Heat each drill adds: the Hobbyist Benches' 10, else §4d's 15.
-    fn heat_per_drill(&self) -> u32 {
+    /// Drill `n`'s heat range, inclusive: 10 to 15 + 5n, the top 5 lower with the Hobbyist Benches.
+    fn heat_range(&self, n: u32) -> (u32, u32) {
+        let top = DEMO_HEAT_TOP_BASE + DEMO_HEAT_TOP_PER_DRILL * n;
         if self.hobbyist_benches {
-            DEMO_BENCHES_HEAT_PER_DRILL
+            (DEMO_HEAT_MIN, top - DEMO_BENCHES_HEAT_TOP_CUT)
         } else {
-            DEMO_HEAT_PER_DRILL
+            (DEMO_HEAT_MIN, top)
         }
     }
 
@@ -1043,21 +1069,28 @@ impl OpsEntry {
             depart_at: ops_time(op.depart_at),
             arrive_at: ops_time(op.arrive_at),
             arrived: now >= op.arrive_at && op.dig.as_ref().is_none_or(|d| d.ambush_at.is_none()),
-            dig: op.dig.as_ref().map(|d| DigView {
-                drills: d.drills,
-                heat: d.heat,
-                threshold: d.threshold,
-                ore_on_site: d.ore_on_site,
-                next_ore: if op.leg == OpLeg::Homeward { 0 } else { self.base.ore(d.drills + 1, d.tier) },
-                ended_by: d.ended_by,
-                next_raid_pct: if op.leg == OpLeg::Outbound && d.raid.is_none() && d.heat + self.base.heat_per_drill() < d.threshold {
-                    Some(self.base.raid_pct(d.drills + 1))
-                } else {
-                    None
-                },
-                raid: d.raid.filter(|r| r.kind == BattleKind::Raid).map(|r| RaidView { mission_id: r.mission_id }),
-                ambush: d.raid.filter(|r| r.kind == BattleKind::Ambush).map(|r| RaidView { mission_id: r.mission_id }),
-                carried: d.carried,
+            dig: op.dig.as_ref().map(|d| {
+                let out = op.leg == OpLeg::Outbound;
+                let (lo, hi) = if out { self.base.heat_range(d.drills + 1) } else { (0, 0) };
+                DigView {
+                    drills: d.drills,
+                    heat: d.heat,
+                    threshold: d.threshold,
+                    ore_on_site: d.ore_on_site,
+                    next_ore: if op.leg == OpLeg::Homeward { 0 } else { self.base.ore(d.drills + 1, d.tier) },
+                    next_heat_min: lo,
+                    next_heat_max: hi,
+                    might_overheat: out && d.heat + hi >= d.threshold,
+                    ended_by: d.ended_by,
+                    next_raid_pct: if out && d.raid.is_none() && d.heat + lo < d.threshold {
+                        Some(self.base.raid_pct(d.drills + 1))
+                    } else {
+                        None
+                    },
+                    raid: d.raid.filter(|r| r.kind == BattleKind::Raid).map(|r| RaidView { mission_id: r.mission_id }),
+                    ambush: d.raid.filter(|r| r.kind == BattleKind::Ambush).map(|r| RaidView { mission_id: r.mission_id }),
+                    carried: d.carried,
+                }
             }),
             fought: op.contract.as_ref().and_then(|c| match c.result {
                 Some(RaidResult::Held) => Some("won"),
@@ -1370,7 +1403,7 @@ impl DemoOpsStore {
         Ok(())
     }
 
-    /// One drill on an arrived dig: drill `n` adds the base's heat (`OpsBase::heat_per_drill`); at
+    /// One drill on an arrived dig: drill `n` adds a seeded heat in the base's range (`drill_heat` over `OpsBase::heat_range`); at
     /// the threshold the site melts down (the ore on site is lost, the homeward leg starts at once
     /// and the Crew's heads are returned for the route to write), otherwise it adds the base's ore
     /// (`OpsBase::ore`) and, when the first roll is at most the base's raid chance
@@ -1402,7 +1435,7 @@ impl DemoOpsStore {
         }
         dig.drills += 1;
         let (raid_d100, heads) = drill_roll(op.op_seed, dig.drills);
-        dig.heat += base.heat_per_drill();
+        dig.heat += drill_heat(op.op_seed, dig.drills, base.heat_range(dig.drills));
         e.moved_at = Some(now);
         e.touched = now;
         let melts = dig.heat >= dig.threshold;
@@ -2131,7 +2164,20 @@ mod tests {
         assert_eq!(drill_roll(8, 7).1, 1);
     }
 
-    /// §4d: +15 heat per drill; drill n yields 10 × n on tier 1 and twice that on tier 3.
+    /// Drill n's heat against an independent Mulberry32 (Linux's Python oracle, BP-13 spec check),
+    /// on literal ranges: seed 2 at 10 to 15 + 5n and at the Benches' 10 to 10 + 5n (the same draws,
+    /// never hotter), and seed 57 at 10 to 15 + 5n.
+    #[test]
+    fn ops_drill_heat_matches_the_oracle() {
+        let plain: Vec<u32> = (1..=8).map(|n| drill_heat(2, n, (10, 15 + 5 * n))).collect();
+        assert_eq!(plain, vec![12, 17, 19, 21, 28, 19, 12, 43]);
+        let benches: Vec<u32> = (1..=8).map(|n| drill_heat(2, n, (10, 10 + 5 * n))).collect();
+        assert_eq!(benches, vec![11, 14, 17, 19, 25, 18, 12, 39]);
+        let s57: Vec<u32> = (1..=8).map(|n| drill_heat(57, n, (10, 15 + 5 * n))).collect();
+        assert_eq!(s57, vec![13, 11, 21, 13, 22, 20, 19, 54]);
+    }
+
+    /// BP-13: seed 2's seeded heat (12, 17, 19); drill n yields 20 × n on tier 1 and twice that on tier 3.
     #[test]
     fn ops_store_drill_adds_heat_and_ore_by_tier() {
         let store = DemoOpsStore::new(4);
@@ -2145,40 +2191,42 @@ mod tests {
             let (va, vb) = (dig_view(&store, a, at(20)), dig_view(&store, b, at(20)));
             seen.push((va.drills, va.heat, va.ore_on_site, va.next_ore, vb.ore_on_site, vb.next_ore));
         }
-        assert_eq!(seen, vec![(1, 15, 10, 20, 20, 40), (2, 30, 30, 30, 60, 60), (3, 45, 60, 40, 120, 80)]);
+        assert_eq!(seen, vec![(1, 12, 20, 40, 40, 80), (2, 29, 60, 60, 120, 120), (3, 48, 120, 80, 240, 160)]);
     }
 
-    /// Seed 2, threshold 100: drills 1–6 dig, the 7th (heat 105) melts down and costs 3 heads.
+    /// Seed 57, threshold 100: drills 1–5 dig, the 6th reaches exactly 100 and melts down (the
+    /// threshold is `>=`), costing 2 heads.
     #[test]
-    fn ops_store_meltdown_on_the_7th_drill_at_100() {
+    fn ops_store_meltdown_on_the_6th_drill_at_exactly_100() {
         let store = DemoOpsStore::new(2);
         let a = Uuid::from_u128(1);
-        on_site(&store, a, 1, 100, 2);
-        for i in 1..=6 {
+        on_site(&store, a, 1, 100, 57);
+        for i in 1..=5 {
             assert_eq!(store.drill_op(a, at(10 + i)), Ok(DrillOutcome::Drilled), "drill {i}");
         }
-        assert_eq!(store.drill_op(a, at(20)), Ok(DrillOutcome::Meltdown { crew_id: CREW, heads: 3 }));
+        assert_eq!(store.drill_op(a, at(20)), Ok(DrillOutcome::Meltdown { crew_id: CREW, heads: 2 }));
         let op = store.op_view(a, at(21)).expect("op");
         assert_eq!(op.leg, OpLeg::Homeward);
         assert_eq!((op.depart_at, op.arrive_at), (ops_time(at(20)), ops_time(at(30))));
         let d = op.dig.expect("a dig");
-        assert_eq!((d.drills, d.heat, d.ore_on_site, d.next_ore, d.ended_by), (7, 105, 0, 0, Some(OpEnd::Meltdown)));
+        assert_eq!((d.drills, d.heat, d.ore_on_site, d.next_ore, d.ended_by), (6, 100, 0, 0, Some(OpEnd::Meltdown)));
         assert_eq!(store.drill_op(a, at(22)), Err(DrillRefusal::AlreadyHomeward));
     }
 
-    /// §4d: a Coolant-Jockey's threshold is 115, so seed 2's 7th drill digs and the 8th melts down (1 head).
+    /// §4d: a Coolant-Jockey's threshold is 115, so seed 57's 6th drill (heat 100) digs and the
+    /// 7th melts down at 119 (1 head).
     #[test]
-    fn ops_store_coolant_threshold_is_115_and_melts_on_the_8th() {
+    fn ops_store_coolant_threshold_is_115_and_melts_on_the_7th() {
         assert_eq!((dig_threshold(false), dig_threshold(true)), (100, 115));
         let store = DemoOpsStore::new(2);
         let a = Uuid::from_u128(1);
-        on_site(&store, a, 1, 115, 2);
-        for i in 1..=7 {
+        on_site(&store, a, 1, 115, 57);
+        for i in 1..=6 {
             assert_eq!(store.drill_op(a, at(10 + i)), Ok(DrillOutcome::Drilled), "drill {i}");
         }
-        assert_eq!(dig_view(&store, a, at(18)).heat, 105);
+        assert_eq!(dig_view(&store, a, at(17)).heat, 100);
         assert_eq!(store.drill_op(a, at(18)), Ok(DrillOutcome::Meltdown { crew_id: CREW, heads: 1 }));
-        assert_eq!(dig_view(&store, a, at(19)).heat, 120);
+        assert_eq!(dig_view(&store, a, at(19)).heat, 119);
     }
 
     #[test]
@@ -2216,7 +2264,7 @@ mod tests {
         on_site(&store, a, 1, 100, 2);
         store.drill_op(a, at(11)).expect("drill");
         store.drill_op(a, at(12)).expect("drill");
-        assert_eq!(dig_view(&store, a, at(13)).ore_on_site, 30);
+        assert_eq!(dig_view(&store, a, at(13)).ore_on_site, 60);
         assert_eq!(store.return_op(a, at(13)), Ok(()));
         let d = dig_view(&store, a, at(14));
         assert_eq!((d.drills, d.ore_on_site, d.next_ore, d.ended_by), (2, 0, 0, Some(OpEnd::WalkedAway)));
@@ -2232,7 +2280,7 @@ mod tests {
         store.drill_op(a, at(11)).expect("drill");
         let v = serde_json::to_value(store.op_view(a, at(12)).expect("op")).unwrap();
         let keys: std::collections::BTreeSet<&str> = v["dig"].as_object().expect("dig").keys().map(|k| k.as_str()).collect();
-        let want = ["ambush", "carried", "drills", "ended_by", "heat", "next_ore", "next_raid_pct", "ore_on_site", "raid", "threshold"];
+        let want = ["ambush", "carried", "drills", "ended_by", "heat", "might_overheat", "next_heat_max", "next_heat_min", "next_ore", "next_raid_pct", "ore_on_site", "raid", "threshold"];
         assert_eq!(keys, want.into_iter().collect());
         assert_eq!(v["dig"]["raid"], serde_json::json!({"mission_id": "GUARD_DUTY"}));
         let text = v.to_string();
@@ -2248,8 +2296,8 @@ mod tests {
         RaidTrigger { trigger_at: at(at_secs), mission_id: DEMO_RAID_MISSION, kind: BattleKind::Raid }
     }
 
-    /// §4d: drill n raids on its d100 ≤ 5 × n. Seed 7's drill 1 (d100 2) raids at heat 15 and ore
-    /// 10; seed 5's drills 1–2 (69, 22) don't and its drill 3 (9 ≤ 15) does, at heat 45 and ore 60.
+    /// §4d: drill n raids on its d100 ≤ 5 × n. Seed 7's drill 1 (d100 2) raids at heat 10 and ore
+    /// 20; seed 5's drills 1–2 (69, 22) don't and its drill 3 (9 ≤ 15) does, at heat 50 and ore 120.
     #[test]
     fn ops_store_raid_triggers_on_the_seeds_drill() {
         let store = DemoOpsStore::new(4);
@@ -2257,7 +2305,7 @@ mod tests {
         on_site(&store, a, 1, 100, 7);
         assert_eq!(store.drill_op(a, at(11)), Ok(DrillOutcome::Drilled));
         let d = dig_view(&store, a, at(12));
-        assert_eq!((d.heat, d.ore_on_site, d.next_raid_pct), (15, 10, None));
+        assert_eq!((d.heat, d.ore_on_site, d.next_raid_pct), (10, 20, None));
         assert_eq!(d.raid, Some(RaidView { mission_id: "GUARD_DUTY" }));
         assert_eq!(store.pending_raid(a, at(12)), Some(PendingRaid { commander_id: COMMANDER, trigger: trigger(11), section_id: None }));
         on_site(&store, b, 1, 100, 5);
@@ -2266,11 +2314,11 @@ mod tests {
         assert_eq!(store.pending_raid(b, at(13)), None);
         store.drill_op(b, at(13)).expect("drill 3");
         let d = dig_view(&store, b, at(14));
-        assert_eq!((d.drills, d.heat, d.ore_on_site, d.raid.is_some()), (3, 45, 60, true));
+        assert_eq!((d.drills, d.heat, d.ore_on_site, d.raid.is_some()), (3, 50, 120, true));
     }
 
-    /// Seed 1: no raid on drills 1–6, and drill 7 melts down (2 heads) although its d100 (14 ≤ 35)
-    /// would raid: a meltdown rolls no raid.
+    /// Seed 1: no raid on drills 1–6 (heat 97 after them), and drill 7 melts down at 121 (2 heads)
+    /// although its d100 (14 ≤ 35) would raid: a meltdown rolls no raid.
     #[test]
     fn ops_store_meltdown_rolls_no_raid() {
         let store = DemoOpsStore::new(2);
@@ -2297,7 +2345,7 @@ mod tests {
         let op = store.op_view(a, at(13)).expect("op");
         assert_eq!(op.leg, OpLeg::Outbound);
         let d = op.dig.expect("a dig");
-        assert_eq!((d.drills, d.ore_on_site, d.raid.is_some()), (1, 10, true));
+        assert_eq!((d.drills, d.ore_on_site, d.raid.is_some()), (1, 20, true));
     }
 
     /// Each result on seed 7's raid at 11 s: Held resumes drilling, Retreat takes half the ore
@@ -2312,13 +2360,13 @@ mod tests {
         }
         assert!(store.latch_raid(a, &trigger(11), RaidResult::Held, FightPay::credits(0), at(20)));
         let d = dig_view(&store, a, at(20));
-        assert_eq!((d.raid, d.next_raid_pct, d.ore_on_site, d.carried, d.ended_by), (None, Some(10), 10, 0, None));
+        assert_eq!((d.raid, d.next_raid_pct, d.ore_on_site, d.carried, d.ended_by), (None, Some(10), 20, 0, None));
         assert_eq!(store.drill_op(a, at(21)), Ok(DrillOutcome::Drilled), "seed 7's drill 2 (d100 98) digs on");
         assert!(store.latch_raid(b, &trigger(11), RaidResult::Retreat, FightPay::credits(0), at(20)));
         let op = store.op_view(b, at(21)).expect("op");
         assert_eq!((op.leg, op.depart_at, op.arrive_at), (OpLeg::Homeward, ops_time(at(20)), ops_time(at(30))));
         let d = op.dig.expect("a dig");
-        assert_eq!((d.carried, d.ore_on_site, d.ended_by, d.raid, d.next_raid_pct), (5, 0, Some(OpEnd::Retreat), None, None));
+        assert_eq!((d.carried, d.ore_on_site, d.ended_by, d.raid, d.next_raid_pct), (10, 0, Some(OpEnd::Retreat), None, None));
         assert!(store.latch_raid(c, &trigger(11), RaidResult::Wiped, FightPay::credits(0), at(20)));
         assert!(store.op_view(c, at(21)).is_none(), "the op is cleared");
     }
@@ -2392,7 +2440,7 @@ mod tests {
         let op = store.op_view(a, at(15)).expect("op");
         assert_eq!(op.leg, OpLeg::Outbound);
         let d = op.dig.expect("a dig");
-        assert_eq!((d.ore_on_site, d.carried, d.ended_by), (60, 0, None));
+        assert_eq!((d.ore_on_site, d.carried, d.ended_by), (120, 0, None));
         assert_eq!(store.pending_raid(a, at(15)).map(|p| p.trigger), Some(trigger(14)));
     }
 
@@ -2408,26 +2456,81 @@ mod tests {
         assert!(store.moved_since(a, at(400), at(600)));
     }
 
-    /// The next drill's raid chance: 5 × (drills + 1) %, `None` once the next drill melts down.
-    /// Seed 2 raids on none of drills 1–7.
+    /// `(heat, next_heat_min, next_heat_max, might_overheat, next_raid_pct)`.
+    fn next_drill(d: &DigView) -> (u32, u32, u32, bool, Option<u32>) {
+        (d.heat, d.next_heat_min, d.next_heat_max, d.might_overheat, d.next_raid_pct)
+    }
+
+    /// BP-13: the next drill's range is 10 to 15 + 5 × (drills + 1); `might_overheat` once its top
+    /// reaches the threshold, while the raid chance, 5 × (drills + 1) %, stays until even the
+    /// bottom would melt. Seed 57 raids on none of drills 1–7. At 100 the 6th drill melts at
+    /// exactly 100 (the homeward zeros); at 115 it digs, and the 7th melts at 119.
     #[test]
     fn ops_store_next_raid_pct() {
         let store = DemoOpsStore::new(4);
         let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
-        on_site(&store, a, 1, 100, 2);
-        on_site(&store, b, 1, 115, 2);
-        let mut at100 = vec![dig_view(&store, a, at(11)).next_raid_pct];
-        let mut at115 = vec![dig_view(&store, b, at(11)).next_raid_pct];
-        for i in 1..=6 {
-            store.drill_op(a, at(10 + i)).expect("drill");
-            store.drill_op(b, at(10 + i)).expect("drill");
-            at100.push(dig_view(&store, a, at(20)).next_raid_pct);
-            at115.push(dig_view(&store, b, at(20)).next_raid_pct);
+        on_site(&store, a, 1, 100, 57);
+        on_site(&store, b, 1, 115, 57);
+        let mut seen = vec![next_drill(&dig_view(&store, a, at(11)))];
+        for i in 1..=5 {
+            assert_eq!(store.drill_op(a, at(10 + i)), Ok(DrillOutcome::Drilled), "drill {i}");
+            assert_eq!(store.drill_op(b, at(10 + i)), Ok(DrillOutcome::Drilled), "drill {i}");
+            seen.push(next_drill(&dig_view(&store, a, at(20))));
         }
-        assert_eq!(at100, vec![Some(5), Some(10), Some(15), Some(20), Some(25), Some(30), None]);
-        assert_eq!(at115, vec![Some(5), Some(10), Some(15), Some(20), Some(25), Some(30), Some(35)]);
-        store.drill_op(b, at(21)).expect("drill 7");
-        assert_eq!(dig_view(&store, b, at(22)).next_raid_pct, None, "heat 105: the 8th drill melts down at 115");
+        let want = vec![
+            (0, 10, 20, false, Some(5)),
+            (13, 10, 25, false, Some(10)),
+            (24, 10, 30, false, Some(15)),
+            (45, 10, 35, false, Some(20)),
+            (58, 10, 40, false, Some(25)),
+            (80, 10, 45, true, Some(30)),
+        ];
+        assert_eq!(seen, want);
+        assert_eq!(store.drill_op(a, at(21)), Ok(DrillOutcome::Meltdown { crew_id: CREW, heads: 2 }));
+        assert_eq!(next_drill(&dig_view(&store, a, at(22))), (100, 0, 0, false, None));
+        assert_eq!(store.drill_op(b, at(21)), Ok(DrillOutcome::Drilled), "drill 6 at 115");
+        assert_eq!(next_drill(&dig_view(&store, b, at(22))), (100, 10, 50, true, Some(35)));
+        assert_eq!(store.drill_op(b, at(23)), Ok(DrillOutcome::Meltdown { crew_id: CREW, heads: 1 }));
+        assert_eq!(next_drill(&dig_view(&store, b, at(24))), (119, 0, 0, false, None));
+    }
+
+    /// Seed 8 at 100 (no raid on drills 1–4): heat 60 after four drills and the 5th's top 40 reach
+    /// exactly 100, so the next drill might overheat (`>=`); the raid % stays (60 + 10 < 100).
+    #[test]
+    fn ops_view_might_overheat_at_exactly_the_top() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        on_site(&store, a, 1, 100, 8);
+        for i in 1..=4 {
+            assert_eq!(store.drill_op(a, at(10 + i)), Ok(DrillOutcome::Drilled), "drill {i}");
+        }
+        assert_eq!(next_drill(&dig_view(&store, a, at(20))), (60, 10, 40, true, Some(25)));
+    }
+
+    /// Seed 3 at 100 (no raid on drills 1–5): heat 90 after five drills, so even the bottom of the
+    /// 6th's range (10) melts the site: no raid % (a meltdown rolls no raid).
+    #[test]
+    fn ops_view_certain_meltdown_hides_the_raid_pct() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        on_site(&store, a, 1, 100, 3);
+        for i in 1..=5 {
+            assert_eq!(store.drill_op(a, at(10 + i)), Ok(DrillOutcome::Drilled), "drill {i}");
+        }
+        assert_eq!(next_drill(&dig_view(&store, a, at(20))), (90, 10, 45, true, None));
+    }
+
+    /// Seed 54 at 100: heat 86 after four drills. The bottom of the 5th's range (86 + 10 < 100)
+    /// keeps the raid %, where §4d's old fixed 15 (86 + 15 ≥ 100) would have hidden it.
+    #[test]
+    fn ops_view_raid_pct_reads_the_bottom_of_the_range() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        on_site(&store, a, 1, 100, 54);
+        for i in 1..=4 {
+            assert_eq!(store.drill_op(a, at(10 + i)), Ok(DrillOutcome::Drilled), "drill {i}");
+        }
+        assert_eq!(next_drill(&dig_view(&store, a, at(20))), (86, 10, 40, true, Some(25)));
     }
 
     /// The ambush's d100 against an independent Mulberry32 (Linux's Python oracle, BP-8b-2 spec
@@ -2455,7 +2558,7 @@ mod tests {
         assert_eq!(store.pull_op(a, at(20)), Ok(()));
     }
 
-    /// Seed 2 (ambush d100 53 > 15 %): the pull loads all 60 ore and heads home, with no ambush
+    /// Seed 2 (ambush d100 53 > 20 %): the pull loads all 120 ore and heads home, with no ambush
     /// at any time.
     #[test]
     fn ops_store_pull_loads_the_ore_and_heads_home() {
@@ -2465,7 +2568,7 @@ mod tests {
         let op = store.op_view(a, at(26)).expect("op");
         assert_eq!((op.leg, op.depart_at, op.arrive_at, op.arrived), (OpLeg::Homeward, ops_time(at(20)), ops_time(at(30)), false));
         let d = op.dig.expect("a dig");
-        assert_eq!((d.carried, d.ore_on_site, d.next_ore, d.next_raid_pct, d.ended_by), (60, 0, 0, None, Some(OpEnd::Pulled)));
+        assert_eq!((d.carried, d.ore_on_site, d.next_ore, d.next_raid_pct, d.ended_by), (120, 0, 0, None, Some(OpEnd::Pulled)));
         assert_eq!((d.raid, d.ambush), (None, None));
         assert_eq!(store.pending_raid(a, at(29)), None);
     }
@@ -2484,7 +2587,7 @@ mod tests {
         store.drill_op(b, at(11)).expect("drill 1: seed 7 raids");
         assert_eq!(store.pull_op(b, at(12)), Err(PullRefusal::RaidPending));
         let d = dig_view(&store, b, at(12));
-        assert_eq!((d.ore_on_site, d.carried, d.ended_by, d.raid.is_some()), (10, 0, None, true));
+        assert_eq!((d.ore_on_site, d.carried, d.ended_by, d.raid.is_some()), (20, 0, None, true));
         on_site(&store, c, 1, 100, 2);
         store.drill_op(c, at(11)).expect("drill");
         assert_eq!(store.pull_op(c, at(12)), Ok(()));
@@ -2498,17 +2601,17 @@ mod tests {
         let a = Uuid::from_u128(1);
         pulled(&store, a, 2, 3);
         assert_eq!(store.ops_snapshot(a, at(29)).1, 0, "still on the road");
-        assert_eq!(store.ops_snapshot(a, at(30)), (None, 60, OpsBase::default()));
-        assert_eq!(store.ops_snapshot(a, at(31)), (None, 60, OpsBase::default()), "banked once");
+        assert_eq!(store.ops_snapshot(a, at(30)), (None, 120, OpsBase::default()));
+        assert_eq!(store.ops_snapshot(a, at(31)), (None, 120, OpsBase::default()), "banked once");
         assert!(store.moved_since(a, at(30), at(31)), "the arrival is the last movement");
         let crew = DigStart { crew_id: CREW, commander_id: COMMANDER, threshold: 100, section_id: None };
         store.start_op(a, (5, 0), board(), &dig(1), 2, Some(crew), None, at(40)).expect("start");
         store.drill_op(a, at(51)).expect("drill");
         store.pull_op(a, at(52)).expect("pull");
-        assert_eq!(store.ops_snapshot(a, at(62)), (None, 70, OpsBase::default()));
+        assert_eq!(store.ops_snapshot(a, at(62)), (None, 140, OpsBase::default()));
     }
 
-    /// Reviewer BP-8b-1b F4: a retreat's `carried` (seed 7: 10 ore, half is 5) is banked on arrival.
+    /// Reviewer BP-8b-1b F4: a retreat's `carried` (seed 7: 20 ore, half is 10) is banked on arrival.
     #[test]
     fn ops_store_retreat_banks_what_it_carried() {
         let store = DemoOpsStore::new(2);
@@ -2517,7 +2620,7 @@ mod tests {
         store.drill_op(a, at(11)).expect("drill");
         assert!(store.latch_raid(a, &trigger(11), RaidResult::Retreat, FightPay::credits(0), at(20)));
         assert_eq!(store.ops_snapshot(a, at(29)).1, 0);
-        assert_eq!(store.ops_snapshot(a, at(30)), (None, 5, OpsBase::default()));
+        assert_eq!(store.ops_snapshot(a, at(30)), (None, 10, OpsBase::default()));
     }
 
     /// A walk-away, a meltdown and a contract carry nothing home, so they bank nothing.
@@ -2530,18 +2633,18 @@ mod tests {
         store.drill_op(a, at(12)).expect("drill");
         store.return_op(a, at(13)).expect("return");
         assert_eq!(store.ops_snapshot(a, at(23)), (None, 0, OpsBase::default()));
-        on_site(&store, b, 1, 100, 2);
-        for i in 1..=6 {
+        on_site(&store, b, 1, 100, 57);
+        for i in 1..=5 {
             store.drill_op(b, at(10 + i)).expect("drill");
         }
-        assert_eq!(store.drill_op(b, at(20)), Ok(DrillOutcome::Meltdown { crew_id: CREW, heads: 3 }));
+        assert_eq!(store.drill_op(b, at(20)), Ok(DrillOutcome::Meltdown { crew_id: CREW, heads: 2 }));
         assert_eq!(store.ops_snapshot(b, at(30)), (None, 0, OpsBase::default()));
         store.start_op(c, (5, 0), board(), &site(), 7, None, None, at(0)).expect("start");
         store.return_op(c, at(10)).expect("return");
         assert_eq!(store.ops_snapshot(c, at(20)), (None, 0, OpsBase::default()));
     }
 
-    /// Seed 14 (d100 4 ≤ 10 %) is ambushed and seed 2 (53) is not, on the same 30-ore haul. The two
+    /// Seed 14 (d100 4 ≤ 15 %) is ambushed and seed 2 (53) is not, on the same 60-ore haul. The two
     /// read the same until the midpoint (25 s); the first read from then on fires seed 14's ambush
     /// at that read's time, and its leg waits on the road while seed 2's comes home and banks.
     #[test]
@@ -2550,21 +2653,23 @@ mod tests {
         let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
         pulled(&store, a, 14, 2);
         pulled(&store, b, 2, 2);
-        assert_eq!(store.op_view(a, at(24)), store.op_view(b, at(24)));
+        // The two seeds' heats differ (37 and 29, BP-13); everything else reads the same.
+        let masked = |v: Option<ActiveOpView>| v.map(|mut o| { if let Some(d) = o.dig.as_mut() { d.heat = 0; } o });
+        assert_eq!(masked(store.op_view(a, at(24))), masked(store.op_view(b, at(24))));
         assert_eq!(store.pending_raid(a, at(24)), None);
         assert_eq!(store.pending_raid(a, at(26)), Some(PendingRaid { commander_id: COMMANDER, trigger: ambush_trigger(26), section_id: None }));
         assert_eq!(store.pending_raid(b, at(26)), None);
         let op = store.op_view(a, at(40)).expect("the ambushed team is still on the road");
         assert_eq!((op.leg, op.arrived), (OpLeg::Homeward, false));
         let d = op.dig.expect("a dig");
-        assert_eq!((d.ambush, d.raid, d.carried), (Some(RaidView { mission_id: "GUARD_DUTY" }), None, 30));
+        assert_eq!((d.ambush, d.raid, d.carried), (Some(RaidView { mission_id: "GUARD_DUTY" }), None, 60));
         assert_eq!(store.ops_snapshot(a, at(40)).1, 0);
-        assert_eq!(store.ops_snapshot(b, at(40)), (None, 30, OpsBase::default()));
+        assert_eq!(store.ops_snapshot(b, at(40)), (None, 60, OpsBase::default()));
     }
 
     /// Each result of seed 14's ambush (fired at 25 s, fought by 28 s): Held resumes the leg
-    /// shifted by the 3 s wait with all 30 ore, Retreat with 15, Wiped clears the op; the
-    /// arrivals at 33 s bank 30 and 15.
+    /// shifted by the 3 s wait with all 60 ore, Retreat with 30, Wiped clears the op; the
+    /// arrivals at 33 s bank 60 and 30.
     #[test]
     fn ops_store_ambush_latch_applies_each_result() {
         let store = DemoOpsStore::new(4);
@@ -2577,19 +2682,19 @@ mod tests {
         let op = store.op_view(a, at(32)).expect("op");
         assert_eq!((op.depart_at, op.arrive_at, op.arrived), (ops_time(at(23)), ops_time(at(33)), false));
         let d = op.dig.expect("a dig");
-        assert_eq!((d.carried, d.ended_by, d.ambush), (30, Some(OpEnd::Pulled), None));
+        assert_eq!((d.carried, d.ended_by, d.ambush), (60, Some(OpEnd::Pulled), None));
         assert!(store.latch_raid(b, &ambush_trigger(25), RaidResult::Retreat, FightPay::credits(0), at(28)));
         let d = dig_view(&store, b, at(32));
-        assert_eq!((d.carried, d.ended_by, d.ambush), (15, Some(OpEnd::Retreat), None));
+        assert_eq!((d.carried, d.ended_by, d.ambush), (30, Some(OpEnd::Retreat), None));
         assert!(store.latch_raid(c, &ambush_trigger(25), RaidResult::Wiped, FightPay::credits(0), at(28)));
         assert_eq!(store.ops_snapshot(c, at(28)), (None, 0, OpsBase::default()));
-        assert_eq!(store.ops_snapshot(a, at(33)), (None, 30, OpsBase::default()));
-        assert_eq!(store.ops_snapshot(b, at(33)), (None, 15, OpsBase::default()));
+        assert_eq!(store.ops_snapshot(a, at(33)), (None, 60, OpsBase::default()));
+        assert_eq!(store.ops_snapshot(b, at(33)), (None, 30, OpsBase::default()));
         assert_eq!(store.ops_snapshot(c, at(40)), (None, 0, OpsBase::default()));
     }
 
     /// Two reads that both saw the ambush latch it once: the second finds no trigger, so a
-    /// Retreat halves the load once (30 → 15, never 7).
+    /// Retreat halves the load once (60 → 30, never 15).
     #[test]
     fn ops_store_ambush_latches_once() {
         let store = DemoOpsStore::new(2);
@@ -2598,7 +2703,7 @@ mod tests {
         store.pending_raid(a, at(25)).expect("the ambush fires");
         assert!(store.latch_raid(a, &ambush_trigger(25), RaidResult::Retreat, FightPay::credits(0), at(28)));
         assert!(!store.latch_raid(a, &ambush_trigger(25), RaidResult::Retreat, FightPay::credits(0), at(29)), "already latched");
-        assert_eq!(dig_view(&store, a, at(30)).carried, 15);
+        assert_eq!(dig_view(&store, a, at(30)).carried, 30);
     }
 
     /// A pull and an ambush latch each count as movement, read before the leg's arrival so the
@@ -2628,21 +2733,21 @@ mod tests {
         on_site(&store, a, 1, 100, 2);
         store.drill_op(a, at(11)).expect("drill");
         store.pull_op(a, at(12)).expect("pull");
-        assert_eq!(store.ops_snapshot(a, at(22)), (None, 10, OpsBase::default()));
+        assert_eq!(store.ops_snapshot(a, at(22)), (None, 20, OpsBase::default()));
         assert!(store.put_board(b, (5, 0), board(), at(30)));
         assert!(store.put_board(c, (5, 0), board(), at(40)));
         assert_eq!(store.len(), 2);
         assert!(store.board(b, (5, 0), at(41)).is_none(), "the board-only entry is evicted");
-        assert_eq!(store.ops_snapshot(a, at(41)).1, 10, "the banked ore is kept");
+        assert_eq!(store.ops_snapshot(a, at(41)).1, 20, "the banked ore is kept");
     }
 
-    /// §4d's step per 50 ore on seed 57 (d100 13): 30 ore (10 %) is not ambushed, 60 ore (15 %) is.
+    /// §4d's step per 50 ore on seed 57 (d100 13): 20 ore (10 %) is not ambushed, 60 ore (15 %) is.
     #[test]
     fn ops_store_ambush_chance_steps_per_50_ore() {
         let store = DemoOpsStore::new(4);
         let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
-        pulled(&store, a, 57, 2);
-        pulled(&store, b, 57, 3);
+        pulled(&store, a, 57, 1);
+        pulled(&store, b, 57, 2);
         assert_eq!(store.pending_raid(a, at(25)), None);
         assert_eq!(store.pending_raid(b, at(25)).map(|p| p.trigger), Some(ambush_trigger(25)));
     }
@@ -2667,11 +2772,12 @@ mod tests {
     fn ops_base_numbers_match_the_oracle() {
         let plain = OpsBase::default();
         let all = OpsBase { radio_shack: true, hobbyist_benches: true, grease_pit: true, gunsmith: true };
-        assert_eq!((plain.heat_per_drill(), all.heat_per_drill()), (15, 10));
+        assert_eq!((plain.heat_range(1), plain.heat_range(2), plain.heat_range(3)), ((10, 20), (10, 25), (10, 30)));
+        assert_eq!((all.heat_range(1), all.heat_range(2), all.heat_range(3)), ((10, 15), (10, 20), (10, 25)));
         let raid: Vec<(u32, u32)> = (1..=3).map(|n| (plain.raid_pct(n), all.raid_pct(n))).collect();
         assert_eq!(raid, vec![(5, 3), (10, 6), (15, 9)]);
         let ore: Vec<(u32, u32, u32, u32)> = (1..=3).map(|n| (plain.ore(n, 1), all.ore(n, 1), plain.ore(n, 3), all.ore(n, 3))).collect();
-        assert_eq!(ore, vec![(10, 12, 20, 25), (20, 25, 40, 50), (30, 37, 60, 75)]);
+        assert_eq!(ore, vec![(20, 25, 40, 50), (40, 50, 80, 100), (60, 75, 120, 150)]);
         let ambush: Vec<(u32, u32)> = [30, 50, 60, 120, 450].into_iter().map(|l| (plain.haul_ambush_pct(l), all.haul_ambush_pct(l))).collect();
         assert_eq!(ambush, vec![(10, 5), (15, 7), (15, 7), (20, 10), (50, 25)]);
         let ids = ["radio_shack", "hobbyist_benches", "grease_pit", "gunsmith", "barracks", ""];
@@ -2679,10 +2785,10 @@ mod tests {
         assert_eq!(costs, vec![Some(50), Some(120), Some(80), Some(80), None, None]);
     }
 
-    /// Seed 2's three-drill haul (60 ore), banked by a read at 30 s.
-    fn banked_60(store: &DemoOpsStore, a: Uuid) {
+    /// Seed 2's three-drill haul (120 ore), banked by a read at 30 s.
+    fn banked_120(store: &DemoOpsStore, a: Uuid) {
         pulled(store, a, 2, 3);
-        assert_eq!(store.ops_snapshot(a, at(30)).1, 60);
+        assert_eq!(store.ops_snapshot(a, at(30)).1, 120);
     }
 
     /// A build debits its cost and stands. Already built comes before short of ore, and a
@@ -2692,13 +2798,13 @@ mod tests {
         let store = DemoOpsStore::new(2);
         let a = Uuid::from_u128(1);
         assert_eq!(store.build_op(a, BaseBuilding::RadioShack, at(0)), Err(BuildRefusal::NotEnoughOre), "no entry: nothing banked");
-        banked_60(&store, a);
+        banked_120(&store, a);
         assert_eq!(store.build_op(a, BaseBuilding::RadioShack, at(31)), Ok(()));
         let shack = OpsBase { radio_shack: true, ..OpsBase::default() };
-        assert_eq!(store.ops_snapshot(a, at(32)), (None, 10, shack));
+        assert_eq!(store.ops_snapshot(a, at(32)), (None, 70, shack));
         assert_eq!(store.build_op(a, BaseBuilding::RadioShack, at(33)), Err(BuildRefusal::AlreadyBuilt));
         assert_eq!(store.build_op(a, BaseBuilding::Gunsmith, at(34)), Err(BuildRefusal::NotEnoughOre));
-        assert_eq!(store.ops_snapshot(a, at(35)), (None, 10, shack));
+        assert_eq!(store.ops_snapshot(a, at(35)), (None, 70, shack));
     }
 
     /// Never while an op is out, and "out" comes first: a haul on the road (nothing banked yet),
@@ -2710,8 +2816,8 @@ mod tests {
         let a = Uuid::from_u128(1);
         pulled(&store, a, 2, 3);
         assert_eq!(store.build_op(a, BaseBuilding::RadioShack, at(25)), Err(BuildRefusal::OpOut), "on the road, 0 banked");
-        assert_eq!(store.build_op(a, BaseBuilding::RadioShack, at(30)), Ok(()), "the arrival banks 60, then pays 50");
-        assert_eq!(store.ops_snapshot(a, at(30)).1, 10);
+        assert_eq!(store.build_op(a, BaseBuilding::RadioShack, at(30)), Ok(()), "the arrival banks 120, then pays 50");
+        assert_eq!(store.ops_snapshot(a, at(30)).1, 70);
         store.start_op(a, (5, 0), board(), &site(), 7, None, None, at(40)).expect("start");
         assert_eq!(store.build_op(a, BaseBuilding::RadioShack, at(45)), Err(BuildRefusal::OpOut), "before AlreadyBuilt");
         assert_eq!(store.build_op(a, BaseBuilding::RadioShack, at(50)), Err(BuildRefusal::OpOut), "arrived at the contract");
@@ -2721,10 +2827,11 @@ mod tests {
     }
 
     /// The base feeds the drill and the view alike (sync 2026-10-31, claim 4). The Benches and
-    /// the Shack at the Coolant-Jockey's 115 on seed 2 (no raid on drills 1–11): 10 heat a
-    /// drill, the view's raid chance 3 × (drills + 1) while the next drill is safe, `None` at
-    /// 110 heat, and the 12th drill melts (120). Only heat 100 tells 10 from 15 here: 110 < 115,
-    /// 115 is not. The Gunsmith on tier 3: 25, 50, 75 on site, then `next_ore` 100.
+    /// the Shack at the Coolant-Jockey's 115 on seed 2 (no raid on drills 1–6): the Benches'
+    /// heats 11, 14, 17, 19, 25, 18 (104 after six), the view's raid chance 3 × (drills + 1) while
+    /// even the bottom of the range is safe, and the 7th drill melts (116, 3 heads). Drill 6
+    /// tells the Benches from plain here: plain seed 2 is at 116 after six and melts. The
+    /// Gunsmith on tier 3: 50, 100, 150 a drill, so 50, 150, 300 on site, then `next_ore` 200.
     #[test]
     fn ops_store_base_feeds_the_drill_and_the_view() {
         let store = DemoOpsStore::new(4);
@@ -2733,16 +2840,15 @@ mod tests {
         store.set_base(a, OpsBase { radio_shack: true, hobbyist_benches: true, ..OpsBase::default() });
         on_site(&store, a, 1, 115, 2);
         let mut seen = vec![dig_view(&store, a, at(11)).next_raid_pct];
-        for i in 1..=11 {
+        for i in 1..=6 {
             assert_eq!(store.drill_op(a, at(10 + i)), Ok(DrillOutcome::Drilled), "drill {i}");
             seen.push(dig_view(&store, a, at(30)).next_raid_pct);
         }
-        let want: Vec<Option<u32>> = (1..=11).map(|n| Some(3 * n)).chain([None]).collect();
-        assert_eq!(seen, want);
+        assert_eq!(seen, vec![Some(3), Some(6), Some(9), Some(12), Some(15), Some(18), Some(21)]);
         let d = dig_view(&store, a, at(30));
-        assert_eq!((d.heat, d.threshold, d.raid), (110, 115, None));
-        assert_eq!(store.drill_op(a, at(31)), Ok(DrillOutcome::Meltdown { crew_id: CREW, heads: 1 }));
-        assert_eq!(dig_view(&store, a, at(32)).heat, 120);
+        assert_eq!((d.heat, d.threshold, d.raid), (104, 115, None));
+        assert_eq!(store.drill_op(a, at(31)), Ok(DrillOutcome::Meltdown { crew_id: CREW, heads: 3 }));
+        assert_eq!(dig_view(&store, a, at(32)).heat, 116);
         store.put_board(b, (5, 0), board(), at(0));
         store.set_base(b, OpsBase { gunsmith: true, ..OpsBase::default() });
         on_site(&store, b, 3, 100, 2);
@@ -2751,8 +2857,8 @@ mod tests {
             store.drill_op(b, at(10 + i)).expect("drill");
             piles.push(dig_view(&store, b, at(20)).ore_on_site);
         }
-        assert_eq!(piles, vec![25, 75, 150]);
-        assert_eq!(dig_view(&store, b, at(20)).next_ore, 100);
+        assert_eq!(piles, vec![50, 150, 300]);
+        assert_eq!(dig_view(&store, b, at(20)).next_ore, 200);
     }
 
     /// The Radio Shack's flip (Linux's oracle): seed 45's first drill rolls d100 4, a raid at 5 %
@@ -2772,8 +2878,8 @@ mod tests {
         assert_eq!(dig_view(&store, b, at(12)).raid, None);
     }
 
-    /// The Grease-Pit's flip on seed 57 (ambush d100 13) and a 60-ore haul: ambushed at 15 %, not
-    /// at 7 %, so the Pit's haul banks all 60.
+    /// The Grease-Pit's flip on seed 57 (ambush d100 13) and a 120-ore haul: ambushed at 20 %, not
+    /// at 10 %, so the Pit's haul banks all 120.
     #[test]
     fn ops_store_grease_pit_halves_the_ambush() {
         let store = DemoOpsStore::new(4);
@@ -2785,7 +2891,7 @@ mod tests {
         pulled(&store, b, 57, 3);
         assert_eq!(store.pending_raid(a, at(25)).map(|p| p.trigger), Some(ambush_trigger(25)));
         assert_eq!(store.pending_raid(b, at(25)), None);
-        assert_eq!(store.ops_snapshot(b, at(30)), (None, 60, pit));
+        assert_eq!(store.ops_snapshot(b, at(30)), (None, 120, pit));
     }
 
     /// Reviewer BP-8b-2 F5: cap 2, `a` holds only a building (no op, nothing banked) and is the
@@ -2810,7 +2916,7 @@ mod tests {
     fn ops_store_build_counts_as_moving() {
         let store = DemoOpsStore::new(2);
         let a = Uuid::from_u128(1);
-        banked_60(&store, a);
+        banked_120(&store, a);
         assert!(!store.moved_since(a, at(400), at(450)), "home at 30 s, nothing since");
         assert_eq!(store.build_op(a, BaseBuilding::RadioShack, at(500)), Ok(()));
         assert!(store.moved_since(a, at(500), at(501)), "the build");

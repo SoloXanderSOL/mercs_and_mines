@@ -1443,7 +1443,7 @@ mod tests {
         assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("already heading home")));
     }
 
-    /// Three drills through the route: heat 15 per drill and ore 10 × n on the tier-1 site,
+    /// Three drills through the route: seed 2's seeded heat (12, 17, 19) and ore 20 × n on the tier-1 site,
     /// the dig's exact keys, and no seed or Crew in the body.
     #[tokio::test]
     async fn ops_drill_adds_heat_and_ore() {
@@ -1460,19 +1460,19 @@ mod tests {
             assert!(d["ended_by"].is_null());
             last = bytes;
         }
-        assert_eq!(seen, vec![(Some(1), Some(15), Some(10), Some(20), Some(100)), (Some(2), Some(30), Some(30), Some(30), Some(100)), (Some(3), Some(45), Some(60), Some(40), Some(100))]);
+        assert_eq!(seen, vec![(Some(1), Some(12), Some(20), Some(40), Some(100)), (Some(2), Some(29), Some(60), Some(60), Some(100)), (Some(3), Some(48), Some(120), Some(80), Some(100))]);
         let text = String::from_utf8_lossy(&last);
         assert!(!text.contains("seed") && !text.contains("crew"), "{text}");
     }
 
-    /// Seed 2, threshold 100: the 7th drill melts down, the team heads home empty and the Crew
-    /// loses 3 heads (8 → 5) under a launch lock that is released afterwards.
+    /// Seed 57, threshold 100: the 6th drill reaches exactly 100 and melts down, the team heads
+    /// home empty and the Crew loses 2 heads (8 → 6) under a launch lock that is released afterwards.
     #[tokio::test]
-    async fn ops_meltdown_on_the_7th_costs_the_crew_3_heads() {
+    async fn ops_meltdown_on_the_6th_costs_the_crew_2_heads() {
         let state = Arc::new(session_state());
         let (c, crew) = dig_campaign(&state, false).await;
-        dig_on_site(&state, c, 2).await;
-        for i in 1..=6 {
+        dig_on_site(&state, c, 57).await;
+        for i in 1..=5 {
             let (status, body, _) = drill(&state, c).await;
             assert_eq!(status, StatusCode::OK, "drill {i}: {body}");
             assert_eq!(body["active_op"]["leg"], "outbound", "drill {i}");
@@ -1482,24 +1482,24 @@ mod tests {
         let op = &body["active_op"];
         assert_eq!(op["leg"], "homeward");
         assert_eq!(op["depart_at"], body["now"]);
-        assert_eq!((op["dig"]["heat"].as_u64(), op["dig"]["ore_on_site"].as_u64()), (Some(105), Some(0)));
+        assert_eq!((op["dig"]["heat"].as_u64(), op["dig"]["ore_on_site"].as_u64()), (Some(100), Some(0)));
         assert_eq!(op["dig"]["ended_by"], "meltdown");
-        assert_eq!(headcount(&state, crew).await, 5);
+        assert_eq!(headcount(&state, crew).await, 6);
         assert_eq!(state.crew_repo.get_crew(crew).await.unwrap().expect("the Crew").morale, 50, "60 − 10 (BP-11a-1)");
         assert_eq!(state.launch_locks.len(), 0, "the launch lock is released");
         let (status, body, _) = drill(&state, c).await;
         assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("already heading home")));
-        assert_eq!(headcount(&state, crew).await, 5, "the heads are lost once");
+        assert_eq!(headcount(&state, crew).await, 6, "the heads are lost once");
     }
 
-    /// A Coolant-Jockey Foreman: threshold 115, so seed 2's 7th drill digs and the 8th melts
-    /// down, costing 1 head (8 → 7).
+    /// A Coolant-Jockey Foreman: threshold 115, so seed 57's 6th drill (heat 100) digs and the
+    /// 7th melts down at 119, costing 1 head (8 → 7).
     #[tokio::test]
-    async fn ops_coolant_jockey_melts_down_on_the_8th() {
+    async fn ops_coolant_jockey_melts_down_on_the_7th() {
         let state = Arc::new(session_state());
         let (c, crew) = dig_campaign(&state, true).await;
-        dig_on_site(&state, c, 2).await;
-        for i in 1..=7 {
+        dig_on_site(&state, c, 57).await;
+        for i in 1..=6 {
             let (status, body, _) = drill(&state, c).await;
             assert_eq!(status, StatusCode::OK, "drill {i}: {body}");
             assert_eq!(body["active_op"]["dig"]["threshold"], 115, "drill {i}");
@@ -1561,10 +1561,10 @@ mod tests {
         let state = Arc::new(state);
         let (c, crew) = dig_campaign(&state, false).await;
         dig_on_site(&state, c, 2).await;
-        for _ in 1..=6 {
+        for _ in 1..=5 {
             assert_eq!(drill(&state, c).await.0, StatusCode::OK);
         }
-        let (status, body, _) = drill(&state, c).await;
+        let (status, body, _) = drill(&state, c).await; // seed 2's 6th drill melts at 116 (BP-13)
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
         let op = state.demo_ops.store.op_view(c, chrono::Utc::now()).expect("op");
         assert_eq!(op.leg, crate::demo_ops::OpLeg::Homeward);
@@ -1742,7 +1742,7 @@ mod tests {
         let d = &body["active_op"]["dig"];
         assert_eq!(d["raid"], serde_json::json!({"mission_id": "GUARD_DUTY"}));
         assert!(d["next_raid_pct"].is_null());
-        assert_eq!((d["heat"].as_u64(), d["ore_on_site"].as_u64()), (Some(15), Some(10)));
+        assert_eq!((d["heat"].as_u64(), d["ore_on_site"].as_u64()), (Some(10), Some(20)));
         let text = String::from_utf8_lossy(&bytes);
         assert!(!text.contains("trigger") && !text.contains("commander"), "{text}");
         let (status, body, _) = drill(&state, c).await;
@@ -1778,7 +1778,7 @@ mod tests {
         assert_eq!(op["leg"], "homeward");
         assert_eq!(op["depart_at"], body["now"]);
         assert_eq!(op["dig"]["ended_by"], "retreat");
-        assert_eq!((op["dig"]["carried"].as_u64(), op["dig"]["ore_on_site"].as_u64()), (Some(5), Some(0)));
+        assert_eq!((op["dig"]["carried"].as_u64(), op["dig"]["ore_on_site"].as_u64()), (Some(10), Some(0)));
         let (status, body, _) = drill(&state, c).await;
         assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("already heading home")));
         assert_eq!(headcount(&state, crew).await, 8, "a retreat costs no heads");
@@ -1836,7 +1836,7 @@ mod tests {
     }
 
     /// The pull's refusals in its order, on a contract and on a dig, then a pull that goes
-    /// through (seed 2, one drill: 10 ore).
+    /// through (seed 2, one drill: 20 ore).
     #[tokio::test]
     async fn ops_pull_refusals() {
         let state = Arc::new(session_state());
@@ -1862,14 +1862,14 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         let op = &body["active_op"];
         assert_eq!((op["leg"].as_str(), op["dig"]["ended_by"].as_str()), (Some("homeward"), Some("pulled")));
-        assert_eq!((op["dig"]["carried"].as_u64(), op["dig"]["ore_on_site"].as_u64()), (Some(10), Some(0)));
+        assert_eq!((op["dig"]["carried"].as_u64(), op["dig"]["ore_on_site"].as_u64()), (Some(20), Some(0)));
         assert_eq!(op["depart_at"], body["now"]);
         assert_eq!(secs_between(op), site_secs(&body, DIG), "the haul takes the site's time");
         let (status, body, _) = pull(&state, c).await;
         assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("already heading home")));
     }
 
-    /// Reviewer BP-8b-1b F4 through the routes: seed 7's raid is lost, the team retreats with 5
+    /// Reviewer BP-8b-1b F4 through the routes: seed 7's raid is lost, the team retreats with 10
     /// ore, and the first read after the arrival banks it.
     #[tokio::test]
     async fn ops_retreat_banks_carried_on_the_arrival_read() {
@@ -1880,15 +1880,15 @@ mod tests {
         fight(&state, c, sim_engine::game_types::OutcomeType::Defeat).await;
         let (status, body) = get(&state, Some("t"), c).await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!((body["active_op"]["dig"]["carried"].as_u64(), body["ore_banked"].as_u64()), (Some(5), Some(0)));
+        assert_eq!((body["active_op"]["dig"]["carried"].as_u64(), body["ore_banked"].as_u64()), (Some(10), Some(0)));
         state.demo_ops.store.rewind_op(c, site_secs(&body, DIG));
         let (status, body) = get(&state, Some("t"), c).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(body["active_op"].is_null(), "home: {body}");
-        assert_eq!(body["ore_banked"], 5);
+        assert_eq!(body["ore_banked"], 10);
     }
 
-    /// Seed 2 (never ambushed): three drills, a pull of 60 ore, banked by the first read after the
+    /// Seed 2 (never ambushed): three drills, a pull of 120 ore, banked by the first read after the
     /// arrival; the bank survives the next dig's start.
     #[tokio::test]
     async fn ops_pull_banks_on_the_arrival_read() {
@@ -1900,7 +1900,7 @@ mod tests {
         }
         let (status, body, _) = pull(&state, c).await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!((body["active_op"]["dig"]["carried"].as_u64(), body["ore_banked"].as_u64()), (Some(60), Some(0)));
+        assert_eq!((body["active_op"]["dig"]["carried"].as_u64(), body["ore_banked"].as_u64()), (Some(120), Some(0)));
         assert!(body["active_op"]["dig"]["ambush"].is_null());
         let (_, body) = get(&state, Some("t"), c).await;
         assert_eq!((body["active_op"]["arrived"].as_bool(), body["ore_banked"].as_u64()), (Some(false), Some(0)), "on the road");
@@ -1908,10 +1908,10 @@ mod tests {
         let (status, body) = get(&state, Some("t"), c).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(body["active_op"].is_null(), "home: {body}");
-        assert_eq!(body["ore_banked"], 60);
+        assert_eq!(body["ore_banked"], 120);
         let (status, body, _) = start(&state, c, DIG).await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body["ore_banked"], 60, "the bank outlives the op");
+        assert_eq!(body["ore_banked"], 120, "the bank outlives the op");
     }
 
     /// Raiders can't be outrun with the ore: seed 7's raid refuses the pull, and nothing moves.
@@ -1925,12 +1925,12 @@ mod tests {
         assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("raiders at the site")));
         let (_, body) = get(&state, Some("t"), c).await;
         assert_eq!(body["active_op"]["leg"], "outbound");
-        assert_eq!((body["active_op"]["dig"]["ore_on_site"].as_u64(), body["active_op"]["dig"]["carried"].as_u64()), (Some(10), Some(0)));
+        assert_eq!((body["active_op"]["dig"]["ore_on_site"].as_u64(), body["active_op"]["dig"]["carried"].as_u64()), (Some(20), Some(0)));
     }
 
     /// Seed 14 (ambush d100 4): the pull's body shows no ambush; the read after the midpoint fires
     /// it and the team waits on the road; a won fight is latched by the next read and the leg
-    /// resumes; the read after its arrival banks all 30 ore.
+    /// resumes; the read after its arrival banks all 60 ore.
     #[tokio::test]
     async fn ops_ambush_is_fought_then_the_haul_banks() {
         let state = Arc::new(session_state());
@@ -1955,12 +1955,12 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         let op = &body["active_op"];
         assert!(op["dig"]["ambush"].is_null(), "{body}");
-        assert_eq!((op["arrived"].as_bool(), op["dig"]["carried"].as_u64()), (Some(false), Some(30)));
+        assert_eq!((op["arrived"].as_bool(), op["dig"]["carried"].as_u64()), (Some(false), Some(60)));
         state.demo_ops.store.rewind_op(c, secs);
         let (status, body) = get(&state, Some("t"), c).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(body["active_op"].is_null(), "home: {body}");
-        assert_eq!(body["ore_banked"], 30);
+        assert_eq!(body["ore_banked"], 60);
     }
 
     /// Seed 14's ambush ends in a Wipeout: the op is cleared, nothing is banked, and the next dig
@@ -2134,7 +2134,7 @@ mod tests {
         post(state, campaign, "build", Some(&serde_json::json!({ "building": building }).to_string())).await
     }
 
-    /// Seed 2's 60-ore haul lands; the build's own call banks it and pays the Radio Shack's 50,
+    /// Seed 2's 120-ore haul lands; the build's own call banks it and pays the Radio Shack's 50,
     /// and `base` shows it. Then already built, then short of ore; a board read shows the same.
     #[tokio::test]
     async fn ops_build_spends_the_bank_and_shows_the_base() {
@@ -2153,14 +2153,14 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(body["active_op"].is_null(), "home: {body}");
         let shack = serde_json::json!({"radio_shack": true, "hobbyist_benches": false, "grease_pit": false, "gunsmith": false});
-        assert_eq!((body["ore_banked"].as_u64(), &body["base"]), (Some(10), &shack));
+        assert_eq!((body["ore_banked"].as_u64(), &body["base"]), (Some(70), &shack));
         let (status, body, _) = build(&state, c, "radio_shack").await;
         assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("already built")));
         let (status, body, _) = build(&state, c, "gunsmith").await;
         assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("not enough banked ore")));
         let (status, body) = get(&state, Some("t"), c).await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!((body["ore_banked"].as_u64(), &body["base"]), (Some(10), &shack));
+        assert_eq!((body["ore_banked"].as_u64(), &body["base"]), (Some(70), &shack));
     }
 
     /// The build's refusals in its order: no gateway; an unknown building, after the member

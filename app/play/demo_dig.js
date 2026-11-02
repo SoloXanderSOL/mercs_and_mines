@@ -6,14 +6,16 @@
 // the roster the client already holds, so the client keeps no heat or ore constant. Every string
 // goes in through textContent.
 
-// Booth copy, verbatim from the BP-9b prompt.
+// Booth copy, verbatim from the BP-9b prompt (range, risk and riskHot from BP-13's).
 export const DIG_COPY = {
   drill: 'Keep drilling',
   pull: 'Pull out',
   home: 'Head home',
   fight: 'Fight',
   status: 'Drills {n} · {ore} ore on site · Heat {heat}/{threshold}',
-  risk: 'Next drill: +{ore} ore, {pct}% raid risk',
+  range: 'Next drill: +{min}–{max} heat, +{ore} ore',
+  risk: '{pct}% raid risk.',
+  riskHot: '{pct}% raid risk. The drill might overheat.',
   melts: 'Next drill melts the site down.',
   crew: 'Crew {heads} · Foreman {name}, {spec}',
   crewNoSpec: 'Crew {heads} · Foreman {name}',
@@ -47,6 +49,10 @@ export const DIG_CSS = `
 .dig-heat-fill { position: absolute; left: 0; top: 0; bottom: 0; width: 0; background: var(--accent); transition: width 0.25s ease-out, background-color 0.25s ease-out; }
 .dig-heat-fill.hot { background: var(--danger); }
 .dig-heat-tick { position: absolute; top: 0; bottom: 0; left: ${(100 / SCALE).toFixed(3)}%; width: 0.6cqw; margin-left: -0.3cqw; background: #fff; }
+.dig-heat-ghost, .dig-heat-over { position: absolute; top: 0; bottom: 0; left: 0; width: 0; pointer-events: none; }
+.dig-heat-ghost { background: var(--accent); opacity: 0.3; }
+.dig-heat-over { background: var(--danger); opacity: 0.55; }
+.dig-heat-over[hidden] { display: none; }
 .dig-line { margin: 0; font-size: 3.9cqw; line-height: 1.35; }
 .dig-line.alert { color: var(--accent); font-weight: 700; }
 .dig-line.danger { color: var(--danger); font-weight: 700; }
@@ -89,14 +95,18 @@ export function createDigPanel() {
   const node = el('div', 'dig-panel');
   const heat = el('div', 'dig-heat');
   const bar = el('div', 'dig-heat-fill');
-  heat.append(bar, el('div', 'dig-heat-tick'));
-  const status = el('p', 'dig-line');
-  const risk = el('p', 'dig-line');
-  const crew = el('p', 'dig-line');
+  const ghost = el('div', 'dig-heat-ghost'); // BP-13: the heat the next drill may add
+  const over = el('div', 'dig-heat-over');   // the part of it past the threshold
+  over.hidden = true;
+  heat.append(bar, ghost, over, el('div', 'dig-heat-tick'));
+  const status = el('p', 'dig-line dig-status');
+  const range = el('p', 'dig-line dig-range');
+  const risk = el('p', 'dig-line dig-risk');
+  const crew = el('p', 'dig-line dig-crew');
   const pop = el('span', 'dig-pop');
-  node.append(heat, status, risk, crew, pop);
+  node.append(heat, status, range, risk, crew, pop);
   node.hidden = true;
-  return { node, bar, status, risk, crew, pop, lastOre: null };
+  return { node, bar, ghost, over, status, range, risk, crew, pop, lastOre: null };
 }
 
 // The Crew and Foreman the dig start picked: the roster's first of each (same listers, same order).
@@ -115,11 +125,27 @@ export function renderDig(p, dig, roster) {
   p.bar.style.width = (share * 100).toFixed(2) + '%';
   p.bar.classList.toggle('hot', dig.heat >= dig.threshold * HOT);
   p.status.textContent = fill(DIG_COPY.status, { n: dig.drills, ore: dig.ore_on_site, heat: dig.heat, threshold: dig.threshold });
+  // BP-13: the next drill's range from the body (absent on an older server: no range, no ghost).
+  const live = Number.isFinite(dig.next_heat_max) && dig.next_heat_max > 0 && !dig.raid;
+  const hot = live && dig.might_overheat === true;
+  const at = v => (scale > 0 ? Math.max(0, Math.min(1, v / scale)) : 0);
+  const pc = v => (v * 100).toFixed(2) + '%';
+  const top = live ? dig.heat + dig.next_heat_max : dig.heat;
+  const from = Math.max(dig.heat, dig.threshold);
+  p.ghost.style.left = pc(at(dig.heat));
+  p.ghost.style.width = pc(at(top) - at(dig.heat));
+  p.over.style.left = pc(at(from));
+  p.over.style.width = pc(Math.max(0, at(top) - at(from)));
+  p.over.hidden = !hot;
+  p.range.textContent = live ? fill(DIG_COPY.range, { min: dig.next_heat_min, max: dig.next_heat_max, ore: dig.next_ore }) : '';
+  p.range.hidden = !p.range.textContent;
   let risk = '', tone = '';
   if (!dig.raid) {
-    // next_raid_pct is null on an arrived outbound leg with no raid only when the next drill melts.
+    // next_raid_pct is null on an arrived outbound leg with no raid only when even the bottom of the
+    // next drill's range reaches the threshold; might_overheat is the top's warning (BP-13).
     if (dig.next_raid_pct === null) { risk = DIG_COPY.melts; tone = 'danger'; }
-    else { risk = fill(DIG_COPY.risk, { ore: dig.next_ore, pct: dig.next_raid_pct }); if (dig.next_raid_pct >= 20) tone = 'alert'; }
+    else if (hot) { risk = fill(DIG_COPY.riskHot, { pct: dig.next_raid_pct }); tone = 'danger'; }
+    else { risk = fill(DIG_COPY.risk, { pct: dig.next_raid_pct }); if (dig.next_raid_pct >= 20) tone = 'alert'; }
   }
   p.risk.textContent = risk;
   p.risk.hidden = !risk;
