@@ -88,6 +88,12 @@ pub const DEMO_TROPHY_CAP: usize = 20;
 pub const DEMO_REPLACE_MERC_CREDITS: u32 = 120;
 /// Credits per miner replaced (BP-12a-2, §4e): a fresh head for a Crew, up to 8.
 pub const DEMO_REPLACE_MINER_CREDITS: u32 = 80;
+/// A squad hire's price (BP-18a-2, §4e B6): a Section and a Commander together.
+pub const DEMO_HIRE_CREDITS: u32 = 600;
+/// The most squads (Sections) a member holds (BP-18a-2): the starter and one hire.
+pub const DEMO_HIRE_CAP: usize = 2;
+/// Wages (BP-18a-2, §4e B6): credits per squad per whole minute, settled on read, floor 0.
+pub const DEMO_WAGE_CREDITS_PER_MIN: u32 = 5;
 /// Drill *n* adds a seeded heat from `DEMO_HEAT_MIN` to `DEMO_HEAT_TOP_BASE + DEMO_HEAT_TOP_PER_DRILL × n`
 /// inclusive (§4e B1, BP-13: drill 1 10–20, drill 2 10–25, …); the site melts down at the threshold.
 pub const DEMO_HEAT_MIN: u32 = 10;
@@ -852,6 +858,24 @@ pub struct ReplaceHold {
     credits: u32,
 }
 
+/// Why `begin_hire` refused (BP-18a-2), in the order it checks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HireRefusal {
+    /// The member's Sections, plus a hire in flight, are already `DEMO_HIRE_CAP`.
+    Cap,
+    /// Fewer banked credits than `DEMO_HIRE_CREDITS` (also a campaign with no entry).
+    NotEnoughCredits,
+}
+
+/// A squad hire's debit, held until its writes land (BP-18a-2). Only `finish_hire` consumes
+/// it, so the refund is always the amount debited.
+#[must_use]
+#[derive(Debug, PartialEq, Eq)]
+pub struct HireHold {
+    campaign_id: Uuid,
+    credits: u32,
+}
+
 /// The raid's fight among the Commander's deployments: the earliest one that is not `aborted`,
 /// is the trigger's mission and started strictly after the trigger (`started_at` is the app's
 /// clock, as `trigger_at` is). `None` while there is none or it is still `active` (a later
@@ -1110,6 +1134,17 @@ struct OpsEntry {
     /// Credits a replace has debited and not yet finished (BP-12a-2): set by `begin_replace`,
     /// cleared by `finish_replace`. `make_room` keeps an entry while it is not 0.
     credits_in_flight: u32,
+    /// Wages (BP-18a-2): the instant up to which this entry's squads are paid. Starts at the
+    /// entry's creation and moves by whole minutes only (`settle_wages`), so a partial minute
+    /// carries. Not on the keep list (it is never at a default), and `rewind_op` leaves it, so
+    /// a route test that rewinds an op pays no wages.
+    wages_at: DateTime<Utc>,
+    /// The squads (Sections) the wages count (BP-18a-2): 1 at creation (every demo member joins
+    /// with one Section), then the route's recount under the launch lock (`finish_hire`).
+    squads: u8,
+    /// A squad hire is between `begin_hire` and `finish_hire` (BP-18a-2). Its credits ride in
+    /// `credits_in_flight`, so `make_room` keeps the entry meanwhile.
+    hire_in_flight: bool,
     /// The last Crew fight (BP-17a), written by the Crew's raid in `drill_op` and by
     /// `latch_crew`, cleared by the next `start_op` or `next_op`. Display only, not on the keep
     /// list: an evicted entry loses only the message.
@@ -1240,6 +1275,20 @@ impl OpsEntry {
         true
     }
 
+    /// Pays the wages due since `wages_at` (BP-18a-2): `DEMO_WAGE_CREDITS_PER_MIN` per squad per
+    /// whole minute, saturating at 0 (a wage the bank can't cover is forgiven, never owed). The
+    /// anchor moves by whole minutes only, so a partial minute carries; a clock at or behind the
+    /// anchor pays nothing. A clock test under the lock: it reads nothing outside the entry.
+    fn settle_wages(&mut self, now: DateTime<Utc>) {
+        let mins = (now - self.wages_at).num_minutes();
+        if mins <= 0 {
+            return;
+        }
+        self.wages_at += Duration::minutes(mins);
+        let owed = u32::try_from(mins).unwrap_or(u32::MAX).saturating_mul(DEMO_WAGE_CREDITS_PER_MIN).saturating_mul(u32::from(self.squads));
+        self.credits_banked = self.credits_banked.saturating_sub(owed);
+    }
+
     /// Brings back every batch whose `healed_at` has come, then drops the bays back at the
     /// default (BP-12a-1). A clock test under the lock: it reads nothing outside the entry.
     fn settle_sickbay(&mut self, now: DateTime<Utc>) {
@@ -1273,7 +1322,10 @@ impl OpsEntry {
     /// contracts by key), a cleared one removes its key, and an arrival stamps
     /// `moved_at = max(moved_at, arrived_at)`, so an older arrival settled after a newer
     /// movement never moves the stamp back (the same as today's write while one op is out).
+    /// BP-18a-2: the wages (`settle_wages`) first of all, so pay a latch adds after this settle
+    /// is never taken for minutes that passed before it.
     fn settle_arrival(&mut self, now: DateTime<Utc>) {
+        self.settle_wages(now);
         self.settle_contracts(now);
         self.settle_sickbay(now);
         let mut arrivals: Vec<(DateTime<Utc>, u32)> = Vec::new();
@@ -1665,7 +1717,7 @@ impl DemoOpsStore {
         if !self.make_room(&mut inner) {
             return false;
         }
-        inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, dig: None, contracts_out: BTreeMap::new(), moved_at: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), contracts: HashMap::new(), sickbay: HashMap::new(), trophies: Vec::new(), credits_in_flight: 0, crew_fight: None });
+        inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, dig: None, contracts_out: BTreeMap::new(), moved_at: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), contracts: HashMap::new(), sickbay: HashMap::new(), trophies: Vec::new(), credits_in_flight: 0, crew_fight: None, wages_at: now, squads: 1, hire_in_flight: false });
         true
     }
 
@@ -1715,7 +1767,7 @@ impl DemoOpsStore {
             if !self.make_room(&mut inner) {
                 return Err(StartRefusal::Full);
             }
-            inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, dig: None, contracts_out: BTreeMap::new(), moved_at: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), contracts: HashMap::new(), sickbay: HashMap::new(), trophies: Vec::new(), credits_in_flight: 0, crew_fight: None });
+            inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, dig: None, contracts_out: BTreeMap::new(), moved_at: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), contracts: HashMap::new(), sickbay: HashMap::new(), trophies: Vec::new(), credits_in_flight: 0, crew_fight: None, wages_at: now, squads: 1, hire_in_flight: false });
         }
         let Some(e) = inner.get_mut(&campaign_id) else {
             return Err(StartRefusal::Full);
@@ -2215,10 +2267,18 @@ impl DemoOpsStore {
     /// always the primary (`slot_keys` is dig-first), so it is never here. Empty with one op or
     /// none. A second return, never a field on `OpsSnapshot`, which a test compares whole.
     pub fn ops_state_all(&self, campaign_id: Uuid, now: DateTime<Utc>) -> (OpsSnapshot, Vec<MoreOp>) {
+        let (snapshot, more_ops, _) = self.ops_body(campaign_id, now);
+        (snapshot, more_ops)
+    }
+
+    /// `ops_state_all` and the squads the wages count (BP-18a-2), from one lock: the body's
+    /// `company.wages`. A campaign with no entry counts one squad (every demo member joins with
+    /// one), and pays nothing until it has an entry.
+    pub fn ops_body(&self, campaign_id: Uuid, now: DateTime<Utc>) -> (OpsSnapshot, Vec<MoreOp>, u8) {
         let mut inner = self.lock();
         let Some(e) = inner.get_mut(&campaign_id) else {
             let none = OpsSnapshot { sites: None, op: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), company: CompanyView::default(), crew_fight: None };
-            return (none, Vec::new());
+            return (none, Vec::new(), 1);
         };
         e.settle_arrival(now);
         let primary = e.primary_key();
@@ -2243,7 +2303,7 @@ impl DemoOpsStore {
             company: e.company(),
             crew_fight: e.crew_fight,
         };
-        (snapshot, more_ops)
+        (snapshot, more_ops, e.squads)
     }
 
     /// Which of `sections` the store holds busy (BP-18a-1b-2, `OpsEntry::section_busy`), after
@@ -2271,8 +2331,9 @@ impl DemoOpsStore {
     }
 
     /// The Section on the op `squad` selects (BP-18a-1b-2, next's at-0 check), after settling, by
-    /// `OpsEntry::select`: `Some` of the slot's Section (a contract's key, a dig's recorded
-    /// Section), itself `None` for an op with no Section; `None` when the selection finds no op
+    /// `OpsEntry::select`: `Some` of the slot's Section (a contract's key, a guarded dig's guard,
+    /// BP-18a-2), itself `None` for an op with no Section or an unguarded dig; `None` when the
+    /// selection finds no op
     /// (`NoOp`, or `SayWhich` with two out), so the route falls back to the member's first Section
     /// and `next_op_for` answers the selection's refusal after the at-0 check, as today.
     pub fn squad_section(&self, campaign_id: Uuid, squad: Option<OpSquad>, now: DateTime<Utc>) -> Option<Option<Uuid>> {
@@ -2282,7 +2343,11 @@ impl DemoOpsStore {
         let key = e.select(squad).ok()?;
         match key {
             SlotKey::Contract(s) => Some(s),
-            SlotKey::Dig => e.slot(key).map(|op| op.dig.as_ref().and_then(|d| d.section_id)),
+            // BP-18a-2 (Reviewer BP-18a-1b-2 F2): the guard's Section only. A Crew-alone dig's
+            // recorded home Section is not its squad (A4), so an unguarded dig has none here, the
+            // at-0 check passes and `next_op_for` answers `GuardNotHere`. Any change to
+            // `GuardNotHere` keeps this arm and the A2 copy in `next_op_for` on `guarded_dig()`.
+            SlotKey::Dig => Some(e.guarded_dig().and_then(|d| d.section_id)),
         }
     }
 
@@ -2467,6 +2532,52 @@ impl DemoOpsStore {
         }
     }
 
+    /// Debits a squad hire (BP-18a-2) and holds it in flight until `finish_hire`. `sections` is
+    /// the member's Section count as the route read it. Settles first (the wages included).
+    /// Refusals in order: `Cap` (`sections`, plus a hire in flight, already at `DEMO_HIRE_CAP`)
+    /// → `NotEnoughCredits` (also no entry). Allowed while a squad is out: a hire reports at
+    /// base. Check and debit are one critical section, no await. The route's count can be stale
+    /// (a hire that finished between its read and this call), so the route recounts under the
+    /// launch lock before it writes; this is the cheap early refusal. Writes `moved_at` (the keep
+    /// list), as `begin_hold` does.
+    pub fn begin_hire(&self, campaign_id: Uuid, sections: usize, now: DateTime<Utc>) -> Result<HireHold, HireRefusal> {
+        let mut inner = self.lock();
+        let Some(e) = inner.get_mut(&campaign_id) else {
+            return Err(HireRefusal::NotEnoughCredits);
+        };
+        e.settle_arrival(now);
+        if sections + usize::from(e.hire_in_flight) >= DEMO_HIRE_CAP {
+            return Err(HireRefusal::Cap);
+        }
+        if !e.debit_credits(DEMO_HIRE_CREDITS) {
+            return Err(HireRefusal::NotEnoughCredits);
+        }
+        e.credits_in_flight = e.credits_in_flight.saturating_add(DEMO_HIRE_CREDITS);
+        e.hire_in_flight = true;
+        e.moved_at = Some(now);
+        e.touched = now;
+        Ok(HireHold { campaign_id, credits: DEMO_HIRE_CREDITS })
+    }
+
+    /// Ends a squad hire (BP-18a-2): the hold leaves flight, and without `landed` it goes back
+    /// to the bank. `squads`, when the route knows it (its recount under the launch lock, plus
+    /// one for a hire that landed), becomes the wage count; the partial minute before it bills at
+    /// the new count. An entry gone by now went with its campaign, so nothing is recreated.
+    pub fn finish_hire(&self, hold: HireHold, landed: bool, squads: Option<u8>) {
+        let mut inner = self.lock();
+        let Some(e) = inner.get_mut(&hold.campaign_id) else {
+            return;
+        };
+        e.credits_in_flight = e.credits_in_flight.saturating_sub(hold.credits);
+        e.hire_in_flight = false;
+        if let Some(n) = squads {
+            e.squads = n;
+        }
+        if !landed {
+            e.credits_banked = e.credits_banked.saturating_add(hold.credits);
+        }
+    }
+
     /// The reaper's keep check: the team departed, drilled, latched a battle or came home at or after `cutoff` (a leg
     /// that has arrived by `now` counts at its arrival, also while a haul's ambush waits: an
     /// accepted overcount of at most `travel_secs`). Reading the board is not moving.
@@ -2524,6 +2635,15 @@ impl DemoOpsStore {
                     *t -= back;
                 }
             }
+        }
+    }
+
+    /// Moves the campaign's wage clock `secs` into the past (BP-18a-2), so a route test pays
+    /// wages without sleeping. `rewind_op` leaves it.
+    #[cfg(test)]
+    pub(crate) fn rewind_wages(&self, campaign_id: Uuid, secs: i64) {
+        if let Some(e) = self.lock().get_mut(&campaign_id) {
+            e.wages_at -= Duration::seconds(secs);
         }
     }
 
@@ -4524,5 +4644,125 @@ mod tests {
         assert_eq!(store.squad_section(a, Some(OpSquad::Dig), at(1)), None);
         alone(&store, a, 7);
         assert_eq!(store.squad_section(a, None, at(1)), None);
+    }
+
+    // ---- BP-18a-2: wages and the squad hire. Every entry is made by `put_board` at `at(0)`, so
+    // the wage clock starts there.
+
+    fn wage_entry(store: &DemoOpsStore, a: Uuid, credits: u32) {
+        assert!(store.put_board(a, (5, 0), board(), at(0)));
+        store.set_credits(a, credits);
+    }
+
+    fn credits_at(store: &DemoOpsStore, a: Uuid, secs: i64) -> u32 {
+        store.ops_state(a, at(secs)).credits_banked
+    }
+
+    /// One squad pays 5 a whole minute: nothing at 59 s, 5 at 60 s, 10 at 179 s.
+    #[test]
+    fn wages_pay_per_whole_minute() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        wage_entry(&store, a, 100);
+        assert_eq!(credits_at(&store, a, 59), 100);
+        assert_eq!(credits_at(&store, a, 60), 95);
+        assert_eq!(credits_at(&store, a, 179), 90);
+    }
+
+    /// N5: the anchor moves by whole minutes, so the 30 s past the first minute carry: 95 at 90 s
+    /// (anchor 60 s), 90 at 130 s (anchor 120 s).
+    #[test]
+    fn wages_carry_a_partial_minute() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        wage_entry(&store, a, 100);
+        assert_eq!(credits_at(&store, a, 90), 95);
+        assert_eq!(credits_at(&store, a, 130), 90);
+    }
+
+    /// N4: 2 minutes owe 10 against 7 banked; the bank stops at 0 and the rest is forgiven.
+    #[test]
+    fn wages_never_go_below_0() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        wage_entry(&store, a, 7);
+        assert_eq!(credits_at(&store, a, 120), 0);
+        store.set_credits(a, 50);
+        assert_eq!(credits_at(&store, a, 121), 50, "nothing carried as a debt");
+    }
+
+    /// N6: after a landed hire the wages count two squads: 10 a minute.
+    #[test]
+    fn wages_are_per_squad() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        wage_entry(&store, a, 700);
+        let hold = store.begin_hire(a, 1, at(0)).expect("a hire");
+        store.finish_hire(hold, true, Some(2));
+        assert_eq!(store.ops_body(a, at(1)).2, 2);
+        assert_eq!(credits_at(&store, a, 59), 100);
+        assert_eq!(credits_at(&store, a, 60), 90);
+    }
+
+    /// A clock behind the anchor pays nothing and leaves the anchor where it was.
+    #[test]
+    fn wages_pay_nothing_behind_the_anchor() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        wage_entry(&store, a, 100);
+        assert_eq!(credits_at(&store, a, -120), 100);
+        assert_eq!(credits_at(&store, a, 60), 95);
+    }
+
+    /// N1: with two Sections the hire refuses `Cap` and debits nothing.
+    #[test]
+    fn begin_hire_refuses_at_two_squads() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        wage_entry(&store, a, 600);
+        assert_eq!(store.begin_hire(a, 2, at(1)), Err(HireRefusal::Cap));
+        assert_eq!(credits_at(&store, a, 2), 600);
+    }
+
+    /// N2: one Section and a hire in flight make two: a second hire refuses `Cap`, though the
+    /// bank could pay for it.
+    #[test]
+    fn begin_hire_refuses_while_one_is_in_flight() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        wage_entry(&store, a, 1200);
+        let hold = store.begin_hire(a, 1, at(1)).expect("the first hire");
+        assert_eq!(store.begin_hire(a, 1, at(2)), Err(HireRefusal::Cap));
+        assert_eq!(credits_at(&store, a, 3), 600);
+        store.finish_hire(hold, false, None);
+    }
+
+    /// 599 banked is short; a campaign with no entry has banked nothing.
+    #[test]
+    fn begin_hire_refuses_when_short() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        wage_entry(&store, a, 599);
+        assert_eq!(store.begin_hire(a, 1, at(1)), Err(HireRefusal::NotEnoughCredits));
+        assert_eq!(credits_at(&store, a, 2), 599);
+        assert_eq!(store.begin_hire(Uuid::from_u128(9), 1, at(1)), Err(HireRefusal::NotEnoughCredits));
+    }
+
+    /// `landed: false` refunds and ends the flight (a second hire then passes); `landed: true`
+    /// keeps the debit and sets the wage count.
+    #[test]
+    fn finish_hire_refunds_or_keeps_the_debit() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        wage_entry(&store, a, 600);
+        let hold = store.begin_hire(a, 1, at(1)).expect("a hire");
+        assert_eq!(credits_at(&store, a, 2), 0);
+        store.finish_hire(hold, false, None);
+        assert_eq!(credits_at(&store, a, 3), 600, "refunded");
+        assert_eq!(store.ops_body(a, at(3)).2, 1, "no count given, none set");
+        let hold = store.begin_hire(a, 1, at(4)).expect("the flight ended");
+        store.finish_hire(hold, true, Some(2));
+        assert_eq!(credits_at(&store, a, 5), 0, "kept");
+        assert_eq!(store.ops_body(a, at(5)).2, 2);
     }
 }

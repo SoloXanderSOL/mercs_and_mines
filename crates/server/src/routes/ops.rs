@@ -40,6 +40,9 @@ use crate::demo_ops::{
     ReturnRefusal, StartRefusal, DEMO_CREW_FIGHT_MORALE_LOSS, DEMO_MELTDOWN_MORALE_LOSS, DEMO_REPLACE_MERC_CREDITS,
     DEMO_REPLACE_MINER_CREDITS,
 };
+use crate::commander_gen::generate_commander;
+use crate::demo_ops::{HireHold, HireRefusal, DEMO_HIRE_CAP, DEMO_HIRE_CREDITS, DEMO_WAGE_CREDITS_PER_MIN};
+use crate::repository::section::starter_section;
 use crate::repository::{outcome_db_str, CampaignInstance, CampaignLifecycle, DeploymentRecord, SectionRecord, SectorState};
 use crate::state::AppState;
 
@@ -66,13 +69,15 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/campaign/:campaign_id/ops/heal", post(post_ops_heal).layer(DefaultBodyLimit::max(OPS_BODY_LIMIT)))
         .route("/api/campaign/:campaign_id/ops/replace", post(post_ops_replace).layer(DefaultBodyLimit::max(OPS_BODY_LIMIT)))
         .route("/api/campaign/:campaign_id/ops/escort", post(post_ops_escort))
+        .route("/api/campaign/:campaign_id/ops/hire", post(post_ops_hire))
 }
 
 /// The ops state as the client sees it, from every route. `now` is the server's clock, so the
 /// client's crawl survives a phone whose clock is off. `ore_banked` is the campaign's banked ore
 /// (BP-8b-2), `credits_banked` its banked pay (BP-11a-2) and `base` its merc base's buildings
 /// (BP-10a), 0 and none built for a member with no gateway; and `company` the sickbays and the
-/// Trophy Shelf (BP-12a-1; empty for a member with no gateway).
+/// Trophy Shelf (BP-12a-1; empty for a member with no gateway), with the wage line and the squad
+/// hire's terms beside them (BP-18a-2, `CompanyBody`).
 #[derive(Serialize)]
 pub struct OpsView<'a> {
     pub campaign_id: Uuid,
@@ -82,7 +87,7 @@ pub struct OpsView<'a> {
     pub ore_banked: u32,
     pub credits_banked: u32,
     pub base: OpsBase,
-    pub company: CompanyView,
+    pub company: CompanyBody,
     pub now: String,
     /// The last Crew fight (BP-17a), until the next start; absent when there is none.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -91,6 +96,38 @@ pub struct OpsView<'a> {
     /// same shape as `active_op`, in key order; absent with one op or none.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub more_ops: Vec<MoreOp>,
+}
+
+/// `company` as the client sees it (BP-18a-2): the store's sickbays and shelf (`CompanyView`,
+/// flattened, so its keys are unchanged), the wage line and the squad hire's terms. Always
+/// present: the client draws the wage line for one squad too.
+#[derive(Serialize)]
+pub struct CompanyBody {
+    #[serde(flatten)]
+    pub store: CompanyView,
+    pub wages: WagesView,
+    pub hire: HireView,
+}
+
+/// The wage line (BP-18a-2): what the squads cost a minute, and how many there are.
+#[derive(Serialize)]
+pub struct WagesView {
+    pub per_minute: u32,
+    pub squads: u8,
+}
+
+/// A squad hire's terms (BP-18a-2): its price and the most squads a member holds.
+#[derive(Serialize)]
+pub struct HireView {
+    pub credits: u32,
+    pub cap: usize,
+}
+
+impl CompanyBody {
+    fn new(store: CompanyView, squads: u8) -> Self {
+        let wages = WagesView { per_minute: DEMO_WAGE_CREDITS_PER_MIN * u32::from(squads), squads };
+        Self { store, wages, hire: HireView { credits: DEMO_HIRE_CREDITS, cap: DEMO_HIRE_CAP } }
+    }
 }
 
 /// `ops/start`'s and `ops/next`'s body. `escort` (BP-17a) is read by `ops/start` for a dig only,
@@ -258,7 +295,7 @@ async fn load_board(
 }
 
 fn ops_response(state: &AppState, campaign_id: Uuid, gw: (i32, i32), board: &OpsBoard, now: DateTime<Utc>) -> Response {
-    let (s, more_ops) = state.demo_ops.store.ops_state_all(campaign_id, now);
+    let (s, more_ops, squads) = state.demo_ops.store.ops_body(campaign_id, now);
     // BP-11a-3: the sites as they stand (a fought contract off the board, a returned one moved);
     // the route's own board only when the campaign has no entry (a store full of ops).
     let sites = s.sites.as_deref().unwrap_or(&board.sites);
@@ -270,7 +307,7 @@ fn ops_response(state: &AppState, campaign_id: Uuid, gw: (i32, i32), board: &Ops
         ore_banked: s.ore_banked,
         credits_banked: s.credits_banked,
         base: s.base,
-        company: s.company,
+        company: CompanyBody::new(s.company, squads),
         now: ops_time(now),
         crew_fight: s.crew_fight,
         more_ops,
@@ -492,12 +529,30 @@ async fn get_ops_board(
     let now = Utc::now();
     let (campaign, gateway, _) = ops_member(&state, &token, campaign_id, "get_ops_board").await?;
     let Some(gw) = gateway else {
-        let view = OpsView { campaign_id, gateway: None, sites: &[], active_op: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), company: CompanyView::default(), now: ops_time(now), crew_fight: None, more_ops: Vec::new() };
+        let view = OpsView { campaign_id, gateway: None, sites: &[], active_op: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), company: CompanyBody::new(CompanyView::default(), 1), now: ops_time(now), crew_fight: None, more_ops: Vec::new() };
         return Ok(Json(view).into_response());
     };
     let board = load_board(&state, &campaign, gw, now, false, "get_ops_board").await?;
     latch_pending_raid(&state, campaign_id, now, "get_ops_board").await?;
     Ok(ops_response(&state, campaign_id, gw, &board, now))
+}
+
+/// The nameless Section pick (BP-18a-2, Reviewer BP-18a-1b-2 F1 (b)): the member's first
+/// Section with soldiers, else the first, so a member whose every Section is at 0 still meets
+/// the at-0 refusal. Oldest first, as `list_sections_for_member` sorts.
+fn alive_first(sections: &[SectionRecord]) -> Option<&SectionRecord> {
+    sections.iter().find(|s| s.headcount > 0).or(sections.first())
+}
+
+/// The at-0 refusal's words (BP-18a-2, sync 2026-11-03e): "start a new run" only when every
+/// Section the member has is at 0; otherwise the squad sent has no one and another squad does.
+/// The one place that condition is computed.
+fn no_soldiers(sections: &[SectionRecord]) -> AppError {
+    if sections.iter().all(|s| s.headcount == 0) {
+        conflict("no soldiers left to send: start a new run")
+    } else {
+        conflict("that squad has no soldiers left")
+    }
 }
 
 /// Sends the team to a site, `POST /api/campaign/:campaign_id/ops/start {site_id}` (BP-8a-2,
@@ -511,8 +566,9 @@ async fn get_ops_board(
 /// `400` a Crew alone takes no squad (a `section_id` with `escort: false`) → for a dig, the
 /// Crew, Foreman and Commander reads (`500` on failure), `409` no Crew left and `409` no
 /// Commander left; for a contract, the Commander read (`500` on failure) and `409` no Commander
-/// left → `409` no soldiers left when the Section sent (the named one, else the first) is at 0
-/// (BP-11a-1) → `503` the store is full of ops → `409` an op is under way → `409` that squad is
+/// left → `409` no soldiers left when the Section sent (the named one, else the first with
+/// soldiers, else the first, BP-18a-2) is at 0 (BP-11a-1; "no soldiers left to send: start a
+/// new run" only with every Section at 0, else "that squad has no soldiers left") → `503` the store is full of ops → `409` an op is under way → `409` that squad is
 /// out → `409` another squad has that contract → `409` every Commander is out → `200`, the
 /// whole state.
 /// - BP-18a-1b-2: `section_id` names the Section sent; the start is then named
@@ -520,7 +576,8 @@ async fn get_ops_board(
 ///   only with no op out, or as a Crew-alone dig beside a contract (the dig slot empty).
 /// - **Picks (BP-18a-1b-2, A1):** a guarded dig's and a contract's Commander is the first usable
 ///   one the store does not hold busy, else the first usable one; a Crew-alone dig's is the
-///   first usable one (A4). The Section is the named one, else the first. The picks are
+///   first usable one (A4). The Section is the named one, else the first with soldiers, else
+///   the first (`alive_first`, BP-18a-2, Reviewer BP-18a-1b-2 F1 (b)). The picks are
 ///   advisory: a start that lands between the busy read and this start is answered by the
 ///   store's `409` (that squad is out / every Commander is out).
 /// - The site is looked up as it stands (BP-11a-3): a fought contract is `400 unknown site`
@@ -579,14 +636,15 @@ async fn post_ops_start(
     }
     let dig = if site.kind == "dig" { Some(dig_start(&state, campaign_id, &wallet, escort, now, "post_ops_start").await?) } else { None };
     let lead = if site.kind == "contract" { Some(usable_commander(&state, campaign_id, &wallet, true, now, "post_ops_start").await?) } else { None };
-    // BP-11a-1: the Section sent is the named one, else the member's first (oldest first; an
-    // unnamed start can't get past `Busy` with a squad out, so the first is never busy where it
-    // lands, BP-18a-1b-2). At 0 it has no one to send; after the Commander check, so a KIA
-    // Commander still answers first. A member with no Section passes, and the dig then has no
-    // at-0 check.
-    let first_section = named.or(sections.first());
+    // BP-11a-1: the Section sent is the named one, else the member's first with soldiers, else
+    // the first (`alive_first`, BP-18a-2; an unnamed start can't get past `Busy` with a squad
+    // out, so the pick is never busy where it lands, BP-18a-1b-2). At 0 it has no one to send,
+    // worded by the whole roster (`no_soldiers`); a named Section at 0 stays a refusal (the
+    // player chose it). After the Commander check, so a KIA Commander still answers first. A
+    // member with no Section passes, and the dig then has no at-0 check.
+    let first_section = named.or_else(|| alive_first(&sections));
     if escort && first_section.is_some_and(|s| s.headcount == 0) {
-        return Err(conflict("no soldiers left to send: start a new run"));
+        return Err(no_soldiers(&sections));
     }
     let contract = lead.map(|commander_id| ContractStart { commander_id, section_id: first_section.map(|s| s.section_id) });
     let dig = dig.map(|d| DigStart { section_id: first_section.map(|s| s.section_id), escort, ..d });
@@ -606,9 +664,10 @@ async fn post_ops_start(
 /// by the lister's order (a demo member holds one, the join's); `409` when it has no heads left,
 /// since only a new run brings a fresh one. The first Foreman's specialization sets the threshold
 /// (`dig_threshold`); no Foreman means the plain threshold. The Commander, who fights the dig's
-/// raids, is the first usable one (not KIA, not Shattered: the mission route's refusals); a
-/// member holds at most one, so the client's raid fight picks the same. `409` when none is
-/// usable. The Crew is checked first, so a member with neither hears about the Crew.
+/// raids, is the first usable one (not KIA, not Shattered: the mission route's refusals), or
+/// with `prefer_free` the first usable one not busy (`usable_commander`); a squad hire gives a
+/// member a second (BP-18a-2), so the client names the Commander it fights with. `409` when
+/// none is usable. The Crew is checked first, so a member with neither hears about the Crew.
 async fn dig_start(state: &AppState, campaign_id: Uuid, wallet: &[u8], prefer_free: bool, now: DateTime<Utc>, route: &str) -> Result<DigStart, AppError> {
     let crews = state.crew_repo.list_crews_for_member(campaign_id, wallet).await.map_err(|e| {
         internal_error(format!("{route}: list_crews_for_member failed for campaign {campaign_id}: {e}"))
@@ -763,8 +822,9 @@ async fn post_ops_return(
 /// than `dig`) → the member's Sections read (`500` on failure) → `400` unknown section (not the
 /// member's, or not an id) → the lead reads as `ops/start` (a dig: Crew, Foreman and Commander;
 /// a contract: Commander; `500` on failure, `409` none left; no busy pick) → `409` no soldiers
-/// left when the moving op's Section is at 0 (the member's first when the selection finds no
-/// op, Linux Q3) → `409` no op under way (also: the named squad holds none) → `400` say which
+/// left when the moving op's Section is at 0 (when the selection finds no op, the member's
+/// first with soldiers, else the first, Linux Q3 and BP-18a-2; "start a new run" only with
+/// every Section at 0, else "that squad has no soldiers left") → `409` no op under way (also: the named squad holds none) → `400` say which
 /// squad (no squad named, two ops out, BP-18a-1b-1) → `409` already heading home → `409` still
 /// travelling → `409` raiders at the site → `409` the guard hasn't reached the dig (BP-18a-1a: a
 /// dig whose guard does not stand) → `409` already there → `409` an op is already under way (a
@@ -817,14 +877,16 @@ async fn post_ops_next(
     let squad = pick_squad(pick, &sections)?;
     let dig = if site.kind == "dig" { Some(dig_start(&state, campaign_id, &wallet, false, now, "post_ops_next").await?) } else { None };
     let lead = if site.kind == "contract" { Some(usable_commander(&state, campaign_id, &wallet, false, now, "post_ops_next").await?) } else { None };
-    // The moving op's Section (`squad_section`), else the member's first when the selection finds
-    // no op (Linux Q3: the at-0 check then answers before the store's own refusal, as today).
+    // The moving op's Section (`squad_section`), else, when the selection finds no op, the
+    // member's first with soldiers, else the first (`alive_first`, BP-18a-2; Linux Q3: the at-0
+    // check then answers before the store's own refusal, as today). A found selection at 0 stays
+    // a refusal (the moving squad is fixed, A2), worded by the whole roster (`no_soldiers`).
     let first_section = match state.demo_ops.store.squad_section(campaign_id, squad, now) {
         Some(s) => s.and_then(|id| sections.iter().find(|r| r.section_id == id)),
-        None => sections.first(),
+        None => alive_first(&sections),
     };
     if first_section.is_some_and(|s| s.headcount == 0) {
-        return Err(conflict("no soldiers left to send: start a new run"));
+        return Err(no_soldiers(&sections));
     }
     let contract = lead.map(|commander_id| ContractStart { commander_id, section_id: first_section.map(|s| s.section_id) });
     let dig = dig.map(|d| DigStart { section_id: first_section.map(|s| s.section_id), ..d });
@@ -917,8 +979,10 @@ async fn post_ops_drill(
 /// 0 → `409` no op under way → `409` not a dig site → `409` already heading home → `409` already
 /// guarded → `409` that squad is out (the Section chosen is busy, BP-18a-1b-1) → `409` every
 /// Commander is out → `200`, the whole state.
-/// - **Picks (BP-18a-1b-2, A1/A3):** the Section is the named one, else the first the store does
-///   not hold busy, else the first; the Commander is the first usable one not busy, else the
+/// - **Picks (BP-18a-1b-2, A1/A3; BP-18a-2):** the Section is the named one, else the first
+///   with soldiers the store does not hold busy, else the first with soldiers, else the first
+///   (so with every Section at 0 the at-0 refusal answers, "no soldiers left to send", and
+///   otherwise a busy alive Section is the store's `409 that squad is out`); the Commander is the first usable one not busy, else the
 ///   first usable one. Advisory: a start that lands between the busy reads and this escort is
 ///   answered by the store's `409`.
 /// - The guard stands from `now` + the site's `travel_secs` (`dig.escort_at`): a battle born
@@ -959,7 +1023,14 @@ async fn post_ops_escort(
         Pick::Any | Pick::Dig => {
             let ids: Vec<Uuid> = sections.iter().map(|s| s.section_id).collect();
             let busy = state.demo_ops.store.busy_sections(campaign_id, &ids, now);
-            sections.iter().find(|s| !busy.contains(&s.section_id)).or(sections.first())
+            // BP-18a-2 (Reviewer BP-18a-1b-2 F1 (b)): free and alive → alive → first, so the store
+            // still answers `that squad is out` before the at-0 check whenever every alive Section
+            // is busy, and the at-0 check fires on a nameless escort only with every Section at 0.
+            sections
+                .iter()
+                .find(|s| !busy.contains(&s.section_id) && s.headcount > 0)
+                .or_else(|| sections.iter().find(|s| s.headcount > 0))
+                .or(sections.first())
         }
     };
     let commander_id = usable_commander(&state, campaign_id, &wallet, true, now, "post_ops_escort").await?;
@@ -1221,6 +1292,92 @@ async fn replace_write(
             Err(internal_error(format!("post_ops_replace: {target:?} +{n} failed for campaign {campaign_id}: {e}")))
         }
     }
+}
+
+/// Hires a squad, a Section and a Commander together, `POST
+/// /api/campaign/:campaign_id/ops/hire` (BP-18a-2, demo-only, §4e B6; the "squad hire", not the
+/// Crew Hire on `ops/replace`). No body. Order: `401` → `429` `ops_ip` → `429` `ops_wallet` →
+/// `404` → `403` → `409` not `Active` (entry dropped) → `409` no gateway → the board → a pending
+/// battle latched → the member's Sections read (`500` on failure) → `409` you already have two
+/// squads → `409` not enough banked credits → the launch lock → the recount (`500` on failure,
+/// refunded; `409` you already have two squads, refunded) → the Commander write, then the
+/// Section write (each `500` on failure, refunded) → `200`, the whole state.
+/// - `DEMO_HIRE_CREDITS`; at most `DEMO_HIRE_CAP` Sections. Allowed while a squad is out.
+/// - The recount under the launch lock is the cap's guard: the first read can be stale (a hire
+///   that finished between it and `begin_hire`), and the squad hire is the only writer that
+///   inserts a Section for an existing member, under that lock.
+/// - Commander first: a failed Section write leaves a refunded player with a spare Commander
+///   (harmless: the picks prefer a free one, and the cap counts Sections), never a Section with
+///   no Commander to lead it. Documented-only: no fixture fails the second write alone.
+/// - The writes run in their own task (`ops/replace`'s pattern), so a client that goes away
+///   can't cancel them between the debit and `finish_hire`: dropping the `JoinHandle` detaches
+///   the task, and the route never calls `abort()`, so the only `JoinError` is a panic.
+/// - Abuse bound: one Sections read and two inserts on the demo's Postgres per accepted hire, at
+///   most one accepted hire per campaign (the cap), under the shared ops limiter (40/min per
+///   wallet, 400 per address). It holds the store lock for the check and debit (no await), then
+///   the campaign's launch lock.
+async fn post_ops_hire(
+    AuthSession(token): AuthSession,
+    State(state): State<Arc<AppState>>,
+    ci: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    Path(campaign_id): Path<Uuid>,
+) -> Result<Response, AppError> {
+    if let Some(r) = ops_limits(&state, &token, ci, &headers)? {
+        return Ok(r);
+    }
+    let now = Utc::now();
+    let (campaign, gateway, wallet) = ops_member(&state, &token, campaign_id, "post_ops_hire").await?;
+    let Some(gw) = gateway else {
+        return Err(conflict("no gateway assigned"));
+    };
+    let board = load_board(&state, &campaign, gw, now, false, "post_ops_hire").await?;
+    latch_pending_raid(&state, campaign_id, now, "post_ops_hire").await?;
+    let sections = state.section_repo.list_sections_for_member(campaign_id, &wallet).await.map_err(|e| {
+        internal_error(format!("post_ops_hire: list_sections_for_member failed for campaign {campaign_id}: {e}"))
+    })?;
+    let hold = match state.demo_ops.store.begin_hire(campaign_id, sections.len(), now) {
+        Ok(h) => h,
+        Err(HireRefusal::Cap) => return Err(conflict("you already have two squads")),
+        Err(HireRefusal::NotEnoughCredits) => return Err(conflict("not enough banked credits")),
+    };
+    let task_state = state.clone();
+    let handle = tokio::spawn(async move { hire_write(task_state, campaign_id, wallet, hold).await });
+    match handle.await {
+        Ok(result) => result?,
+        Err(e) => return Err(internal_error(format!("post_ops_hire: task failed for campaign {campaign_id}: {e}"))),
+    }
+    Ok(ops_response(&state, campaign_id, gw, &board, now))
+}
+
+/// The squad hire's durable writes (BP-18a-2), run in the task `post_ops_hire` starts, so it
+/// always reaches `finish_hire`: kept when both rows land, refunded on the cap or a failure.
+async fn hire_write(state: Arc<AppState>, campaign_id: Uuid, wallet: Vec<u8>, hold: HireHold) -> Result<(), AppError> {
+    let _launch = state.launch_locks.lock(campaign_id).await;
+    let held = match state.section_repo.list_sections_for_member(campaign_id, &wallet).await {
+        Ok(s) => s.len(),
+        Err(e) => {
+            state.demo_ops.store.finish_hire(hold, false, None);
+            return Err(internal_error(format!("post_ops_hire: recount failed for campaign {campaign_id}: {e}")));
+        }
+    };
+    let squads = u8::try_from(held).unwrap_or(u8::MAX);
+    if held >= DEMO_HIRE_CAP {
+        state.demo_ops.store.finish_hire(hold, false, Some(squads));
+        return Err(conflict("you already have two squads"));
+    }
+    let commander = generate_commander(wallet.clone(), campaign_id, generate_seed());
+    if let Err(e) = state.commander_repo.create_commander(commander).await {
+        state.demo_ops.store.finish_hire(hold, false, None);
+        return Err(internal_error(format!("post_ops_hire: create_commander failed for campaign {campaign_id}: {e}")));
+    }
+    let section = SectionRecord { name: "2nd Section".to_string(), ..starter_section(campaign_id, wallet) };
+    if let Err(e) = state.section_repo.create_section(section).await {
+        state.demo_ops.store.finish_hire(hold, false, None);
+        return Err(internal_error(format!("post_ops_hire: create_section failed for campaign {campaign_id}: {e}")));
+    }
+    state.demo_ops.store.finish_hire(hold, true, Some(squads.saturating_add(1)));
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2464,8 +2621,13 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from(body.to_string()))
             .unwrap();
+        let (journal, guard) = journal_capture();
         let resp = with_test_peer(crate::routes::router(Arc::clone(&state)), TEST_PEER).oneshot(req).await.unwrap();
+        drop(guard);
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        // Reviewer BP-16a F3: the journal names which `500` it was (the body is generic).
+        let journal = journal.text();
+        assert!(journal.contains("commander record is off the roll roster"), "another 500: {journal}");
         let deps = state.commander_repo.list_deployments_by_commander(commander_id).await.expect("deployments");
         assert_eq!(deps.iter().map(|d| d.status.as_str()).collect::<Vec<_>>(), ["aborted"]);
     }
@@ -2480,10 +2642,16 @@ mod tests {
         let bad = serde_json::json!({ "rank": 9, "specialization": "Cannoneer", "fatal_flaw": "Paranoid" });
         let (commander, _) = fight_logged_at(&state, c.campaign_id, SUCCESS_SEED, None, chrono::Utc::now(), Some(bad)).await;
         let deps = state.commander_repo.list_deployments_by_commander(commander).await.expect("deployments");
-        match replay_report(&state, &deps[0], "test").await {
+        let (journal, guard) = journal_capture();
+        let replayed = replay_report(&state, &deps[0], "test").await;
+        drop(guard);
+        match replayed {
             Err((status, _)) => assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR),
             Ok(_) => panic!("the replay rebuilt a fight from roll_inputs no build writes"),
         }
+        // Reviewer BP-16a F3: the journal names which `500` it was (the body is generic).
+        let journal = journal.text();
+        assert!(journal.contains("session_start roll_inputs are off the roster"), "another 500: {journal}");
     }
 
     /// BP-14a: an approach off the list is a body rejection (`422`), before anything is opened.
@@ -2978,8 +3146,9 @@ mod tests {
     }
 
     /// Reviewer BP-11a-1 F2 (BP-12a-2): replace writes the same Section row, so a first Section at
-    /// 0 is lifted. With a second Section at 8 the start refuses; replacing into the second
-    /// changes nothing for the start (it reads the first); replacing into the first frees it.
+    /// 0 is lifted. BP-18a-2: a bare start would take the second (it has soldiers), so the starts
+    /// that probe the first name it: with the second at 8 they refuse `that squad has no soldiers
+    /// left`; replacing into the second changes nothing for them; replacing into the first frees it.
     #[tokio::test]
     async fn ops_replace_lifts_the_first_section_at_0() {
         let state = Arc::new(session_state());
@@ -2992,8 +3161,9 @@ mod tests {
         let second = s.section_id;
         state.section_repo.create_section(s).await.expect("create_section");
         state.section_loss.lose_soldiers(first, 8).await.expect("lose_soldiers");
-        let (status, body, _) = start(&state, c, SITE).await;
-        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("no soldiers left to send: start a new run")));
+        let probe = serde_json::json!({ "site_id": SITE, "section_id": first });
+        let (status, body, _) = start_body(&state, c, probe.clone()).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("that squad has no soldiers left")));
         let (status, body, _) = replace(&state, c, serde_json::json!({ "section_id": second, "count": 1 })).await;
         assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("no room: a Section holds 8")));
         assert_eq!(banked(&state, c).await, 1000, "refunded");
@@ -3002,13 +3172,13 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["credits_banked"], 520);
         assert_eq!(section_headcount(&state, second).await, 8);
-        let (status, body, _) = start(&state, c, SITE).await;
-        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("no soldiers left to send: start a new run")));
+        let (status, body, _) = start_body(&state, c, probe.clone()).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("that squad has no soldiers left")));
         let (status, body, _) = replace(&state, c, serde_json::json!({ "section_id": first, "count": 3 })).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["credits_banked"], 160);
         assert_eq!(section_headcount(&state, first).await, 3);
-        let (status, body, _) = start(&state, c, SITE).await;
+        let (status, body, _) = start_body(&state, c, probe).await;
         assert_eq!(status, StatusCode::OK, "{body}");
     }
 
@@ -3826,5 +3996,278 @@ mod tests {
         assert_eq!(more.len(), 1, "{body}");
         assert_eq!(more[0]["section_id"], s1.to_string());
         assert_eq!(more[0]["op"]["kind"], "contract");
+    }
+
+    // ---- BP-18a-2: the squad hire, wages, Reviewer BP-18a-1b-2 F1 (b) and F2, Reviewer BP-16a F3.
+
+    /// A journal capture for one call (Reviewer BP-16a F3; `checkout.rs`'s `Buf`, held across
+    /// awaits: `#[tokio::test]` is the current-thread runtime, so the thread default covers them).
+    #[derive(Clone, Default)]
+    struct Journal(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Journal {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Journal {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    /// Starts capturing the journal; the capture ends when the guard drops.
+    fn journal_capture() -> (Journal, tracing::subscriber::DefaultGuard) {
+        let buf = Journal::default();
+        let w = buf.clone();
+        let sub = tracing_subscriber::fmt().with_writer(move || w.clone()).with_ansi(false).finish();
+        (buf, tracing::subscriber::set_default(sub))
+    }
+
+    async fn hire(state: &Arc<AppState>, campaign: Uuid) -> (StatusCode, serde_json::Value, Vec<u8>) {
+        post(state, campaign, "hire", None).await
+    }
+
+    async fn sections_of(state: &AppState, campaign: Uuid) -> Vec<SectionRecord> {
+        state.section_repo.list_sections_for_member(campaign, &WALLET).await.expect("list_sections_for_member")
+    }
+
+    async fn commanders_of(state: &AppState, campaign: Uuid) -> usize {
+        state.commander_repo.list_commanders_for_member(campaign, &WALLET).await.expect("list").len()
+    }
+
+    /// A hire lands: 600 debited, a "2nd Section" of 8 and a second Commander written, and the
+    /// body's `company` carries the two-squad wage line and the hire's terms beside the store's
+    /// keys (a new key pin).
+    #[tokio::test]
+    async fn ops_hire_lands_a_section_and_a_commander() {
+        let state = Arc::new(session_state());
+        let c = replace_campaign(&state, 600).await;
+        seed_commander(&state, c).await;
+        member_section(&state, c).await;
+        let (status, body, _) = hire(&state, c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["credits_banked"], 0);
+        let sections = sections_of(&state, c).await;
+        assert_eq!(sections.len(), 2);
+        assert_eq!((sections[1].name.as_str(), sections[1].headcount), ("2nd Section", 8));
+        assert_eq!(commanders_of(&state, c).await, 2);
+        assert_eq!(body["company"]["wages"], serde_json::json!({ "per_minute": 10, "squads": 2 }));
+        assert_eq!(body["company"]["hire"], serde_json::json!({ "credits": 600, "cap": 2 }));
+        let keys: std::collections::BTreeSet<&str> = body["company"].as_object().expect("company").keys().map(|k| k.as_str()).collect();
+        assert_eq!(keys, ["hire", "sections", "trophies", "wages"].into_iter().collect());
+    }
+
+    /// A5: with the first squad on a contract, the hire lands (a hire reports at base) and a start
+    /// naming the hired Section on another contract goes, led by the hired Commander.
+    #[tokio::test]
+    async fn ops_hired_squad_takes_a_second_op() {
+        let state = Arc::new(session_state());
+        let c = contract_campaign(&state).await;
+        member_section(&state, c).await;
+        let (status, body, _) = start(&state, c, SITE).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        state.demo_ops.store.set_credits(c, 600);
+        let (status, body, _) = hire(&state, c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let s2 = sections_of(&state, c).await[1].section_id;
+        let (status, body, _) = start_body(&state, c, serde_json::json!({ "site_id": NEXT_SITE, "section_id": s2 })).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["more_ops"].as_array().expect("more_ops").len(), 1, "{body}");
+    }
+
+    /// A hire while the squad is out on a dig lands.
+    #[tokio::test]
+    async fn ops_hire_while_a_squad_is_out() {
+        let state = Arc::new(session_state());
+        let (c, _) = dig_campaign(&state, false).await;
+        member_section(&state, c).await;
+        let (status, body, _) = start(&state, c, DIG).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        state.demo_ops.store.set_credits(c, 600);
+        let (status, body, _) = hire(&state, c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["active_op"]["kind"], "dig", "the op is untouched");
+        assert_eq!(sections_of(&state, c).await.len(), 2);
+    }
+
+    /// Short credits, then a second hire at the cap: both `409`, nothing debited or written.
+    #[tokio::test]
+    async fn ops_hire_refusals() {
+        let state = Arc::new(session_state());
+        let c = replace_campaign(&state, 599).await;
+        member_section(&state, c).await;
+        let (status, body, _) = hire(&state, c).await;
+        assert_eq!((status, err(&body)), (StatusCode::CONFLICT, Some("not enough banked credits")));
+        assert_eq!(banked(&state, c).await, 599);
+        state.demo_ops.store.set_credits(c, 1200);
+        assert_eq!(hire(&state, c).await.0, StatusCode::OK);
+        let (status, body, _) = hire(&state, c).await;
+        assert_eq!((status, err(&body)), (StatusCode::CONFLICT, Some("you already have two squads")));
+        assert_eq!(banked(&state, c).await, 600, "the second hire debited nothing");
+        assert_eq!(sections_of(&state, c).await.len(), 2);
+    }
+
+    /// N10: a hold begun on a stale count (1) while the member already holds 2 Sections: the
+    /// tail's recount under the launch lock refuses, refunds and writes nothing.
+    #[tokio::test]
+    async fn ops_hire_recounts_under_the_lock() {
+        let state = Arc::new(session_state());
+        let c = replace_campaign(&state, 600).await;
+        second_section(&state, c).await;
+        let hold = state.demo_ops.store.begin_hire(c, 1, chrono::Utc::now()).expect("a stale count passes");
+        let result = hire_write(Arc::clone(&state), c, WALLET.to_vec(), hold).await;
+        let (status, Json(body)) = result.expect_err("the recount refuses");
+        assert_eq!((status, err(&body)), (StatusCode::CONFLICT, Some("you already have two squads")));
+        assert_eq!(banked(&state, c).await, 600, "refunded");
+        assert_eq!(sections_of(&state, c).await.len(), 2);
+        assert_eq!(commanders_of(&state, c).await, 0, "no Commander written");
+        assert_eq!(state.launch_locks.len(), 0);
+    }
+
+    /// N3: the Commander write fails (a closed pool): `500`, the 600 back, no Section written.
+    /// The pool sits only on `commander_repo`, which nothing reads on this path before the write
+    /// (no join or launch runs, so `campaign_join_repo` is left as is).
+    #[tokio::test]
+    async fn ops_hire_refunds_a_failed_write() {
+        let pool = sqlx::postgres::PgPoolOptions::new().connect_lazy("postgres://unused@127.0.0.1:1/unused").expect("lazy pool");
+        pool.close().await;
+        let mut state = session_state();
+        state.commander_repo = Arc::new(crate::repository::PostgresCommanderRepository::new(pool));
+        let state = Arc::new(state);
+        let c = replace_campaign(&state, 600).await;
+        member_section(&state, c).await;
+        let (journal, guard) = journal_capture();
+        let (status, _, _) = hire(&state, c).await;
+        drop(guard);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(journal.text().contains("post_ops_hire: create_commander failed"), "{}", journal.text());
+        assert_eq!(banked(&state, c).await, 600, "refunded");
+        assert_eq!(sections_of(&state, c).await.len(), 1);
+    }
+
+    /// Linux Q5: a member with no gateway sees the one-squad wage line and the hire's terms.
+    #[tokio::test]
+    async fn ops_no_gateway_body_shows_one_squad_of_wages() {
+        let state = Arc::new(session_state());
+        let c = campaign_with(&state, WALLET, true, None).await;
+        let (status, body) = get(&state, Some("t"), c.campaign_id).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["company"]["wages"], serde_json::json!({ "per_minute": 5, "squads": 1 }));
+        assert_eq!(body["company"]["hire"], serde_json::json!({ "credits": 600, "cap": 2 }));
+    }
+
+    /// Wages in the body: one squad, 5 a rewound minute.
+    #[tokio::test]
+    async fn ops_wages_drain_the_bank_in_the_body() {
+        let state = Arc::new(session_state());
+        let c = replace_campaign(&state, 100).await;
+        state.demo_ops.store.rewind_wages(c, 120);
+        assert_eq!(banked(&state, c).await, 90);
+        state.demo_ops.store.rewind_wages(c, 60);
+        assert_eq!(banked(&state, c).await, 85);
+    }
+
+    /// The F1 fixtures: `second_section` (S1, S2 at 8), then S1 to 0.
+    async fn s1_at_0(state: &AppState, c: Uuid) -> (Uuid, Uuid) {
+        let (s1, s2) = second_section(state, c).await;
+        state.section_repo.update_headcount(s1, 0).await.expect("update_headcount");
+        (s1, s2)
+    }
+
+    /// D7a (N7a): a bare start skips S1 at 0 and sends S2.
+    #[tokio::test]
+    async fn ops_bare_start_sends_the_squad_with_soldiers() {
+        let state = Arc::new(session_state());
+        let c = contract_campaign(&state).await;
+        let (s1, s2) = s1_at_0(&state, c).await;
+        let (status, body, _) = start(&state, c, SITE).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(state.demo_ops.store.busy_sections(c, &[s1, s2], chrono::Utc::now()), vec![s2]);
+    }
+
+    /// D7b (N7b): a bare next with no op out and S1 at 0 reaches the store's `no op under way`.
+    #[tokio::test]
+    async fn ops_bare_next_with_no_op_skips_s1_at_0() {
+        let state = Arc::new(session_state());
+        let c = contract_campaign(&state).await;
+        s1_at_0(&state, c).await;
+        let (status, body, _) = next(&state, c, NEXT_SITE).await;
+        assert_eq!((status, err(&body)), (StatusCode::CONFLICT, Some("no op under way")));
+    }
+
+    /// D7c-1 (N7c-1): a bare escort with S1 at 0 and S2 free sends S2; the guard reads back as S2.
+    #[tokio::test]
+    async fn ops_bare_escort_sends_the_free_squad_with_soldiers() {
+        let state = Arc::new(session_state());
+        let (c, _) = dig_campaign(&state, false).await;
+        let (s1, s2) = second_section(&state, c).await;
+        let (status, body, _) = start_alone(&state, c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        state.section_repo.update_headcount(s1, 0).await.expect("update_headcount");
+        let (status, body, _) = escort(&state, c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let now = chrono::Utc::now();
+        assert_eq!(state.demo_ops.store.squad_section(c, Some(OpSquad::Section(s2)), now), Some(Some(s2)));
+        assert_eq!(state.demo_ops.store.squad_section(c, Some(OpSquad::Dig), now), Some(Some(s2)));
+    }
+
+    /// D7c-2 (N7c-2): S1 at 0 is free, S2 alive leads a contract: a bare escort picks S2, so the
+    /// store answers `that squad is out`, not the at-0 refusal.
+    #[tokio::test]
+    async fn ops_bare_escort_with_the_alive_squad_busy_is_that_squad_is_out() {
+        let state = Arc::new(session_state());
+        let (c, _) = dig_campaign(&state, false).await;
+        let (s1, s2) = second_section(&state, c).await;
+        let (status, body, _) = start_body(&state, c, serde_json::json!({ "site_id": SITE, "section_id": s2 })).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body, _) = start_alone(&state, c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        state.section_repo.update_headcount(s1, 0).await.expect("update_headcount");
+        let (status, body, _) = escort(&state, c).await;
+        assert_eq!((status, err(&body)), (StatusCode::CONFLICT, Some("that squad is out")));
+    }
+
+    /// D8a (N8, N8a): a start naming S1 at 0 while S2 has soldiers: the squad-scoped words.
+    #[tokio::test]
+    async fn ops_named_start_at_0_beside_a_live_squad_says_that_squad() {
+        let state = Arc::new(session_state());
+        let c = contract_campaign(&state).await;
+        let (s1, _) = s1_at_0(&state, c).await;
+        let (status, body, _) = start_body(&state, c, serde_json::json!({ "site_id": SITE, "section_id": s1 })).await;
+        assert_eq!((status, err(&body)), (StatusCode::CONFLICT, Some("that squad has no soldiers left")));
+    }
+
+    /// D8b (N8, N8b): S1 guards the dig on site and falls to 0 while S2 has soldiers: a bare next
+    /// (the moving squad is S1) has the squad-scoped words, and the op stays. A dig: a contract at
+    /// 0 is wiped by the latch before the next reads it.
+    #[tokio::test]
+    async fn ops_next_with_the_moving_squad_at_0_says_that_squad() {
+        let state = Arc::new(session_state());
+        let (c, _) = dig_campaign(&state, false).await;
+        let (s1, _) = second_section(&state, c).await;
+        dig_on_site(&state, c, 2).await;
+        state.section_repo.update_headcount(s1, 0).await.expect("update_headcount");
+        let (status, body, _) = next(&state, c, SITE).await;
+        assert_eq!((status, err(&body)), (StatusCode::CONFLICT, Some("that squad has no soldiers left")));
+        assert_eq!(state.demo_ops.store.op_view(c, chrono::Utc::now()).expect("op").site_id, DIG);
+    }
+
+    /// D-F2 (N9): a Crew-alone dig on site whose recorded home Section (S1) is at 0, S2 alive: a
+    /// bare next meets the store's guard refusal, not an at-0 refusal (S1 isn't on the dig).
+    #[tokio::test]
+    async fn ops_next_from_a_crew_alone_dig_ignores_its_home_section() {
+        let state = Arc::new(session_state());
+        let (c, _) = dig_campaign(&state, false).await;
+        let (s1, _) = second_section(&state, c).await;
+        alone_on_site(&state, c, 7).await;
+        state.section_repo.update_headcount(s1, 0).await.expect("update_headcount");
+        let (status, body, _) = next(&state, c, SITE).await;
+        assert_eq!((status, err(&body)), (StatusCode::CONFLICT, Some("the guard hasn't reached the dig")));
     }
 }
