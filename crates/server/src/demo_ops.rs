@@ -836,8 +836,8 @@ pub enum HealRefusal {
 /// Why `begin_replace` refused (BP-12a-2), in the order it checks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReplaceRefusal {
-    /// An op is out that holds the team: for a Crew, any op; for a Section, any op but an
-    /// unguarded dig (`section_home`). Replacements report at base.
+    /// An op is out that holds the team: for a Crew, any op; for a Section, while that Section
+    /// is busy (it leads a contract or guards the dig, BP-18a-1b-1). Replacements report at base.
     OpOut,
     /// Fewer banked credits than the replace costs (also a campaign with no entry).
     NotEnoughCredits,
@@ -895,14 +895,6 @@ struct ActiveOp {
     contract: Option<ContractState>,
 }
 
-impl ActiveOp {
-    /// The Section is at base while the op is out (BP-17a): an unescorted dig whose guard has
-    /// not been sent.
-    fn section_home(&self) -> bool {
-        self.dig.as_ref().is_some_and(|d| d.escort_at.is_none())
-    }
-}
-
 /// The op as the client sees it. Times are RFC 3339 with milliseconds; `arrived` is
 /// `now >= arrive_at` at the read, and `false` while a haul's ambush is still to be fought.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -937,13 +929,30 @@ pub fn ops_time(t: DateTime<Utc>) -> String {
     t.to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
+/// Which squad a return or a next acts for (BP-18a-1b-1): the contract slot a Section leads, or
+/// the dig it guards; or the dig slot itself (the Crew's, guarded or not).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpSquad {
+    Section(Uuid),
+    Dig,
+}
+
 /// Why `start_op` refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StartRefusal {
-    /// An op is still out (an arrived homeward leg is cleared first, so this one is not home).
+    /// An op is still out (an arrived homeward leg is cleared first, so this one is not home):
+    /// a dig start while the dig slot is held, or an unnamed start while any slot is held,
+    /// except a Crew-alone dig start, which needs only the dig slot empty (BP-18a-1b-1).
     Busy,
     /// The campaign has no entry and every entry at the cap holds an op, banked ore or a building.
     Full,
+    /// A named start's Section is busy: it leads a contract or guards the dig (BP-18a-1b-1).
+    SectionBusy,
+    /// Another slot's contract has the target's mission, or a contract slot already holds the
+    /// target's own key (BP-18a-1b-1; Reviewer BP-18a-1a F1).
+    Taken,
+    /// A named start's Commander is busy: it leads a contract or a guarded dig (BP-18a-1b-1).
+    CommanderBusy,
 }
 
 /// Why `drill_op` refused.
@@ -981,6 +990,8 @@ pub enum ReturnRefusal {
     AlreadyHomeward,
     /// Raiders are at the site: the raid must be fought first (BP-8b-1b).
     RaidPending,
+    /// No squad was named and two or more ops are out (BP-18a-1b-1).
+    SayWhich,
 }
 
 /// Why `next_op` refused (BP-11a-4).
@@ -1000,6 +1011,13 @@ pub enum NextRefusal {
     GuardNotHere,
     /// The target stands on the team's own hex.
     SameSite,
+    /// No squad was named and two or more ops are out (BP-18a-1b-1).
+    SayWhich,
+    /// The target is a dig and another slot holds the dig (BP-18a-1b-1).
+    DigHeld,
+    /// Another slot's contract has the target's mission, or another contract slot already holds
+    /// the new op's key (BP-18a-1b-1; Reviewer BP-18a-1a F1).
+    Taken,
 }
 
 /// Why `pull_op` refused (BP-8b-2).
@@ -1030,6 +1048,10 @@ pub enum EscortRefusal {
     AlreadyHomeward,
     /// The Section already guards the dig, or is on its way.
     AlreadyEscorted,
+    /// The Section sent is busy: it leads a contract (BP-18a-1b-1).
+    SectionBusy,
+    /// The Commander sent is busy: it leads a contract (BP-18a-1b-1).
+    CommanderBusy,
 }
 
 /// Why `build_op` refused (BP-10a).
@@ -1111,7 +1133,7 @@ impl OpsEntry {
     }
 
     /// The primary op's slot (BP-18a-1a): the dig, else the first contract by key. It is the op
-    /// the body's `op` shows, and the one `return_op` and `next_op` act on.
+    /// the body's `op` shows (`view`), the one definition of "primary" (Reviewer BP-18a-1a F3).
     fn primary_key(&self) -> Option<SlotKey> {
         self.slot_keys().into_iter().next()
     }
@@ -1130,6 +1152,61 @@ impl OpsEntry {
         }
     }
 
+    /// The dig's state while a Section guards it, walking or standing (`escort_at` set). A
+    /// Crew-alone dig records the member's home Section and a Commander for the run-alive check
+    /// only, so neither is busy on it (BP-18a-1b-1, spec check A4).
+    fn guarded_dig(&self) -> Option<&DigState> {
+        self.dig.as_ref().and_then(|op| op.dig.as_ref()).filter(|d| d.escort_at.is_some())
+    }
+
+    /// A Section is busy (BP-18a-1b-1) while a contract slot is keyed by it, or while it guards
+    /// the dig. Defined once; every site calls it.
+    fn section_busy(&self, s: Uuid) -> bool {
+        self.contracts_out.contains_key(&Some(s)) || self.guarded_dig().is_some_and(|d| d.section_id == Some(s))
+    }
+
+    /// A Commander is busy (BP-18a-1b-1) while it leads a contract, or a guarded dig. Defined
+    /// once; every site calls it.
+    fn commander_busy(&self, c: Uuid) -> bool {
+        self.contracts_out.values().any(|op| op.contract.as_ref().is_some_and(|k| k.commander_id == c)) || self.guarded_dig().is_some_and(|d| d.commander_id == c)
+    }
+
+    /// Whether a slot other than `except` holds a contract of `mission` (BP-18a-1b-1).
+    fn mission_held(&self, mission: &str, except: Option<SlotKey>) -> bool {
+        self.slot_keys()
+            .into_iter()
+            .filter(|k| Some(*k) != except)
+            .filter_map(|k| self.slot(k))
+            .any(|op| op.contract.as_ref().is_some_and(|c| c.mission_id == mission))
+    }
+
+    /// The slot a return or a next acts on (BP-18a-1b-1). `None`: no op → `NoOp`, one op → that
+    /// op, two or more → `SayWhich`. `Dig`: the dig slot, else `NoOp`. `Section(s)`: the contract
+    /// slot keyed by `s`, else the dig `s` guards, else `NoOp`. A `None`-keyed contract (a member
+    /// with no Section) is selected only by `None` with one op out; production can't hold one
+    /// beside another op (every demo member has a starter Section).
+    fn select(&self, squad: Option<OpSquad>) -> Result<SlotKey, Select> {
+        match squad {
+            None => {
+                let keys = self.slot_keys();
+                if keys.len() > 1 {
+                    return Err(Select::SayWhich);
+                }
+                keys.into_iter().next().ok_or(Select::NoOp)
+            }
+            Some(OpSquad::Dig) => self.dig.as_ref().map(|_| SlotKey::Dig).ok_or(Select::NoOp),
+            Some(OpSquad::Section(s)) => {
+                if self.contracts_out.contains_key(&Some(s)) {
+                    Ok(SlotKey::Contract(Some(s)))
+                } else if self.guarded_dig().is_some_and(|d| d.section_id == Some(s)) {
+                    Ok(SlotKey::Dig)
+                } else {
+                    Err(Select::NoOp)
+                }
+            }
+        }
+    }
+
     /// Clears a slot: the dig's goes to `None`, a contract's key is removed.
     fn clear_slot(&mut self, key: SlotKey) {
         match key {
@@ -1140,8 +1217,11 @@ impl OpsEntry {
         }
     }
 
-    /// Puts `op` in its own slot (`slot_of`).
+    /// Puts `op` in its own slot (`slot_of`). The slot must be empty (Reviewer BP-18a-1a F1):
+    /// every caller's busy and taken checks refuse an occupied target first, so the assertion
+    /// only catches a missed check in a test build; release relies on those checks.
     fn insert_op(&mut self, op: ActiveOp) {
+        debug_assert!(self.slot(slot_of(&op)).is_none(), "insert_op: slot already held");
         match slot_of(&op) {
             SlotKey::Dig => self.dig = Some(op),
             SlotKey::Contract(k) => {
@@ -1288,9 +1368,10 @@ impl OpsEntry {
             .collect()
     }
 
-    /// The primary op (BP-18a-1a: the dig, else the first contract by key) as the client sees it.
+    /// The primary op (`primary_key`, the one definition: the dig, else the first contract by
+    /// key) as the client sees it.
     fn view(&self, now: DateTime<Utc>) -> Option<ActiveOpView> {
-        self.ops().next().map(|op| ActiveOpView {
+        self.primary_key().and_then(|k| self.slot(k)).map(|op| ActiveOpView {
             leg: op.leg,
             site_id: op.site_id.clone(),
             at: OpHex { q: op.at.0, r: op.at.1 },
@@ -1336,6 +1417,18 @@ impl OpsEntry {
 enum SlotKey {
     Dig,
     Contract(Option<Uuid>),
+}
+
+/// Why `OpsEntry::select` found no slot (BP-18a-1b-1).
+enum Select {
+    NoOp,
+    SayWhich,
+}
+
+/// The squad an op takes (BP-18a-1b-1): `(commander, section)` of a contract, or of an
+/// escorted dig; `None` for a Crew-alone dig or a bare op.
+fn lead_of(dig: Option<&DigStart>, contract: Option<&ContractStart>) -> Option<(Uuid, Option<Uuid>)> {
+    contract.map(|c| (c.commander_id, c.section_id)).or_else(|| dig.filter(|d| d.escort).map(|d| (d.commander_id, d.section_id)))
 }
 
 /// The slot an op lives in (BP-18a-1a): the dig slot for a dig, otherwise the contract slot of
@@ -1474,9 +1567,13 @@ fn new_op(site: &OpsSite, op_seed: u32, dig: Option<DigStart>, contract: Option<
 /// **Keyed per campaign with one gateway, one dig slot (`dig`, the Crew's) and the contract
 /// slots (`contracts_out`, by the leading Section's id; `None` for a member with no Section, or a
 /// bare op).** A cleared op removes its key. The primary op (the dig, else the first contract by
-/// key) is the one the body's `op` shows. **Until BP-18a-1b every start refuses `Busy` while any
-/// slot holds an op, so at most one op is out; a start, return or next without a selector must
-/// keep doing exactly that after BP-18a-1b.** Correct only while `DEMO_PLAYER_CAP = 1`
+/// key) is the one the body's `op` shows. **BP-18a-1b-1: an unnamed start lands only with no op
+/// out, or as a Crew-alone dig in the empty dig slot; a named start (`start_op_for`) lands beside
+/// other ops when its Section and Commander are not busy and its contract is not taken. Return
+/// and next act on the op their squad selects (`OpsEntry::select`): unnamed, the one op out, or
+/// `SayWhich` with two. Every busy and taken check is the store's, under the lock.** Two
+/// battles' losses always fall on different rows (a Section is busy on one op, and the Crew
+/// only on the dig). Correct only while `DEMO_PLAYER_CAP = 1`
 /// (`routes/campaign.rs`); a second member per campaign needs a per-wallet key.
 pub struct DemoOpsStore {
     inner: Mutex<HashMap<Uuid, OpsEntry>>,
@@ -1557,10 +1654,7 @@ impl DemoOpsStore {
         true
     }
 
-    /// Starts the outbound leg to `site`: `depart_at = now`, `arrive_at = now + travel_secs`.
-    /// One op per campaign (`Busy`); a campaign with no entry is cached with `board` first
-    /// (`Full` when every entry at the cap holds an op). A dig passes `dig` (its tier comes
-    /// from the site); a contract passes `contract` (BP-11a-2; its mission comes from the site).
+    /// `start_op_for` with no squad named (`named: false`): today's start.
     pub fn start_op(
         &self,
         campaign_id: Uuid,
@@ -1570,6 +1664,35 @@ impl DemoOpsStore {
         op_seed: u32,
         dig: Option<DigStart>,
         contract: Option<ContractStart>,
+        now: DateTime<Utc>,
+    ) -> Result<(), StartRefusal> {
+        self.start_op_for(campaign_id, gateway, board, site, op_seed, dig, contract, false, now)
+    }
+
+    /// Starts the outbound leg to `site`: `depart_at = now`, `arrive_at = now + travel_secs`.
+    /// A campaign with no entry is cached with `board` first (`Full` when every entry at the cap
+    /// holds an op). A dig passes `dig` (its tier comes from the site); a contract passes
+    /// `contract` (BP-11a-2; its mission comes from the site). The squad (Section and Commander)
+    /// is the one in `dig`/`contract`, as the route built it; `named` is "the client named a
+    /// squad" (BP-18a-1b-1). Refusals in order, under the lock, after settling:
+    /// - `Busy`: a dig start while the dig slot is held; or an unnamed start while any slot is
+    ///   held, except a Crew-alone dig start, which needs only the dig slot empty (G-B). So an
+    ///   unnamed start lands only with no op out, or as a Crew-alone dig in the empty dig slot;
+    /// - named, for an op that takes a Section: `SectionBusy` (`OpsEntry::section_busy`);
+    /// - `Taken`: another slot's contract has the target's mission, or a contract slot already
+    ///   holds the new op's key (two `None`-keyed contracts; Reviewer BP-18a-1a F1);
+    /// - named: `CommanderBusy` (`OpsEntry::commander_busy`) for the op's Commander.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_op_for(
+        &self,
+        campaign_id: Uuid,
+        gateway: (i32, i32),
+        board: Arc<OpsBoard>,
+        site: &OpsSite,
+        op_seed: u32,
+        dig: Option<DigStart>,
+        contract: Option<ContractStart>,
+        named: bool,
         now: DateTime<Utc>,
     ) -> Result<(), StartRefusal> {
         let mut inner = self.lock();
@@ -1583,11 +1706,26 @@ impl DemoOpsStore {
             return Err(StartRefusal::Full);
         };
         e.settle_arrival(now);
-        // BP-18a-1a: any slot holding an op refuses, so at most one op is out (no selector yet).
-        if e.any_op() {
+        // BP-18a-1b-1: a dig start needs the dig slot empty; an unnamed start needs every slot
+        // empty, except a Crew-alone dig (it takes no Section, so it can't collide with a contract).
+        let crew_alone = dig.as_ref().is_some_and(|d| !d.escort);
+        if (dig.is_some() && e.dig.is_some()) || (!named && !crew_alone && e.any_op()) {
             return Err(StartRefusal::Busy);
         }
-        e.insert_op(new_op(site, op_seed, dig, contract, site.travel_secs, now));
+        let lead = lead_of(dig.as_ref(), contract.as_ref());
+        if named && lead.and_then(|(_, s)| s).is_some_and(|s| e.section_busy(s)) {
+            return Err(StartRefusal::SectionBusy);
+        }
+        let op = new_op(site, op_seed, dig, contract, site.travel_secs, now);
+        let key = slot_of(&op);
+        let taken = op.contract.as_ref().is_some_and(|c| e.mission_held(c.mission_id, None)) || (key != SlotKey::Dig && e.slot(key).is_some());
+        if taken {
+            return Err(StartRefusal::Taken);
+        }
+        if named && lead.is_some_and(|(c, _)| e.commander_busy(c)) {
+            return Err(StartRefusal::CommanderBusy);
+        }
+        e.insert_op(op);
         e.crew_fight = None;
         e.moved_at = Some(now);
         e.touched = now;
@@ -1597,15 +1735,27 @@ impl DemoOpsStore {
     /// Starts the homeward leg once the outbound one has arrived, taking the site's time again.
     /// From a dig the team walks away: the ore on site is left (`OpEnd::WalkedAway`, F6);
     /// BP-8b-2's pull is the loaded return. Refusals in order: `NoOp` → `AlreadyHomeward` →
-    /// `NotArrived` → `RaidPending` (raiders can't be walked away from).
+    /// `NotArrived` → `RaidPending` (raiders can't be walked away from). `return_op_for` with no
+    /// squad named.
     pub fn return_op(&self, campaign_id: Uuid, now: DateTime<Utc>) -> Result<(), ReturnRefusal> {
+        self.return_op_for(campaign_id, None, now)
+    }
+
+    /// `return_op` for the op `squad` selects (BP-18a-1b-1, `OpsEntry::select`): the selection
+    /// comes first (`SayWhich` with no squad named and two or more ops out; `NoOp` when the
+    /// squad has none), then today's refusals on that op. Writes `moved_at = now`.
+    pub fn return_op_for(&self, campaign_id: Uuid, squad: Option<OpSquad>, now: DateTime<Utc>) -> Result<(), ReturnRefusal> {
         let mut inner = self.lock();
         let Some(e) = inner.get_mut(&campaign_id) else {
             return Err(ReturnRefusal::NoOp);
         };
         e.settle_arrival(now);
-        // BP-18a-1a: the primary op, the only one out until BP-18a-1b's selector.
-        let Some(op) = e.primary_key().and_then(|k| e.slot_mut(k)) else {
+        let key = match e.select(squad) {
+            Ok(k) => k,
+            Err(Select::NoOp) => return Err(ReturnRefusal::NoOp),
+            Err(Select::SayWhich) => return Err(ReturnRefusal::SayWhich),
+        };
+        let Some(op) = e.slot_mut(key) else {
             return Err(ReturnRefusal::NoOp);
         };
         if op.leg == OpLeg::Homeward {
@@ -1635,8 +1785,7 @@ impl DemoOpsStore {
     /// raid) → `GuardNotHere` (a dig whose guard does not stand yet, BP-18a-1a) → `SameSite` (the
     /// target's hex is the team's `at`; hexes, not site ids, since a refreshed contract keeps its
     /// id).
-    /// - BP-18a-1a: it acts on the primary op (the only one out until BP-18a-1b), clears that
-    ///   slot and puts the new op in its own (`slot_of`).
+    /// - `next_op_for` with no squad named: it acts on the one op out (`SayWhich` with two).
     /// - The leg runs from `op.at`, never from a board lookup: the hop's hexes at the target's
     ///   seconds per hex (`travel_secs / distance`, distance at least 1), at least 1 s. Home from
     ///   there is the target's own `travel_secs`.
@@ -1654,13 +1803,39 @@ impl DemoOpsStore {
         contract: Option<ContractStart>,
         now: DateTime<Utc>,
     ) -> Result<(), NextRefusal> {
+        self.next_op_for(campaign_id, None, site, op_seed, dig, contract, now)
+    }
+
+    /// `next_op` for the op `squad` selects (BP-18a-1b-1, `OpsEntry::select`). Refusals in
+    /// order: `NoOp` (no entry) → the selection (`SayWhich`, `NoOp`) → today's checks on the
+    /// selected op → then, with the moving squad copied in (below), `DigHeld` (the target is a
+    /// dig and another slot holds the dig) → `Taken` (another slot's contract has the target's
+    /// mission, or another contract slot holds the new op's key; Reviewer BP-18a-1a F1).
+    /// - **The squad moves with its op (spec check A2):** the new op's Commander and Section are
+    ///   the leaving op's (a contract's `ContractState`, a guarded dig's `DigState`), whatever the
+    ///   route built; every other field is the route's. A bare op keeps the route's values.
+    /// - Only the selected slot is cleared; the new op goes in its own (`slot_of`). Writes
+    ///   `moved_at = now`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn next_op_for(
+        &self,
+        campaign_id: Uuid,
+        squad: Option<OpSquad>,
+        site: &OpsSite,
+        op_seed: u32,
+        dig: Option<DigStart>,
+        contract: Option<ContractStart>,
+        now: DateTime<Utc>,
+    ) -> Result<(), NextRefusal> {
         let mut inner = self.lock();
         let Some(e) = inner.get_mut(&campaign_id) else {
             return Err(NextRefusal::NoOp);
         };
         e.settle_arrival(now);
-        let Some(key) = e.primary_key() else {
-            return Err(NextRefusal::NoOp);
+        let key = match e.select(squad) {
+            Ok(k) => k,
+            Err(Select::NoOp) => return Err(NextRefusal::NoOp),
+            Err(Select::SayWhich) => return Err(NextRefusal::SayWhich),
         };
         let Some(op) = e.slot(key) else {
             return Err(NextRefusal::NoOp);
@@ -1682,8 +1857,24 @@ impl DemoOpsStore {
         }
         let hop = hex_axial_distance(op.at.0, op.at.1, site.q, site.r);
         let leg_secs = (site.travel_secs / site.distance.max(1) * hop).max(1);
+        // A2: the squad on the leaving op moves with it.
+        let moving = op.contract.as_ref().map(|c| (c.commander_id, c.section_id)).or_else(|| op.dig.as_ref().map(|d| (d.commander_id, d.section_id)));
+        let (mut dig, mut contract) = (dig, contract);
+        if let Some((commander_id, section_id)) = moving {
+            dig = dig.map(|d| DigStart { commander_id, section_id, ..d });
+            contract = contract.map(|_| ContractStart { commander_id, section_id });
+        }
+        let next = new_op(site, op_seed, dig, contract, leg_secs, now);
+        let target = slot_of(&next);
+        if target == SlotKey::Dig && e.dig.is_some() && key != SlotKey::Dig {
+            return Err(NextRefusal::DigHeld);
+        }
+        let held_elsewhere = next.contract.as_ref().is_some_and(|c| e.mission_held(c.mission_id, Some(key))) || (target != SlotKey::Dig && target != key && e.slot(target).is_some());
+        if held_elsewhere {
+            return Err(NextRefusal::Taken);
+        }
         e.clear_slot(key);
-        e.insert_op(new_op(site, op_seed, dig, contract, leg_secs, now));
+        e.insert_op(next);
         e.crew_fight = None;
         e.moved_at = Some(now);
         e.touched = now;
@@ -1820,14 +2011,23 @@ impl DemoOpsStore {
 
     /// The battle waiting for its fight (a raid, or a haul's ambush once fired, or a contract's
     /// fight once the team is on site (BP-11a-2)), after settling the op: the op's Commander, the
-    /// trigger and its Section. `None` when none is pending. BP-18a-1a: the slots are checked in
-    /// order (the dig, then the contracts by key) and the first pending battle is returned, the
-    /// same as today while one op is out (BP-18a-1b's `pending_raids` returns them all).
+    /// trigger and its Section. `None` when none is pending. The first of `pending_raids`.
     pub fn pending_raid(&self, campaign_id: Uuid, now: DateTime<Utc>) -> Option<PendingRaid> {
+        self.pending_raids(campaign_id, now).into_iter().next()
+    }
+
+    /// Every battle waiting for its fight (BP-18a-1b-1, H3), after settling, in slot order: the
+    /// dig's, then the contracts' by key. Empty with no entry. **Skip semantics (Reviewer
+    /// BP-18a-1a F2):** a slot with no trigger is skipped and does not hide the slots after it;
+    /// so is a contract slot whose trigger has no contract (unreachable: `contract_trigger`
+    /// needs one). Each battle carries its own trigger, so the latch matches it on its own.
+    pub fn pending_raids(&self, campaign_id: Uuid, now: DateTime<Utc>) -> Vec<PendingRaid> {
         let mut inner = self.lock();
-        let e = inner.get_mut(&campaign_id)?;
+        let Some(e) = inner.get_mut(&campaign_id) else {
+            return Vec::new();
+        };
         e.settle_arrival(now);
-        let pending = e.ops().find_map(|op| {
+        e.ops().filter_map(|op| {
             if let Some(trigger) = contract_trigger(op, now) {
                 let c = op.contract.as_ref()?;
                 return Some(PendingRaid { commander_id: c.commander_id, trigger, section_id: c.section_id, crew: None });
@@ -1842,8 +2042,8 @@ impl DemoOpsStore {
                 });
                 PendingRaid { commander_id: dig.commander_id, trigger, section_id: dig.section_id, crew }
             })
-        });
-        pending
+        })
+        .collect()
     }
 
     /// Applies a fought battle, only if `trigger` is still the op's pending one (`false`, and no
@@ -2052,7 +2252,10 @@ impl DemoOpsStore {
     /// guard from `now + travel_secs` (`escort_at`) and fights every battle born from then on;
     /// `commander_id` and `section_id` (read by the route) become the dig's. Allowed while
     /// outbound (no fight can come before the arrival). Writes `moved_at` (a departure).
-    /// Refusals in order: `NoOp` → `Contract` → `AlreadyHomeward` → `AlreadyEscorted`.
+    /// Refusals in order: `NoOp` → `Contract` → `AlreadyHomeward` → `AlreadyEscorted` →
+    /// `SectionBusy` (the Section sent leads a contract) → `CommanderBusy` (the Commander sent
+    /// leads a contract) (BP-18a-1b-1, spec check A1/A3). The Crew-alone dig's own recorded
+    /// Commander and Section are not busy while `escort_at` is `None` (A4).
     pub fn escort_op(&self, campaign_id: Uuid, commander_id: Uuid, section_id: Option<Uuid>, now: DateTime<Utc>) -> Result<(), EscortRefusal> {
         let mut inner = self.lock();
         let Some(e) = inner.get_mut(&campaign_id) else {
@@ -2061,20 +2264,28 @@ impl DemoOpsStore {
         e.settle_arrival(now);
         // BP-18a-1a: the dig slot; a contract slot alone is today's `Contract`.
         let held = e.any_op();
-        let Some(op) = e.dig.as_mut() else {
+        let Some(op) = e.dig.as_ref() else {
             return Err(if held { EscortRefusal::Contract } else { EscortRefusal::NoOp });
         };
         let travel_secs = op.travel_secs;
-        let leg = op.leg;
-        let Some(dig) = op.dig.as_mut() else {
+        let Some(dig) = op.dig.as_ref() else {
             return Err(EscortRefusal::Contract);
         };
-        if leg == OpLeg::Homeward {
+        if op.leg == OpLeg::Homeward {
             return Err(EscortRefusal::AlreadyHomeward);
         }
         if dig.escort_at.is_some() {
             return Err(EscortRefusal::AlreadyEscorted);
         }
+        if section_id.is_some_and(|s| e.section_busy(s)) {
+            return Err(EscortRefusal::SectionBusy);
+        }
+        if e.commander_busy(commander_id) {
+            return Err(EscortRefusal::CommanderBusy);
+        }
+        let Some(dig) = e.dig.as_mut().and_then(|op| op.dig.as_mut()) else {
+            return Err(EscortRefusal::Contract);
+        };
         dig.escort_at = Some(now + Duration::seconds(i64::from(travel_secs)));
         dig.commander_id = commander_id;
         dig.section_id = section_id;
@@ -2125,23 +2336,31 @@ impl DemoOpsStore {
     /// on the same call. Writes `moved_at` (the keep list). Refusals in order: `OpOut` →
     /// `NotEnoughCredits` (also no entry). Check and debit are one critical section, no await.
     pub fn begin_replace(&self, campaign_id: Uuid, cost: u32, now: DateTime<Utc>) -> Result<ReplaceHold, ReplaceRefusal> {
-        self.begin_hold(campaign_id, cost, false, now)
+        self.begin_hold(campaign_id, cost, None, now)
     }
 
-    /// `begin_replace` for a Section's Requisition (BP-17a): it also passes while the op is an
-    /// unescorted dig whose guard has not been sent (`ActiveOp::section_home`), since the
-    /// Section is at base. A Crew Hire never does: the Crew is out.
-    pub fn begin_requisition(&self, campaign_id: Uuid, cost: u32, now: DateTime<Utc>) -> Result<ReplaceHold, ReplaceRefusal> {
-        self.begin_hold(campaign_id, cost, true, now)
+    /// `begin_replace` for Section `section_id`'s Requisition (BP-17a; per Section since
+    /// BP-18a-1b-1): it passes while that Section is not busy (`OpsEntry::section_busy`), so
+    /// during an unescorted dig (the Section is at base) and while another Section is out. A
+    /// Crew Hire still refuses while any op is out: the Crew is shared.
+    pub fn begin_requisition(&self, campaign_id: Uuid, section_id: Uuid, cost: u32, now: DateTime<Utc>) -> Result<ReplaceHold, ReplaceRefusal> {
+        self.begin_hold(campaign_id, cost, Some(section_id), now)
     }
 
-    fn begin_hold(&self, campaign_id: Uuid, cost: u32, section: bool, now: DateTime<Utc>) -> Result<ReplaceHold, ReplaceRefusal> {
+    /// The hold behind both: `Some(s)` (a Requisition) refuses `OpOut` iff Section `s` is busy;
+    /// `None` (the Crew Hire) iff any op is out. Restates Reviewer BP-18a-1a's `begin_hold` note
+    /// per Section: two Sections can each be out on their own op.
+    fn begin_hold(&self, campaign_id: Uuid, cost: u32, section: Option<Uuid>, now: DateTime<Utc>) -> Result<ReplaceHold, ReplaceRefusal> {
         let mut inner = self.lock();
         let Some(e) = inner.get_mut(&campaign_id) else {
             return Err(ReplaceRefusal::NotEnoughCredits);
         };
         e.settle_arrival(now);
-        if e.ops().any(|op| !(section && op.section_home())) {
+        let out = match section {
+            Some(s) => e.section_busy(s),
+            None => e.any_op(),
+        };
+        if out {
             return Err(ReplaceRefusal::OpOut);
         }
         if !e.debit_credits(cost) {
@@ -3997,5 +4216,184 @@ mod tests {
         assert_eq!(store.len(), 2);
         assert!(store.op_view(a, at(12)).is_some_and(|op| op.dig.is_some()), "the dig entry is kept");
         assert!(store.board(b, (5, 0), at(12)).is_none(), "the board-only entry is evicted");
+    }
+
+    // ---- BP-18a-1b-1: the second op, store half.
+
+    const S1: Uuid = Uuid::from_u128(0x51);
+    const S2: Uuid = Uuid::from_u128(0x52);
+    const C1: Uuid = Uuid::from_u128(0xD1);
+    const C2: Uuid = Uuid::from_u128(0xD2);
+
+    /// A contract to `site` led by `commander` and Section `section`, started with the squad named.
+    fn named(store: &DemoOpsStore, a: Uuid, site: &OpsSite, commander: Uuid, section: Uuid, now: DateTime<Utc>) -> Result<(), StartRefusal> {
+        let lead = ContractStart { commander_id: commander, section_id: Some(section) };
+        store.start_op_for(a, (5, 0), board(), site, 7, None, Some(lead), true, now)
+    }
+
+    /// With a Crew-alone dig and a contract out, a return that names no squad can't pick; naming
+    /// the dig brings the Crew home.
+    #[test]
+    fn ops_store_a_bare_return_with_two_ops_is_say_which() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        alone(&store, a, 7);
+        assert_eq!(named(&store, a, &site(), C1, S1, at(0)), Ok(()));
+        assert_eq!(store.return_op(a, at(11)), Err(ReturnRefusal::SayWhich));
+        assert_eq!(store.return_op_for(a, Some(OpSquad::Dig), at(11)), Ok(()));
+    }
+
+    /// With a dig and a contract out, the body's op is the dig (F3: `primary_key`).
+    #[test]
+    fn ops_store_the_primary_op_is_the_dig() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        alone(&store, a, 7);
+        assert_eq!(named(&store, a, &site(), C1, S1, at(0)), Ok(()));
+        assert!(store.op_view(a, at(1)).expect("an op").dig.is_some(), "the dig is the primary op");
+    }
+
+    /// The guard Section, once sent, can't lead a contract.
+    #[test]
+    fn ops_store_a_named_start_refuses_the_guard_section() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        alone(&store, a, 7);
+        assert_eq!(store.escort_op(a, C1, Some(S1), at(10)), Ok(()));
+        assert_eq!(named(&store, a, &site(), C2, S1, at(11)), Err(StartRefusal::SectionBusy));
+    }
+
+    /// One contract, one squad: a second Section can't take the contract another holds.
+    #[test]
+    fn ops_store_a_named_start_refuses_a_taken_contract() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        assert_eq!(named(&store, a, &site(), C1, S1, at(0)), Ok(()));
+        assert_eq!(named(&store, a, &site(), C2, S2, at(1)), Err(StartRefusal::Taken));
+    }
+
+    /// A Commander leads one op at a time.
+    #[test]
+    fn ops_store_a_named_start_refuses_a_busy_commander() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        assert_eq!(named(&store, a, &site(), C1, S1, at(0)), Ok(()));
+        assert_eq!(named(&store, a, &supply_raid(), C1, S2, at(1)), Err(StartRefusal::CommanderBusy));
+    }
+
+    /// A Section on a contract can't be sent to guard the dig.
+    #[test]
+    fn ops_store_escort_refuses_a_busy_section() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        alone(&store, a, 7);
+        assert_eq!(named(&store, a, &site(), C1, S1, at(0)), Ok(()));
+        assert_eq!(store.escort_op(a, C2, Some(S1), at(10)), Err(EscortRefusal::SectionBusy));
+    }
+
+    /// A Commander on a contract can't be sent to guard the dig.
+    #[test]
+    fn ops_store_escort_refuses_a_busy_commander() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        alone(&store, a, 7);
+        assert_eq!(named(&store, a, &site(), C1, S1, at(0)), Ok(()));
+        assert_eq!(store.escort_op(a, C1, Some(S2), at(10)), Err(EscortRefusal::CommanderBusy));
+    }
+
+    /// A next from a contract into a dig while the Crew already digs is refused before the
+    /// insert (Reviewer BP-18a-1a F1: without the check, `insert_op`'s assertion fires).
+    #[test]
+    fn ops_store_next_into_a_held_dig_is_refused() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        alone(&store, a, 7);
+        assert_eq!(named(&store, a, &site(), C1, S1, at(0)), Ok(()));
+        let crew = DigStart { crew_id: CREW, commander_id: C1, threshold: 1000, section_id: Some(S1), escort: true };
+        assert_eq!(store.next_op_for(a, Some(OpSquad::Section(S1)), &dig(1), 9, Some(crew), None, at(11)), Err(NextRefusal::DigHeld));
+    }
+
+    /// A next keeps the squad of the op it leaves (A2): the route's squad (S2/C2) is never taken.
+    #[test]
+    fn ops_store_next_keeps_the_squad_it_leaves() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        assert_eq!(named(&store, a, &site(), C1, S1, at(0)), Ok(()));
+        let other = ContractStart { commander_id: C2, section_id: Some(S2) };
+        assert_eq!(store.next_op_for(a, Some(OpSquad::Section(S1)), &supply_raid(), 9, None, Some(other), at(11)), Ok(()));
+        assert_eq!(named(&store, a, &site(), C2, S2, at(12)), Ok(()), "S2 and C2 are free");
+    }
+
+    /// G-B: a Crew-alone dig starts beside a contract with no squad named; any other unnamed
+    /// start is still `Busy` (H2).
+    #[test]
+    fn ops_store_a_crew_alone_dig_starts_beside_a_contract() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        assert_eq!(named(&store, a, &site(), C1, S1, at(0)), Ok(()));
+        let crew = DigStart { crew_id: CREW, commander_id: COMMANDER, threshold: 1000, section_id: None, escort: false };
+        assert_eq!(store.start_op(a, (5, 0), board(), &dig(1), 7, Some(crew), None, at(1)), Ok(()));
+        assert_eq!(store.start_op(a, (5, 0), board(), &supply_raid(), 7, None, Some(LEAD), at(2)), Err(StartRefusal::Busy));
+    }
+
+    /// A Requisition is per Section: S2 at base takes one while S1 is out; S1 can't.
+    #[test]
+    fn ops_store_requisition_is_per_section() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        assert_eq!(named(&store, a, &site(), C1, S1, at(0)), Ok(()));
+        store.set_credits(a, 240);
+        let hold = store.begin_requisition(a, S2, 120, at(1)).expect("S2 is at base");
+        store.finish_replace(hold, false);
+        assert_eq!(store.begin_requisition(a, S1, 120, at(2)), Err(ReplaceRefusal::OpOut));
+    }
+
+    /// Spec check §9 (i): `settle_contracts` keeps a refreshed contract off every slot's hex.
+    /// Board pool `[(8,0), (10,0), (3,4)]`; S1 on `GUARD_DUTY` (8,0) and S2 on `SUPPLY_RAID`
+    /// (10,0) both arrive at 10; `SUPPLY_RAID` latched at 11 (due 56), `GUARD_DUTY` at 20 (due
+    /// 65). At 56 `SUPPLY_RAID`'s only free hex is (3,4); at 65 `GUARD_DUTY` has none ((8,0) its
+    /// own, (10,0) S2's team, (3,4) shown), so it stays off. Every free list has one element.
+    #[test]
+    fn ops_store_a_refreshed_contract_skips_every_held_hex() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        let b = contract_board(&[(8, 0), (10, 0), (3, 4)]);
+        let lead = |c, s| Some(ContractStart { commander_id: c, section_id: Some(s) });
+        assert_eq!(store.start_op_for(a, (5, 0), Arc::clone(&b), &b.sites[0], 7, None, lead(C1, S1), true, at(0)), Ok(()));
+        assert_eq!(store.start_op_for(a, (5, 0), Arc::clone(&b), &b.sites[2], 7, None, lead(C2, S2), true, at(0)), Ok(()));
+        let supply = RaidTrigger { trigger_at: at(10), mission_id: "SUPPLY_RAID", kind: BattleKind::Contract };
+        assert!(store.latch_raid(a, &supply, RaidResult::Held, FightPay::credits(0), at(11)));
+        assert!(store.latch_raid(a, &guard_duty_arrival(), RaidResult::Held, FightPay::credits(0), at(20)));
+        let at56 = shown(&store, a, at(56));
+        let back = at56.iter().find(|s| s.site_id == "contract:SUPPLY_RAID").expect("SUPPLY_RAID is back at 56 s");
+        assert_eq!((back.q, back.r), (3, 4));
+        assert_eq!(guard_duty(&shown(&store, a, at(65))), None, "no free hex: S2's team stands on (10,0)");
+    }
+
+    /// Spec check §9 (ii), Reviewer BP-18a-1a F5: two arrivals settled by one read keep the
+    /// later move. The contract goes home at 10 (home 20), the dig at 12 (home 22); the read at
+    /// 30 settles the dig (22) first, then the contract (20).
+    #[test]
+    fn ops_store_two_arrivals_keep_the_later_move() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        alone(&store, a, 7);
+        assert_eq!(named(&store, a, &site(), C1, S1, at(0)), Ok(()));
+        assert_eq!(store.return_op_for(a, Some(OpSquad::Section(S1)), at(10)), Ok(()));
+        assert_eq!(store.return_op_for(a, Some(OpSquad::Dig), at(12)), Ok(()));
+        assert_eq!(store.op_view(a, at(30)), None, "both home");
+        assert!(store.moved_since(a, at(21), at(30)), "the dig's arrival at 22 s is the last move");
+    }
+
+    /// H3, F2's order: every due battle, the contracts by key.
+    #[test]
+    fn ops_store_pending_raids_lists_every_due_battle() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        assert_eq!(named(&store, a, &site(), C1, S1, at(0)), Ok(()));
+        assert_eq!(named(&store, a, &supply_raid(), C2, S2, at(0)), Ok(()));
+        let got: Vec<(Uuid, Option<Uuid>, RaidTrigger)> = store.pending_raids(a, at(12)).into_iter().map(|p| (p.commander_id, p.section_id, p.trigger)).collect();
+        let supply = RaidTrigger { trigger_at: at(12), mission_id: "SUPPLY_RAID", kind: BattleKind::Contract };
+        assert_eq!(got, vec![(C1, Some(S1), guard_duty_arrival()), (C2, Some(S2), supply)]);
     }
 }

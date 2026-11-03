@@ -353,9 +353,9 @@ async fn fight_result(state: &AppState, dep: &DeploymentRecord, route: &str) -> 
 ///   read in that gap sees the old headcount: over the cap only, and unreachable, because a
 ///   second fight needs a new trigger. Replace (BP-12a-2) adds heads only after `begin_replace`
 ///   found no op out; an add that lands after a later `ops/start` can only make the next
-///   latch's cap too low, never too high. Since BP-17a a Section's Requisition also passes
-///   during an unguarded dig, so a Section's add begins either with no op out or before
-///   `ops/escort` (`section_home`); either way it can only lower the next cap, and the cap reads
+///   latch's cap too low, never too high. Since BP-18a-1b-1 a Section's Requisition passes
+///   while that Section is not busy (`begin_requisition`), so a Section's add begins before
+///   that Section leaves on an op; either way it can only lower the next cap, and the cap reads
 ///   stay sound. Its loot goes on the shelf.
 ///
 /// **The Crew's own fight (BP-17a):** an ambush revealed before the guard stands comes rolled
@@ -364,67 +364,79 @@ async fn fight_result(state: &AppState, dep: &DeploymentRecord, route: &str) -> 
 /// a wipeout lets begin adds its heads after the loss, never before it (spec check W3). The heads
 /// are written only when the latch applied. A handler dropped between the applied latch and the
 /// write leaves the Crew its heads: a named residual that favours the player, as the meltdown's.
+///
+/// **Every pending battle, one per iteration (BP-18a-1b-1, H3):** the store's pending_raids
+/// list (the dig's battle, then the contracts' by key) is latched in that order, so an unfought
+/// battle never stalls a fought one behind it. Each iteration reads only its own battle; a
+/// battle not fought yet, a Section at 0 and the Crew's fight end that iteration (`continue`),
+/// and every failed read or write still returns its `500`, leaving the battles after it for the
+/// next read. The writes land in list order. Each iteration takes and drops the launch lock
+/// around its own write, never nested. A dropped future loses nothing paid for (pay, sickbay
+/// and loot land inside the latch): a drop before an iteration's latch leaves that battle and
+/// the rest pending for the next read; a drop after an applied latch and before its loss write
+/// leaves that Section or Crew its soldiers, the named residual above, now once per battle.
+/// Two battles' losses always fall on different rows (a Section is busy on one op only), and
+/// each cap reads its own Section's headcount in its own iteration.
 async fn latch_pending_raid(state: &AppState, campaign_id: Uuid, now: DateTime<Utc>, route: &str) -> Result<(), AppError> {
-    let Some(pending) = state.demo_ops.store.pending_raid(campaign_id, now) else {
-        return Ok(());
-    };
-    if let Some(crew) = pending.crew {
+    for pending in state.demo_ops.store.pending_raids(campaign_id, now) {
+        if let Some(crew) = pending.crew {
+            if let Some(seam) = &state.demo_ops.latch_seam {
+                seam().await;
+            }
+            let _launch = state.launch_locks.lock(campaign_id).await;
+            let applied = state.demo_ops.store.latch_crew(campaign_id, &pending.trigger, crew, now);
+            if applied && crew.heads > 0 {
+                if let Err(e) = state.crew_loss.meltdown_loss(crew.crew_id, crew.heads, DEMO_CREW_FIGHT_MORALE_LOSS).await {
+                    return Err(internal_error(format!(
+                        "{route}: crew fight meltdown_loss({}, {DEMO_CREW_FIGHT_MORALE_LOSS}) failed for crew {} of campaign {campaign_id}: {e}",
+                        crew.heads, crew.crew_id
+                    )));
+                }
+            }
+            continue;
+        }
+        let mut read_headcount: Option<(Uuid, i16)> = None;
+        if let Some(section_id) = pending.section_id {
+            let section = state
+                .section_repo
+                .get_section(section_id)
+                .await
+                .map_err(|e| internal_error(format!("{route}: get_section failed for section {section_id} of campaign {campaign_id}: {e}")))?
+                .ok_or_else(|| internal_error(format!("{route}: section {section_id} of campaign {campaign_id} not found")))?;
+            if section.headcount == 0 {
+                state.demo_ops.store.latch_raid(campaign_id, &pending.trigger, RaidResult::Wiped, FightPay::credits(0), now);
+                continue;
+            }
+            read_headcount = Some((section_id, section.headcount));
+        }
+        let commander_id = pending.commander_id;
+        let deps = state.commander_repo.list_deployments_by_commander(commander_id).await.map_err(|e| {
+            internal_error(format!("{route}: list_deployments_by_commander failed for commander {commander_id} of campaign {campaign_id}: {e}"))
+        })?;
+        let result = raid_result(&deps, &pending.trigger)
+            .map_err(|e| internal_error(format!("{route}: raid of campaign {campaign_id}: {e}")))?;
+        let Some(result) = result else {
+            continue;
+        };
+        let fight = raid_fight(&deps, &pending.trigger)
+            .ok_or_else(|| internal_error(format!("{route}: raid of campaign {campaign_id} has a result but no fight")))?;
+        let loss = fight_result(state, fight, route).await?;
         if let Some(seam) = &state.demo_ops.latch_seam {
             seam().await;
         }
-        let _launch = state.launch_locks.lock(campaign_id).await;
-        let applied = state.demo_ops.store.latch_crew(campaign_id, &pending.trigger, crew, now);
-        if applied && crew.heads > 0 {
-            if let Err(e) = state.crew_loss.meltdown_loss(crew.crew_id, crew.heads, DEMO_CREW_FIGHT_MORALE_LOSS).await {
+        let cap = read_headcount
+            .filter(|(id, _)| *id == loss.section_id)
+            .map(|(_, h)| (h - loss.losses).clamp(0, 8) as u8);
+        let pay = FightPay { credits: loss.credits, section_id: loss.section_id, wounded: loss.wounded, cap, loot: loss.loot };
+        let applied = state.demo_ops.store.latch_raid(campaign_id, &pending.trigger, result, pay, now);
+        if applied && loss.losses > 0 {
+            let _launch = state.launch_locks.lock(campaign_id).await;
+            if let Err(e) = state.section_loss.lose_soldiers(loss.section_id, loss.losses).await {
                 return Err(internal_error(format!(
-                    "{route}: crew fight meltdown_loss({}, {DEMO_CREW_FIGHT_MORALE_LOSS}) failed for crew {} of campaign {campaign_id}: {e}",
-                    crew.heads, crew.crew_id
+                    "{route}: lose_soldiers({}) failed for section {} of campaign {campaign_id}: {e}",
+                    loss.losses, loss.section_id
                 )));
             }
-        }
-        return Ok(());
-    }
-    let mut read_headcount: Option<(Uuid, i16)> = None;
-    if let Some(section_id) = pending.section_id {
-        let section = state
-            .section_repo
-            .get_section(section_id)
-            .await
-            .map_err(|e| internal_error(format!("{route}: get_section failed for section {section_id} of campaign {campaign_id}: {e}")))?
-            .ok_or_else(|| internal_error(format!("{route}: section {section_id} of campaign {campaign_id} not found")))?;
-        if section.headcount == 0 {
-            state.demo_ops.store.latch_raid(campaign_id, &pending.trigger, RaidResult::Wiped, FightPay::credits(0), now);
-            return Ok(());
-        }
-        read_headcount = Some((section_id, section.headcount));
-    }
-    let commander_id = pending.commander_id;
-    let deps = state.commander_repo.list_deployments_by_commander(commander_id).await.map_err(|e| {
-        internal_error(format!("{route}: list_deployments_by_commander failed for commander {commander_id} of campaign {campaign_id}: {e}"))
-    })?;
-    let result = raid_result(&deps, &pending.trigger)
-        .map_err(|e| internal_error(format!("{route}: raid of campaign {campaign_id}: {e}")))?;
-    let Some(result) = result else {
-        return Ok(());
-    };
-    let fight = raid_fight(&deps, &pending.trigger)
-        .ok_or_else(|| internal_error(format!("{route}: raid of campaign {campaign_id} has a result but no fight")))?;
-    let loss = fight_result(state, fight, route).await?;
-    if let Some(seam) = &state.demo_ops.latch_seam {
-        seam().await;
-    }
-    let cap = read_headcount
-        .filter(|(id, _)| *id == loss.section_id)
-        .map(|(_, h)| (h - loss.losses).clamp(0, 8) as u8);
-    let pay = FightPay { credits: loss.credits, section_id: loss.section_id, wounded: loss.wounded, cap, loot: loss.loot };
-    let applied = state.demo_ops.store.latch_raid(campaign_id, &pending.trigger, result, pay, now);
-    if applied && loss.losses > 0 {
-        let _launch = state.launch_locks.lock(campaign_id).await;
-        if let Err(e) = state.section_loss.lose_soldiers(loss.section_id, loss.losses).await {
-            return Err(internal_error(format!(
-                "{route}: lose_soldiers({}) failed for section {} of campaign {campaign_id}: {e}",
-                loss.losses, loss.section_id
-            )));
         }
     }
     Ok(())
@@ -471,8 +483,12 @@ async fn get_ops_board(
 /// failed read) → `400` unknown site → for a dig, the Crew, Foreman and Commander reads
 /// (`500` on failure), `409` no Crew left and `409` no Commander left; for a contract, the
 /// Commander read (`500` on failure) and `409` no Commander left → for any site, the
-/// member's first Section read (`500` on failure) and `409` when it is at 0 (BP-11a-1) → `409`
-/// an op is under way → `503` the store is full of ops → `200`, the whole state.
+/// member's first Section read (`500` on failure) and `409` when it is at 0 (BP-11a-1) → `503`
+/// the store is full of ops → `409` an op is under way → `409` that squad is out → `409` another
+/// squad has that contract → `409` every Commander is out → `200`, the whole state.
+/// - BP-18a-1b-1: the start names no squad, so it lands only with no op out, or as a Crew-alone
+///   dig beside a contract (the dig slot empty); the last three refusals are the store's for a
+///   named start (BP-18a-1b-2's selector) and are unreachable from this route today.
 /// - The site is looked up as it stands (BP-11a-3): a fought contract is `400 unknown site`
 ///   (before `409` an op is under way) until it returns 45 s later at another hex. A return
 ///   landing between the lookup and the start sends the team to the old pin (accepted).
@@ -533,6 +549,9 @@ async fn post_ops_start(
         Ok(()) => {}
         Err(StartRefusal::Busy) => return Err(conflict("an op is already under way")),
         Err(StartRefusal::Full) => return Err(service_unavailable("the ops board is full")),
+        Err(StartRefusal::SectionBusy) => return Err(conflict("that squad is out")),
+        Err(StartRefusal::Taken) => return Err(conflict("another squad has that contract")),
+        Err(StartRefusal::CommanderBusy) => return Err(conflict("every Commander is out")),
     }
     Ok(ops_response(&state, campaign_id, gw, &board, now))
 }
@@ -575,7 +594,8 @@ async fn usable_commander(state: &AppState, campaign_id: Uuid, wallet: &[u8], ro
 /// Brings the team home, `POST /api/campaign/:campaign_id/ops/return` (BP-8a-2, demo-only).
 /// No body is read. Order: `401` → `429` `ops_ip` → `429` `ops_wallet` → `404` → `403` →
 /// `409` not `Active` (entry dropped) → `409` no op under way (also: no gateway) → the board
-/// → a pending raid latched → `409` no op under way → `409` already heading home → `409` still
+/// → a pending raid latched → `409` no op under way → `400` say which squad (two ops out: a
+/// Crew-alone dig beside a contract, BP-18a-1b-1) → `409` already heading home → `409` still
 /// travelling → `409` raiders at the site → `200`, the whole state.
 /// - The homeward leg takes the site's `travel_secs` again (§4d: "each way"), not the
 ///   gateway's terrain: every gateway is City-State (×0.5), which would halve every trip home.
@@ -604,6 +624,7 @@ async fn post_ops_return(
         Err(ReturnRefusal::NotArrived) => return Err(conflict("still travelling")),
         Err(ReturnRefusal::AlreadyHomeward) => return Err(conflict("already heading home")),
         Err(ReturnRefusal::RaidPending) => return Err(conflict("raiders at the site")),
+        Err(ReturnRefusal::SayWhich) => return Err(bad_request("say which squad")),
     }
     Ok(ops_response(&state, campaign_id, gw, &board, now))
 }
@@ -615,10 +636,13 @@ async fn post_ops_return(
 /// way (also: no gateway) → the board, a hit proven by `EXISTS` → a pending battle latched →
 /// `400` unknown site → the lead reads as `ops/start` (a dig: Crew, Foreman and Commander; a
 /// contract: Commander; `500` on failure, `409` none left) → the member's first Section read
-/// (`500` on failure) and `409` when it is at 0 → `409` no op under way → `409` already heading
-/// home → `409` still travelling → `409` raiders at the site → `409` the guard hasn't reached
-/// the dig (BP-18a-1a: a dig whose guard does not stand) → `409` already there → `200`, the
-/// whole state.
+/// (`500` on failure) and `409` when it is at 0 → `409` no op under way → `400` say which squad
+/// (two ops out, BP-18a-1b-1) → `409` already heading home → `409` still travelling → `409`
+/// raiders at the site → `409` the guard hasn't reached the dig (BP-18a-1a: a dig whose guard
+/// does not stand) → `409` already there → `409` an op is already under way (a dig target while
+/// another slot holds the dig) → `409` another squad has that contract → `200`, the whole state.
+/// - BP-18a-1b-1: the moving squad is the op's own (the store copies the leaving op's Commander
+///   and Section into the new op); with one squad that is the route's pick.
 /// - A new op from the team's own hex (`next_op`): the hop's hexes at the target's seconds per
 ///   hex, at least 1 s; home from there is the target's own time.
 /// - The ore on a dig's site is walked away from, as `ops/return`; an unfought contract stays on
@@ -672,6 +696,9 @@ async fn post_ops_next(
         Err(NextRefusal::RaidPending) => return Err(conflict("raiders at the site")),
         Err(NextRefusal::GuardNotHere) => return Err(conflict("the guard hasn't reached the dig")),
         Err(NextRefusal::SameSite) => return Err(conflict("already there")),
+        Err(NextRefusal::SayWhich) => return Err(bad_request("say which squad")),
+        Err(NextRefusal::DigHeld) => return Err(conflict("an op is already under way")),
+        Err(NextRefusal::Taken) => return Err(conflict("another squad has that contract")),
     }
     Ok(ops_response(&state, campaign_id, gw, &board, now))
 }
@@ -744,7 +771,8 @@ async fn post_ops_drill(
 /// op under way (also: no gateway) → the board → a pending battle latched → the Commander read
 /// (`500` on failure) and `409` no Commander left → the member's first Section read (`500` on
 /// failure) and `409` when it is at 0 → `409` no op under way → `409` not a dig site → `409`
-/// already heading home → `409` already guarded → `200`, the whole state.
+/// already heading home → `409` already guarded → `409` that squad is out (the first Section
+/// leads a contract, BP-18a-1b-1) → `409` every Commander is out → `200`, the whole state.
 /// - The guard stands from `now` + the site's `travel_secs` (`dig.escort_at`): a battle born
 ///   before then is still the Crew's.
 /// - Memory only, no DB write, so no launch lock.
@@ -779,6 +807,8 @@ async fn post_ops_escort(
         Err(EscortRefusal::Contract) => return Err(conflict("not a dig site")),
         Err(EscortRefusal::AlreadyHomeward) => return Err(conflict("already heading home")),
         Err(EscortRefusal::AlreadyEscorted) => return Err(conflict("already guarded")),
+        Err(EscortRefusal::SectionBusy) => return Err(conflict("that squad is out")),
+        Err(EscortRefusal::CommanderBusy) => return Err(conflict("every Commander is out")),
     }
     Ok(ops_response(&state, campaign_id, gw, &board, now))
 }
@@ -974,9 +1004,10 @@ async fn post_ops_replace(
         ReplaceTarget::Section(_) => DEMO_REPLACE_MERC_CREDITS,
         ReplaceTarget::Crew(_) => DEMO_REPLACE_MINER_CREDITS,
     };
-    // BP-17a: a Section's Requisition passes while the Section is at base on an unescorted dig.
+    // BP-18a-1b-1: a Section's Requisition passes while that Section is not busy (at base on an
+    // unescorted dig, or while another Section is out); a Crew Hire while no op is out.
     let begun = match target {
-        ReplaceTarget::Section(_) => state.demo_ops.store.begin_requisition(campaign_id, each * u32::from(n), now),
+        ReplaceTarget::Section(id) => state.demo_ops.store.begin_requisition(campaign_id, id, each * u32::from(n), now),
         ReplaceTarget::Crew(_) => state.demo_ops.store.begin_replace(campaign_id, each * u32::from(n), now),
     };
     let hold = match begun {
@@ -3306,5 +3337,43 @@ mod tests {
         assert_eq!(headcount(&state, crew).await, 6);
         assert_eq!(section_headcount(&state, section).await, 8);
         assert_eq!(body["active_op"]["dig"]["carried"], 30, "{body}");
+    }
+
+    /// BP-18a-1b-1 (H3): two contracts on site, one read. The first Section (by `created_at`)
+    /// leads `SITE` through the route; a second Section, whose id sorts first, leads `NEXT_SITE`
+    /// through the store with a Commander that has no deployments, so its battle stays unfought
+    /// and comes first by key. Only the first Section's fight is logged (SUCCESS_SEED pays 400).
+    /// One `GET` latches it behind the unfought one, which stays pending.
+    #[tokio::test]
+    async fn ops_one_read_latches_a_battle_behind_an_unfought_one() {
+        let state = Arc::new(session_state());
+        let cc = campaign_with(&state, WALLET, true, Some(GATEWAY)).await;
+        seed_commander(&state, cc.campaign_id).await;
+        seed_sector(&state, &cc).await;
+        let c = cc.campaign_id;
+        let first = member_section(&state, c).await;
+        let created = state.section_repo.get_section(first).await.unwrap().expect("the first").created_at;
+        let mut s = crate::repository::section::starter_section(c, WALLET.to_vec());
+        s.created_at = created + chrono::Duration::seconds(1);
+        s.section_id = Uuid::from_u128(1);
+        let second = s.section_id;
+        assert!(second < first, "the unfought contract is first by key");
+        state.section_repo.create_section(s).await.expect("create_section");
+        let (status, body, _) = start(&state, c, SITE).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let now = chrono::Utc::now();
+        let empty = OpsBoard { sites: vec![], contract_pool: vec![] };
+        let next_site = state.demo_ops.store.site(c, &empty, NEXT_SITE, now).expect("the second contract");
+        let unfought = Uuid::from_u128(0xD2);
+        let lead = ContractStart { commander_id: unfought, section_id: Some(second) };
+        state.demo_ops.store.start_op_for(c, GATEWAY, Arc::new(empty), &next_site, 7, None, Some(lead), true, now).expect("the second op");
+        state.demo_ops.store.rewind_op(c, 120);
+        fight_logged(&state, c, SUCCESS_SEED, None).await;
+        let (status, body) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["credits_banked"], 400, "the fought contract, second by key, is latched");
+        assert_eq!(section_headcount(&state, first).await, 7);
+        let left = state.demo_ops.store.pending_raid(c, chrono::Utc::now()).expect("the unfought one");
+        assert_eq!((left.commander_id, left.section_id), (unfought, Some(second)));
     }
 }
