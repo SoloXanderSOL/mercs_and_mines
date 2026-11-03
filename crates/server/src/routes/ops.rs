@@ -1674,7 +1674,7 @@ mod tests {
         assert_eq!(keys, ["active_op", "base", "campaign_id", "company", "credits_banked", "gateway", "now", "ore_banked", "sites"].into_iter().collect());
         let op = &body["active_op"];
         let op_keys: std::collections::BTreeSet<&str> = op.as_object().expect("an op").keys().map(|k| k.as_str()).collect();
-        assert_eq!(op_keys, ["arrive_at", "arrived", "at", "depart_at", "kind", "leg", "site_id"].into_iter().collect());
+        assert_eq!(op_keys, ["arrive_at", "arrived", "at", "commander_id", "depart_at", "kind", "leg", "site_id"].into_iter().collect());
         assert_eq!((op["leg"].as_str(), op["site_id"].as_str(), op["kind"].as_str()), (Some("outbound"), Some(SITE), Some("contract")));
         assert_eq!(op["arrived"], false);
         assert_eq!(op["depart_at"], body["now"]);
@@ -2216,7 +2216,7 @@ mod tests {
         assert!(d["next_raid_pct"].is_null());
         assert_eq!((d["heat"].as_u64(), d["ore_on_site"].as_u64()), (Some(10), Some(20)));
         let text = String::from_utf8_lossy(&bytes);
-        assert!(!text.contains("trigger") && !text.contains("commander"), "{text}");
+        assert!(!text.contains("trigger") && !text.replace("\"commander_id\"", "").contains("commander"), "{text}");
         let (status, body, _) = drill(&state, c).await;
         assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("raiders at the site")));
         let (status, body, _) = post(&state, c, "return", None).await;
@@ -3338,7 +3338,7 @@ mod tests {
         assert_eq!(keys, ["active_op", "base", "campaign_id", "company", "credits_banked", "gateway", "now", "ore_banked", "sites"].into_iter().collect());
         let op = &body["active_op"];
         let op_keys: std::collections::BTreeSet<&str> = op.as_object().expect("an op").keys().map(|k| k.as_str()).collect();
-        assert_eq!(op_keys, ["arrive_at", "arrived", "at", "depart_at", "kind", "leg", "site_id"].into_iter().collect());
+        assert_eq!(op_keys, ["arrive_at", "arrived", "at", "commander_id", "depart_at", "kind", "leg", "section_id", "site_id"].into_iter().collect());
         assert_eq!((op["site_id"].as_str(), op["leg"].as_str()), (Some(NEXT_SITE), Some("outbound")));
         assert_eq!(op["at"], serde_json::json!({"q": target["q"], "r": target["r"]}));
         let n = |v: &serde_json::Value| v.as_i64().expect("a number");
@@ -3996,6 +3996,72 @@ mod tests {
         assert_eq!(more.len(), 1, "{body}");
         assert_eq!(more[0]["section_id"], s1.to_string());
         assert_eq!(more[0]["op"]["kind"], "contract");
+    }
+
+    /// BP-18b-1 (H1): every op names the squad it fights with. One member, two Sections and two
+    /// Commanders. (a) A guarded dig (S1) and a contract named S2: each op carries its own Section
+    /// and the Commander the store recorded for it (read back from the store, never the body).
+    /// (b) A Crew-alone dig carries neither key. (c) After `ops/escort`, it carries the guard's.
+    #[tokio::test]
+    async fn ops_ops_name_their_squad() {
+        let state = Arc::new(session_state());
+        let keys = |op: &serde_json::Value| op.as_object().expect("an op").keys().cloned().collect::<std::collections::BTreeSet<String>>();
+        // (a)
+        let (c, _) = dig_campaign(&state, false).await;
+        let c1 = commander_of_first(&state, c).await;
+        let c2 = second_commander(&state, c).await;
+        let (s1, s2) = second_section(&state, c).await;
+        let (status, body, _) = start(&state, c, DIG).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let now = chrono::Utc::now();
+        assert_eq!(state.demo_ops.store.busy_commanders(c, &[c1, c2], now), vec![c1], "the dig's Commander, as recorded");
+        assert_eq!(state.demo_ops.store.squad_section(c, Some(OpSquad::Dig), now), Some(Some(s1)), "the dig's guard, as recorded");
+        let (status, body, _) = start_body(&state, c, serde_json::json!({ "site_id": SITE, "section_id": s2 })).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        state.demo_ops.store.rewind_op(c, 120);
+        let raids = state.demo_ops.store.pending_raids(c, chrono::Utc::now());
+        let lead = raids.iter().find(|p| p.trigger.kind == crate::demo_ops::BattleKind::Contract).expect("the contract, recorded");
+        assert_eq!(lead.section_id, Some(s2));
+        let (status, body) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["active_op"]["kind"], "dig", "{body}");
+        assert_eq!(body["active_op"]["section_id"], s1.to_string(), "{body}");
+        assert_eq!(body["active_op"]["commander_id"], c1.to_string(), "{body}");
+        let more = body["more_ops"].as_array().expect("more_ops");
+        assert_eq!(more.len(), 1, "{body}");
+        assert_eq!(more[0]["op"]["kind"], "contract", "{body}");
+        assert_eq!(more[0]["op"]["section_id"], s2.to_string(), "{body}");
+        assert_eq!(more[0]["op"]["commander_id"], lead.commander_id.to_string(), "{body}");
+        // (b)
+        let (c, _) = dig_campaign(&state, false).await;
+        let c1 = commander_of_first(&state, c).await;
+        let c2 = second_commander(&state, c).await;
+        second_section(&state, c).await;
+        let (status, body, _) = start_alone(&state, c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let alone: std::collections::BTreeSet<String> =
+            ["arrive_at", "arrived", "at", "depart_at", "dig", "kind", "leg", "site_id"].iter().map(|k| k.to_string()).collect();
+        assert_eq!(keys(&body["active_op"]), alone, "{body}");
+        // (c)
+        state.demo_ops.store.rewind_op(c, 120);
+        let (status, body, _) = escort(&state, c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let now = chrono::Utc::now();
+        let guard = state.demo_ops.store.squad_section(c, Some(OpSquad::Dig), now).flatten().expect("the guard, as recorded");
+        let led = state.demo_ops.store.busy_commanders(c, &[c1, c2], now);
+        assert_eq!(led.len(), 1, "one Commander leads the guard");
+        let (status, body) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["active_op"]["section_id"], guard.to_string(), "{body}");
+        assert_eq!(body["active_op"]["commander_id"], led[0].to_string(), "{body}");
+    }
+
+    /// The member's first Commander (the one `dig_campaign` seeds).
+    async fn commander_of_first(state: &AppState, campaign: Uuid) -> Uuid {
+        let all = state.commander_repo.list_commanders_for_member(campaign, &WALLET).await.expect("list");
+        all.first().expect("the first Commander").commander_id
     }
 
     // ---- BP-18a-2: the squad hire, wages, Reviewer BP-18a-1b-2 F1 (b) and F2, Reviewer BP-16a F3.

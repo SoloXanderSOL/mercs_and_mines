@@ -939,6 +939,11 @@ pub struct ActiveOpView {
     /// before the fight and on a dig, so an unfought contract keeps its seven keys.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fought: Option<&'static str>,
+    /// The squad the op sends into its fights (BP-18b-1): a contract's Section and Commander, or a dig's guard once one is named (`escort_at` set). Absent on a Crew-alone dig, so its keys stand.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub section_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commander_id: Option<Uuid>,
 }
 
 /// A hex as the ops routes send it: `{"q": …, "r": …}`.
@@ -1429,43 +1434,52 @@ impl OpsEntry {
     /// One slot's op as the client sees it (BP-18a-1b-2): `view` shows the primary's, the body's
     /// `more_ops` every other slot's. One builder, so the two shapes can't drift.
     fn view_of(&self, key: SlotKey, now: DateTime<Utc>) -> Option<ActiveOpView> {
-        self.slot(key).map(|op| ActiveOpView {
-            leg: op.leg,
-            site_id: op.site_id.clone(),
-            at: OpHex { q: op.at.0, r: op.at.1 },
-            kind: op.kind,
-            depart_at: ops_time(op.depart_at),
-            arrive_at: ops_time(op.arrive_at),
-            arrived: now >= op.arrive_at && op.dig.as_ref().is_none_or(|d| d.ambush_at.is_none()),
-            dig: op.dig.as_ref().map(|d| {
-                let out = op.leg == OpLeg::Outbound;
-                let (lo, hi) = if out { self.base.heat_range(d.drills + 1) } else { (0, 0) };
-                DigView {
-                    drills: d.drills,
-                    heat: d.heat,
-                    threshold: d.threshold,
-                    ore_on_site: d.ore_on_site,
-                    next_ore: if op.leg == OpLeg::Homeward { 0 } else { self.base.ore(d.drills + 1, d.tier) },
-                    next_heat_min: lo,
-                    next_heat_max: hi,
-                    might_overheat: out && d.heat + hi >= d.threshold,
-                    ended_by: d.ended_by,
-                    next_raid_pct: if out && d.raid.is_none() && d.heat + lo < d.threshold {
-                        Some(self.base.raid_pct(d.drills + 1))
-                    } else {
-                        None
-                    },
-                    raid: d.raid.filter(|r| r.kind == BattleKind::Raid).map(|r| RaidView { mission_id: r.mission_id }),
-                    ambush: d.raid.filter(|r| r.kind == BattleKind::Ambush).map(|r| RaidView { mission_id: r.mission_id }),
-                    carried: d.carried,
-                    escort_at: d.escort_at.map(ops_time),
-                }
-            }),
-            fought: op.contract.as_ref().and_then(|c| match c.result {
-                Some(RaidResult::Held) => Some("won"),
-                Some(RaidResult::Retreat) => Some("lost"),
-                Some(RaidResult::Wiped) | None => None,
-            }),
+        self.slot(key).map(|op| {
+            let (section_id, commander_id) = match (&op.contract, &op.dig) {
+                (Some(c), _) => (c.section_id, Some(c.commander_id)),
+                (None, Some(d)) if d.escort_at.is_some() => (d.section_id, Some(d.commander_id)),
+                _ => (None, None),
+            };
+            ActiveOpView {
+                leg: op.leg,
+                site_id: op.site_id.clone(),
+                at: OpHex { q: op.at.0, r: op.at.1 },
+                kind: op.kind,
+                depart_at: ops_time(op.depart_at),
+                arrive_at: ops_time(op.arrive_at),
+                arrived: now >= op.arrive_at && op.dig.as_ref().is_none_or(|d| d.ambush_at.is_none()),
+                dig: op.dig.as_ref().map(|d| {
+                    let out = op.leg == OpLeg::Outbound;
+                    let (lo, hi) = if out { self.base.heat_range(d.drills + 1) } else { (0, 0) };
+                    DigView {
+                        drills: d.drills,
+                        heat: d.heat,
+                        threshold: d.threshold,
+                        ore_on_site: d.ore_on_site,
+                        next_ore: if op.leg == OpLeg::Homeward { 0 } else { self.base.ore(d.drills + 1, d.tier) },
+                        next_heat_min: lo,
+                        next_heat_max: hi,
+                        might_overheat: out && d.heat + hi >= d.threshold,
+                        ended_by: d.ended_by,
+                        next_raid_pct: if out && d.raid.is_none() && d.heat + lo < d.threshold {
+                            Some(self.base.raid_pct(d.drills + 1))
+                        } else {
+                            None
+                        },
+                        raid: d.raid.filter(|r| r.kind == BattleKind::Raid).map(|r| RaidView { mission_id: r.mission_id }),
+                        ambush: d.raid.filter(|r| r.kind == BattleKind::Ambush).map(|r| RaidView { mission_id: r.mission_id }),
+                        carried: d.carried,
+                        escort_at: d.escort_at.map(ops_time),
+                    }
+                }),
+                fought: op.contract.as_ref().and_then(|c| match c.result {
+                    Some(RaidResult::Held) => Some("won"),
+                    Some(RaidResult::Retreat) => Some("lost"),
+                    Some(RaidResult::Wiped) | None => None,
+                }),
+                section_id,
+                commander_id,
+            }
         })
     }
 }
@@ -3136,7 +3150,7 @@ mod tests {
         assert_eq!(keys, want.into_iter().collect());
         assert_eq!(v["dig"]["raid"], serde_json::json!({"mission_id": "GUARD_DUTY"}));
         let text = v.to_string();
-        assert!(!text.contains("seed") && !text.contains("crew") && !text.contains("commander") && !text.contains("trigger"), "{text}");
+        assert!(!text.contains("seed") && !text.contains("crew") && !text.replace("\"commander_id\"", "").contains("commander") && !text.contains("trigger"), "{text}");
     }
 
     #[test]
