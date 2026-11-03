@@ -119,6 +119,16 @@ export function setStill(fn) { stillFor = fn; }
 let beforeOutcome = (ctx, next) => next();
 export function setBeforeOutcome(fn) { beforeOutcome = fn; }
 
+// Which Commander and Section a fight sends (the demo's op): `{ commander_id, section_id }`, either
+// may be absent. By default none, so the campaign's Commander and the first Section fight.
+let fightSquad = () => null;
+export function setFightSquad(fn) { fightSquad = fn; }
+
+// The first Commander still able to lead (not KIA, not Shattered), as main.js's reveal picks one.
+function nextUsable(roster) {
+  return ((roster && roster.commanders) || []).find(c => !c.is_kia && !c.is_shattered) || null;
+}
+
 // `deps` is main.js's side of the client: screens, the error screen, the roster it keeps,
 // the one Audio element, and the flows the battle hands back to (hub, reveal, join).
 export function createBattle(deps) {
@@ -260,8 +270,11 @@ export function createBattle(deps) {
     const camp = store.campaign();
     const roster = deps.getRoster();
     if (!camp || !roster) return null;
-    const commander = (roster.commanders || []).find(c => c.commander_id === camp.commander_id);
-    const section = (roster.sections || [])[0];
+    const pick = fightSquad() || {};
+    const commanderId = pick.commander_id || camp.commander_id;
+    const commander = (roster.commanders || []).find(c => c.commander_id === commanderId);
+    const sections = roster.sections || [];
+    const section = pick.section_id ? sections.find(s => s.section_id === pick.section_id) : sections[0];
     return commander && section ? { camp, roster, commander, section } : null;
   }
 
@@ -357,7 +370,11 @@ export function createBattle(deps) {
   function deathFromRefusal(d, flags) {
     Object.assign(d.commander, flags);
     store.setRoster(d.camp.campaign_id, d.roster);
-    showEndOfRun(d.commander.commander_id);
+    const next = nextUsable(d.roster);
+    if (!next) return showEndOfRun(d.commander.commander_id);
+    store.setCampaign({ campaign_id: d.camp.campaign_id, commander_id: next.commander_id });
+    music(MUSIC.hub);
+    deps.enterHub();
   }
 
   // The roster patch (spec check §7): the deployed Commander only; never `sections`.
@@ -519,7 +536,11 @@ export function createBattle(deps) {
   function afterAar() {
     const d = deployed();
     if (result.commander.kia || (d && d.commander.is_shattered)) {
-      return showEndOfRun(d ? d.commander.commander_id : store.campaign()?.commander_id);
+      // A death ends the run only when no Commander is left to lead; otherwise the next one takes the campaign.
+      const next = nextUsable(deps.getRoster());
+      const held = store.campaign();
+      if (!next || !held) return showEndOfRun(d ? d.commander.commander_id : held?.commander_id);
+      store.setCampaign({ campaign_id: held.campaign_id, commander_id: next.commander_id });
     }
     const camp = store.campaign();
     if (camp && !store.offered(camp.campaign_id)) { // the checkout, once per campaign (BP-3c-2b)
