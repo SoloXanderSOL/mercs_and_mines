@@ -32,10 +32,10 @@
 
 import { request, ApiError, store, getMissions, getRoster } from './api.js';
 import { onMapCreated } from './hexmap.js';
-import { setAarNote, setBeforeOffer, setSquadSize, setDeployExtra, setStill } from './battle.js';
+import { setAarNote, setBeforeOffer, setSquadSize, setDeployExtra, setStill, setFightSquad } from './battle.js';
 import { mountStory, writeAar } from './demo_story.js';
 import { showCard, cardSeen } from './demo_card.js';
-import { mountCompany, dressBriefing, renderCompany, healPrice } from './demo_company.js';
+import { mountCompany, dressBriefing, renderCompany, redrawCompany, healPrice, wageLine } from './demo_company.js';
 import { DIG_COPY, DIG_CSS, createDigPanel, renderDig, hideDig, homewardLines, flash, bankedLine, crewFightLine } from './demo_dig.js';
 import { BASE_COPY, BASE_CSS, createBase, renderBase, hideBase } from './demo_base.js';
 
@@ -74,8 +74,8 @@ const COPY = {
   leaveIt: 'Leave it',
   stay: 'Stay',
   listTitle: 'Contracts on offer',
-  listSub: 'Pick a contract. The team walks there first.',
-  listOut: 'The team is out.',
+  listSub: 'Pick a contract. The squad walks there first.',
+  listOut: 'A squad is out.',
   listMeta: '{n} hexes · {s} s',
   aarLost: 'Lost: {names}.',
   aarDead: '{name} ({status})',
@@ -87,6 +87,10 @@ const COPY = {
   zeroFit: 'Everyone fit to fight is in the sickbay. Patch them up first.',
   zeroFitHealing: 'Nobody is fit to fight yet. Deploy opens when the sickbay lets them go.',
   walkingWounded: 'Nobody is fit to fight. The walking wounded are going anyway.',
+  // BP-18b-1 (Wiki copy)
+  squadEmpty: 'That squad has nobody left to send.',
+  escortEmpty: 'Nobody left in that squad to stand guard.',
+  takesCommand: '{name} is gone. {next} takes command.',
 };
 
 // Refusals the client keys on by exact text (routes/ops.rs; a server reword changes this block in the same brick).
@@ -95,6 +99,10 @@ const REFUSAL = {
   out: 'the team is out: replacements report at base',
   sectionFull: 'no room: a Section holds 8',
   crewFull: 'no room: a Crew holds 8',
+  // BP-18b-1 (Reviewer BP-18a-2 F6): matched by equality only; escortEmpty is a prefix of NO_SOLDIERS.
+  squadEmpty: 'that squad has no soldiers left',
+  escortEmpty: 'no soldiers left to send',
+  cap: 'you already have two squads',
 };
 
 // A12: the relic contract reads as a relic dig (Wiki copy, BP-11b-2). The server's name stays.
@@ -133,7 +141,7 @@ const sceneFor = (phase, { report }) => {
 
 // The end of run when the server says nobody is left to send (BP-11b-1).
 const END = {
-  soldiers: { title: 'Section lost', body: 'The 1st Section is gone to the last Rookie. Command has closed the file and opened a new one.' },
+  soldiers: { title: 'No soldiers left', body: 'Every Section is gone to the last Rookie. Command has closed the file and opened a new one.' },
   commander: { title: 'No one left to lead', body: 'There is no Commander left to sign the orders. The Company is already hiring.' },
 };
 const NO_SOLDIERS = 'no soldiers left to send: start a new run';
@@ -188,6 +196,7 @@ const CSS = `
 .still[src$="scene_ambush_fight.jpg"] { object-position: 50% 37%; }
 .still[src$="scene_defeat.jpg"] { object-position: 50% 62%; }
 .still[src$="scene_wipeout.jpg"] { object-position: 50% 28%; }
+.ops-banked { white-space: pre-line; }
 `;
 
 const opsPath = id => '/api/campaign/' + encodeURIComponent(id) + '/ops';
@@ -288,7 +297,9 @@ let opFight = false;    // the fight on the briefing was opened from here (the A
 let reopen = null;      // the opener that showed the demo fight's briefing: fight or fightContract (Reviewer BP-12b F2)
 let fitTimer = null;    // the 0-fit briefing's re-dress at healed_at (Reviewer BP-12b F2)
 let refreshDue = 0;     // when the one refresh read after a contract latch is due, in browser ms
-let fightHead = null; // the first Section's headcount when the demo opened the fight (Reviewer BP-11b-1 F1)
+let fightHead = null; // the fought Section's headcount when the demo opened the fight (Reviewer BP-11b-1 F1)
+let fightPick = null; // BP-18b-1: the fought op's squad, { commander_id, section_id }, latched when its fight opens (battle.js's fight-squad hook)
+let hiredNote = false; // BP-18b-1: a squad hire landed; the Company screen says so until it closes
 let endOnHub = null;   // a Section-at-0 end of run waiting for the hub, so it never cuts an AAR (Reviewer BP-11b-1 F1)
 let listOpen = false;   // the contracts list is showing
 
@@ -317,9 +328,12 @@ const battleKey = o => (!battleOf(o) ? null : (o.dig.raid ? 'raid:' : 'ambush:')
 // BP-17b: a dig only once its guard stands (spec check F5).
 const canNext = o => Boolean(o && o.leg === 'outbound' && progress(o) >= 1 && !battleOf(o) && (o.kind === 'dig' ? guardStands(o) : o.fought));
 // BP-17b, the escort: escort_at null = the Crew is alone; the guard stands once the server's clock reaches it.
-const guardStands = o => Boolean(o && o.dig && o.dig.escort_at !== null && serverNow() >= Date.parse(o.dig.escort_at));
-// "Go guard the dig": outbound and unguarded, and never with the Section at 0 (spec check F6).
-const canGuard = o => Boolean(o && o.leg === 'outbound' && o.dig && o.dig.escort_at === null && sectionHead() !== 0);
+// Reviewer BP-17b F1: an absent escort_at (a body from before BP-17a) is guarded.
+const guardStands = o => Boolean(o && o.dig && (o.dig.escort_at === undefined || (o.dig.escort_at !== null && serverNow() >= Date.parse(o.dig.escort_at))));
+// "Go guard the dig": outbound and unguarded, and never with the Section a bare escort sends at 0 (spec check F6).
+const canGuard = o => Boolean(o && o.leg === 'outbound' && o.dig && o.dig.escort_at === null && guardHead() !== 0);
+// BP-18b-1: the squad an op fights with, from its own keys (H1); an op with neither (an old body) has none.
+const squadOfOp = o => (o && (o.section_id || o.commander_id) ? { commander_id: o.commander_id || null, section_id: o.section_id || null } : null);
 // The Crew fight line (spec check F2): every result but a raid held is the op's last fight and shows as is;
 // a raid held can be followed by another fight, so it shows only outbound while no guard stands.
 const crewShown = o => {
@@ -402,7 +416,8 @@ function refresh() {
   // While a raid or an ambush waits, the hub's own GUARD_DUTY would count as its fight
   // (Reviewer BP-8b-2 F1), so the mission list is shut until the dig's fight is fought.
   deps.$('btn-missions').disabled = Boolean(battleOf(op));
-  bankChip.textContent = bankedLine(banked, credits);
+  const wages = wageLine(company); // BP-18b-1: the wage line under the bank (pre-line)
+  bankChip.textContent = wages ? bankedLine(banked, credits) + '\n' + wages : bankedLine(banked, credits);
   bankChip.hidden = !(banked > 0 || credits > 0);
   shownPhase = null;
   shownSecs = null;
@@ -676,6 +691,7 @@ async function fight() {
   opFight = true;
   reopen = fight;
   fightMission = b.mission_id;
+  fightPick = squadOfOp(op);
   fightHead = sectionHead();
   fightDress = { name: null, lead, family: op.dig.raid ? 'defence' : 'ambush' };
   await deps.openMission(b.mission_id, () => deps.enterHub());
@@ -690,6 +706,7 @@ async function fightContract() {
   opFight = true;
   reopen = fightContract;
   fightMission = t.mission_id;
+  fightPick = squadOfOp(op);
   fightHead = sectionHead();
   fightDress = t.mission_id === RELIC.mission_id
     ? { name: RELIC.name, lead: RELIC.lead, family: FAMILY[t.mission_id] }
@@ -715,8 +732,7 @@ function dressFight() {
   dressBriefing();
   if (fightDress && fightDress.name) deps.$('briefing-name').textContent = fightDress.name;
   if (fightDress && fightDress.lead) deps.$('briefing-text').textContent = fightDress.lead;
-  const roster = deps.getRoster();
-  const section = roster && Array.isArray(roster.sections) ? roster.sections[0] : null;
+  const section = fightSection();
   let text = '';
   if (section) {
     const d = { section };
@@ -778,11 +794,28 @@ function commanderName() {
   return c && typeof c.name === 'string' ? c.name : '';
 }
 
-// The first Section's headcount in main.js's roster, the one battle.js's squad reads.
-function sectionHead() {
+// BP-18b-1: the Section the fight sends, as battle.js's deployed() picks it: the fought op's, else the first.
+function fightSection() {
   const roster = deps.getRoster();
-  const section = roster && Array.isArray(roster.sections) ? roster.sections[0] : null;
+  const sections = roster && Array.isArray(roster.sections) ? roster.sections : [];
+  const id = fightPick && fightPick.section_id;
+  return (id ? sections.find(s => s.section_id === id) : sections.find(() => true)) || null;
+}
+
+// The fought Section's headcount in main.js's roster, the one battle.js's squad reads.
+function sectionHead() {
+  const section = fightSection();
   return section ? section.headcount : null;
+}
+
+// The headcount of the Section a bare escort sends (the server's pick): the first in roster order with
+// soldiers that the op does not hold; 0 when none has any; null with no roster.
+function guardHead() {
+  const roster = deps.getRoster();
+  const sections = roster && Array.isArray(roster.sections) ? roster.sections : [];
+  if (sections.length === 0) return null;
+  const free = sections.find(s => s.headcount > 0 && !(op && op.section_id === s.section_id));
+  return free ? free.headcount : 0;
 }
 
 // The AAR's loss lines for a fight opened from here: who died, and the Section's count after it
@@ -804,16 +837,23 @@ function aarNote({ report, section }) {
   // BP-12b: the wounded go to the sickbay when the fight latches.
   const wounded = (report && report.unit_results || []).filter(u => u.final_status === 'Wounded').length;
   if (wounded > 0) lines.push(fill(COPY.aarWounded, { n: wounded }));
+  // BP-18b-1 (R3): the fought Commander is dead or Shattered (battle.js has patched the roster) and another can
+  // lead: the next is battle.js's nextUsable pick, the first usable in roster order.
+  const roster = deps.getRoster();
+  const commanders = roster && Array.isArray(roster.commanders) ? roster.commanders : [];
+  const camp = store.campaign();
+  const ledId = (fightPick && fightPick.commander_id) || (camp && camp.commander_id);
+  const led = commanders.find(c => c.commander_id === ledId);
+  const next = commanders.find(c => !c.is_kia && !c.is_shattered);
+  if (led && (led.is_kia || led.is_shattered) && next) lines.push(fill(COPY.takesCommand, { name: led.name, next: next.name }));
   return lines;
 }
 
 // The run is over: nobody is left to send. The keeper end screen's New run does the rest.
 function endOfRun(kind) {
   const c = END[kind];
-  const roster = store.roster(campaignId);
-  const section = roster && Array.isArray(roster.sections) ? roster.sections[0] : null;
   deps.$('end-title').textContent = c.title;
-  deps.$('end-name').textContent = kind === 'soldiers' && section ? section.name : '';
+  deps.$('end-name').textContent = ''; // BP-18b-1: the soldiers' card names no Section (every one is at 0)
   deps.$('end-grade').textContent = '';
   deps.$('end-flaw').textContent = '';
   deps.$('end-body').textContent = c.body;
@@ -1011,7 +1051,7 @@ function adopt(body, built, spent = 0) {
 
 // The stored roster is read again (a meltdown cost Crew heads; a fight cost soldiers), so the Crew
 // line, a reload's reveal and the next squad (main.js's roster, through deps.setRoster) all show
-// the new headcount. A Section at 0 ends the run. Under the roster limiters, not the ops ones.
+// the new headcount. Every Section at 0 ends the run (BP-18b-1). Under the roster limiters, not the ops ones.
 async function rereadRoster() {
   const id = campaignId;
   try {
@@ -1019,8 +1059,8 @@ async function rereadRoster() {
     if (id !== campaignId) return;
     store.setRoster(id, body);
     deps.setRoster(body);
-    const section = Array.isArray(body.sections) ? body.sections[0] : null;
-    if (section && section.headcount === 0) {
+    const sections = Array.isArray(body.sections) ? body.sections : [];
+    if (sections.length > 0 && sections.every(s => s.headcount === 0)) {
       if (hubShown()) return endOfRun('soldiers');
       endOnHub = 'soldiers'; // off the hub (an AAR may be showing): the end of run waits for it
       return;
@@ -1089,8 +1129,9 @@ async function load() {
 // One POST; a refusal other than a stale campaign re-reads the board once and shows its state.
 // `built`: the building a build POST asks for, so its success gets the sheet's moment.
 // `spentOf(res)`: what a heal or replace spent, from its own body (H4). `beforeAdopt(res)`: run
-// on a 200 before the body is adopted (replace patches the kept roster there, BP-12b).
-async function send(path, body, built, spentOf, beforeAdopt) {
+// on a 200 before the body is adopted (replace patches the kept roster there, BP-12b). `afterAdopt(res)`:
+// run on a 200 after it (the squad hire re-reads the roster, BP-18b-1).
+async function send(path, body, built, spentOf, beforeAdopt, afterAdopt) {
   const id = campaignId;
   if (held() || !id) return;
   busy = true;
@@ -1111,7 +1152,9 @@ async function send(path, body, built, spentOf, beforeAdopt) {
   if (!err) {
     if (from && res && res.active_op) saveWalk(res.active_op.depart_at, from);
     if (beforeAdopt) beforeAdopt(res);
-    return adopt(res, built, spentOf ? spentOf(res) : 0);
+    adopt(res, built, spentOf ? spentOf(res) : 0);
+    if (afterAdopt) afterAdopt(res);
+    return;
   }
   refresh();
   if (stale(err) || rated(err)) return;
@@ -1119,6 +1162,10 @@ async function send(path, body, built, spentOf, beforeAdopt) {
     // BP-12b: heal's and replace's refusals by exact text; the bank comes from the re-read, never from here.
     if (err.message === REFUSAL.short || err.message === REFUSAL.out) {
       companyNotice = { ...ask, kind: err.message === REFUSAL.short ? 'short' : 'out' };
+      return load();
+    }
+    if (err.message === REFUSAL.cap) { // BP-18b-1: the squad hire's cap
+      companyNotice = { ...ask, kind: 'cap' };
       return load();
     }
     if (err.message === REFUSAL.sectionFull || err.message === REFUSAL.crewFull) {
@@ -1131,6 +1178,11 @@ async function send(path, body, built, spentOf, beforeAdopt) {
     // Nobody left to send ends the run; no Crew only shuts the digs.
     if (err.message === NO_SOLDIERS) return endOfRun('soldiers');
     if (err.message === NO_COMMANDER) return endOfRun('commander');
+    // BP-18b-1 (F6): one squad at 0 with another alive: a line on the strip after the re-read (adopt clears it first).
+    if (err.message === REFUSAL.squadEmpty || err.message === REFUSAL.escortEmpty) {
+      const line = err.message === REFUSAL.squadEmpty ? COPY.squadEmpty : COPY.escortEmpty;
+      return load().then(() => { notice = line; refresh(); });
+    }
     if (err.message === NO_CREW) {
       selected = null;
       picking = false;
@@ -1160,8 +1212,10 @@ function sendEscort() {
   send(opsPath(campaignId) + '/escort', undefined);
 }
 
+// BP-18b-1: Return names its op: the dig by its slot, a contract by its Section; a contract with no Section goes bare.
 function sendReturn() {
-  send(opsPath(campaignId) + '/return', undefined);
+  const query = op && op.kind === 'dig' ? '?slot=dig' : op && op.section_id ? '?section_id=' + encodeURIComponent(op.section_id) : '';
+  send(opsPath(campaignId) + '/return' + query, undefined);
 }
 
 function sendDrill() {
@@ -1219,7 +1273,21 @@ function sendReplace(target, id, count, each) {
 function sendNext(site) {
   if (!site || !op || held() || !canNext(op)) return;
   nextFrom = { q: op.at.q, r: op.at.r };
-  send(opsPath(campaignId) + '/next', { site_id: site.site_id });
+  // BP-18b-1: Next names the op it moves, as Return does.
+  const which = op.kind === 'dig' ? { slot: 'dig' } : op.section_id ? { section_id: op.section_id } : {};
+  send(opsPath(campaignId) + '/next', { site_id: site.site_id, ...which });
+}
+
+// BP-18b-1: the squad hire (no body). A 200 re-reads the roster (the new Section and Commander), then the
+// Company screen redraws with the hired line; its two 409s become the hire block's lines (send's ask map).
+function sendHire() {
+  if (held() || !campaignId) return;
+  companyNotice = null;
+  companyAsk = { action: 'hire', target: 'company' };
+  send(opsPath(campaignId) + '/hire', undefined, false, undefined, undefined, () => {
+    hiredNote = true;
+    rereadRoster().then(() => redrawCompany());
+  });
 }
 
 // ── the hub's re-entry and the end screen ─────────────────────────────────────
@@ -1312,6 +1380,8 @@ function attach(m) {
   wonCredits = 0;
   refreshDue = 0;
   fightHead = null;
+  fightPick = null;
+  hiredNote = false;
   endOnHub = null;
   listOpen = false;
   crewFight = null;
@@ -1375,6 +1445,7 @@ export function mountOps(d) {
   deps.$('btn-new-run').before(endNote);
   setAarNote(aarNote);
   setSquadSize(fitToFight);
+  setFightSquad(() => fightPick); // BP-18b-1 (H1): the fight sends the fought op's Commander and Section
   setDeployExtra(() => { sentApproach = pendingApproach; return pendingApproach ? { approach: pendingApproach } : {}; });
   setStill(sceneFor);
   mountStory(deps, { family: () => (opFight && fightDress ? fightDress.family : null) }); // B4 (BP-15b): the fight log
@@ -1387,7 +1458,13 @@ export function mountOps(d) {
     credits: () => credits,
     base: () => base,
     out: () => Boolean(op),
-    sectionHome: () => Boolean(op && op.dig && op.dig.escort_at === null), // BP-17a's section_home: a Section at base on an unguarded dig
+    sectionOut: id => Boolean(op && op.section_id && op.section_id === id), // the Section is not busy on an unguarded dig (section_busy)
+    leaderOf: id => (op && op.section_id && op.section_id === id ? op.commander_id || null : null), // BP-18b-1: "Led by" an op's Commander
+    fightSection,
+    company: () => company,
+    hired: () => hiredNote,
+    clearHired: () => { hiredNote = false; },
+    hire: sendHire,
     held,
     serverNow,
     bay: id => company.sections.find(s => s.section_id === id) || { wounded: 0, healing: 0, healed_at: null },

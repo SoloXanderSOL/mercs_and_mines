@@ -31,7 +31,7 @@ export const REPLACE_MINER_CREDITS = 80;  // demo_ops.rs DEMO_REPLACE_MINER_CRED
 
 // A7: what a rank really changes in this build (since B5, each rank above 1 is also +2 on every roll).
 const RANK_LINES = {
-  2: 'Rank 2. +2 on every roll. Cleared to command 4 Sections. You have one. The paperwork is very impressive.',
+  2: 'Rank 2. +2 on every roll. Cleared to command 4 Sections. The paperwork is very impressive.',
   3: 'Rank 3. +4 on every roll. A death on the relic dig or the Black Site now goes down as glorious.',
   4: 'Rank 4. +6 on every roll. Cleared for 64 Sections. Command admires the optimism.',
   5: 'Rank 5. Top rank, +8 on every roll. Any death now goes down as glorious.',
@@ -114,9 +114,18 @@ const COMPANY_COPY = {
   short: 'Not enough banked credits. {each} each.',
   requisition: 'Requisition {n} · {cost} credits',
   requisitionNote: '{each} credits a Rookie. They arrive with no history and no complaints yet.',
-  hire: 'Hire {n} · {cost} credits',
+  hire: 'Hire {n} miners · {cost} credits',
   hireNote: '{each} credits a miner. Morale stays where it is.',
-  out: 'The team is out. Replacements report at base.',
+  out: 'A squad is out. Miners sign on when every squad is home.',
+  // BP-18b-1 (Wiki copy)
+  sectionOut: 'This Section is out. Replacements report at base.',
+  squadHire: 'Hire a squad: a Commander and 8 mercs, {credits} credits.',
+  squadHireBtn: 'Hire squad',
+  hireCap: 'Two squads is the most you can field.',
+  hireShort: 'Not enough banked credits. A squad costs {credits}.',
+  hired: 'A Commander and 8 mercs report for duty.',
+  wages: 'Wages: {n} credits a minute.',
+  wagesNote: 'Demo wages, worked out when you check in, never below 0. A Section with nobody left still draws pay.',
   full: 'Full strength: 8 / 8.',
   sectionFull: 'The Section is already full.',
   crewFull: 'The Crew is already full.',
@@ -189,6 +198,10 @@ const CSS = `
 .company-trophy-name { margin: 0; font-family: var(--display); font-weight: 800; font-size: 4.2cqw; line-height: 1.2; overflow-wrap: anywhere; }
 .company-trophy-grade { margin: 0; font-family: var(--mono); font-size: 3.2cqw; text-transform: uppercase; color: var(--accent); }
 .company-trophy-line { margin: 0; font-size: 3.6cqw; line-height: 1.35; color: var(--muted); }
+.company-hire { display: flex; flex-direction: column; gap: 1.5cqw; margin-top: 3cqw; text-align: left; }
+.company-hire .company-card-line { font-size: 3.8cqw; }
+.company-hire .company-card-line.muted { font-size: 3.4cqw; }
+.company-hire .company-act { width: 100%; max-width: none; margin-top: 0; min-height: 11cqw; font-size: 4.4cqw; }
 `;
 
 const fill = (text, values) => text.replace(/\{(\w+)\}/g, (m, k) => (k in values ? String(values[k]) : m));
@@ -208,6 +221,7 @@ let traitsLine = null; // the briefing's trait lines, created on the first brief
 let shown = null;     // the card on screen: { kind, index }, or null
 let tick = null;      // the heal countdown's display timer (no network call)
 let drawnKey = null;  // the open card's drawn state, the countdown left out (Reviewer BP-12b F1)
+let hireBox = null;   // BP-18b-1: the squad hire block on the Company screen
 
 // ── the roster the client holds ────────────────────────────────────────────────
 function roster() {
@@ -224,9 +238,12 @@ function campaignCommander() {
   return r.commanders.find(c => c.commander_id === camp.commander_id) || null;
 }
 
-function firstSection() {
-  const r = roster();
-  return r && Array.isArray(r.sections) ? r.sections[0] || null : null;
+// BP-18b-1: the wage line, from the body's company.wages (the one reader; Reviewer BP-18a-2 F3: never its
+// cached squad count). '' when the body carries none.
+export function wageLine(company) {
+  const w = company && company.wages;
+  const n = w ? Number(w.per_minute) : NaN;
+  return Number.isFinite(n) ? fill(COMPANY_COPY.wages, { n }) : '';
 }
 
 // The next threshold from the server's rank, never a rank computed here. Rank 5 is the top.
@@ -299,6 +316,46 @@ function dressReveal(container) {
     shelf.setAttribute('tabindex', '0');
     list.append(shelf);
   }
+  // BP-18b-1: the squad hire, once, above the chips (from the hub, with an adopted body that carries company.hire):
+  // #reveal-content scrolls with it below them (measured: scrollHeight 949 to 1024 against clientHeight 600).
+  hireBox = null;
+  if (opened && list && view && view.adopted() && view.company().hire) {
+    hireBox = el('div', 'company-hire');
+    list.before(hireBox);
+    drawHire();
+  }
+}
+
+// The hire block: its line, Hire squad, the cap or short line, the hire's refusal, the hired line, the wage
+// line and the demo note. The squad count is the roster's Sections, never the body's (Reviewer BP-18a-2 F3).
+function drawHire() {
+  if (!hireBox || !hireBox.isConnected || !view) return;
+  const hire = view.company().hire;
+  if (!hire) return hireBox.replaceChildren();
+  const r = roster();
+  const squads = r && Array.isArray(r.sections) ? r.sections.length : 0;
+  const capped = squads >= Number(hire.cap);
+  const short = view.credits() < Number(hire.credits);
+  const rows = [line(fill(COMPANY_COPY.squadHire, { credits: hire.credits })),
+    act(COMPANY_COPY.squadHireBtn, capped || short || view.held(), () => view.hire())];
+  const texts = [];
+  if (capped) texts.push(COMPANY_COPY.hireCap);
+  else if (short) texts.push(fill(COMPANY_COPY.hireShort, { credits: hire.credits }));
+  const n = view.notice();
+  const refused = n && n.action === 'hire' ? (n.kind === 'cap' ? COMPANY_COPY.hireCap : n.kind === 'short' ? fill(COMPANY_COPY.hireShort, { credits: hire.credits }) : null) : null;
+  if (refused && !texts.includes(refused)) texts.push(refused);
+  if (view.hired()) texts.push(COMPANY_COPY.hired);
+  const wages = wageLine(view.company());
+  if (wages) texts.push(wages);
+  rows.push(...texts.map(t => line(t)), line(COMPANY_COPY.wagesNote, true));
+  hireBox.replaceChildren(...rows);
+}
+
+// After a squad hire's roster re-read (demo_ops.js): the open Company screen is drawn again from the new
+// roster through the hub's own Your Company path, so the new Section's chip and the hire block both redraw.
+export function redrawCompany() {
+  if (!deps || deps.$('screen-reveal').hidden) return;
+  deps.$('btn-back').click();
 }
 
 // ── A10: the stats card ────────────────────────────────────────────────────────
@@ -345,7 +402,7 @@ function noticeLine(target, action, each) {
   const n = view.notice();
   if (!n || n.target !== target || n.action !== action) return null;
   if (n.kind === 'short') return fill(COMPANY_COPY.short, { each });
-  if (n.kind === 'out') return COMPANY_COPY.out;
+  if (n.kind === 'out') return target === 'section' ? COMPANY_COPY.sectionOut : COMPANY_COPY.out;
   if (n.kind === 'full') return target === 'section' ? COMPANY_COPY.sectionFull : COMPANY_COPY.crewFull;
   return null;
 }
@@ -357,14 +414,14 @@ function replaceRows(target, id, h, each, label, note) {
     const full = noticeLine(target, 'replace', each); // a "no room" refusal, after its roster re-read
     return full ? [line(COMPANY_COPY.full), line(full)] : [line(COMPANY_COPY.full)];
   }
-  const out = target === 'section' ? view.out() && !view.sectionHome() : view.out(); // BP-17b: a Section at base on an unguarded dig takes Rookies; a Crew out never hires
+  const out = target === 'section' ? view.sectionOut(id) : view.out(); // BP-18b-1: a Section is out only while an op holds it; a Crew never hires with any op out
   const isHeld = view.held();
   const btn = act(fill(label, { n: offer.n, cost: offer.n * each }), false, () => view.replace(target, id, offer.n, each));
   btn.disabled = !offer.afford || out || isHeld;
   const rows = [btn, line(fill(note, { each }), true)];
   const texts = [];
   if (!offer.afford) texts.push(fill(COMPANY_COPY.short, { each }));
-  if (out) texts.push(COMPANY_COPY.out);
+  if (out) texts.push(target === 'section' ? COMPANY_COPY.sectionOut : COMPANY_COPY.out);
   const extra = noticeLine(target, 'replace', each);
   if (extra && !texts.includes(extra)) texts.push(extra);
   return rows.concat(texts.map(t => line(t)));
@@ -397,7 +454,10 @@ function sectionRows(s) {
       rows.push(line(COMPANY_COPY.back));
     }
   }
-  const c = campaignCommander();
+  // BP-18b-1: a Section an op holds is led by that op's Commander; any other by the campaign's.
+  const leaderId = view.leaderOf(s.section_id);
+  const r = roster();
+  const c = (leaderId && r && Array.isArray(r.commanders) ? r.commanders.find(x => x.commander_id === leaderId) : null) || campaignCommander();
   if (c) rows.push(line(fill(COMPANY_COPY.led, { name: c.name, xp: xpLine(c.xp, c.rank), n: c.stress }), true));
   rows.push(line(COMPANY_COPY.kit, true), line(fill(COMPANY_COPY.bank, { n: credits })));
   if (b.wounded > 0 && b.healing === 0) {
@@ -491,6 +551,7 @@ function openCard(kind, index) {
 // (BP-12b spec check H3): the open card is drawn again from the state it now holds.
 export function renderCompany() {
   if (card && shown && !card.node.hidden) openCard(shown.kind, shown.index);
+  drawHire(); // BP-18b-1: the hire block follows held(), the bank and the last refusal too
 }
 
 function chipAction(e) {
@@ -531,7 +592,7 @@ function dressAar(box) {
 // ── A11 on the combat screen ───────────────────────────────────────────────────
 // Only the label's text changes: no row is hidden, moved or restyled, so the presentation runs as before.
 function dressScore(lines) {
-  const s = firstSection();
+  const s = view.fightSection(); // BP-18b-1: the fought op's Section
   const n = s ? view.squadOf(s) : 0; // the squad sent (BP-12b: the headcount less the sickbay)
   const labels = [...lines.querySelectorAll('li.score-row .score-label')];
   // The roll's own rows say whether the Gunsmith stood (roll_inputs.gunsmith, read once by the server): no base read.
@@ -562,8 +623,8 @@ export function dressBriefing() {
 }
 
 // `d`: demo_ops.js's deps (main.js's $, getRoster, ...); `v`: demo_ops.js's view of its state
-// (adopted, credits, out, sectionHome, held, serverNow, bay, bayOf, squadOf, trophies, notice, clearNotice,
-// heal, replace).
+// (adopted, credits, out, sectionOut, leaderOf, fightSection, company, hired, clearHired, hire, held, serverNow,
+// bay, bayOf, squadOf, trophies, notice, clearNotice, heal, replace).
 export function mountCompany(d, v) {
   deps = d;
   view = v;
@@ -583,7 +644,7 @@ export function mountCompany(d, v) {
   // hidden on every call), a Back that rendered no reveal leaves no stale fromHub, and the card
   // (with its tick) closes. Created before the content observer, so a Back's own render, which
   // shows the reveal before this runs, keeps the flag.
-  new MutationObserver(() => { if (screen.hidden) { fromHub = false; hideCard(); } }).observe(screen, { attributes: true, attributeFilter: ['hidden'] });
+  new MutationObserver(() => { if (screen.hidden) { fromHub = false; hideCard(); view.clearHired(); } }).observe(screen, { attributes: true, attributeFilter: ['hidden'] });
   new MutationObserver(() => dressReveal(reveal)).observe(reveal, { childList: true, subtree: true });
   reveal.addEventListener('click', chipAction);
   reveal.addEventListener('keydown', chipAction);

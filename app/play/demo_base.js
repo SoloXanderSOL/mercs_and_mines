@@ -38,7 +38,7 @@ export const BASE_COPY = {
   title: 'Company Base',
   build: 'Build · {cost} ore',
   short: 'Need {n} more ore',
-  out: "The team is out. Build when they're home.",
+  out: 'A squad is out. Build when every squad is home.',
   planned: 'PLANNED',
   operational: 'OPERATIONAL',
   pop: '−{n} ore',
