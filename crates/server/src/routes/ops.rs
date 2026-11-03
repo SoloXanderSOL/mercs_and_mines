@@ -353,8 +353,10 @@ async fn fight_result(state: &AppState, dep: &DeploymentRecord, route: &str) -> 
 ///   read in that gap sees the old headcount: over the cap only, and unreachable, because a
 ///   second fight needs a new trigger. Replace (BP-12a-2) adds heads only after `begin_replace`
 ///   found no op out; an add that lands after a later `ops/start` can only make the next
-///   latch's cap too low, never too high. So the cap reads are sound while replace refuses at
-///   its begin. Its loot goes on the shelf.
+///   latch's cap too low, never too high. Since BP-17a a Section's Requisition also passes
+///   during an unguarded dig, so a Section's add begins either with no op out or before
+///   `ops/escort` (`section_home`); either way it can only lower the next cap, and the cap reads
+///   stay sound. Its loot goes on the shelf.
 ///
 /// **The Crew's own fight (BP-17a):** an ambush revealed before the guard stands comes rolled
 /// (`PendingRaid::crew`): no Section or deployment is read. After the seam, the launch lock is
@@ -614,7 +616,8 @@ async fn post_ops_return(
 /// `400` unknown site → the lead reads as `ops/start` (a dig: Crew, Foreman and Commander; a
 /// contract: Commander; `500` on failure, `409` none left) → the member's first Section read
 /// (`500` on failure) and `409` when it is at 0 → `409` no op under way → `409` already heading
-/// home → `409` still travelling → `409` raiders at the site → `409` already there → `200`, the
+/// home → `409` still travelling → `409` raiders at the site → `409` the guard hasn't reached
+/// the dig (BP-18a-1a: a dig whose guard does not stand) → `409` already there → `200`, the
 /// whole state.
 /// - A new op from the team's own hex (`next_op`): the hop's hexes at the target's seconds per
 ///   hex, at least 1 s; home from there is the target's own time.
@@ -667,6 +670,7 @@ async fn post_ops_next(
         Err(NextRefusal::AlreadyHomeward) => return Err(conflict("already heading home")),
         Err(NextRefusal::NotArrived) => return Err(conflict("still travelling")),
         Err(NextRefusal::RaidPending) => return Err(conflict("raiders at the site")),
+        Err(NextRefusal::GuardNotHere) => return Err(conflict("the guard hasn't reached the dig")),
         Err(NextRefusal::SameSite) => return Err(conflict("already there")),
     }
     Ok(ops_response(&state, campaign_id, gw, &board, now))
@@ -3256,5 +3260,51 @@ mod tests {
         let s = state.demo_ops.store.ops_state(c, Utc::now());
         assert_eq!(s.crew_fight.map(|f| (f.kind, f.result, f.heads_lost)), Some(("ambush", "retreat", 2)));
         assert_eq!(s.op.and_then(|op| op.dig).map(|d| d.carried), Some(30));
+    }
+
+    // ---- BP-18a-1a: ops keyed by slots.
+
+    /// BP-18a-1a (the Brief's residual (ii)): Next from a Crew-alone dig is refused until a guard
+    /// stands.
+    #[tokio::test]
+    async fn ops_next_waits_for_the_guard() {
+        let state = Arc::new(session_state());
+        let (c, _) = dig_campaign(&state, false).await;
+        alone_on_site(&state, c, 2).await;
+        let (status, body, _) = next(&state, c, SITE).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("the guard hasn't reached the dig")));
+        assert_eq!(state.demo_ops.store.op_view(c, chrono::Utc::now()).expect("op").site_id, DIG);
+    }
+
+    /// Reviewer BP-17a F1 + F4. Seed 59 alone on site (two drills, no raid; a 60-ore haul
+    /// ambushed). The guard is sent at t0 and stands at t0 + 12 s (`DIG`'s time); a second escort
+    /// is `409 already guarded` (F4, before the pull, which would answer "already heading home"
+    /// first). The pull at t1 ≈ t0 puts the ambush at t1 + 6 s; a rewind of 7 s (never the whole
+    /// 12 s, which would put the guard's arrival before the trigger and make it the Section's
+    /// fight) puts the ambush at t1 − 1 s and the guard's arrival at t0 + 5 s. So the clock window:
+    /// the GET that reveals the ambush must come within 5 s of the escort. Born before the guard
+    /// stands, the ambush is the Crew's: 2 heads lost, the Section's headcount unchanged, half the
+    /// load rides on.
+    #[tokio::test]
+    async fn ops_ambush_before_the_guard_stands_is_the_crews() {
+        let state = Arc::new(session_state());
+        let (c, crew) = dig_campaign(&state, false).await;
+        let section = member_section(&state, c).await;
+        alone_on_site(&state, c, 59).await;
+        let (status, body, _) = escort(&state, c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body, _) = escort(&state, c).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("already guarded")));
+        assert_eq!(drill(&state, c).await.0, StatusCode::OK);
+        assert_eq!(drill(&state, c).await.0, StatusCode::OK);
+        let (status, body, _) = pull(&state, c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        state.demo_ops.store.rewind_op(c, 7);
+        let (status, body) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["crew_fight"], serde_json::json!({"kind": "ambush", "result": "retreat", "heads_lost": 2}), "{body}");
+        assert_eq!(headcount(&state, crew).await, 6);
+        assert_eq!(section_headcount(&state, section).await, 8);
+        assert_eq!(body["active_op"]["dig"]["carried"], 30, "{body}");
     }
 }

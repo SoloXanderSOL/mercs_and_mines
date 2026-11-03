@@ -36,7 +36,7 @@
 //!   reader goes through `OpsBase`, so the panel never disagrees with the roll. The Gunsmith's
 //!   +10 is read by the mission route (`DemoOpsStore::base_of`) and logged in `roll_inputs`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -829,14 +829,15 @@ pub enum HealRefusal {
     NobodyToHeal,
     /// A batch is still healing: one batch per Section at a time.
     AlreadyHealing,
-    /// Fewer banked credits than `DEMO_HEAL_CREDITS` × the wounded.
+    /// Fewer banked credits than `OpsBase::heal_credits()` × the wounded.
     NotEnoughCredits,
 }
 
 /// Why `begin_replace` refused (BP-12a-2), in the order it checks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReplaceRefusal {
-    /// An op is out: replacements report at base.
+    /// An op is out that holds the team: for a Crew, any op; for a Section, any op but an
+    /// unguarded dig (`section_home`). Replacements report at base.
     OpOut,
     /// Fewer banked credits than the replace costs (also a campaign with no entry).
     NotEnoughCredits,
@@ -993,6 +994,10 @@ pub enum NextRefusal {
     NotArrived,
     /// Raiders are at the dig: the raid must be fought first.
     RaidPending,
+    /// The team is at a dig whose guard does not stand yet (BP-18a-1a): the Crew is alone
+    /// (`escort_at` null) or the guard is still walking. Next moves the whole team, guard and
+    /// Crew, so it waits for the guard; BP-17b's client offers Next only once the guard stands.
+    GuardNotHere,
     /// The target stands on the team's own hex.
     SameSite,
 }
@@ -1047,14 +1052,19 @@ struct ContractSlot {
     pin: Option<(i32, i32, u32, u32)>,
 }
 
-/// One campaign's ops state: the cached board, the op in flight, when the team last moved, the
-/// banked ore and the merc base.
+/// One campaign's ops state: the cached board, the ops in flight (one slot each), when the team
+/// last moved, the banked ore and the merc base.
 struct OpsEntry {
     /// The gateway the board was computed for; another gateway is a miss.
     gateway: (i32, i32),
     board: Arc<OpsBoard>,
     touched: DateTime<Utc>,
-    op: Option<ActiveOp>,
+    /// The dig slot (BP-18a-1a): the Crew's op, guarded or not. There is one Crew.
+    dig: Option<ActiveOp>,
+    /// The contract slots (BP-18a-1a), by the leading Section's id: `None` for a member with no
+    /// Section, and for a bare op (no dig, no contract). A cleared op removes its key, so a key
+    /// is present exactly while it holds an op (never a placeholder).
+    contracts_out: BTreeMap<Option<Uuid>, ActiveOp>,
     /// The latest departure, drill or homeward arrival. Outlives the op, so a player who has just
     /// come home still counts as moving for the reaper.
     moved_at: Option<DateTime<Utc>>,
@@ -1085,6 +1095,61 @@ struct OpsEntry {
 }
 
 impl OpsEntry {
+    /// Every op out, in slot order: the dig, then the contract slots by key.
+    fn ops(&self) -> impl Iterator<Item = &ActiveOp> {
+        self.dig.iter().chain(self.contracts_out.values())
+    }
+
+    /// Whether any slot holds an op.
+    fn any_op(&self) -> bool {
+        self.dig.is_some() || !self.contracts_out.is_empty()
+    }
+
+    /// Every held slot's key, in slot order (the dig, then the contracts by key).
+    fn slot_keys(&self) -> Vec<SlotKey> {
+        self.dig.iter().map(|_| SlotKey::Dig).chain(self.contracts_out.keys().map(|k| SlotKey::Contract(*k))).collect()
+    }
+
+    /// The primary op's slot (BP-18a-1a): the dig, else the first contract by key. It is the op
+    /// the body's `op` shows, and the one `return_op` and `next_op` act on.
+    fn primary_key(&self) -> Option<SlotKey> {
+        self.slot_keys().into_iter().next()
+    }
+
+    fn slot(&self, key: SlotKey) -> Option<&ActiveOp> {
+        match key {
+            SlotKey::Dig => self.dig.as_ref(),
+            SlotKey::Contract(k) => self.contracts_out.get(&k),
+        }
+    }
+
+    fn slot_mut(&mut self, key: SlotKey) -> Option<&mut ActiveOp> {
+        match key {
+            SlotKey::Dig => self.dig.as_mut(),
+            SlotKey::Contract(k) => self.contracts_out.get_mut(&k),
+        }
+    }
+
+    /// Clears a slot: the dig's goes to `None`, a contract's key is removed.
+    fn clear_slot(&mut self, key: SlotKey) {
+        match key {
+            SlotKey::Dig => self.dig = None,
+            SlotKey::Contract(k) => {
+                self.contracts_out.remove(&k);
+            }
+        }
+    }
+
+    /// Puts `op` in its own slot (`slot_of`).
+    fn insert_op(&mut self, op: ActiveOp) {
+        match slot_of(&op) {
+            SlotKey::Dig => self.dig = Some(op),
+            SlotKey::Contract(k) => {
+                self.contracts_out.insert(k, op);
+            }
+        }
+    }
+
     /// Takes `cost` from the banked credits, or refuses (`false`) when short, never saturating
     /// (BP-12a-1, the first credit debit). Callers hold the store lock.
     fn debit_credits(&mut self, cost: u32) -> bool {
@@ -1124,24 +1189,28 @@ impl OpsEntry {
     /// waiting and none to come, banking what it carried and recording the arrival (not the
     /// read) as the last movement. Every read and write of the op calls it first, under the lock.
     /// It first runs the board refresh (`settle_contracts`, BP-11a-3), then the sickbay
-    /// (`settle_sickbay`, BP-12a-1).
+    /// (`settle_sickbay`, BP-12a-1). BP-18a-1a: every slot is settled (the dig, then the
+    /// contracts by key), a cleared one removes its key, and an arrival stamps
+    /// `moved_at = max(moved_at, arrived_at)`, so an older arrival settled after a newer
+    /// movement never moves the stamp back (the same as today's write while one op is out).
     fn settle_arrival(&mut self, now: DateTime<Utc>) {
         self.settle_contracts(now);
         self.settle_sickbay(now);
-        let Some(op) = self.op.as_mut() else {
-            return;
-        };
-        if let Some(d) = op.dig.as_mut() {
-            if d.raid.is_none() && d.ambush_at.is_some_and(|t| now >= t) {
-                d.raid = Some(RaidTrigger { trigger_at: now, mission_id: DEMO_AMBUSH_MISSION, kind: BattleKind::Ambush });
-            }
+        let mut arrivals: Vec<(DateTime<Utc>, u32)> = Vec::new();
+        if let Some(arrival) = self.dig.as_mut().and_then(|op| settle_op(op, now)) {
+            arrivals.push(arrival);
+            self.dig = None;
         }
-        let waiting = op.dig.as_ref().is_some_and(|d| d.raid.is_some() || d.ambush_at.is_some());
-        if op.leg == OpLeg::Homeward && now >= op.arrive_at && !waiting {
-            let (arrived_at, carried) = (op.arrive_at, op.dig.as_ref().map_or(0, |d| d.carried));
+        self.contracts_out.retain(|_, op| match settle_op(op, now) {
+            Some(arrival) => {
+                arrivals.push(arrival);
+                false
+            }
+            None => true,
+        });
+        for (arrived_at, carried) in arrivals {
             self.ore_banked = self.ore_banked.saturating_add(carried);
-            self.moved_at = Some(arrived_at);
-            self.op = None;
+            self.moved_at = self.moved_at.max(Some(arrived_at));
         }
     }
 
@@ -1169,13 +1238,14 @@ impl OpsEntry {
                 .filter(|m| *m != mission)
                 .filter_map(|m| self.contract_hex(m))
                 .collect();
-            let at = self.op.as_ref().map(|op| op.at);
+            // BP-18a-1a: never on any slot's hex (with one op out, the op's hex as before).
+            let at: HashSet<(i32, i32)> = self.ops().map(|op| op.at).collect();
             let free: Vec<(i32, i32, u32, u32)> = self
                 .board
                 .contract_pool
                 .iter()
                 .copied()
-                .filter(|&(q, r, _, _)| Some((q, r)) != own && !shown.contains(&(q, r)) && Some((q, r)) != at)
+                .filter(|&(q, r, _, _)| Some((q, r)) != own && !shown.contains(&(q, r)) && !at.contains(&(q, r)))
                 .collect();
             if free.is_empty() {
                 continue;
@@ -1218,8 +1288,9 @@ impl OpsEntry {
             .collect()
     }
 
+    /// The primary op (BP-18a-1a: the dig, else the first contract by key) as the client sees it.
     fn view(&self, now: DateTime<Utc>) -> Option<ActiveOpView> {
-        self.op.as_ref().map(|op| ActiveOpView {
+        self.ops().next().map(|op| ActiveOpView {
             leg: op.leg,
             site_id: op.site_id.clone(),
             at: OpHex { q: op.at.0, r: op.at.1 },
@@ -1258,6 +1329,36 @@ impl OpsEntry {
             }),
         })
     }
+}
+
+/// A slot of `OpsEntry` (BP-18a-1a): the dig's, or a contract's by the leading Section's id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SlotKey {
+    Dig,
+    Contract(Option<Uuid>),
+}
+
+/// The slot an op lives in (BP-18a-1a): the dig slot for a dig, otherwise the contract slot of
+/// its leading Section (`None` for a member with no Section, and for a bare op).
+fn slot_of(op: &ActiveOp) -> SlotKey {
+    if op.dig.is_some() {
+        SlotKey::Dig
+    } else {
+        SlotKey::Contract(op.contract.as_ref().and_then(|c| c.section_id))
+    }
+}
+
+/// One slot's settle (BP-18a-1a, `settle_arrival`'s body per op): first fires a haul's ambush
+/// once its time has come, then reports a homeward leg that has arrived with no battle waiting
+/// and none to come as `(arrived_at, carried)`, for the caller to bank and clear.
+fn settle_op(op: &mut ActiveOp, now: DateTime<Utc>) -> Option<(DateTime<Utc>, u32)> {
+    if let Some(d) = op.dig.as_mut() {
+        if d.raid.is_none() && d.ambush_at.is_some_and(|t| now >= t) {
+            d.raid = Some(RaidTrigger { trigger_at: now, mission_id: DEMO_AMBUSH_MISSION, kind: BattleKind::Ambush });
+        }
+    }
+    let waiting = op.dig.as_ref().is_some_and(|d| d.raid.is_some() || d.ambush_at.is_some());
+    (op.leg == OpLeg::Homeward && now >= op.arrive_at && !waiting).then(|| (op.arrive_at, op.dig.as_ref().map_or(0, |d| d.carried)))
 }
 
 /// The contract's fight as a battle trigger (BP-11a-2): once the team is on site and until the
@@ -1333,7 +1434,7 @@ fn new_op(site: &OpsSite, op_seed: u32, dig: Option<DigStart>, contract: Option<
 ///   unknown;
 /// - only `start_op`, `next_op`, `return_op`, `drill_op`, `pull_op`, `latch_raid` and
 ///   `settle_arrival` (the ambush's reveal and the arrival, run first by every op read and
-///   write) write the op. The arrival adds to the banked ore and `build_op` debits it; only
+///   write) write a slot. The arrival adds to the banked ore and `build_op` debits it; only
 ///   `build_op` writes the base, and never while an op is out. Each takes the lock, calls
 ///   `settle_arrival` first and returns owned data; none is held across an `.await`;
 /// - **the merc base (BP-10a):** the drill's heat, raid chance and ore, the view's `next_ore`,
@@ -1364,14 +1465,19 @@ fn new_op(site: &OpsSite, op_seed: u32, dig: Option<DigStart>, contract: Option<
 ///   does not, nor does the ambush's reveal; a read that latches a battle does. While an
 ///   ambush waits, `moved_since` still counts the leg's passed `arrive_at`, at most
 ///   `travel_secs` (≤ 48 s) after the pull: an accepted overcount;
-/// - the eviction takes only an entry with no op, no banked ore, no banked credits, no
+/// - the eviction takes only an entry with no op in any slot, no banked ore, no banked credits, no
 ///   building, no sickbay off the default, no trophy and no replace in flight (BP-12a-1,
 ///   BP-12a-2);
 /// - an entry is dropped only by `remove` (a read of a campaign that is no longer `Active`,
 ///   the reaper's retire) and the reaper's prune (`retain_campaigns`).
 ///
-/// **Keyed per campaign with one gateway and one op: correct only while `DEMO_PLAYER_CAP = 1`**
-/// (`routes/campaign.rs`). A second member per campaign needs a per-wallet key.
+/// **Keyed per campaign with one gateway, one dig slot (`dig`, the Crew's) and the contract
+/// slots (`contracts_out`, by the leading Section's id; `None` for a member with no Section, or a
+/// bare op).** A cleared op removes its key. The primary op (the dig, else the first contract by
+/// key) is the one the body's `op` shows. **Until BP-18a-1b every start refuses `Busy` while any
+/// slot holds an op, so at most one op is out; a start, return or next without a selector must
+/// keep doing exactly that after BP-18a-1b.** Correct only while `DEMO_PLAYER_CAP = 1`
+/// (`routes/campaign.rs`); a second member per campaign needs a per-wallet key.
 pub struct DemoOpsStore {
     inner: Mutex<HashMap<Uuid, OpsEntry>>,
     cap: usize,
@@ -1394,7 +1500,7 @@ impl DemoOpsStore {
     }
 
     /// Makes room for a new entry: below the cap, nothing; at it, evicts the least recently
-    /// touched entry that holds no op, no banked ore, no banked credits, no building, no sickbay
+    /// touched entry that holds no op in any slot (BP-18a-1a), no banked ore, no banked credits, no building, no sickbay
     /// off the default, no trophy and no replace in flight (BP-12a-1, BP-12a-2), and journals
     /// (first, then at most hourly). The sickbay is tested by value, never by presence: a latch
     /// can leave a bay at the default until the entry's next settle (Reviewer BP-12a-1 F1).
@@ -1407,7 +1513,7 @@ impl DemoOpsStore {
         }
         let victim = inner
             .iter()
-            .filter(|(_, e)| e.op.is_none() && e.ore_banked == 0 && e.credits_banked == 0 && e.base == OpsBase::default() && e.sickbay.values().all(|b| *b == SickBay::default()) && e.trophies.is_empty() && e.credits_in_flight == 0)
+            .filter(|(_, e)| e.dig.is_none() && e.contracts_out.is_empty() && e.ore_banked == 0 && e.credits_banked == 0 && e.base == OpsBase::default() && e.sickbay.values().all(|b| *b == SickBay::default()) && e.trophies.is_empty() && e.credits_in_flight == 0)
             .min_by_key(|(_, e)| e.touched)
             .map(|(id, _)| *id);
         let Some(id) = victim else {
@@ -1447,7 +1553,7 @@ impl DemoOpsStore {
         if !self.make_room(&mut inner) {
             return false;
         }
-        inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, op: None, moved_at: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), contracts: HashMap::new(), sickbay: HashMap::new(), trophies: Vec::new(), credits_in_flight: 0, crew_fight: None });
+        inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, dig: None, contracts_out: BTreeMap::new(), moved_at: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), contracts: HashMap::new(), sickbay: HashMap::new(), trophies: Vec::new(), credits_in_flight: 0, crew_fight: None });
         true
     }
 
@@ -1471,16 +1577,17 @@ impl DemoOpsStore {
             if !self.make_room(&mut inner) {
                 return Err(StartRefusal::Full);
             }
-            inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, op: None, moved_at: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), contracts: HashMap::new(), sickbay: HashMap::new(), trophies: Vec::new(), credits_in_flight: 0, crew_fight: None });
+            inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, dig: None, contracts_out: BTreeMap::new(), moved_at: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), contracts: HashMap::new(), sickbay: HashMap::new(), trophies: Vec::new(), credits_in_flight: 0, crew_fight: None });
         }
         let Some(e) = inner.get_mut(&campaign_id) else {
             return Err(StartRefusal::Full);
         };
         e.settle_arrival(now);
-        if e.op.is_some() {
+        // BP-18a-1a: any slot holding an op refuses, so at most one op is out (no selector yet).
+        if e.any_op() {
             return Err(StartRefusal::Busy);
         }
-        e.op = Some(new_op(site, op_seed, dig, contract, site.travel_secs, now));
+        e.insert_op(new_op(site, op_seed, dig, contract, site.travel_secs, now));
         e.crew_fight = None;
         e.moved_at = Some(now);
         e.touched = now;
@@ -1497,7 +1604,8 @@ impl DemoOpsStore {
             return Err(ReturnRefusal::NoOp);
         };
         e.settle_arrival(now);
-        let Some(op) = e.op.as_mut() else {
+        // BP-18a-1a: the primary op, the only one out until BP-18a-1b's selector.
+        let Some(op) = e.primary_key().and_then(|k| e.slot_mut(k)) else {
             return Err(ReturnRefusal::NoOp);
         };
         if op.leg == OpLeg::Homeward {
@@ -1522,9 +1630,13 @@ impl DemoOpsStore {
     }
 
     /// Moves the team from the site it stands on straight to `site` (BP-11a-4), as a new op
-    /// (`new_op`). It accepts what `return_op` accepts. Refusals in order: `NoOp` →
-    /// `AlreadyHomeward` → `NotArrived` → `RaidPending` (a dig's raid) → `SameSite` (the target's
-    /// hex is the team's `at`; hexes, not site ids, since a refreshed contract keeps its id).
+    /// (`new_op`). It accepts what `return_op` accepts, except a dig whose guard does not stand.
+    /// Refusals in order: `NoOp` → `AlreadyHomeward` → `NotArrived` → `RaidPending` (a dig's
+    /// raid) → `GuardNotHere` (a dig whose guard does not stand yet, BP-18a-1a) → `SameSite` (the
+    /// target's hex is the team's `at`; hexes, not site ids, since a refreshed contract keeps its
+    /// id).
+    /// - BP-18a-1a: it acts on the primary op (the only one out until BP-18a-1b), clears that
+    ///   slot and puts the new op in its own (`slot_of`).
     /// - The leg runs from `op.at`, never from a board lookup: the hop's hexes at the target's
     ///   seconds per hex (`travel_secs / distance`, distance at least 1), at least 1 s. Home from
     ///   there is the target's own `travel_secs`.
@@ -1547,7 +1659,10 @@ impl DemoOpsStore {
             return Err(NextRefusal::NoOp);
         };
         e.settle_arrival(now);
-        let Some(op) = e.op.as_ref() else {
+        let Some(key) = e.primary_key() else {
+            return Err(NextRefusal::NoOp);
+        };
+        let Some(op) = e.slot(key) else {
             return Err(NextRefusal::NoOp);
         };
         if op.leg == OpLeg::Homeward {
@@ -1559,12 +1674,16 @@ impl DemoOpsStore {
         if op.dig.as_ref().is_some_and(|d| d.raid.is_some()) {
             return Err(NextRefusal::RaidPending);
         }
+        if op.dig.as_ref().is_some_and(|d| !d.guarded(now)) {
+            return Err(NextRefusal::GuardNotHere);
+        }
         if (site.q, site.r) == op.at {
             return Err(NextRefusal::SameSite);
         }
         let hop = hex_axial_distance(op.at.0, op.at.1, site.q, site.r);
         let leg_secs = (site.travel_secs / site.distance.max(1) * hop).max(1);
-        e.op = Some(new_op(site, op_seed, dig, contract, leg_secs, now));
+        e.clear_slot(key);
+        e.insert_op(new_op(site, op_seed, dig, contract, leg_secs, now));
         e.crew_fight = None;
         e.moved_at = Some(now);
         e.touched = now;
@@ -1590,8 +1709,10 @@ impl DemoOpsStore {
         };
         e.settle_arrival(now);
         let base = e.base;
-        let Some(op) = e.op.as_mut() else {
-            return Err(DrillRefusal::NoOp);
+        // BP-18a-1a: the dig slot; a contract slot alone is today's `Contract`.
+        let held = e.any_op();
+        let Some(op) = e.dig.as_mut() else {
+            return Err(if held { DrillRefusal::Contract } else { DrillRefusal::NoOp });
         };
         let Some(dig) = op.dig.as_mut() else {
             return Err(DrillRefusal::Contract);
@@ -1642,7 +1763,7 @@ impl DemoOpsStore {
                 op.depart_at = now;
                 op.arrive_at = now + Duration::seconds(i64::from(op.travel_secs));
             }
-            RaidResult::Wiped => e.op = None,
+            RaidResult::Wiped => e.dig = None,
         }
         e.crew_fight = Some(crew_fight_view("raid", result, heads));
         Ok(DrillOutcome::CrewFight { crew_id, heads })
@@ -1662,8 +1783,10 @@ impl DemoOpsStore {
         };
         e.settle_arrival(now);
         let base = e.base;
-        let Some(op) = e.op.as_mut() else {
-            return Err(PullRefusal::NoOp);
+        // BP-18a-1a: the dig slot; a contract slot alone is today's `Contract`.
+        let held = e.any_op();
+        let Some(op) = e.dig.as_mut() else {
+            return Err(if held { PullRefusal::Contract } else { PullRefusal::NoOp });
         };
         let Some(dig) = op.dig.as_mut() else {
             return Err(PullRefusal::Contract);
@@ -1697,26 +1820,30 @@ impl DemoOpsStore {
 
     /// The battle waiting for its fight (a raid, or a haul's ambush once fired, or a contract's
     /// fight once the team is on site (BP-11a-2)), after settling the op: the op's Commander, the
-    /// trigger and its Section. `None` when none is pending.
+    /// trigger and its Section. `None` when none is pending. BP-18a-1a: the slots are checked in
+    /// order (the dig, then the contracts by key) and the first pending battle is returned, the
+    /// same as today while one op is out (BP-18a-1b's `pending_raids` returns them all).
     pub fn pending_raid(&self, campaign_id: Uuid, now: DateTime<Utc>) -> Option<PendingRaid> {
         let mut inner = self.lock();
         let e = inner.get_mut(&campaign_id)?;
         e.settle_arrival(now);
-        let op = e.op.as_ref()?;
-        if let Some(trigger) = contract_trigger(op, now) {
-            let c = op.contract.as_ref()?;
-            return Some(PendingRaid { commander_id: c.commander_id, trigger, section_id: c.section_id, crew: None });
-        }
-        let dig = op.dig.as_ref()?;
-        // BP-17a: a battle born before the guard stands is the Crew's (only an ambush can be: an
-        // unguarded raid is fought inside `drill_op`), rolled here from the Crew stream.
-        dig.raid.map(|trigger| {
-            let crew = (!dig.guarded(trigger.trigger_at)).then(|| {
-                let (result, heads) = crew_fight_roll(op.op_seed, DEMO_CREW_AMBUSH_DRAW);
-                CrewRoll { crew_id: dig.crew_id, result, heads }
-            });
-            PendingRaid { commander_id: dig.commander_id, trigger, section_id: dig.section_id, crew }
-        })
+        let pending = e.ops().find_map(|op| {
+            if let Some(trigger) = contract_trigger(op, now) {
+                let c = op.contract.as_ref()?;
+                return Some(PendingRaid { commander_id: c.commander_id, trigger, section_id: c.section_id, crew: None });
+            }
+            let dig = op.dig.as_ref()?;
+            // BP-17a: a battle born before the guard stands is the Crew's (only an ambush can be:
+            // an unguarded raid is fought inside `drill_op`), rolled here from the Crew stream.
+            dig.raid.map(|trigger| {
+                let crew = (!dig.guarded(trigger.trigger_at)).then(|| {
+                    let (result, heads) = crew_fight_roll(op.op_seed, DEMO_CREW_AMBUSH_DRAW);
+                    CrewRoll { crew_id: dig.crew_id, result, heads }
+                });
+                PendingRaid { commander_id: dig.commander_id, trigger, section_id: dig.section_id, crew }
+            })
+        });
+        pending
     }
 
     /// Applies a fought battle, only if `trigger` is still the op's pending one (`false`, and no
@@ -1741,23 +1868,25 @@ impl DemoOpsStore {
             return false;
         };
         e.settle_arrival(now);
-        let Some(op) = e.op.as_mut() else {
-            return false;
-        };
         if trigger.kind == BattleKind::Contract {
-            if contract_trigger(op, now) != Some(*trigger) {
+            // BP-18a-1a: the slot whose contract trigger is this one; its Wipeout clears that slot.
+            let Some(key) = e.slot_keys().into_iter().find(|k| e.slot(*k).is_some_and(|op| contract_trigger(op, now) == Some(*trigger))) else {
                 return false;
-            }
+            };
             match result {
                 RaidResult::Held | RaidResult::Retreat => {
-                    if let Some(c) = op.contract.as_mut() {
+                    if let Some(c) = e.slot_mut(key).and_then(|op| op.contract.as_mut()) {
                         c.result = Some(result);
                     }
                 }
-                RaidResult::Wiped => e.op = None,
+                RaidResult::Wiped => e.clear_slot(key),
             }
             e.contracts.entry(trigger.mission_id).or_default().finished_at = Some(now);
         } else {
+            // BP-18a-1a: a raid or an ambush is the dig slot's.
+            let Some(op) = e.dig.as_mut() else {
+                return false;
+            };
             let Some(dig) = op.dig.as_mut() else {
                 return false;
             };
@@ -1786,7 +1915,7 @@ impl DemoOpsStore {
                     op.depart_at += wait;
                     op.arrive_at += wait;
                 }
-                (_, RaidResult::Wiped) => e.op = None,
+                (_, RaidResult::Wiped) => e.dig = None,
             }
         }
         e.credits_banked = e.credits_banked.saturating_add(pay.credits);
@@ -1812,7 +1941,8 @@ impl DemoOpsStore {
             return false;
         };
         e.settle_arrival(now);
-        let Some(op) = e.op.as_mut() else {
+        // BP-18a-1a: the dig slot (the Crew's).
+        let Some(op) = e.dig.as_mut() else {
             return false;
         };
         let Some(dig) = op.dig.as_mut() else {
@@ -1832,7 +1962,7 @@ impl DemoOpsStore {
                 op.depart_at += wait;
                 op.arrive_at += wait;
             }
-            RaidResult::Wiped => e.op = None,
+            RaidResult::Wiped => e.dig = None,
         }
         e.crew_fight = Some(crew_fight_view("ambush", crew.result, crew.heads));
         e.moved_at = Some(now);
@@ -1901,7 +2031,7 @@ impl DemoOpsStore {
             return Err(BuildRefusal::NotEnoughOre);
         };
         e.settle_arrival(now);
-        if e.op.is_some() {
+        if e.any_op() {
             return Err(BuildRefusal::OpOut);
         }
         if e.base.has(building) {
@@ -1929,8 +2059,10 @@ impl DemoOpsStore {
             return Err(EscortRefusal::NoOp);
         };
         e.settle_arrival(now);
-        let Some(op) = e.op.as_mut() else {
-            return Err(EscortRefusal::NoOp);
+        // BP-18a-1a: the dig slot; a contract slot alone is today's `Contract`.
+        let held = e.any_op();
+        let Some(op) = e.dig.as_mut() else {
+            return Err(if held { EscortRefusal::Contract } else { EscortRefusal::NoOp });
         };
         let travel_secs = op.travel_secs;
         let leg = op.leg;
@@ -2009,7 +2141,7 @@ impl DemoOpsStore {
             return Err(ReplaceRefusal::NotEnoughCredits);
         };
         e.settle_arrival(now);
-        if e.op.as_ref().is_some_and(|op| !(section && op.section_home())) {
+        if e.ops().any(|op| !(section && op.section_home())) {
             return Err(ReplaceRefusal::OpOut);
         }
         if !e.debit_credits(cost) {
@@ -2043,7 +2175,8 @@ impl DemoOpsStore {
         let Some(e) = inner.get(&campaign_id) else {
             return false;
         };
-        let arrived = e.op.as_ref().map(|op| op.arrive_at).filter(|t| *t <= now);
+        // BP-18a-1a: the latest passed arrival over every slot.
+        let arrived = e.ops().map(|op| op.arrive_at).filter(|t| *t <= now).max();
         e.moved_at.max(arrived).is_some_and(|t| t >= cutoff)
     }
 
@@ -2068,7 +2201,7 @@ impl DemoOpsStore {
         self.len() == 0
     }
 
-    /// Moves the campaign's op (its leg and a haul's hidden ambush time), its last movement and
+    /// Moves the campaign's ops, every slot (its leg and a haul's hidden ambush time), its last movement and
     /// its finished contracts' times (BP-11a-3) `secs` into the past, so a route test crosses an
     /// arrival or a refresh without sleeping. A trigger's time stays: a fight's `started_at` is
     /// the real clock.
@@ -2077,7 +2210,7 @@ impl DemoOpsStore {
         let mut inner = self.lock();
         if let Some(e) = inner.get_mut(&campaign_id) {
             let back = Duration::seconds(secs);
-            if let Some(op) = e.op.as_mut() {
+            for op in e.dig.iter_mut().chain(e.contracts_out.values_mut()) {
                 op.depart_at -= back;
                 op.arrive_at -= back;
                 if let Some(d) = op.dig.as_mut() {
@@ -2112,10 +2245,11 @@ impl DemoOpsStore {
         }
     }
 
-    /// Fixes the op's seed, so a test chooses its rolls instead of hoping for them.
+    /// Fixes the primary op's seed (the dig, else the first contract by key), so a test chooses
+    /// its rolls instead of hoping for them.
     #[cfg(test)]
     pub(crate) fn set_op_seed(&self, campaign_id: Uuid, seed: u32) {
-        if let Some(op) = self.lock().get_mut(&campaign_id).and_then(|e| e.op.as_mut()) {
+        if let Some(op) = self.lock().get_mut(&campaign_id).and_then(|e| e.primary_key().and_then(|k| e.slot_mut(k))) {
             op.op_seed = seed;
         }
     }
@@ -3798,5 +3932,70 @@ mod tests {
         assert_eq!(crew_fight_roll(45, 0), (RaidResult::Retreat, 2));
         assert_eq!(crew_fight_roll(505, 0), (RaidResult::Wiped, 8));
         assert_eq!(crew_fight_roll(59, DEMO_CREW_AMBUSH_DRAW), (RaidResult::Retreat, 2));
+    }
+
+    // ---- BP-18a-1a: ops keyed by slots.
+
+    /// A dig started alone at 0 s (`escort: false`), on site from 10 s, its seed `seed`.
+    fn alone(store: &DemoOpsStore, a: Uuid, seed: u32) {
+        let crew = DigStart { crew_id: CREW, commander_id: COMMANDER, threshold: 1000, section_id: None, escort: false };
+        store.start_op(a, (5, 0), board(), &dig(1), seed, Some(crew), None, at(0)).expect("start");
+    }
+
+    /// BP-18a-1a: the guard is sent at 10 s and stands at 20 s; a Next at 11 s waits for it, the
+    /// same Next at 20 s goes through.
+    #[test]
+    fn ops_store_next_waits_for_a_walking_guard() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        alone(&store, a, 7);
+        assert_eq!(store.escort_op(a, COMMANDER, None, at(10)), Ok(()));
+        assert_eq!(dig_view(&store, a, at(10)).escort_at, Some(ops_time(at(20))));
+        assert_eq!(store.next_op(a, &site(), 9, None, Some(LEAD), at(11)), Err(NextRefusal::GuardNotHere));
+        assert_eq!(store.next_op(a, &site(), 9, None, Some(LEAD), at(20)), Ok(()));
+    }
+
+    /// BP-18a-1a: with no guard sent, Next from the dig is refused however long the Crew waits.
+    #[test]
+    fn ops_store_next_refuses_a_crew_alone_dig() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        alone(&store, a, 7);
+        assert_eq!(store.next_op(a, &site(), 9, None, Some(LEAD), at(10)), Err(NextRefusal::GuardNotHere));
+        assert_eq!(store.next_op(a, &site(), 9, None, Some(LEAD), at(30)), Err(NextRefusal::GuardNotHere));
+    }
+
+    /// Reviewer BP-17a F1 (store twin, no wall clock). The guard is sent at 10 s and stands at
+    /// 20 s; seed 59 drills twice with no raid, and the 60-ore haul pulled at 13 s is ambushed at
+    /// the leg's midpoint, 18 s: born before the guard stands, so it is the Crew's, rolled from
+    /// the Crew stream (`crew_fight_roll_pins`: seed 59's ambush falls back with 2).
+    #[test]
+    fn ops_store_ambush_before_the_guard_stands_is_the_crews() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        alone(&store, a, 7);
+        assert_eq!(store.escort_op(a, COMMANDER, None, at(10)), Ok(()));
+        store.set_op_seed(a, 59);
+        assert_eq!(store.drill_op(a, at(11)), Ok(DrillOutcome::Drilled));
+        assert_eq!(store.drill_op(a, at(12)), Ok(DrillOutcome::Drilled));
+        assert_eq!(store.pull_op(a, at(13)), Ok(()));
+        let pending = store.pending_raid(a, at(18)).expect("the ambush is revealed at 18 s");
+        assert_eq!(pending.trigger, RaidTrigger { trigger_at: at(18), mission_id: DEMO_AMBUSH_MISSION, kind: BattleKind::Ambush });
+        assert_eq!(pending.crew, Some(CrewRoll { crew_id: CREW, result: RaidResult::Retreat, heads: 2 }));
+    }
+
+    /// BP-18a-1a, the dig term of `make_room`: cap 2; `a` holds a dig on site with nothing
+    /// banked and is the least recently touched, `b` holds a board only. A new campaign evicts
+    /// `b`, never `a`.
+    #[test]
+    fn ops_store_eviction_skips_a_dig_with_nothing_banked() {
+        let store = DemoOpsStore::new(2);
+        let (a, b, c) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
+        on_site(&store, a, 1, 1000, 7);
+        assert!(store.put_board(b, (5, 0), board(), at(1)));
+        assert!(store.put_board(c, (5, 0), board(), at(11)));
+        assert_eq!(store.len(), 2);
+        assert!(store.op_view(a, at(12)).is_some_and(|op| op.dig.is_some()), "the dig entry is kept");
+        assert!(store.board(b, (5, 0), at(12)).is_none(), "the board-only entry is evicted");
     }
 }
