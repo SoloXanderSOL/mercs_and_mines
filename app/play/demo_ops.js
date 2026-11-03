@@ -36,7 +36,7 @@ import { setAarNote, setBeforeOffer, setSquadSize, setDeployExtra, setStill } fr
 import { mountStory, writeAar } from './demo_story.js';
 import { showCard, cardSeen } from './demo_card.js';
 import { mountCompany, dressBriefing, renderCompany, healPrice } from './demo_company.js';
-import { DIG_COPY, DIG_CSS, createDigPanel, renderDig, hideDig, homewardLines, flash, bankedLine } from './demo_dig.js';
+import { DIG_COPY, DIG_CSS, createDigPanel, renderDig, hideDig, homewardLines, flash, bankedLine, crewFightLine } from './demo_dig.js';
 import { BASE_COPY, BASE_CSS, createBase, renderBase, hideBase } from './demo_base.js';
 
 // Booth copy, verbatim from the BP-9a and BP-11b-1 prompts.
@@ -50,6 +50,9 @@ const COPY = {
   distance: '{n} hexes from the gateway',
   travel: '{n} s each way',
   go: 'Go',
+  goGuarded: 'Guarded',   // BP-17b: a dig's start with the Section (the body as before)
+  goAlone: 'Crew alone',  // BP-17b: a dig's start without it (escort: false)
+  guard: 'Send the guard',
   close: 'Close',
   cancel: 'Cancel',
   ret: 'Return',
@@ -63,7 +66,7 @@ const COPY = {
   lost: '{title} failed. The client is not paying.',
   homeward: 'Heading home. {n} s',
   noDig: 'No workable veins near your gateway. Take a contract.',
-  noCrew: 'No Crew left to dig. Contracts only.',
+  noCrew: 'No Crew left to dig. Hire one at Your Company, or take a contract.',
   pick: 'Tap a site for the next job.',
   hop: '{n} hexes from here',
   hopSecs: '{s} s on foot',
@@ -259,6 +262,10 @@ let companyNotice = null; // its refusal's line on the card: { action, target, k
 let fightDress = null;  // the demo fight's own briefing dressing, { name, lead, family }, re-applied on every show (Reviewer BP-11b-2 F2)
 let fitNote = null;     // the briefing's 0-fit line
 let bankNote = null;    // the one-off "ore banked" line after a laden leg lands
+let crewNote = null;    // BP-17b: the one-off wiped line after a Crew wipeout clears the op
+let crewFight = null;   // BP-17b: the last adopted body's crew_fight, sticky until the next start
+let crewKept = null;    // its JSON, so a new Crew loss re-reads the roster once (spec check F1)
+let guardTimer = null;  // BP-17b: the arrived dig's guard countdown (spec check F4)
 let notice = '';        // a one-off refusal line (the Crew's), until the next adopted body
 let seenBattle = null;  // the raid or ambush whose briefing has opened once ('raid:<site>', 'ambush:<site>')
 let legKey = null;      // the site and leg the two reads below belong to
@@ -307,7 +314,19 @@ const held = () => busy || Date.now() < throttleUntil;
 const battleOf = o => (o && o.dig && (o.dig.raid || o.dig.ambush)) || null;
 const battleKey = o => (!battleOf(o) ? null : (o.dig.raid ? 'raid:' : 'ambush:') + o.site_id);
 // Next: an outbound, arrived op with no battle pending; a contract only once fought (Reviewer BP-11a-4 F1/F2).
-const canNext = o => Boolean(o && o.leg === 'outbound' && progress(o) >= 1 && !battleOf(o) && (o.kind === 'dig' || o.fought));
+// BP-17b: a dig only once its guard stands (spec check F5).
+const canNext = o => Boolean(o && o.leg === 'outbound' && progress(o) >= 1 && !battleOf(o) && (o.kind === 'dig' ? guardStands(o) : o.fought));
+// BP-17b, the escort: escort_at null = the Crew is alone; the guard stands once the server's clock reaches it.
+const guardStands = o => Boolean(o && o.dig && o.dig.escort_at !== null && serverNow() >= Date.parse(o.dig.escort_at));
+// "Go guard the dig": outbound and unguarded, and never with the Section at 0 (spec check F6).
+const canGuard = o => Boolean(o && o.leg === 'outbound' && o.dig && o.dig.escort_at === null && sectionHead() !== 0);
+// The Crew fight line (spec check F2): every result but a raid held is the op's last fight and shows as is;
+// a raid held can be followed by another fight, so it shows only outbound while no guard stands.
+const crewShown = o => {
+  if (!crewFight) return '';
+  const heldRaid = crewFight.kind === 'raid' && crewFight.result === 'held';
+  return heldRaid && !(o && o.leg === 'outbound' && !guardStands(o)) ? '' : crewFightLine(crewFight);
+};
 const hexDistance = (a, b) => (Math.abs(a.q - b.q) + Math.abs(a.r - b.r) + Math.abs(a.q + a.r - b.q - b.r)) / 2;
 const sameHex = (a, b) => a.q === b.q && a.r === b.r;
 
@@ -422,12 +441,13 @@ function refresh() {
       if (op.dig && op.dig.ambush) return setStrip('', [DIG_COPY.ambushWait, rate], [[DIG_COPY.fight, fight]]);
       shownSecs = secsLeft(op);
       const h = homewardLines(op.dig, title, shownSecs);
-      if (h) return setStrip(h.title, [...h.lines, rate], [], h.danger);
+      const c = crewShown(op);
+      if (h) return setStrip(h.title, [...h.lines, ...(c ? [c] : []), rate], [], h.danger);
       return setStrip('', [fill(COPY.homeward, { n: shownSecs }), rate], []);
     }
     if (p < 1) {
       shownSecs = secsLeft(op);
-      return setStrip('', [fill(COPY.outbound, { title, n: shownSecs }), rate], [[COPY.ret, null, true]]);
+      return setStrip('', [fill(COPY.outbound, { title, n: shownSecs }), rate], [[COPY.ret, null, true], ...(canGuard(op) ? [[COPY.guard, sendEscort]] : [])]);
     }
     if (op.kind === 'contract') {
       // Fight while unfought; Next mission wherever canNext allows it; Head home always.
@@ -443,6 +463,7 @@ function refresh() {
   }
   if (selected) return showSheet(selected);
   if (bankNote) return setStrip('', [bankNote, rate], [[BASE_COPY.button, openBase], [COPY.close, close]]);
+  if (crewNote) return setStrip('', [crewNote, rate], [[COPY.close, close]]);
   if (noDigOpen) return setStrip('', [COPY.noDig, rate], [[COPY.close, close]]);
   if (rate) return setStrip('', [rate], notice ? [[COPY.close, close]] : []);
   hideStrip();
@@ -456,12 +477,30 @@ function showDig(o) {
   const title = opTitle(o);
   const rate = Date.now() < throttleUntil ? fill(DIG_COPY.rate, { n: throttleSecs }) : notice;
   shownPhase = `${o.leg}:true`;
-  renderDig(dig, o.dig, store.roster(campaignId));
-  // Next mission joins wherever canNext allows it (never while raiders wait: canNext says so).
-  const next = canNext(o) ? [[COPY.next, startPick]] : [];
+  renderDig(dig, o.dig, store.roster(campaignId), { guard: guardLine(o), crewFight: crewShown(o) });
+  armGuard(o);
+  // The third slot: Send the guard while the dig is unguarded, else Next mission wherever canNext allows it.
+  const next = canGuard(o) ? [[COPY.guard, sendEscort]] : canNext(o) ? [[COPY.next, startPick]] : [];
   if (o.dig.raid) return setStrip(title, [fill(DIG_COPY.raidWait, { title }), rate], [[DIG_COPY.fight, fight], ...next]);
   const second = o.dig.ore_on_site > 0 ? [DIG_COPY.pull, sendPull] : [DIG_COPY.home, sendReturn];
   return setStrip(title, [rate], [[DIG_COPY.drill, sendDrill], second, ...next]);
+}
+
+// BP-17b: the dig card's guard line: alone, or the Section's countdown to standing guard.
+function guardLine(o) {
+  if (!o.dig || o.leg !== 'outbound') return '';
+  if (o.dig.escort_at === null) return DIG_COPY.unguarded;
+  const s = Math.ceil((Date.parse(o.dig.escort_at) - serverNow()) / 1000);
+  return s > 0 ? fill(DIG_COPY.guardWalking, { n: s }) : '';
+}
+
+// The guard's countdown at an arrived dig (spec check F4): nothing else redraws there, so a display
+// timer runs only while escort_at is in the future. An escorted dig (escort_at = depart_at) arms none.
+function armGuard(o) {
+  if (guardTimer !== null || !o.dig || o.dig.escort_at === null) return;
+  const wait = Date.parse(o.dig.escort_at) - serverNow();
+  if (!(wait > 0)) return;
+  guardTimer = setTimeout(() => { guardTimer = null; refresh(); }, Math.min(1000, wait));
 }
 
 function showSheet(site) {
@@ -480,7 +519,8 @@ function showSheet(site) {
       lineNodes[2].hidden = false;
     }, () => {});
   }
-  setStrip(titleOf(site), lines, [[COPY.go, sendStart], [COPY.close, close]]);
+  const go = site.kind === 'dig' ? [[COPY.goGuarded, sendStart], [COPY.goAlone, sendAlone]] : [[COPY.go, sendStart]];
+  setStrip(titleOf(site), lines, [...go, [COPY.close, close]]);
 }
 
 // Next mission's three steps: the prompt, the chosen site's hop, and the ore-on-site confirm.
@@ -532,7 +572,7 @@ function goNext() {
 function close() {
   selected = null;
   noDigOpen = false;
-  bankNote = null;
+  bankNote = null; crewNote = null;
   notice = '';
   hideStrip();
 }
@@ -544,7 +584,7 @@ function openBase() {
   listOpen = false;
   selected = null;
   noDigOpen = false;
-  bankNote = null;
+  bankNote = null; crewNote = null;
   refresh();
 }
 
@@ -567,7 +607,7 @@ function openList() {
   listOpen = true;
   baseOpen = false;
   noDigOpen = false;
-  bankNote = null;
+  bankNote = null; crewNote = null;
   refresh();
 }
 
@@ -610,7 +650,7 @@ function listPick(site) {
   }
   selected = site;
   noDigOpen = false;
-  bankNote = null;
+  bankNote = null; crewNote = null;
   refresh();
 }
 
@@ -900,7 +940,7 @@ function tap(x, y) {
   }
   selected = pick(x, y);
   noDigOpen = false;
-  bankNote = null;
+  bankNote = null; crewNote = null;
   notice = '';
   if (selected) showSheet(selected);
   else refresh();
@@ -927,6 +967,10 @@ function adopt(body, built, spent = 0) {
   base = body.base || {};
   justBuilt = built && base[built] === true && baseOpen ? built : null; // a moment only for a sheet still open when the build lands (Reviewer BP-10b F1)
   notice = '';
+  crewFight = body.crew_fight || null;
+  const crewNow = JSON.stringify(crewFight);
+  const crewLoss = crewNow !== crewKept && Boolean(crewFight) && crewFight.heads_lost > 0; // a new Crew loss (spec check F1)
+  crewKept = crewNow;
   if (op) selected = null;
   else if (selected) selected = siteOf(selected.site_id); // the board may have moved on (Reviewer BP-9a F4)
   if (!canNext(op)) { picking = false; pickSite = null; confirming = false; }
@@ -937,6 +981,8 @@ function adopt(body, built, spent = 0) {
   else if (banked > was && before && before.leg === 'homeward' && before.dig && before.dig.carried > 0) {
     bankNote = fill(DIG_COPY.banked, { gained: banked - was });
   }
+  if (op) crewNote = null;
+  else if (before && crewFight && crewFight.result === 'wiped') crewNote = DIG_COPY.crewWiped; // the wipe's own body: before is the op it cleared
   if (!op && gateway && !noDigOffered && !sites.some(st => st.kind === 'dig')) {
     noDigOffered = true;
     noDigOpen = true;
@@ -957,7 +1003,7 @@ function adopt(body, built, spent = 0) {
   if (map) map.requestFrame();
   refresh();
   if (melted) { flash(strip); rereadRoster(); }
-  if (raidLatched || contractLatched) rereadRoster();
+  if (raidLatched || contractLatched || crewLoss) rereadRoster();
   if (contractLatched) armRefresh();
   if (relicWon(op) && hubShown() && !cardSeen(campaignId)) showCard({ commander: commanderName() }, () => deps.enterHub()); // A12: DEMO-001 after a relic win, on the hub only
   if (opening) fight();
@@ -1103,6 +1149,17 @@ function sendStart() {
   send(opsPath(campaignId) + '/start', { site_id: selected.site_id });
 }
 
+// BP-17b: the Crew goes alone. Guarded keeps the body above, so the escorted start is byte-identical.
+function sendAlone() {
+  if (!selected) return;
+  send(opsPath(campaignId) + '/start', { site_id: selected.site_id, escort: false });
+}
+
+// "Go guard the dig" (§4e B2): the Section walks out and stands guard after the site's travel time.
+function sendEscort() {
+  send(opsPath(campaignId) + '/escort', undefined);
+}
+
 function sendReturn() {
   send(opsPath(campaignId) + '/return', undefined);
 }
@@ -1237,7 +1294,7 @@ function attach(m) {
   adoptedFor = null;
   companyAsk = null;
   companyNotice = null;
-  bankNote = null;
+  bankNote = null; crewNote = null;
   notice = '';
   seenBattle = null;
   legKey = null;
@@ -1257,6 +1314,10 @@ function attach(m) {
   fightHead = null;
   endOnHub = null;
   listOpen = false;
+  crewFight = null;
+  crewKept = null;
+  if (guardTimer !== null) clearTimeout(guardTimer);
+  guardTimer = null;
   refresh();
   m.overlay = draw;
   m.onTap = tap;
@@ -1326,6 +1387,7 @@ export function mountOps(d) {
     credits: () => credits,
     base: () => base,
     out: () => Boolean(op),
+    sectionHome: () => Boolean(op && op.dig && op.dig.escort_at === null), // BP-17a's section_home: a Section at base on an unguarded dig
     held,
     serverNow,
     bay: id => company.sections.find(s => s.section_id === id) || { wounded: 0, healing: 0, healed_at: null },

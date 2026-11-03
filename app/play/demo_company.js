@@ -96,7 +96,7 @@ const COMPANY_COPY = {
   sectionLoss: 'Losses come off this number. Replacements cost credits.',
   crewTitle: 'Mining Crew',
   crewMiners: 'Miners: {n} / 8',
-  crewMorale: 'Morale: {m} / 100. A meltdown costs miners and 10 morale.',
+  crewMorale: 'Morale: {m} / 100. A meltdown or a lost Crew fight costs miners and 10 morale.',
   crewForeman: 'Foreman: {name}, {spec}',
   close: 'Close',
   // BP-12b (Wiki copy)
@@ -357,7 +357,7 @@ function replaceRows(target, id, h, each, label, note) {
     const full = noticeLine(target, 'replace', each); // a "no room" refusal, after its roster re-read
     return full ? [line(COMPANY_COPY.full), line(full)] : [line(COMPANY_COPY.full)];
   }
-  const out = view.out();
+  const out = target === 'section' ? view.out() && !view.sectionHome() : view.out(); // BP-17b: a Section at base on an unguarded dig takes Rookies; a Crew out never hires
   const isHeld = view.held();
   const btn = act(fill(label, { n: offer.n, cost: offer.n * each }), false, () => view.replace(target, id, offer.n, each));
   btn.disabled = !offer.afford || out || isHeld;
@@ -562,7 +562,7 @@ export function dressBriefing() {
 }
 
 // `d`: demo_ops.js's deps (main.js's $, getRoster, ...); `v`: demo_ops.js's view of its state
-// (adopted, credits, out, held, serverNow, bay, bayOf, squadOf, trophies, notice, clearNotice,
+// (adopted, credits, out, sectionHome, held, serverNow, bay, bayOf, squadOf, trophies, notice, clearNotice,
 // heal, replace).
 export function mountCompany(d, v) {
   deps = d;

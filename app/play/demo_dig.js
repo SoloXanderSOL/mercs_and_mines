@@ -20,6 +20,14 @@ export const DIG_COPY = {
   crew: 'Crew {heads} · Foreman {name}, {spec}',
   crewNoSpec: 'Crew {heads} · Foreman {name}',
   crewOnly: 'Crew {heads}',
+  // BP-17b (Wiki copy): the escort and the Crew's own fights.
+  unguarded: 'No guard. Raiders face the Crew alone.',
+  guardWalking: 'The Section is on its way. On guard in {n} s.',
+  crewHeld: 'The Crew saw the raiders off. Nobody lost.',
+  crewHeldAmbush: 'The Crew beat off the ambush. Nobody lost.',
+  crewRetreat: 'The Crew fought the raiders alone and lost miners.',
+  crewRetreatAmbush: 'The Crew was ambushed on the road and lost miners.',
+  crewWiped: 'The Crew was overrun. Nobody came back, and neither did the ore.',
   pop: '+{n} ore',
   raidWait: 'Raiders at {title}. Fight to resume drilling.',
   ambushWait: 'Ambushed on the road. Fight to bring the haul home.',
@@ -103,10 +111,12 @@ export function createDigPanel() {
   const range = el('p', 'dig-line dig-range');
   const risk = el('p', 'dig-line dig-risk');
   const crew = el('p', 'dig-line dig-crew');
+  const guard = el('p', 'dig-line dig-guard');           // BP-17b: who guards the dig
+  const crewFight = el('p', 'dig-line dig-crew-fight');  // BP-17b: the Crew's own fight
   const pop = el('span', 'dig-pop');
-  node.append(heat, status, range, risk, crew, pop);
+  node.append(heat, status, range, risk, crew, guard, crewFight, pop);
   node.hidden = true;
-  return { node, bar, ghost, over, status, range, risk, crew, pop, lastOre: null };
+  return { node, bar, ghost, over, status, range, risk, crew, guard, crewFight, pop, lastOre: null };
 }
 
 // The Crew and Foreman the dig start picked: the roster's first of each (same listers, same order).
@@ -118,8 +128,18 @@ function crewLine(roster) {
   return fill(fm.specialization ? DIG_COPY.crew : DIG_COPY.crewNoSpec, { heads: crew.headcount, name: fm.name, spec: fm.specialization });
 }
 
-// `dig`: the server's view at an arrived dig; `roster`: the stored roster body, or null.
-export function renderDig(p, dig, roster) {
+// BP-17b: the line for the body's crew_fight (absent = none). It is sticky until the next start and has
+// no id (Reviewer BP-17a F3), so demo_ops.js draws it as standing state, never as a diffed toast.
+export function crewFightLine(f) {
+  if (!f) return '';
+  if (f.result === 'held') return f.kind === 'ambush' ? DIG_COPY.crewHeldAmbush : DIG_COPY.crewHeld;
+  if (f.result === 'retreat') return f.kind === 'ambush' ? DIG_COPY.crewRetreatAmbush : DIG_COPY.crewRetreat;
+  return f.result === 'wiped' ? DIG_COPY.crewWiped : '';
+}
+
+// `dig`: the server's view at an arrived dig; `roster`: the stored roster body, or null;
+// `extra`: BP-17b's guard and Crew fight lines from demo_ops.js ('' = hidden).
+export function renderDig(p, dig, roster, extra = {}) {
   const scale = dig.threshold * SCALE;
   const share = scale > 0 ? Math.min(1, dig.heat / scale) : 0;
   p.bar.style.width = (share * 100).toFixed(2) + '%';
@@ -154,6 +174,10 @@ export function renderDig(p, dig, roster) {
   const crew = crewLine(roster);
   p.crew.textContent = crew;
   p.crew.hidden = !crew;
+  p.guard.textContent = extra.guard || '';
+  p.guard.hidden = !p.guard.textContent;
+  p.crewFight.textContent = extra.crewFight || '';
+  p.crewFight.hidden = !p.crewFight.textContent;
   if (p.lastOre !== null && dig.ore_on_site > p.lastOre) {
     p.pop.textContent = fill(DIG_COPY.pop, { n: dig.ore_on_site - p.lastOre });
     replay(p.pop, 'shown');
