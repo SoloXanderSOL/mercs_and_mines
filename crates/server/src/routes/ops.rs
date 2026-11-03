@@ -32,9 +32,10 @@ use crate::api_types::MissionResolveRequest;
 use crate::auth::AuthSession;
 use crate::demo_ops::{
     dig_threshold, fight_losses, fight_wounded, ops_board, ops_time, raid_fight, raid_result, ActiveOpView, BaseBuilding,
-    BuildRefusal, CompanyView, ContractStart, DigStart, DrillOutcome, DrillRefusal, FightPay, HealRefusal, NextRefusal,
-    OpsBase, OpsBoard, OpsSite, PullRefusal, RaidResult, ReplaceHold, ReplaceRefusal, ReturnRefusal, StartRefusal,
-    DEMO_MELTDOWN_MORALE_LOSS, DEMO_REPLACE_MERC_CREDITS, DEMO_REPLACE_MINER_CREDITS,
+    BuildRefusal, CompanyView, ContractStart, CrewFightView, DigStart, DrillOutcome, DrillRefusal, EscortRefusal, FightPay,
+    HealRefusal, NextRefusal, OpsBase, OpsBoard, OpsSite, PullRefusal, RaidResult, ReplaceHold, ReplaceRefusal,
+    ReturnRefusal, StartRefusal, DEMO_CREW_FIGHT_MORALE_LOSS, DEMO_MELTDOWN_MORALE_LOSS, DEMO_REPLACE_MERC_CREDITS,
+    DEMO_REPLACE_MINER_CREDITS,
 };
 use crate::repository::{outcome_db_str, CampaignInstance, CampaignLifecycle, DeploymentRecord, SectorState};
 use crate::state::AppState;
@@ -61,6 +62,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/campaign/:campaign_id/ops/build", post(post_ops_build).layer(DefaultBodyLimit::max(OPS_BODY_LIMIT)))
         .route("/api/campaign/:campaign_id/ops/heal", post(post_ops_heal).layer(DefaultBodyLimit::max(OPS_BODY_LIMIT)))
         .route("/api/campaign/:campaign_id/ops/replace", post(post_ops_replace).layer(DefaultBodyLimit::max(OPS_BODY_LIMIT)))
+        .route("/api/campaign/:campaign_id/ops/escort", post(post_ops_escort))
 }
 
 /// The ops state as the client sees it, from every route. `now` is the server's clock, so the
@@ -79,11 +81,17 @@ pub struct OpsView<'a> {
     pub base: OpsBase,
     pub company: CompanyView,
     pub now: String,
+    /// The last Crew fight (BP-17a), until the next start; absent when there is none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub crew_fight: Option<CrewFightView>,
 }
 
+/// `ops/start`'s and `ops/next`'s body. `escort` (BP-17a) is read by `ops/start` for a dig only,
+/// absent = true; `ops/next` always escorts (a hop is the team moving).
 #[derive(Deserialize)]
 pub struct OpsStartRequest {
     pub site_id: String,
+    pub escort: Option<bool>,
 }
 
 /// `building` is a string, matched after the member checks, so an unknown id is `400` as an
@@ -240,6 +248,7 @@ fn ops_response(state: &AppState, campaign_id: Uuid, gw: (i32, i32), board: &Ops
         base: s.base,
         company: s.company,
         now: ops_time(now),
+        crew_fight: s.crew_fight,
     };
     Json(view).into_response()
 }
@@ -346,10 +355,33 @@ async fn fight_result(state: &AppState, dep: &DeploymentRecord, route: &str) -> 
 ///   found no op out; an add that lands after a later `ops/start` can only make the next
 ///   latch's cap too low, never too high. So the cap reads are sound while replace refuses at
 ///   its begin. Its loot goes on the shelf.
+///
+/// **The Crew's own fight (BP-17a):** an ambush revealed before the guard stands comes rolled
+/// (`PendingRaid::crew`): no Section or deployment is read. After the seam, the launch lock is
+/// taken **before** the latch and held through the heads' write, so a Hire that the cleared op of
+/// a wipeout lets begin adds its heads after the loss, never before it (spec check W3). The heads
+/// are written only when the latch applied. A handler dropped between the applied latch and the
+/// write leaves the Crew its heads: a named residual that favours the player, as the meltdown's.
 async fn latch_pending_raid(state: &AppState, campaign_id: Uuid, now: DateTime<Utc>, route: &str) -> Result<(), AppError> {
     let Some(pending) = state.demo_ops.store.pending_raid(campaign_id, now) else {
         return Ok(());
     };
+    if let Some(crew) = pending.crew {
+        if let Some(seam) = &state.demo_ops.latch_seam {
+            seam().await;
+        }
+        let _launch = state.launch_locks.lock(campaign_id).await;
+        let applied = state.demo_ops.store.latch_crew(campaign_id, &pending.trigger, crew, now);
+        if applied && crew.heads > 0 {
+            if let Err(e) = state.crew_loss.meltdown_loss(crew.crew_id, crew.heads, DEMO_CREW_FIGHT_MORALE_LOSS).await {
+                return Err(internal_error(format!(
+                    "{route}: crew fight meltdown_loss({}, {DEMO_CREW_FIGHT_MORALE_LOSS}) failed for crew {} of campaign {campaign_id}: {e}",
+                    crew.heads, crew.crew_id
+                )));
+            }
+        }
+        return Ok(());
+    }
     let mut read_headcount: Option<(Uuid, i16)> = None;
     if let Some(section_id) = pending.section_id {
         let section = state
@@ -421,7 +453,7 @@ async fn get_ops_board(
     let now = Utc::now();
     let (campaign, gateway, _) = ops_member(&state, &token, campaign_id, "get_ops_board").await?;
     let Some(gw) = gateway else {
-        let view = OpsView { campaign_id, gateway: None, sites: &[], active_op: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), company: CompanyView::default(), now: ops_time(now) };
+        let view = OpsView { campaign_id, gateway: None, sites: &[], active_op: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), company: CompanyView::default(), now: ops_time(now), crew_fight: None };
         return Ok(Json(view).into_response());
     };
     let board = load_board(&state, &campaign, gw, now, false, "get_ops_board").await?;
@@ -450,6 +482,9 @@ async fn get_ops_board(
 ///   without waiting for a board read.
 /// - No launch lock: an op that starts while the reaper retires the campaign is retired with
 ///   it, and the next ops call answers `409` (an accepted residual, as BP-3c-1b-1's).
+/// - **`escort` (BP-17a):** `false` sends the Crew to a dig alone. The Commander is still
+///   required (a dead Commander ends the run), but the at-0 check is skipped: the Section stays
+///   at base. Absent = true; ignored for a contract.
 async fn post_ops_start(
     AuthSession(token): AuthSession,
     State(state): State<Arc<AppState>>,
@@ -485,11 +520,12 @@ async fn post_ops_start(
         internal_error(format!("post_ops_start: list_sections_for_member failed for campaign {campaign_id}: {e}"))
     })?;
     let first_section = sections.first();
-    if first_section.is_some_and(|s| s.headcount == 0) {
+    let escort = site.kind != "dig" || req.escort.unwrap_or(true);
+    if escort && first_section.is_some_and(|s| s.headcount == 0) {
         return Err(conflict("no soldiers left to send: start a new run"));
     }
     let contract = lead.map(|commander_id| ContractStart { commander_id, section_id: first_section.map(|s| s.section_id) });
-    let dig = dig.map(|d| DigStart { section_id: first_section.map(|s| s.section_id), ..d });
+    let dig = dig.map(|d| DigStart { section_id: first_section.map(|s| s.section_id), escort, ..d });
     let op_seed = generate_seed();
     match state.demo_ops.store.start_op(campaign_id, gw, Arc::clone(&board), &site, op_seed, dig, contract, now) {
         Ok(()) => {}
@@ -518,7 +554,7 @@ async fn dig_start(state: &AppState, campaign_id: Uuid, wallet: &[u8], route: &s
     })?;
     let coolant = foremen.first().is_some_and(|f| f.specialization == ForemanSpecialization::CoolantJockey.as_str());
     let commander_id = usable_commander(state, campaign_id, wallet, route).await?;
-    Ok(DigStart { crew_id: crew.crew_id, commander_id, threshold: dig_threshold(coolant), section_id: None })
+    Ok(DigStart { crew_id: crew.crew_id, commander_id, threshold: dig_threshold(coolant), section_id: None, escort: true })
 }
 
 /// The member's first usable Commander (BP-11a-2, extracted from `dig_start`): not KIA, not
@@ -667,14 +703,25 @@ async fn post_ops_drill(
     };
     let board = load_board(&state, &campaign, gw, now, false, "post_ops_drill").await?;
     latch_pending_raid(&state, campaign_id, now, "post_ops_drill").await?;
+    // BP-17a: the launch lock is taken before the drill and held through any Crew write, so a
+    // Hire that a Crew wipeout's cleared op lets begin adds its heads after the loss (W3).
+    let launch = state.launch_locks.lock(campaign_id).await;
     match state.demo_ops.store.drill_op(campaign_id, now) {
         Ok(DrillOutcome::Drilled) => {}
         Ok(DrillOutcome::Meltdown { crew_id, heads }) => {
-            let _launch = state.launch_locks.lock(campaign_id).await;
             if let Err(e) = state.crew_loss.meltdown_loss(crew_id, heads, DEMO_MELTDOWN_MORALE_LOSS).await {
                 return Err(internal_error(format!(
                     "post_ops_drill: meltdown_loss({heads}, {DEMO_MELTDOWN_MORALE_LOSS}) failed for crew {crew_id} of campaign {campaign_id}: {e}"
                 )));
+            }
+        }
+        Ok(DrillOutcome::CrewFight { crew_id, heads }) => {
+            if heads > 0 {
+                if let Err(e) = state.crew_loss.meltdown_loss(crew_id, heads, DEMO_CREW_FIGHT_MORALE_LOSS).await {
+                    return Err(internal_error(format!(
+                        "post_ops_drill: crew fight meltdown_loss({heads}, {DEMO_CREW_FIGHT_MORALE_LOSS}) failed for crew {crew_id} of campaign {campaign_id}: {e}"
+                    )));
+                }
             }
         }
         Err(DrillRefusal::NoOp) => return Err(conflict("no op under way")),
@@ -682,6 +729,52 @@ async fn post_ops_drill(
         Err(DrillRefusal::AlreadyHomeward) => return Err(conflict("already heading home")),
         Err(DrillRefusal::NotArrived) => return Err(conflict("still travelling")),
         Err(DrillRefusal::RaidPending) => return Err(conflict("raiders at the site")),
+    }
+    drop(launch);
+    Ok(ops_response(&state, campaign_id, gw, &board, now))
+}
+
+/// Sends the Section to guard an unescorted dig, `POST /api/campaign/:campaign_id/ops/escort`
+/// (BP-17a, demo-only; §4e B2's "go guard the dig"). No body is read. Order: `401` → `429`
+/// `ops_ip` → `429` `ops_wallet` → `404` → `403` → `409` not `Active` (entry dropped) → `409` no
+/// op under way (also: no gateway) → the board → a pending battle latched → the Commander read
+/// (`500` on failure) and `409` no Commander left → the member's first Section read (`500` on
+/// failure) and `409` when it is at 0 → `409` no op under way → `409` not a dig site → `409`
+/// already heading home → `409` already guarded → `200`, the whole state.
+/// - The guard stands from `now` + the site's `travel_secs` (`dig.escort_at`): a battle born
+///   before then is still the Crew's.
+/// - Memory only, no DB write, so no launch lock.
+async fn post_ops_escort(
+    AuthSession(token): AuthSession,
+    State(state): State<Arc<AppState>>,
+    ci: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    Path(campaign_id): Path<Uuid>,
+) -> Result<Response, AppError> {
+    if let Some(r) = ops_limits(&state, &token, ci, &headers)? {
+        return Ok(r);
+    }
+    let now = Utc::now();
+    let (campaign, gateway, wallet) = ops_member(&state, &token, campaign_id, "post_ops_escort").await?;
+    let Some(gw) = gateway else {
+        return Err(conflict("no op under way"));
+    };
+    let board = load_board(&state, &campaign, gw, now, false, "post_ops_escort").await?;
+    latch_pending_raid(&state, campaign_id, now, "post_ops_escort").await?;
+    let commander_id = usable_commander(&state, campaign_id, &wallet, "post_ops_escort").await?;
+    let sections = state.section_repo.list_sections_for_member(campaign_id, &wallet).await.map_err(|e| {
+        internal_error(format!("post_ops_escort: list_sections_for_member failed for campaign {campaign_id}: {e}"))
+    })?;
+    let first_section = sections.first();
+    if first_section.is_some_and(|s| s.headcount == 0) {
+        return Err(conflict("no soldiers left to send"));
+    }
+    match state.demo_ops.store.escort_op(campaign_id, commander_id, first_section.map(|s| s.section_id), now) {
+        Ok(()) => {}
+        Err(EscortRefusal::NoOp) => return Err(conflict("no op under way")),
+        Err(EscortRefusal::Contract) => return Err(conflict("not a dig site")),
+        Err(EscortRefusal::AlreadyHomeward) => return Err(conflict("already heading home")),
+        Err(EscortRefusal::AlreadyEscorted) => return Err(conflict("already guarded")),
     }
     Ok(ops_response(&state, campaign_id, gw, &board, now))
 }
@@ -877,7 +970,12 @@ async fn post_ops_replace(
         ReplaceTarget::Section(_) => DEMO_REPLACE_MERC_CREDITS,
         ReplaceTarget::Crew(_) => DEMO_REPLACE_MINER_CREDITS,
     };
-    let hold = match state.demo_ops.store.begin_replace(campaign_id, each * u32::from(n), now) {
+    // BP-17a: a Section's Requisition passes while the Section is at base on an unescorted dig.
+    let begun = match target {
+        ReplaceTarget::Section(_) => state.demo_ops.store.begin_requisition(campaign_id, each * u32::from(n), now),
+        ReplaceTarget::Crew(_) => state.demo_ops.store.begin_replace(campaign_id, each * u32::from(n), now),
+    };
+    let hold = match begun {
         Ok(h) => h,
         Err(ReplaceRefusal::OpOut) => return Err(conflict("the team is out: replacements report at base")),
         Err(ReplaceRefusal::NotEnoughCredits) => return Err(conflict("not enough banked credits")),
@@ -2947,5 +3045,216 @@ mod tests {
         assert_eq!(post(&state, c, "next", Some("{")).await.0, StatusCode::BAD_REQUEST);
         assert_eq!(post(&state, c, "next", None).await.0, StatusCode::UNSUPPORTED_MEDIA_TYPE);
         assert_eq!(post(&state, c, "next", Some("{}")).await.0, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    // ---- BP-17a: merc escort. Seeds from the Crew stream's pins (`crew_fight_roll_pins`); every
+    // raid seed raids on drill 1 (drill d100 at most 5).
+
+    async fn start_alone(state: &Arc<AppState>, campaign: Uuid) -> (StatusCode, serde_json::Value, Vec<u8>) {
+        post(state, campaign, "start", Some(&serde_json::json!({ "site_id": DIG, "escort": false }).to_string())).await
+    }
+
+    /// An unescorted dig at `DIG`, on site with the seed `seed`.
+    async fn alone_on_site(state: &Arc<AppState>, campaign: Uuid, seed: u32) {
+        let (status, started, _) = start_alone(state, campaign).await;
+        assert_eq!(status, StatusCode::OK, "{started}");
+        assert!(started["active_op"]["dig"]["escort_at"].is_null(), "alone: {started}");
+        state.demo_ops.store.rewind_op(campaign, site_secs(&started, DIG));
+        state.demo_ops.store.set_op_seed(campaign, seed);
+    }
+
+    async fn escort(state: &Arc<AppState>, campaign: Uuid) -> (StatusCode, serde_json::Value, Vec<u8>) {
+        post(state, campaign, "escort", None).await
+    }
+
+    /// An escorted start shows its guard from the start; an unescorted one shows none.
+    #[tokio::test]
+    async fn ops_start_shows_the_guard() {
+        let state = Arc::new(session_state());
+        let (c, _) = dig_campaign(&state, false).await;
+        let (status, body, _) = start(&state, c, DIG).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["active_op"]["dig"]["escort_at"], body["active_op"]["depart_at"]);
+    }
+
+    /// Seed 45 alone: drill 1 brings raiders and the Crew falls back with 2 heads; the drill's own
+    /// body has no raid and shows the fight; half the 20 ore rides home; nothing is paid. The
+    /// fight outlives the arrival and is cleared by the next start.
+    #[tokio::test]
+    async fn ops_unescorted_raid_is_the_crews_retreat() {
+        let state = Arc::new(session_state());
+        let (c, crew) = dig_campaign(&state, false).await;
+        alone_on_site(&state, c, 45).await;
+        let (status, body, _) = drill(&state, c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let op = &body["active_op"];
+        assert!(op["dig"]["raid"].is_null(), "never pending: {body}");
+        assert_eq!((op["leg"].as_str(), op["dig"]["ended_by"].as_str(), op["dig"]["carried"].as_u64()), (Some("homeward"), Some("retreat"), Some(10)));
+        assert_eq!(body["crew_fight"], serde_json::json!({"kind": "raid", "result": "retreat", "heads_lost": 2}));
+        assert_eq!(body["credits_banked"], 0);
+        assert_eq!(headcount(&state, crew).await, 6);
+        assert_eq!(state.launch_locks.len(), 0);
+        state.demo_ops.store.rewind_op(c, dig_secs(&state, c).await);
+        let (_, body) = get(&state, Some("t"), c).await;
+        assert!(body["active_op"].is_null(), "home: {body}");
+        assert_eq!((body["ore_banked"].as_u64(), body["crew_fight"]["result"].as_str()), (Some(10), Some("retreat")));
+        let (status, body, _) = start(&state, c, DIG).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.get("crew_fight").is_none(), "cleared by the start: {body}");
+    }
+
+    /// Seed 191 alone: the Crew holds, loses nobody and drills on.
+    #[tokio::test]
+    async fn ops_unescorted_raid_held_drills_on() {
+        let state = Arc::new(session_state());
+        let (c, crew) = dig_campaign(&state, false).await;
+        alone_on_site(&state, c, 191).await;
+        let (status, body, _) = drill(&state, c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["crew_fight"], serde_json::json!({"kind": "raid", "result": "held", "heads_lost": 0}));
+        assert_eq!((body["active_op"]["leg"].as_str(), body["active_op"]["dig"]["ore_on_site"].as_u64()), (Some("outbound"), Some(20)));
+        assert_eq!(headcount(&state, crew).await, 8);
+        assert_eq!(drill(&state, c).await.0, StatusCode::OK, "drills on");
+    }
+
+    /// Seed 505 alone: the Crew is wiped out: the op is cleared, the ore lost, every head gone,
+    /// and the next dig is refused for want of a Crew.
+    #[tokio::test]
+    async fn ops_crew_wipeout_ends_the_op_and_takes_every_head() {
+        let state = Arc::new(session_state());
+        let (c, crew) = dig_campaign(&state, false).await;
+        alone_on_site(&state, c, 505).await;
+        let (status, body, _) = drill(&state, c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["active_op"].is_null(), "{body}");
+        assert_eq!(body["crew_fight"], serde_json::json!({"kind": "raid", "result": "wiped", "heads_lost": 8}));
+        assert_eq!(body["ore_banked"], 0);
+        assert_eq!(headcount(&state, crew).await, 0);
+        assert_eq!(state.launch_locks.len(), 0);
+        let (status, body, _) = start_alone(&state, c).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("no Crew left to dig: start a new run")));
+    }
+
+    /// With the Section at 0 the Crew can still dig alone; the escorted start is refused.
+    #[tokio::test]
+    async fn ops_unescorted_dig_starts_with_the_section_at_0() {
+        let state = Arc::new(session_state());
+        let (c, _) = dig_campaign(&state, false).await;
+        let section = member_section(&state, c).await;
+        state.section_repo.update_headcount(section, 0).await.expect("update_headcount");
+        let (status, body, _) = start(&state, c, DIG).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("no soldiers left to send: start a new run")));
+        let (status, body, _) = start_alone(&state, c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// Seed 45: the guard is sent but has not arrived, so the drill's raiders are still the
+    /// Crew's.
+    #[tokio::test]
+    async fn ops_raid_before_the_guard_arrives_is_the_crews() {
+        let state = Arc::new(session_state());
+        let (c, crew) = dig_campaign(&state, false).await;
+        alone_on_site(&state, c, 45).await;
+        let (status, body, _) = escort(&state, c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["active_op"]["dig"]["escort_at"].is_string(), "{body}");
+        let (status, body, _) = drill(&state, c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["active_op"]["dig"]["raid"].is_null(), "{body}");
+        assert_eq!(body["crew_fight"]["result"], "retreat");
+        assert_eq!(headcount(&state, crew).await, 6);
+    }
+
+    /// Seed 7: once the guard stands, the drill's raiders are the Section's (a pending raid, no
+    /// Crew fight, no heads lost).
+    #[tokio::test]
+    async fn ops_raid_after_the_guard_arrives_is_the_sections() {
+        let state = Arc::new(session_state());
+        let (c, crew) = dig_campaign(&state, false).await;
+        alone_on_site(&state, c, 7).await;
+        assert_eq!(escort(&state, c).await.0, StatusCode::OK);
+        state.demo_ops.store.rewind_op(c, dig_secs(&state, c).await);
+        let (status, body, _) = drill(&state, c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["active_op"]["dig"]["raid"], serde_json::json!({"mission_id": "GUARD_DUTY"}));
+        assert!(body.get("crew_fight").is_none(), "{body}");
+        assert_eq!(headcount(&state, crew).await, 8);
+    }
+
+    /// `ops/escort`'s refusals in its order, then one that goes through.
+    #[tokio::test]
+    async fn ops_escort_refusals() {
+        let state = Arc::new(session_state());
+        let contract = campaign_with(&state, WALLET, true, Some(GATEWAY)).await;
+        seed_sector(&state, &contract).await;
+        seed_commander(&state, contract.campaign_id).await;
+        let (status, body, _) = escort(&state, contract.campaign_id).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("no op under way")));
+        assert_eq!(start(&state, contract.campaign_id, SITE).await.0, StatusCode::OK);
+        let (status, body, _) = escort(&state, contract.campaign_id).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("not a dig site")));
+        let (c, _) = dig_campaign(&state, false).await;
+        assert_eq!(start(&state, c, DIG).await.0, StatusCode::OK);
+        let (status, body, _) = escort(&state, c).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("already guarded")));
+        let (d, _) = dig_campaign(&state, false).await;
+        alone_on_site(&state, d, 2).await;
+        assert_eq!(post(&state, d, "return", None).await.0, StatusCode::OK);
+        let (status, body, _) = escort(&state, d).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("already heading home")));
+    }
+
+    /// The Section is at base during an unescorted dig: a Requisition goes through, a Crew Hire
+    /// is refused (the Crew is out), and once the guard is sent the Requisition is refused too.
+    #[tokio::test]
+    async fn ops_requisition_passes_during_an_unescorted_dig() {
+        let state = Arc::new(session_state());
+        let (c, crew) = dig_campaign(&state, false).await;
+        let section = member_section(&state, c).await;
+        state.section_repo.update_headcount(section, 6).await.expect("update_headcount");
+        alone_on_site(&state, c, 2).await;
+        state.demo_ops.store.set_credits(c, 1000);
+        let body = serde_json::json!({ "section_id": section.to_string(), "count": 1 }).to_string();
+        let (status, resp, _) = post(&state, c, "replace", Some(&body)).await;
+        assert_eq!(status, StatusCode::OK, "{resp}");
+        assert_eq!(section_headcount(&state, section).await, 7);
+        let hire = serde_json::json!({ "crew_id": crew.to_string(), "count": 1 }).to_string();
+        let (status, resp, _) = post(&state, c, "replace", Some(&hire)).await;
+        assert_eq!((status, resp["error"].as_str()), (StatusCode::CONFLICT, Some("the team is out: replacements report at base")));
+        assert_eq!(escort(&state, c).await.0, StatusCode::OK);
+        let (status, resp, _) = post(&state, c, "replace", Some(&body)).await;
+        assert_eq!((status, resp["error"].as_str()), (StatusCode::CONFLICT, Some("the team is out: replacements report at base")));
+        assert_eq!(section_headcount(&state, section).await, 7);
+    }
+
+    /// Seed 59 alone (two drills, no raid; a 60-ore haul ambushed, d100 14): two reads reveal
+    /// the Crew's ambush and both park at the latch seam; released together, one latch applies,
+    /// so the Crew loses its 2 heads once (8 → 6, never 4) and half the load rides on.
+    #[tokio::test]
+    async fn ops_crew_ambush_loss_applies_once_under_two_racers() {
+        let mut state = session_state();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        state.demo_ops.latch_seam = Some(Arc::new(move || { let barrier = Arc::clone(&barrier); Box::pin(async move { barrier.wait().await; }) }));
+        let state = Arc::new(state);
+        let (c, crew) = dig_campaign(&state, false).await;
+        alone_on_site(&state, c, 59).await;
+        assert_eq!(drill(&state, c).await.0, StatusCode::OK);
+        assert_eq!(drill(&state, c).await.0, StatusCode::OK);
+        let (status, body, _) = pull(&state, c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.get("crew_fight").is_none(), "no raid on the way: {body}");
+        state.demo_ops.store.rewind_op(c, site_secs(&body, DIG));
+        let raced = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(get(&state, Some("t"), c), get(&state, Some("t"), c))
+        })
+        .await;
+        let ((a, body_a), (b, body_b)) = raced.expect("both readers reached the seam");
+        assert_eq!(a, StatusCode::OK, "{body_a}");
+        assert_eq!(b, StatusCode::OK, "{body_b}");
+        assert_eq!(headcount(&state, crew).await, 6, "one loss");
+        assert_eq!(state.launch_locks.len(), 0);
+        let s = state.demo_ops.store.ops_state(c, Utc::now());
+        assert_eq!(s.crew_fight.map(|f| (f.kind, f.result, f.heads_lost)), Some(("ambush", "retreat", 2)));
+        assert_eq!(s.op.and_then(|op| op.dig).map(|d| d.carried), Some(30));
     }
 }

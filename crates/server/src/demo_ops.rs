@@ -126,6 +126,26 @@ pub const DEMO_AMBUSH_SEED_OFFSET: u32 = 0x8000_0000;
 pub const DEMO_HEAT_SEED_OFFSET: u32 = 0x4000_0000;
 /// The mission an ambush is fought as (§4d: `GUARD_DUTY`'s numbers under ambush copy).
 pub const DEMO_AMBUSH_MISSION: &str = "GUARD_DUTY";
+/// The Crew's own fight (BP-17a, §4e B2): a battle no escort fights is an ops-layer d100 from
+/// `Rng::new(op_seed + this)` (wrapping), with no Commander, deployment or log row. 2³⁰ draws
+/// from both the drill stream and the ambush stream, 2³¹ from the heat stream (BP-17a spec
+/// check); a dig reads at most 26 here: a raid on drill n reads draws 2(n − 1) and 2(n − 1) + 1,
+/// the haul's ambush draws `DEMO_CREW_AMBUSH_DRAW` and the one after.
+pub const DEMO_CREW_FIGHT_SEED_OFFSET: u32 = 0xC000_0000;
+/// The first Crew-stream draw the haul's ambush reads: past every raid's (12 drills at most).
+pub const DEMO_CREW_AMBUSH_DRAW: u32 = 24;
+/// The Crew holds on a d100 at most this (50 %): no heads lost.
+pub const DEMO_CREW_HELD_MAX: u32 = 50;
+/// The Crew falls back on a d100 above `DEMO_CREW_HELD_MAX` and at most this (45 %); above it
+/// (5 %) the Crew is wiped out.
+pub const DEMO_CREW_RETREAT_MAX: u32 = 95;
+/// Heads a Crew retreat costs, inclusive (drawn on every Crew fight, so each fight's reads stay fixed).
+pub const DEMO_CREW_RETREAT_HEADS_MIN: u32 = 1;
+pub const DEMO_CREW_RETREAT_HEADS_MAX: u32 = 2;
+/// A Crew wipeout takes every head: `CrewLoss::meltdown_loss` floors at 0, so 8 means all.
+pub const DEMO_CREW_WIPE_HEADS: i16 = 8;
+/// Morale a Crew retreat or wipeout costs, as a meltdown's.
+pub const DEMO_CREW_FIGHT_MORALE_LOSS: i16 = 10;
 // The merc base (BP-10a, reworked by BP-16, §4e C1): the five buildings' effects and costs in
 // banked ore. T1 names from `Base_Infrastructure_Tech_Tree`; the numbers are demo-only, never
 // canon. Every effect is read through `OpsBase`'s methods, never these constants.
@@ -347,6 +367,9 @@ pub struct DigStart {
     pub commander_id: Uuid,
     pub threshold: u32,
     pub section_id: Option<Uuid>,
+    /// The Section guards the dig from the start (BP-17a): `ops/start`'s `escort`, absent = true;
+    /// `ops/next` always escorts.
+    pub escort: bool,
 }
 
 /// What `ops/start` reads for a contract (BP-11a-2): the Commander who fights it and the
@@ -389,6 +412,56 @@ pub struct PendingRaid {
     pub commander_id: Uuid,
     pub trigger: RaidTrigger,
     pub section_id: Option<Uuid>,
+    /// The Crew's own fight (BP-17a): set for a haul's ambush revealed before the guard arrived,
+    /// already rolled; the route latches it with `latch_crew` and reads no deployment.
+    pub crew: Option<CrewRoll>,
+}
+
+/// A Crew's fight, rolled (BP-17a): the Crew, the result and the heads it takes (0 when Held).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CrewRoll {
+    pub crew_id: Uuid,
+    pub result: RaidResult,
+    pub heads: i16,
+}
+
+/// The last Crew fight as the client sees it (BP-17a), top level in the ops body (`crew_fight`),
+/// because a wipeout clears the op: `kind` `"raid"` or `"ambush"`, `result` `"held"`,
+/// `"retreat"` or `"wiped"`, and the heads the fight took (at most the Crew's headcount is
+/// actually lost; the write floors at 0). Cleared by the next `ops/start` or `ops/next`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct CrewFightView {
+    pub kind: &'static str,
+    pub result: &'static str,
+    pub heads_lost: i16,
+}
+
+fn crew_fight_view(kind: &'static str, result: RaidResult, heads: i16) -> CrewFightView {
+    let result = match result {
+        RaidResult::Held => "held",
+        RaidResult::Retreat => "retreat",
+        RaidResult::Wiped => "wiped",
+    };
+    CrewFightView { kind, result, heads_lost: heads }
+}
+
+/// A Crew fight's result and heads (BP-17a), a function of `(op_seed, skip)` alone:
+/// `Rng::new(op_seed + DEMO_CREW_FIGHT_SEED_OFFSET)` skips `skip` draws, then draws the d100 and
+/// the retreat's heads (both always drawn).
+fn crew_fight_roll(op_seed: u32, skip: u32) -> (RaidResult, i16) {
+    let mut rng = Rng::new(op_seed.wrapping_add(DEMO_CREW_FIGHT_SEED_OFFSET));
+    for _ in 0..skip {
+        rng.next_u32();
+    }
+    let d100 = rng.roll_d100();
+    let heads = rng.roll_int(DEMO_CREW_RETREAT_HEADS_MIN, DEMO_CREW_RETREAT_HEADS_MAX) as i16;
+    if d100 <= DEMO_CREW_HELD_MAX {
+        (RaidResult::Held, 0)
+    } else if d100 <= DEMO_CREW_RETREAT_MAX {
+        (RaidResult::Retreat, heads)
+    } else {
+        (RaidResult::Wiped, DEMO_CREW_WIPE_HEADS)
+    }
 }
 
 /// A fought raid: Success holds the site, Defeat or TacticalRetreat is a retreat, Wipeout ends the op.
@@ -420,6 +493,17 @@ struct DigState {
     /// When the haul's ambush fires (the leg's midpoint), set by a pull that rolled one; never
     /// sent. Cleared when its fight is latched (BP-8b-2).
     ambush_at: Option<DateTime<Utc>>,
+    /// When the Section stands guard (BP-17a): the start for an escorted dig, `ops/escort`'s
+    /// arrival for a guard sent later, `None` while the Crew is alone.
+    escort_at: Option<DateTime<Utc>>,
+}
+
+impl DigState {
+    /// A battle born at `t` is the Section's (BP-17a) only once the guard stands: fixed when the
+    /// trigger is made, so no read's timing changes who fights it.
+    fn guarded(&self, t: DateTime<Utc>) -> bool {
+        self.escort_at.is_some_and(|e| t >= e)
+    }
 }
 
 /// A pending raid as the client sees it: the mission to open, never the trigger or the Commander.
@@ -454,6 +538,9 @@ pub struct DigView {
     pub ambush: Option<RaidView>,
     /// The ore riding home (a pull's load, or half after a lost fight); 0 otherwise.
     pub carried: u32,
+    /// When the Section stands guard (BP-17a): the start for an escorted dig, a later arrival
+    /// for a guard sent by `ops/escort`, `null` while the Crew is alone.
+    pub escort_at: Option<String>,
 }
 
 /// The meltdown threshold for a dig: `DEMO_HEAT_THRESHOLD`, or ×1.15 with a Coolant-Jockey Foreman.
@@ -807,6 +894,14 @@ struct ActiveOp {
     contract: Option<ContractState>,
 }
 
+impl ActiveOp {
+    /// The Section is at base while the op is out (BP-17a): an unescorted dig whose guard has
+    /// not been sent.
+    fn section_home(&self) -> bool {
+        self.dig.as_ref().is_some_and(|d| d.escort_at.is_none())
+    }
+}
+
 /// The op as the client sees it. Times are RFC 3339 with milliseconds; `arrived` is
 /// `now >= arrive_at` at the read, and `false` while a haul's ambush is still to be fought.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -870,6 +965,8 @@ pub enum DrillRefusal {
 pub enum DrillOutcome {
     Drilled,
     Meltdown { crew_id: Uuid, heads: i16 },
+    /// Raiders the Crew fought alone (BP-17a), already applied: the route writes `heads` (0 when Held).
+    CrewFight { crew_id: Uuid, heads: i16 },
 }
 
 /// Why `return_op` refused.
@@ -915,6 +1012,19 @@ pub enum PullRefusal {
     NothingToHaul,
     /// Raiders are at the site: the raid must be fought first.
     RaidPending,
+}
+
+/// Why `escort_op` refused (BP-17a).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EscortRefusal {
+    /// No op, or its homeward leg has arrived and been cleared.
+    NoOp,
+    /// The op is a contract.
+    Contract,
+    /// The team is on its way home.
+    AlreadyHomeward,
+    /// The Section already guards the dig, or is on its way.
+    AlreadyEscorted,
 }
 
 /// Why `build_op` refused (BP-10a).
@@ -968,6 +1078,10 @@ struct OpsEntry {
     /// Credits a replace has debited and not yet finished (BP-12a-2): set by `begin_replace`,
     /// cleared by `finish_replace`. `make_room` keeps an entry while it is not 0.
     credits_in_flight: u32,
+    /// The last Crew fight (BP-17a), written by the Crew's raid in `drill_op` and by
+    /// `latch_crew`, cleared by the next `start_op` or `next_op`. Display only, not on the keep
+    /// list: an evicted entry loses only the message.
+    crew_fight: Option<CrewFightView>,
 }
 
 impl OpsEntry {
@@ -1134,6 +1248,7 @@ impl OpsEntry {
                     raid: d.raid.filter(|r| r.kind == BattleKind::Raid).map(|r| RaidView { mission_id: r.mission_id }),
                     ambush: d.raid.filter(|r| r.kind == BattleKind::Ambush).map(|r| RaidView { mission_id: r.mission_id }),
                     carried: d.carried,
+                    escort_at: d.escort_at.map(ops_time),
                 }
             }),
             fought: op.contract.as_ref().and_then(|c| match c.result {
@@ -1168,6 +1283,8 @@ pub struct OpsSnapshot {
     pub base: OpsBase,
     /// and the Company's store half (BP-12a-1).
     pub company: CompanyView,
+    /// The last Crew fight (BP-17a).
+    pub crew_fight: Option<CrewFightView>,
 }
 
 /// A new op (BP-11a-4), built for a start (`start_op`) and for a next (`next_op`): outbound to
@@ -1197,6 +1314,7 @@ fn new_op(site: &OpsSite, op_seed: u32, dig: Option<DigStart>, contract: Option<
             raid: None,
             carried: 0,
             ambush_at: None,
+            escort_at: d.escort.then_some(now),
         }),
         contract: contract.and_then(|c| site.mission_id.map(|mission_id| ContractState { mission_id, commander_id: c.commander_id, section_id: c.section_id, result: None })),
     }
@@ -1237,6 +1355,10 @@ fn new_op(site: &OpsSite, op_seed: u32, dig: Option<DigStart>, contract: Option<
 ///   `ore_banked`, before the op clears. `latch_raid` applies an ambush's fight like a raid's
 ///   (compare-and-set, `moved_at`): Held resumes the rest of the leg with the whole load,
 ///   Defeat or TacticalRetreat with half (floor), Wipeout clears the op and banks nothing;
+/// - **the escort (BP-17a):** a battle born before `escort_at` is the Crew's
+///   (`DigState::guarded`): an unguarded raid is fought inside `drill_op` from the Crew stream
+///   and never pends; an unguarded ambush pends with its roll (`PendingRaid::crew`) and is
+///   latched by `latch_crew`. Only `new_op` and `escort_op` write `escort_at`;
 /// - **the keep list** (the reaper's `moved_since`): a departure (start, next, return, pull), a
 ///   homeward arrival, a drill, a latch, a build, a heal and a replace each write `moved_at`. Reading the board or the op
 ///   does not, nor does the ambush's reveal; a read that latches a battle does. While an
@@ -1325,7 +1447,7 @@ impl DemoOpsStore {
         if !self.make_room(&mut inner) {
             return false;
         }
-        inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, op: None, moved_at: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), contracts: HashMap::new(), sickbay: HashMap::new(), trophies: Vec::new(), credits_in_flight: 0 });
+        inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, op: None, moved_at: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), contracts: HashMap::new(), sickbay: HashMap::new(), trophies: Vec::new(), credits_in_flight: 0, crew_fight: None });
         true
     }
 
@@ -1349,7 +1471,7 @@ impl DemoOpsStore {
             if !self.make_room(&mut inner) {
                 return Err(StartRefusal::Full);
             }
-            inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, op: None, moved_at: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), contracts: HashMap::new(), sickbay: HashMap::new(), trophies: Vec::new(), credits_in_flight: 0 });
+            inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, op: None, moved_at: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), contracts: HashMap::new(), sickbay: HashMap::new(), trophies: Vec::new(), credits_in_flight: 0, crew_fight: None });
         }
         let Some(e) = inner.get_mut(&campaign_id) else {
             return Err(StartRefusal::Full);
@@ -1359,6 +1481,7 @@ impl DemoOpsStore {
             return Err(StartRefusal::Busy);
         }
         e.op = Some(new_op(site, op_seed, dig, contract, site.travel_secs, now));
+        e.crew_fight = None;
         e.moved_at = Some(now);
         e.touched = now;
         Ok(())
@@ -1442,6 +1565,7 @@ impl DemoOpsStore {
         let hop = hex_axial_distance(op.at.0, op.at.1, site.q, site.r);
         let leg_secs = (site.travel_secs / site.distance.max(1) * hop).max(1);
         e.op = Some(new_op(site, op_seed, dig, contract, leg_secs, now));
+        e.crew_fight = None;
         e.moved_at = Some(now);
         e.touched = now;
         Ok(())
@@ -1455,6 +1579,10 @@ impl DemoOpsStore {
     /// → `Contract` → `AlreadyHomeward` → `NotArrived` → `RaidPending`. The meltdown is committed
     /// here, before the route's write, so a second drill sees `AlreadyHomeward` and the heads
     /// can't be lost twice.
+    /// BP-17a: raiders the guard is not there for (`DigState::guarded` at `now`) are the Crew's,
+    /// fought here from the Crew stream and applied at once (no trigger): Held drills on,
+    /// Retreat goes home with half the ore on site as a Section's retreat does, Wiped clears the
+    /// op; `crew_fight` records it and the route writes the heads (`DrillOutcome::CrewFight`).
     pub fn drill_op(&self, campaign_id: Uuid, now: DateTime<Utc>) -> Result<DrillOutcome, DrillRefusal> {
         let mut inner = self.lock();
         let Some(e) = inner.get_mut(&campaign_id) else {
@@ -1483,8 +1611,13 @@ impl DemoOpsStore {
         e.moved_at = Some(now);
         e.touched = now;
         let melts = dig.heat >= dig.threshold;
+        let mut crew = None;
         if !melts && raid_d100 <= base.raid_pct(dig.drills) {
-            dig.raid = Some(RaidTrigger { trigger_at: now, mission_id: DEMO_RAID_MISSION, kind: BattleKind::Raid });
+            if dig.guarded(now) {
+                dig.raid = Some(RaidTrigger { trigger_at: now, mission_id: DEMO_RAID_MISSION, kind: BattleKind::Raid });
+            } else {
+                crew = Some(crew_fight_roll(op.op_seed, DEMO_ROLLS_PER_DRILL * (dig.drills - 1)));
+            }
         }
         if melts {
             dig.ore_on_site = 0;
@@ -1495,7 +1628,24 @@ impl DemoOpsStore {
             return Ok(DrillOutcome::Meltdown { crew_id: dig.crew_id, heads: heads as i16 });
         }
         dig.ore_on_site += base.ore(dig.drills, dig.tier);
-        Ok(DrillOutcome::Drilled)
+        let Some((result, heads)) = crew else {
+            return Ok(DrillOutcome::Drilled);
+        };
+        let crew_id = dig.crew_id;
+        match result {
+            RaidResult::Held => {}
+            RaidResult::Retreat => {
+                dig.carried = dig.ore_on_site / 2;
+                dig.ore_on_site = 0;
+                dig.ended_by = Some(OpEnd::Retreat);
+                op.leg = OpLeg::Homeward;
+                op.depart_at = now;
+                op.arrive_at = now + Duration::seconds(i64::from(op.travel_secs));
+            }
+            RaidResult::Wiped => e.op = None,
+        }
+        e.crew_fight = Some(crew_fight_view("raid", result, heads));
+        Ok(DrillOutcome::CrewFight { crew_id, heads })
     }
 
     /// Hauls the ore home from an arrived dig (BP-8b-2): the ore on site rides home as `carried`
@@ -1555,10 +1705,18 @@ impl DemoOpsStore {
         let op = e.op.as_ref()?;
         if let Some(trigger) = contract_trigger(op, now) {
             let c = op.contract.as_ref()?;
-            return Some(PendingRaid { commander_id: c.commander_id, trigger, section_id: c.section_id });
+            return Some(PendingRaid { commander_id: c.commander_id, trigger, section_id: c.section_id, crew: None });
         }
         let dig = op.dig.as_ref()?;
-        dig.raid.map(|trigger| PendingRaid { commander_id: dig.commander_id, trigger, section_id: dig.section_id })
+        // BP-17a: a battle born before the guard stands is the Crew's (only an ambush can be: an
+        // unguarded raid is fought inside `drill_op`), rolled here from the Crew stream.
+        dig.raid.map(|trigger| {
+            let crew = (!dig.guarded(trigger.trigger_at)).then(|| {
+                let (result, heads) = crew_fight_roll(op.op_seed, DEMO_CREW_AMBUSH_DRAW);
+                CrewRoll { crew_id: dig.crew_id, result, heads }
+            });
+            PendingRaid { commander_id: dig.commander_id, trigger, section_id: dig.section_id, crew }
+        })
     }
 
     /// Applies a fought battle, only if `trigger` is still the op's pending one (`false`, and no
@@ -1643,6 +1801,45 @@ impl DemoOpsStore {
         true
     }
 
+    /// Applies the Crew's own fight on a haul's ambush (BP-17a), only if `trigger` is still the
+    /// op's pending one (`false`, and no write, otherwise): `latch_raid`'s ambush arm with no pay,
+    /// no sickbay and no loot (Held resumes the leg with the whole load, Retreat with
+    /// `OpsBase::ambush_kept` of it, Wiped clears the op), and `crew_fight` recorded on the
+    /// applied path only. Writes `moved_at` (the keep list).
+    pub fn latch_crew(&self, campaign_id: Uuid, trigger: &RaidTrigger, crew: CrewRoll, now: DateTime<Utc>) -> bool {
+        let mut inner = self.lock();
+        let Some(e) = inner.get_mut(&campaign_id) else {
+            return false;
+        };
+        e.settle_arrival(now);
+        let Some(op) = e.op.as_mut() else {
+            return false;
+        };
+        let Some(dig) = op.dig.as_mut() else {
+            return false;
+        };
+        if dig.raid != Some(*trigger) {
+            return false;
+        }
+        dig.raid = None;
+        match crew.result {
+            RaidResult::Held | RaidResult::Retreat => {
+                if crew.result == RaidResult::Retreat {
+                    dig.carried = e.base.ambush_kept(dig.carried);
+                    dig.ended_by = Some(OpEnd::Retreat);
+                }
+                let wait = now - dig.ambush_at.take().unwrap_or(now);
+                op.depart_at += wait;
+                op.arrive_at += wait;
+            }
+            RaidResult::Wiped => e.op = None,
+        }
+        e.crew_fight = Some(crew_fight_view("ambush", crew.result, crew.heads));
+        e.moved_at = Some(now);
+        e.touched = now;
+        true
+    }
+
     /// The op as the client sees it, after clearing an arrived homeward leg.
     pub fn op_view(&self, campaign_id: Uuid, now: DateTime<Utc>) -> Option<ActiveOpView> {
         let mut inner = self.lock();
@@ -1664,7 +1861,7 @@ impl DemoOpsStore {
     pub fn ops_state(&self, campaign_id: Uuid, now: DateTime<Utc>) -> OpsSnapshot {
         let mut inner = self.lock();
         let Some(e) = inner.get_mut(&campaign_id) else {
-            return OpsSnapshot { sites: None, op: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), company: CompanyView::default() };
+            return OpsSnapshot { sites: None, op: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), company: CompanyView::default(), crew_fight: None };
         };
         e.settle_arrival(now);
         OpsSnapshot {
@@ -1674,6 +1871,7 @@ impl DemoOpsStore {
             credits_banked: e.credits_banked,
             base: e.base,
             company: e.company(),
+            crew_fight: e.crew_fight,
         }
     }
 
@@ -1715,6 +1913,39 @@ impl DemoOpsStore {
         }
         e.ore_banked -= cost;
         e.base.set(building);
+        e.moved_at = Some(now);
+        e.touched = now;
+        Ok(())
+    }
+
+    /// Sends the Section to guard an unescorted dig (BP-17a, "go guard the dig"): it stands
+    /// guard from `now + travel_secs` (`escort_at`) and fights every battle born from then on;
+    /// `commander_id` and `section_id` (read by the route) become the dig's. Allowed while
+    /// outbound (no fight can come before the arrival). Writes `moved_at` (a departure).
+    /// Refusals in order: `NoOp` → `Contract` → `AlreadyHomeward` → `AlreadyEscorted`.
+    pub fn escort_op(&self, campaign_id: Uuid, commander_id: Uuid, section_id: Option<Uuid>, now: DateTime<Utc>) -> Result<(), EscortRefusal> {
+        let mut inner = self.lock();
+        let Some(e) = inner.get_mut(&campaign_id) else {
+            return Err(EscortRefusal::NoOp);
+        };
+        e.settle_arrival(now);
+        let Some(op) = e.op.as_mut() else {
+            return Err(EscortRefusal::NoOp);
+        };
+        let travel_secs = op.travel_secs;
+        let leg = op.leg;
+        let Some(dig) = op.dig.as_mut() else {
+            return Err(EscortRefusal::Contract);
+        };
+        if leg == OpLeg::Homeward {
+            return Err(EscortRefusal::AlreadyHomeward);
+        }
+        if dig.escort_at.is_some() {
+            return Err(EscortRefusal::AlreadyEscorted);
+        }
+        dig.escort_at = Some(now + Duration::seconds(i64::from(travel_secs)));
+        dig.commander_id = commander_id;
+        dig.section_id = section_id;
         e.moved_at = Some(now);
         e.touched = now;
         Ok(())
@@ -1762,12 +1993,23 @@ impl DemoOpsStore {
     /// on the same call. Writes `moved_at` (the keep list). Refusals in order: `OpOut` →
     /// `NotEnoughCredits` (also no entry). Check and debit are one critical section, no await.
     pub fn begin_replace(&self, campaign_id: Uuid, cost: u32, now: DateTime<Utc>) -> Result<ReplaceHold, ReplaceRefusal> {
+        self.begin_hold(campaign_id, cost, false, now)
+    }
+
+    /// `begin_replace` for a Section's Requisition (BP-17a): it also passes while the op is an
+    /// unescorted dig whose guard has not been sent (`ActiveOp::section_home`), since the
+    /// Section is at base. A Crew Hire never does: the Crew is out.
+    pub fn begin_requisition(&self, campaign_id: Uuid, cost: u32, now: DateTime<Utc>) -> Result<ReplaceHold, ReplaceRefusal> {
+        self.begin_hold(campaign_id, cost, true, now)
+    }
+
+    fn begin_hold(&self, campaign_id: Uuid, cost: u32, section: bool, now: DateTime<Utc>) -> Result<ReplaceHold, ReplaceRefusal> {
         let mut inner = self.lock();
         let Some(e) = inner.get_mut(&campaign_id) else {
             return Err(ReplaceRefusal::NotEnoughCredits);
         };
         e.settle_arrival(now);
-        if e.op.is_some() {
+        if e.op.as_ref().is_some_and(|op| !(section && op.section_home())) {
             return Err(ReplaceRefusal::OpOut);
         }
         if !e.debit_credits(cost) {
@@ -1840,6 +2082,7 @@ impl DemoOpsStore {
                 op.arrive_at -= back;
                 if let Some(d) = op.dig.as_mut() {
                     d.ambush_at = d.ambush_at.map(|t| t - back);
+                    d.escort_at = d.escort_at.map(|t| t - back);
                 }
             }
             e.moved_at = e.moved_at.map(|t| t - back);
@@ -2200,7 +2443,7 @@ mod tests {
 
     /// A dig on a tier-`tier` vein, started at 0 s and on site from 10 s, its seed `seed`.
     fn on_site(store: &DemoOpsStore, a: Uuid, tier: u8, threshold: u32, seed: u32) {
-        let crew = DigStart { crew_id: CREW, commander_id: COMMANDER, threshold, section_id: None };
+        let crew = DigStart { crew_id: CREW, commander_id: COMMANDER, threshold, section_id: None, escort: true };
         store.start_op(a, (5, 0), board(), &dig(tier), seed, Some(crew), None, at(0)).expect("start");
     }
 
@@ -2335,7 +2578,7 @@ mod tests {
         store.drill_op(a, at(11)).expect("drill");
         let v = serde_json::to_value(store.op_view(a, at(12)).expect("op")).unwrap();
         let keys: std::collections::BTreeSet<&str> = v["dig"].as_object().expect("dig").keys().map(|k| k.as_str()).collect();
-        let want = ["ambush", "carried", "drills", "ended_by", "heat", "might_overheat", "next_heat_max", "next_heat_min", "next_ore", "next_raid_pct", "ore_on_site", "raid", "threshold"];
+        let want = ["ambush", "carried", "drills", "ended_by", "escort_at", "heat", "might_overheat", "next_heat_max", "next_heat_min", "next_ore", "next_raid_pct", "ore_on_site", "raid", "threshold"];
         assert_eq!(keys, want.into_iter().collect());
         assert_eq!(v["dig"]["raid"], serde_json::json!({"mission_id": "GUARD_DUTY"}));
         let text = v.to_string();
@@ -2362,7 +2605,7 @@ mod tests {
         let d = dig_view(&store, a, at(12));
         assert_eq!((d.heat, d.ore_on_site, d.next_raid_pct), (10, 20, None));
         assert_eq!(d.raid, Some(RaidView { mission_id: "GUARD_DUTY" }));
-        assert_eq!(store.pending_raid(a, at(12)), Some(PendingRaid { commander_id: COMMANDER, trigger: trigger(11), section_id: None }));
+        assert_eq!(store.pending_raid(a, at(12)), Some(PendingRaid { commander_id: COMMANDER, trigger: trigger(11), section_id: None, crew: None }));
         on_site(&store, b, 1, 100, 5);
         store.drill_op(b, at(11)).expect("drill 1");
         store.drill_op(b, at(12)).expect("drill 2");
@@ -2659,7 +2902,7 @@ mod tests {
         assert_eq!(store.ops_snapshot(a, at(30)), (None, 120, OpsBase::default()));
         assert_eq!(store.ops_snapshot(a, at(31)), (None, 120, OpsBase::default()), "banked once");
         assert!(store.moved_since(a, at(30), at(31)), "the arrival is the last movement");
-        let crew = DigStart { crew_id: CREW, commander_id: COMMANDER, threshold: 100, section_id: None };
+        let crew = DigStart { crew_id: CREW, commander_id: COMMANDER, threshold: 100, section_id: None, escort: true };
         store.start_op(a, (5, 0), board(), &dig(1), 2, Some(crew), None, at(40)).expect("start");
         store.drill_op(a, at(51)).expect("drill");
         store.pull_op(a, at(52)).expect("pull");
@@ -2712,7 +2955,7 @@ mod tests {
         let masked = |v: Option<ActiveOpView>| v.map(|mut o| { if let Some(d) = o.dig.as_mut() { d.heat = 0; } o });
         assert_eq!(masked(store.op_view(a, at(24))), masked(store.op_view(b, at(24))));
         assert_eq!(store.pending_raid(a, at(24)), None);
-        assert_eq!(store.pending_raid(a, at(26)), Some(PendingRaid { commander_id: COMMANDER, trigger: ambush_trigger(26), section_id: None }));
+        assert_eq!(store.pending_raid(a, at(26)), Some(PendingRaid { commander_id: COMMANDER, trigger: ambush_trigger(26), section_id: None, crew: None }));
         assert_eq!(store.pending_raid(b, at(26)), None);
         let op = store.op_view(a, at(40)).expect("the ambushed team is still on the road");
         assert_eq!((op.leg, op.arrived), (OpLeg::Homeward, false));
@@ -3004,6 +3247,7 @@ mod tests {
                 commander_id: COMMANDER,
                 trigger: RaidTrigger { trigger_at: at(10), mission_id: "GUARD_DUTY", kind: BattleKind::Contract },
                 section_id: None,
+                crew: None,
             })
         );
         let t = RaidTrigger { trigger_at: at(10), mission_id: "GUARD_DUTY", kind: BattleKind::Contract };
@@ -3027,7 +3271,7 @@ mod tests {
         store.return_op(a, at(13)).expect("return");
         assert_eq!(
             store.ops_state(a, at(30)),
-            OpsSnapshot { sites: Some(vec![]), op: None, ore_banked: 0, credits_banked: 400, base: OpsBase::default(), company: CompanyView::default() }
+            OpsSnapshot { sites: Some(vec![]), op: None, ore_banked: 0, credits_banked: 400, base: OpsBase::default(), company: CompanyView::default(), crew_fight: None }
         );
         assert!(!store.put_board(b, (5, 0), board(), at(31)), "not cached");
         assert_eq!(store.len(), 1);
@@ -3542,5 +3786,17 @@ mod tests {
             assert_eq!(guard_duty(&shown(&store, a, at(t))), None, "off at {t} s");
         }
         assert_eq!(shown(&store, a, at(200)).len(), 3);
+    }
+
+    /// BP-17a: the Crew stream's pins (independent Mulberry32 oracle, Wiki): a raid on drill 1
+    /// reads draws 0 and 1, the haul's ambush draws 24 and 25. Seed 191 holds (d100 27), 45 falls
+    /// back with 2 heads (77), 505 is wiped out (97); seed 59's ambush falls back with 2 (73).
+    /// On the ambush stream's offset the same seeds read 71, 44 and 32 (bands R, H, H).
+    #[test]
+    fn crew_fight_roll_pins() {
+        assert_eq!(crew_fight_roll(191, 0), (RaidResult::Held, 0));
+        assert_eq!(crew_fight_roll(45, 0), (RaidResult::Retreat, 2));
+        assert_eq!(crew_fight_roll(505, 0), (RaidResult::Wiped, 8));
+        assert_eq!(crew_fight_roll(59, DEMO_CREW_AMBUSH_DRAW), (RaidResult::Retreat, 2));
     }
 }
