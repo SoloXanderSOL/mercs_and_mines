@@ -1371,7 +1371,13 @@ impl OpsEntry {
     /// The primary op (`primary_key`, the one definition: the dig, else the first contract by
     /// key) as the client sees it.
     fn view(&self, now: DateTime<Utc>) -> Option<ActiveOpView> {
-        self.primary_key().and_then(|k| self.slot(k)).map(|op| ActiveOpView {
+        self.primary_key().and_then(|k| self.view_of(k, now))
+    }
+
+    /// One slot's op as the client sees it (BP-18a-1b-2): `view` shows the primary's, the body's
+    /// `more_ops` every other slot's. One builder, so the two shapes can't drift.
+    fn view_of(&self, key: SlotKey, now: DateTime<Utc>) -> Option<ActiveOpView> {
+        self.slot(key).map(|op| ActiveOpView {
             leg: op.leg,
             site_id: op.site_id.clone(),
             at: OpHex { q: op.at.0, r: op.at.1 },
@@ -1463,6 +1469,15 @@ fn contract_trigger(op: &ActiveOp, now: DateTime<Utc>) -> Option<RaidTrigger> {
         return None;
     }
     Some(RaidTrigger { trigger_at: op.arrive_at, mission_id: c.mission_id, kind: BattleKind::Contract })
+}
+
+/// One op beside the primary, in the body's `more_ops` (BP-18a-1b-2): the Section whose contract
+/// slot it is (`null` for a `None` key, which production can't hold beside another op) and the op
+/// as the client sees it, the same shape as `active_op`.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct MoreOp {
+    pub section_id: Option<Uuid>,
+    pub op: ActiveOpView,
 }
 
 /// What every ops body shows from the store (BP-11a-2): the board's sites as they stand now
@@ -1857,7 +1872,10 @@ impl DemoOpsStore {
         }
         let hop = hex_axial_distance(op.at.0, op.at.1, site.q, site.r);
         let leg_secs = (site.travel_secs / site.distance.max(1) * hop).max(1);
-        // A2: the squad on the leaving op moves with it.
+        // A2: the squad on the leaving op moves with it. The dig arm takes any dig's squad and is
+        // sound only because GuardNotHere (above) refuses an unguarded dig first (Reviewer
+        // BP-18a-1b-1 F1): a change there filters this to `guarded_dig()` or adds
+        // `section_busy`/`commander_busy` at next.
         let moving = op.contract.as_ref().map(|c| (c.commander_id, c.section_id)).or_else(|| op.dig.as_ref().map(|d| (d.commander_id, d.section_id)));
         let (mut dig, mut contract) = (dig, contract);
         if let Some((commander_id, section_id)) = moving {
@@ -2189,12 +2207,34 @@ impl DemoOpsStore {
     /// and pay (BP-11a-2) and the base, from one lock, after settling. A campaign with no entry
     /// has no sites of its own (`None`), and has banked and built nothing.
     pub fn ops_state(&self, campaign_id: Uuid, now: DateTime<Utc>) -> OpsSnapshot {
+        self.ops_state_all(campaign_id, now).0
+    }
+
+    /// `ops_state` and every held slot but the primary (BP-18a-1b-2), from one lock: the body's
+    /// `more_ops`, each contract slot's key and its op (`view_of`), in key order. A held dig is
+    /// always the primary (`slot_keys` is dig-first), so it is never here. Empty with one op or
+    /// none. A second return, never a field on `OpsSnapshot`, which a test compares whole.
+    pub fn ops_state_all(&self, campaign_id: Uuid, now: DateTime<Utc>) -> (OpsSnapshot, Vec<MoreOp>) {
         let mut inner = self.lock();
         let Some(e) = inner.get_mut(&campaign_id) else {
-            return OpsSnapshot { sites: None, op: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), company: CompanyView::default(), crew_fight: None };
+            let none = OpsSnapshot { sites: None, op: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), company: CompanyView::default(), crew_fight: None };
+            return (none, Vec::new());
         };
         e.settle_arrival(now);
-        OpsSnapshot {
+        let primary = e.primary_key();
+        let more_ops = e
+            .slot_keys()
+            .into_iter()
+            .filter(|k| Some(*k) != primary)
+            .filter_map(|k| {
+                let section_id = match k {
+                    SlotKey::Contract(s) => s,
+                    SlotKey::Dig => None,
+                };
+                e.view_of(k, now).map(|op| MoreOp { section_id, op })
+            })
+            .collect();
+        let snapshot = OpsSnapshot {
             sites: Some(e.sites()),
             op: e.view(now),
             ore_banked: e.ore_banked,
@@ -2202,6 +2242,47 @@ impl DemoOpsStore {
             base: e.base,
             company: e.company(),
             crew_fight: e.crew_fight,
+        };
+        (snapshot, more_ops)
+    }
+
+    /// Which of `sections` the store holds busy (BP-18a-1b-2, `OpsEntry::section_busy`), after
+    /// settling, for the route's Section pick. Advisory: the route picks without this lock, so a
+    /// start that lands between this read and the route's store call is answered by the store's
+    /// own `409` (BP-18a-1b-1's store tests decide that re-check; no pause seam reaches the race).
+    pub fn busy_sections(&self, campaign_id: Uuid, sections: &[Uuid], now: DateTime<Utc>) -> Vec<Uuid> {
+        let mut inner = self.lock();
+        let Some(e) = inner.get_mut(&campaign_id) else {
+            return Vec::new();
+        };
+        e.settle_arrival(now);
+        sections.iter().copied().filter(|s| e.section_busy(*s)).collect()
+    }
+
+    /// Which of `commanders` the store holds busy (BP-18a-1b-2, `OpsEntry::commander_busy`), after
+    /// settling, for the route's Commander pick; advisory, as `busy_sections`.
+    pub fn busy_commanders(&self, campaign_id: Uuid, commanders: &[Uuid], now: DateTime<Utc>) -> Vec<Uuid> {
+        let mut inner = self.lock();
+        let Some(e) = inner.get_mut(&campaign_id) else {
+            return Vec::new();
+        };
+        e.settle_arrival(now);
+        commanders.iter().copied().filter(|c| e.commander_busy(*c)).collect()
+    }
+
+    /// The Section on the op `squad` selects (BP-18a-1b-2, next's at-0 check), after settling, by
+    /// `OpsEntry::select`: `Some` of the slot's Section (a contract's key, a dig's recorded
+    /// Section), itself `None` for an op with no Section; `None` when the selection finds no op
+    /// (`NoOp`, or `SayWhich` with two out), so the route falls back to the member's first Section
+    /// and `next_op_for` answers the selection's refusal after the at-0 check, as today.
+    pub fn squad_section(&self, campaign_id: Uuid, squad: Option<OpSquad>, now: DateTime<Utc>) -> Option<Option<Uuid>> {
+        let mut inner = self.lock();
+        let e = inner.get_mut(&campaign_id)?;
+        e.settle_arrival(now);
+        let key = e.select(squad).ok()?;
+        match key {
+            SlotKey::Contract(s) => Some(s),
+            SlotKey::Dig => e.slot(key).map(|op| op.dig.as_ref().and_then(|d| d.section_id)),
         }
     }
 
@@ -4395,5 +4476,53 @@ mod tests {
         let got: Vec<(Uuid, Option<Uuid>, RaidTrigger)> = store.pending_raids(a, at(12)).into_iter().map(|p| (p.commander_id, p.section_id, p.trigger)).collect();
         let supply = RaidTrigger { trigger_at: at(12), mission_id: "SUPPLY_RAID", kind: BattleKind::Contract };
         assert_eq!(got, vec![(C1, Some(S1), guard_duty_arrival()), (C2, Some(S2), supply)]);
+    }
+
+    // ---- BP-18a-1b-2: the route half's store reads.
+
+    /// T16: a Crew-alone dig and two named contracts: the snapshot's op is the dig, the second
+    /// value both contracts in key order (S1 < S2), and `ops_state` is the first value.
+    #[test]
+    fn ops_store_ops_state_all_lists_every_slot_but_the_primary() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        alone(&store, a, 7);
+        assert_eq!(named(&store, a, &site(), C1, S1, at(0)), Ok(()));
+        assert_eq!(named(&store, a, &supply_raid(), C2, S2, at(0)), Ok(()));
+        let (snapshot, more) = store.ops_state_all(a, at(1));
+        assert_eq!(snapshot.op.as_ref().map(|op| op.kind), Some("dig"));
+        let got: Vec<(Option<Uuid>, &str, String)> = more.iter().map(|m| (m.section_id, m.op.kind, m.op.site_id.clone())).collect();
+        assert_eq!(got, vec![(Some(S1), "contract", "contract:GUARD_DUTY".to_string()), (Some(S2), "contract", supply_raid().site_id)]);
+        assert_eq!(store.ops_state(a, at(1)), store.ops_state_all(a, at(1)).0);
+    }
+
+    /// T17: the busy reads follow `section_busy`/`commander_busy`: a Crew-alone dig holds no
+    /// one, a contract its squad, a guard its squad.
+    #[test]
+    fn ops_store_busy_reads_follow_the_busy_rule() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        alone(&store, a, 7);
+        assert_eq!(named(&store, a, &site(), C1, S1, at(0)), Ok(()));
+        assert_eq!(store.busy_sections(a, &[S1, S2], at(1)), vec![S1]);
+        assert_eq!(store.busy_commanders(a, &[C1, C2], at(1)), vec![C1]);
+        assert_eq!(store.escort_op(a, C2, Some(S2), at(1)), Ok(()));
+        assert_eq!(store.busy_sections(a, &[S1, S2], at(1)), vec![S1, S2]);
+        assert_eq!(store.busy_commanders(a, &[C1, C2], at(1)), vec![C1, C2]);
+    }
+
+    /// T18: `squad_section` reads the selected op's Section, and `None` when the selection finds
+    /// no op (`NoOp`, or `SayWhich` with two out).
+    #[test]
+    fn ops_store_squad_section_reads_the_selected_op() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        assert_eq!(named(&store, a, &site(), C2, S2, at(0)), Ok(()));
+        assert_eq!(store.squad_section(a, None, at(1)), Some(Some(S2)));
+        assert_eq!(store.squad_section(a, Some(OpSquad::Section(S2)), at(1)), Some(Some(S2)));
+        assert_eq!(store.squad_section(a, Some(OpSquad::Section(S1)), at(1)), None);
+        assert_eq!(store.squad_section(a, Some(OpSquad::Dig), at(1)), None);
+        alone(&store, a, 7);
+        assert_eq!(store.squad_section(a, None, at(1)), None);
     }
 }

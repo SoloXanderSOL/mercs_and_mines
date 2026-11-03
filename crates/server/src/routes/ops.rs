@@ -12,7 +12,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::{
-    extract::{rejection::JsonRejection, ConnectInfo, DefaultBodyLimit, Path, State},
+    extract::{
+        rejection::{JsonRejection, QueryRejection},
+        ConnectInfo, DefaultBodyLimit, Path, Query, State,
+    },
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -33,11 +36,11 @@ use crate::auth::AuthSession;
 use crate::demo_ops::{
     dig_threshold, fight_losses, fight_wounded, ops_board, ops_time, raid_fight, raid_result, ActiveOpView, BaseBuilding,
     BuildRefusal, CompanyView, ContractStart, CrewFightView, DigStart, DrillOutcome, DrillRefusal, EscortRefusal, FightPay,
-    HealRefusal, NextRefusal, OpsBase, OpsBoard, OpsSite, PullRefusal, RaidResult, ReplaceHold, ReplaceRefusal,
+    HealRefusal, MoreOp, NextRefusal, OpSquad, OpsBase, OpsBoard, OpsSite, PullRefusal, RaidResult, ReplaceHold, ReplaceRefusal,
     ReturnRefusal, StartRefusal, DEMO_CREW_FIGHT_MORALE_LOSS, DEMO_MELTDOWN_MORALE_LOSS, DEMO_REPLACE_MERC_CREDITS,
     DEMO_REPLACE_MINER_CREDITS,
 };
-use crate::repository::{outcome_db_str, CampaignInstance, CampaignLifecycle, DeploymentRecord, SectorState};
+use crate::repository::{outcome_db_str, CampaignInstance, CampaignLifecycle, DeploymentRecord, SectionRecord, SectorState};
 use crate::state::AppState;
 
 use super::sector::GatewayHex;
@@ -84,6 +87,10 @@ pub struct OpsView<'a> {
     /// The last Crew fight (BP-17a), until the next start; absent when there is none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub crew_fight: Option<CrewFightView>,
+    /// Every op beside `active_op` (BP-18a-1b-2): each contract slot's Section and its op, the
+    /// same shape as `active_op`, in key order; absent with one op or none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub more_ops: Vec<MoreOp>,
 }
 
 /// `ops/start`'s and `ops/next`'s body. `escort` (BP-17a) is read by `ops/start` for a dig only,
@@ -92,6 +99,23 @@ pub struct OpsView<'a> {
 pub struct OpsStartRequest {
     pub site_id: String,
     pub escort: Option<bool>,
+    /// BP-18a-1b-2: the squad, a string parsed after the member checks. On `ops/start` the
+    /// Section sent (`400 a Crew alone takes no squad` with `escort: false`); on `ops/next` the
+    /// op that moves (its squad goes with it, A2). A non-string is axum's `422`.
+    pub section_id: Option<String>,
+    /// BP-18a-1b-2: `"dig"` names the dig on `ops/next`; any `slot` on `ops/start` is `400
+    /// unknown section` (a start's slot is its site's kind, Linux Q1).
+    pub slot: Option<String>,
+}
+
+/// `ops/return`'s and `ops/escort`'s query (BP-18a-1b-2): `?section_id=` names the squad by its
+/// Section, `?slot=dig` the dig (return only). Strings, parsed after the member checks (heal's
+/// pattern), so a bad id is our `400 unknown section`; an unknown key is ignored. A repeated key
+/// is axum's `QueryRejection`, answered `400 unknown section` after the limiters.
+#[derive(Deserialize)]
+pub struct OpsSelector {
+    pub section_id: Option<String>,
+    pub slot: Option<String>,
 }
 
 /// `building` is a string, matched after the member checks, so an unknown id is `400` as an
@@ -234,7 +258,7 @@ async fn load_board(
 }
 
 fn ops_response(state: &AppState, campaign_id: Uuid, gw: (i32, i32), board: &OpsBoard, now: DateTime<Utc>) -> Response {
-    let s = state.demo_ops.store.ops_state(campaign_id, now);
+    let (s, more_ops) = state.demo_ops.store.ops_state_all(campaign_id, now);
     // BP-11a-3: the sites as they stand (a fought contract off the board, a returned one moved);
     // the route's own board only when the campaign has no entry (a store full of ops).
     let sites = s.sites.as_deref().unwrap_or(&board.sites);
@@ -249,6 +273,7 @@ fn ops_response(state: &AppState, campaign_id: Uuid, gw: (i32, i32), board: &Ops
         company: s.company,
         now: ops_time(now),
         crew_fight: s.crew_fight,
+        more_ops,
     };
     Json(view).into_response()
 }
@@ -467,7 +492,7 @@ async fn get_ops_board(
     let now = Utc::now();
     let (campaign, gateway, _) = ops_member(&state, &token, campaign_id, "get_ops_board").await?;
     let Some(gw) = gateway else {
-        let view = OpsView { campaign_id, gateway: None, sites: &[], active_op: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), company: CompanyView::default(), now: ops_time(now), crew_fight: None };
+        let view = OpsView { campaign_id, gateway: None, sites: &[], active_op: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), company: CompanyView::default(), now: ops_time(now), crew_fight: None, more_ops: Vec::new() };
         return Ok(Json(view).into_response());
     };
     let board = load_board(&state, &campaign, gw, now, false, "get_ops_board").await?;
@@ -480,15 +505,24 @@ async fn get_ops_board(
 /// counted (`413` over `OPS_BODY_LIMIT`; `400`, `415`, `422`) → `404` → `403` → `409` not
 /// `Active` (entry dropped) → `409` no gateway → the board, a hit proven by `EXISTS` (a lost
 /// sector is repaired: `409` once retired, entry dropped) → a pending raid latched (`500` on a
-/// failed read) → `400` unknown site → for a dig, the Crew, Foreman and Commander reads
-/// (`500` on failure), `409` no Crew left and `409` no Commander left; for a contract, the
-/// Commander read (`500` on failure) and `409` no Commander left → for any site, the
-/// member's first Section read (`500` on failure) and `409` when it is at 0 (BP-11a-1) → `503`
-/// the store is full of ops → `409` an op is under way → `409` that squad is out → `409` another
-/// squad has that contract → `409` every Commander is out → `200`, the whole state.
-/// - BP-18a-1b-1: the start names no squad, so it lands only with no op out, or as a Crew-alone
-///   dig beside a contract (the dig slot empty); the last three refusals are the store's for a
-///   named start (BP-18a-1b-2's selector) and are unreachable from this route today.
+/// failed read) → `400` unknown site → `400` unknown section (both `section_id` and `slot`, or
+/// any `slot`: a start's slot is its site's kind) → the member's Sections read (`500` on
+/// failure) → `400` unknown section (a `section_id` that doesn't parse or isn't the member's) →
+/// `400` a Crew alone takes no squad (a `section_id` with `escort: false`) → for a dig, the
+/// Crew, Foreman and Commander reads (`500` on failure), `409` no Crew left and `409` no
+/// Commander left; for a contract, the Commander read (`500` on failure) and `409` no Commander
+/// left → `409` no soldiers left when the Section sent (the named one, else the first) is at 0
+/// (BP-11a-1) → `503` the store is full of ops → `409` an op is under way → `409` that squad is
+/// out → `409` another squad has that contract → `409` every Commander is out → `200`, the
+/// whole state.
+/// - BP-18a-1b-2: `section_id` names the Section sent; the start is then named
+///   (`start_op_for(…, true, …)`), so it can land beside another squad's op. Unnamed, it lands
+///   only with no op out, or as a Crew-alone dig beside a contract (the dig slot empty).
+/// - **Picks (BP-18a-1b-2, A1):** a guarded dig's and a contract's Commander is the first usable
+///   one the store does not hold busy, else the first usable one; a Crew-alone dig's is the
+///   first usable one (A4). The Section is the named one, else the first. The picks are
+///   advisory: a start that lands between the busy read and this start is answered by the
+///   store's `409` (that squad is out / every Commander is out).
 /// - The site is looked up as it stands (BP-11a-3): a fought contract is `400 unknown site`
 ///   (before `409` an op is under way) until it returns 45 s later at another hex. A return
 ///   landing between the lookup and the start sends the team to the old pin (accepted).
@@ -529,23 +563,35 @@ async fn post_ops_start(
     let Some(site) = state.demo_ops.store.site(campaign_id, &board, &req.site_id, now) else {
         return Err(bad_request("unknown site"));
     };
-    let dig = if site.kind == "dig" { Some(dig_start(&state, campaign_id, &wallet, "post_ops_start").await?) } else { None };
-    let lead = if site.kind == "contract" { Some(usable_commander(&state, campaign_id, &wallet, "post_ops_start").await?) } else { None };
-    // BP-11a-1: the member's first Section (oldest first). At 0 it has no one to send, for any
-    // site; after the Commander check, so a KIA Commander still answers first. A member with no
-    // Section passes, and the dig then has no at-0 check.
+    // BP-18a-1b-2: the selector, before the lead reads. Any `slot` is refused on a start (its
+    // slot is the site's kind, Linux Q1). The member's Sections are read here, before the picks.
+    let pick = selector_shape(req.section_id.as_deref(), req.slot.as_deref(), false)?;
+    let escort = site.kind != "dig" || req.escort.unwrap_or(true);
     let sections = state.section_repo.list_sections_for_member(campaign_id, &wallet).await.map_err(|e| {
         internal_error(format!("post_ops_start: list_sections_for_member failed for campaign {campaign_id}: {e}"))
     })?;
-    let first_section = sections.first();
-    let escort = site.kind != "dig" || req.escort.unwrap_or(true);
+    let named = match pick {
+        Pick::Section(id) => Some(named_section(&sections, id)?),
+        Pick::Any | Pick::Dig => None,
+    };
+    if named.is_some() && !escort {
+        return Err(bad_request("a Crew alone takes no squad"));
+    }
+    let dig = if site.kind == "dig" { Some(dig_start(&state, campaign_id, &wallet, escort, now, "post_ops_start").await?) } else { None };
+    let lead = if site.kind == "contract" { Some(usable_commander(&state, campaign_id, &wallet, true, now, "post_ops_start").await?) } else { None };
+    // BP-11a-1: the Section sent is the named one, else the member's first (oldest first; an
+    // unnamed start can't get past `Busy` with a squad out, so the first is never busy where it
+    // lands, BP-18a-1b-2). At 0 it has no one to send; after the Commander check, so a KIA
+    // Commander still answers first. A member with no Section passes, and the dig then has no
+    // at-0 check.
+    let first_section = named.or(sections.first());
     if escort && first_section.is_some_and(|s| s.headcount == 0) {
         return Err(conflict("no soldiers left to send: start a new run"));
     }
     let contract = lead.map(|commander_id| ContractStart { commander_id, section_id: first_section.map(|s| s.section_id) });
     let dig = dig.map(|d| DigStart { section_id: first_section.map(|s| s.section_id), escort, ..d });
     let op_seed = generate_seed();
-    match state.demo_ops.store.start_op(campaign_id, gw, Arc::clone(&board), &site, op_seed, dig, contract, now) {
+    match state.demo_ops.store.start_op_for(campaign_id, gw, Arc::clone(&board), &site, op_seed, dig, contract, named.is_some(), now) {
         Ok(()) => {}
         Err(StartRefusal::Busy) => return Err(conflict("an op is already under way")),
         Err(StartRefusal::Full) => return Err(service_unavailable("the ops board is full")),
@@ -563,7 +609,7 @@ async fn post_ops_start(
 /// raids, is the first usable one (not KIA, not Shattered: the mission route's refusals); a
 /// member holds at most one, so the client's raid fight picks the same. `409` when none is
 /// usable. The Crew is checked first, so a member with neither hears about the Crew.
-async fn dig_start(state: &AppState, campaign_id: Uuid, wallet: &[u8], route: &str) -> Result<DigStart, AppError> {
+async fn dig_start(state: &AppState, campaign_id: Uuid, wallet: &[u8], prefer_free: bool, now: DateTime<Utc>, route: &str) -> Result<DigStart, AppError> {
     let crews = state.crew_repo.list_crews_for_member(campaign_id, wallet).await.map_err(|e| {
         internal_error(format!("{route}: list_crews_for_member failed for campaign {campaign_id}: {e}"))
     })?;
@@ -574,29 +620,90 @@ async fn dig_start(state: &AppState, campaign_id: Uuid, wallet: &[u8], route: &s
         internal_error(format!("{route}: list_foremen_for_member failed for campaign {campaign_id}: {e}"))
     })?;
     let coolant = foremen.first().is_some_and(|f| f.specialization == ForemanSpecialization::CoolantJockey.as_str());
-    let commander_id = usable_commander(state, campaign_id, wallet, route).await?;
+    let commander_id = usable_commander(state, campaign_id, wallet, prefer_free, now, route).await?;
     Ok(DigStart { crew_id: crew.crew_id, commander_id, threshold: dig_threshold(coolant), section_id: None, escort: true })
 }
 
 /// The member's first usable Commander (BP-11a-2, extracted from `dig_start`): not KIA, not
 /// Shattered (the mission route's refusals). `409` when none is usable. A dig's raids and a
 /// contract's fight are both fought by this one.
-async fn usable_commander(state: &AppState, campaign_id: Uuid, wallet: &[u8], route: &str) -> Result<Uuid, AppError> {
+/// - **`prefer_free` (BP-18a-1b-2, spec check A1):** the first usable one the store does not
+///   hold busy (`busy_commanders`), else the first usable one, so when every usable Commander is
+///   out the store answers its own `409 every Commander is out` after today's refusals, and one
+///   squad picks exactly as before. Advisory: a start that lands between this read and the
+///   route's store call is answered by the store's `409`. A Crew-alone dig passes `false` (its
+///   Commander is the run-alive check only, A4; which one it records is never read, G-H), and so
+///   does a next (its squad is the leaving op's, A2).
+async fn usable_commander(state: &AppState, campaign_id: Uuid, wallet: &[u8], prefer_free: bool, now: DateTime<Utc>, route: &str) -> Result<Uuid, AppError> {
     let commanders = state.commander_repo.list_commanders_for_member(campaign_id, wallet).await.map_err(|e| {
         internal_error(format!("{route}: list_commanders_for_member failed for campaign {campaign_id}: {e}"))
     })?;
-    let Some(commander) = commanders.iter().find(|c| !c.is_kia && !c.is_shattered) else {
+    let usable: Vec<Uuid> = commanders.iter().filter(|c| !c.is_kia && !c.is_shattered).map(|c| c.commander_id).collect();
+    let Some(&first) = usable.first() else {
         return Err(conflict("no Commander left to lead: start a new run"));
     };
-    Ok(commander.commander_id)
+    if !prefer_free {
+        return Ok(first);
+    }
+    let busy = state.demo_ops.store.busy_commanders(campaign_id, &usable, now);
+    Ok(usable.iter().copied().find(|c| !busy.contains(c)).unwrap_or(first))
+}
+
+/// What a selector names before the member's Sections are read (BP-18a-1b-2).
+enum Pick<'a> {
+    Any,
+    Dig,
+    Section(&'a str),
+}
+
+/// A selector's two keys checked against each other (BP-18a-1b-2), in this order: both sent ->
+/// `400 unknown section`; then `slot`: `"dig"` where `slot_ok` (return, next) names the dig, and
+/// any other value, or any `slot` where it is not (start, escort), is `400 unknown section`;
+/// then `section_id`, checked against the member's Sections by `named_section`.
+fn selector_shape<'a>(section_id: Option<&'a str>, slot: Option<&str>, slot_ok: bool) -> Result<Pick<'a>, AppError> {
+    if section_id.is_some() && slot.is_some() {
+        return Err(bad_request("unknown section"));
+    }
+    match slot {
+        Some("dig") if slot_ok => return Ok(Pick::Dig),
+        Some(_) => return Err(bad_request("unknown section")),
+        None => {}
+    }
+    Ok(section_id.map_or(Pick::Any, Pick::Section))
+}
+
+/// The member's Section `id` names (BP-18a-1b-2): `400 unknown section` when it does not parse or
+/// is not one of `sections` (another member's Section included).
+fn named_section<'a>(sections: &'a [SectionRecord], id: &str) -> Result<&'a SectionRecord, AppError> {
+    let Ok(id) = Uuid::parse_str(id) else {
+        return Err(bad_request("unknown section"));
+    };
+    sections.iter().find(|s| s.section_id == id).ok_or_else(|| bad_request("unknown section"))
+}
+
+/// The squad a return or a next acts for (BP-18a-1b-2): `Any` -> none (the store's rule: one op
+/// out is that op, two are `400 say which squad`), `Dig` -> the dig slot, a Section -> that
+/// Section's contract or the dig it guards (`OpsEntry::select`).
+fn pick_squad(pick: Pick<'_>, sections: &[SectionRecord]) -> Result<Option<OpSquad>, AppError> {
+    Ok(match pick {
+        Pick::Any => None,
+        Pick::Dig => Some(OpSquad::Dig),
+        Pick::Section(id) => Some(OpSquad::Section(named_section(sections, id)?.section_id)),
+    })
 }
 
 /// Brings the team home, `POST /api/campaign/:campaign_id/ops/return` (BP-8a-2, demo-only).
-/// No body is read. Order: `401` → `429` `ops_ip` → `429` `ops_wallet` → `404` → `403` →
-/// `409` not `Active` (entry dropped) → `409` no op under way (also: no gateway) → the board
-/// → a pending raid latched → `409` no op under way → `400` say which squad (two ops out: a
-/// Crew-alone dig beside a contract, BP-18a-1b-1) → `409` already heading home → `409` still
-/// travelling → `409` raiders at the site → `200`, the whole state.
+/// No body is read; the squad is `?section_id=` or `?slot=dig` (BP-18a-1b-2). Order: `401` →
+/// `429` `ops_ip` → `429` `ops_wallet` → `400` unknown section (a repeated query key, counted)
+/// → `404` → `403` → `409` not `Active` (entry dropped) → `409` no op under way (also: no
+/// gateway) → the board → a pending raid latched → `400` unknown section (both keys, or a
+/// `slot` other than `dig`) → the member's Sections read, only when a Section is named (`500`
+/// on failure) → `400` unknown section (not the member's, or not an id) → `409` no op under way
+/// (also: the named squad holds none) → `400` say which squad (no squad named, two ops out) →
+/// `409` already heading home → `409` still travelling → `409` raiders at the site → `200`, the
+/// whole state.
+/// - `?section_id=S` selects the contract S leads, else the dig S guards (`escort_at` set); a
+///   Crew-alone dig's home Section names nothing (A4), and `?slot=dig` names any dig.
 /// - The homeward leg takes the site's `travel_secs` again (§4d: "each way"), not the
 ///   gateway's terrain: every gateway is City-State (×0.5), which would halve every trip home.
 /// - From a dig the team walks away and the ore on site is lost (`ended_by: walked_away`,
@@ -607,18 +714,36 @@ async fn post_ops_return(
     ci: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     Path(campaign_id): Path<Uuid>,
+    query: Result<Query<OpsSelector>, QueryRejection>,
 ) -> Result<Response, AppError> {
     if let Some(r) = ops_limits(&state, &token, ci, &headers)? {
         return Ok(r);
     }
+    let Query(sel) = match query {
+        Ok(q) => q,
+        // BP-18a-1b-2: a repeated key, the one rejection `OpsSelector`'s strings leave; counted
+        // by the limiters above, as a body rejection is.
+        Err(_) => return Err(bad_request("unknown section")),
+    };
     let now = Utc::now();
-    let (campaign, gateway, _) = ops_member(&state, &token, campaign_id, "post_ops_return").await?;
+    let (campaign, gateway, wallet) = ops_member(&state, &token, campaign_id, "post_ops_return").await?;
     let Some(gw) = gateway else {
         return Err(conflict("no op under way"));
     };
     let board = load_board(&state, &campaign, gw, now, false, "post_ops_return").await?;
     latch_pending_raid(&state, campaign_id, now, "post_ops_return").await?;
-    match state.demo_ops.store.return_op(campaign_id, now) {
+    // BP-18a-1b-2: the squad (`?section_id=` / `?slot=dig`). The member's Sections are read only
+    // when a Section is named (Linux S1), so a bare return reads nothing new.
+    let pick = selector_shape(sel.section_id.as_deref(), sel.slot.as_deref(), true)?;
+    let sections = if matches!(pick, Pick::Section(_)) {
+        state.section_repo.list_sections_for_member(campaign_id, &wallet).await.map_err(|e| {
+            internal_error(format!("post_ops_return: list_sections_for_member failed for campaign {campaign_id}: {e}"))
+        })?
+    } else {
+        Vec::new()
+    };
+    let squad = pick_squad(pick, &sections)?;
+    match state.demo_ops.store.return_op_for(campaign_id, squad, now) {
         Ok(()) => {}
         Err(ReturnRefusal::NoOp) => return Err(conflict("no op under way")),
         Err(ReturnRefusal::NotArrived) => return Err(conflict("still travelling")),
@@ -634,15 +759,22 @@ async fn post_ops_return(
 /// `ops_ip` → `429` `ops_wallet` → axum's body rejection, counted (`413` over `OPS_BODY_LIMIT`;
 /// `400`, `415`, `422`) → `404` → `403` → `409` not `Active` (entry dropped) → `409` no op under
 /// way (also: no gateway) → the board, a hit proven by `EXISTS` → a pending battle latched →
-/// `400` unknown site → the lead reads as `ops/start` (a dig: Crew, Foreman and Commander; a
-/// contract: Commander; `500` on failure, `409` none left) → the member's first Section read
-/// (`500` on failure) and `409` when it is at 0 → `409` no op under way → `400` say which squad
-/// (two ops out, BP-18a-1b-1) → `409` already heading home → `409` still travelling → `409`
-/// raiders at the site → `409` the guard hasn't reached the dig (BP-18a-1a: a dig whose guard
-/// does not stand) → `409` already there → `409` an op is already under way (a dig target while
-/// another slot holds the dig) → `409` another squad has that contract → `200`, the whole state.
-/// - BP-18a-1b-1: the moving squad is the op's own (the store copies the leaving op's Commander
-///   and Section into the new op); with one squad that is the route's pick.
+/// `400` unknown site → `400` unknown section (both `section_id` and `slot`, or a `slot` other
+/// than `dig`) → the member's Sections read (`500` on failure) → `400` unknown section (not the
+/// member's, or not an id) → the lead reads as `ops/start` (a dig: Crew, Foreman and Commander;
+/// a contract: Commander; `500` on failure, `409` none left; no busy pick) → `409` no soldiers
+/// left when the moving op's Section is at 0 (the member's first when the selection finds no
+/// op, Linux Q3) → `409` no op under way (also: the named squad holds none) → `400` say which
+/// squad (no squad named, two ops out, BP-18a-1b-1) → `409` already heading home → `409` still
+/// travelling → `409` raiders at the site → `409` the guard hasn't reached the dig (BP-18a-1a: a
+/// dig whose guard does not stand) → `409` already there → `409` an op is already under way (a
+/// dig target while another slot holds the dig) → `409` another squad has that contract → `200`,
+/// the whole state.
+/// - BP-18a-1b-2: `section_id` (or `slot: "dig"`) names the op that moves, not a squad sent. The
+///   moving squad is the op's own (BP-18a-1b-1: the store copies the leaving op's Commander and
+///   Section into the new op), so the lead reads pick with no busy preference; the at-0 check
+///   reads that op's Section (`squad_section`), an advisory read the store re-answers under its
+///   own lock.
 /// - A new op from the team's own hex (`next_op`): the hop's hexes at the target's seconds per
 ///   hex, at least 1 s; home from there is the target's own time.
 /// - The ore on a dig's site is walked away from, as `ops/return`; an unfought contract stays on
@@ -676,19 +808,28 @@ async fn post_ops_next(
     let Some(site) = state.demo_ops.store.site(campaign_id, &board, &req.site_id, now) else {
         return Err(bad_request("unknown site"));
     };
-    let dig = if site.kind == "dig" { Some(dig_start(&state, campaign_id, &wallet, "post_ops_next").await?) } else { None };
-    let lead = if site.kind == "contract" { Some(usable_commander(&state, campaign_id, &wallet, "post_ops_next").await?) } else { None };
+    // BP-18a-1b-2: the squad that moves (`section_id`, or `slot: "dig"`). Its Section, not the
+    // member's first, is the one the at-0 check reads (A2: the store moves the leaving op's squad).
+    let pick = selector_shape(req.section_id.as_deref(), req.slot.as_deref(), true)?;
     let sections = state.section_repo.list_sections_for_member(campaign_id, &wallet).await.map_err(|e| {
         internal_error(format!("post_ops_next: list_sections_for_member failed for campaign {campaign_id}: {e}"))
     })?;
-    let first_section = sections.first();
+    let squad = pick_squad(pick, &sections)?;
+    let dig = if site.kind == "dig" { Some(dig_start(&state, campaign_id, &wallet, false, now, "post_ops_next").await?) } else { None };
+    let lead = if site.kind == "contract" { Some(usable_commander(&state, campaign_id, &wallet, false, now, "post_ops_next").await?) } else { None };
+    // The moving op's Section (`squad_section`), else the member's first when the selection finds
+    // no op (Linux Q3: the at-0 check then answers before the store's own refusal, as today).
+    let first_section = match state.demo_ops.store.squad_section(campaign_id, squad, now) {
+        Some(s) => s.and_then(|id| sections.iter().find(|r| r.section_id == id)),
+        None => sections.first(),
+    };
     if first_section.is_some_and(|s| s.headcount == 0) {
         return Err(conflict("no soldiers left to send: start a new run"));
     }
     let contract = lead.map(|commander_id| ContractStart { commander_id, section_id: first_section.map(|s| s.section_id) });
     let dig = dig.map(|d| DigStart { section_id: first_section.map(|s| s.section_id), ..d });
     let op_seed = generate_seed();
-    match state.demo_ops.store.next_op(campaign_id, &site, op_seed, dig, contract, now) {
+    match state.demo_ops.store.next_op_for(campaign_id, squad, &site, op_seed, dig, contract, now) {
         Ok(()) => {}
         Err(NextRefusal::NoOp) => return Err(conflict("no op under way")),
         Err(NextRefusal::AlreadyHomeward) => return Err(conflict("already heading home")),
@@ -766,13 +907,20 @@ async fn post_ops_drill(
 }
 
 /// Sends the Section to guard an unescorted dig, `POST /api/campaign/:campaign_id/ops/escort`
-/// (BP-17a, demo-only; §4e B2's "go guard the dig"). No body is read. Order: `401` → `429`
-/// `ops_ip` → `429` `ops_wallet` → `404` → `403` → `409` not `Active` (entry dropped) → `409` no
-/// op under way (also: no gateway) → the board → a pending battle latched → the Commander read
-/// (`500` on failure) and `409` no Commander left → the member's first Section read (`500` on
-/// failure) and `409` when it is at 0 → `409` no op under way → `409` not a dig site → `409`
-/// already heading home → `409` already guarded → `409` that squad is out (the first Section
-/// leads a contract, BP-18a-1b-1) → `409` every Commander is out → `200`, the whole state.
+/// (BP-17a, demo-only; §4e B2's "go guard the dig"). No body is read; `?section_id=` names the
+/// Section sent (BP-18a-1b-2). Order: `401` → `429` `ops_ip` → `429` `ops_wallet` → `400`
+/// unknown section (a repeated query key, counted) → `404` → `403` → `409` not `Active` (entry
+/// dropped) → `409` no op under way (also: no gateway) → the board → a pending battle latched →
+/// `400` unknown section (any `slot`, or both keys) → the member's Sections read (`500` on
+/// failure) → `400` unknown section (not the member's, or not an id) → the Commander read (`500`
+/// on failure) and `409` no Commander left → `409` no soldiers left when the Section chosen is at
+/// 0 → `409` no op under way → `409` not a dig site → `409` already heading home → `409` already
+/// guarded → `409` that squad is out (the Section chosen is busy, BP-18a-1b-1) → `409` every
+/// Commander is out → `200`, the whole state.
+/// - **Picks (BP-18a-1b-2, A1/A3):** the Section is the named one, else the first the store does
+///   not hold busy, else the first; the Commander is the first usable one not busy, else the
+///   first usable one. Advisory: a start that lands between the busy reads and this escort is
+///   answered by the store's `409`.
 /// - The guard stands from `now` + the site's `travel_secs` (`dig.escort_at`): a battle born
 ///   before then is still the Crew's.
 /// - Memory only, no DB write, so no launch lock.
@@ -782,10 +930,16 @@ async fn post_ops_escort(
     ci: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     Path(campaign_id): Path<Uuid>,
+    query: Result<Query<OpsSelector>, QueryRejection>,
 ) -> Result<Response, AppError> {
     if let Some(r) = ops_limits(&state, &token, ci, &headers)? {
         return Ok(r);
     }
+    let Query(sel) = match query {
+        Ok(q) => q,
+        // BP-18a-1b-2: a repeated key, as `ops/return`.
+        Err(_) => return Err(bad_request("unknown section")),
+    };
     let now = Utc::now();
     let (campaign, gateway, wallet) = ops_member(&state, &token, campaign_id, "post_ops_escort").await?;
     let Some(gw) = gateway else {
@@ -793,11 +947,22 @@ async fn post_ops_escort(
     };
     let board = load_board(&state, &campaign, gw, now, false, "post_ops_escort").await?;
     latch_pending_raid(&state, campaign_id, now, "post_ops_escort").await?;
-    let commander_id = usable_commander(&state, campaign_id, &wallet, "post_ops_escort").await?;
+    // BP-18a-1b-2: the Section sent (`?section_id=`; any `slot` is refused, since escort always
+    // targets the dig), else the first Section the store does not hold busy, else the first, so
+    // the store answers `409 that squad is out` after today's refusals (spec check A3).
+    let pick = selector_shape(sel.section_id.as_deref(), sel.slot.as_deref(), false)?;
     let sections = state.section_repo.list_sections_for_member(campaign_id, &wallet).await.map_err(|e| {
         internal_error(format!("post_ops_escort: list_sections_for_member failed for campaign {campaign_id}: {e}"))
     })?;
-    let first_section = sections.first();
+    let first_section = match pick {
+        Pick::Section(id) => Some(named_section(&sections, id)?),
+        Pick::Any | Pick::Dig => {
+            let ids: Vec<Uuid> = sections.iter().map(|s| s.section_id).collect();
+            let busy = state.demo_ops.store.busy_sections(campaign_id, &ids, now);
+            sections.iter().find(|s| !busy.contains(&s.section_id)).or(sections.first())
+        }
+    };
+    let commander_id = usable_commander(&state, campaign_id, &wallet, true, now, "post_ops_escort").await?;
     if first_section.is_some_and(|s| s.headcount == 0) {
         return Err(conflict("no soldiers left to send"));
     }
@@ -3375,5 +3540,291 @@ mod tests {
         assert_eq!(section_headcount(&state, first).await, 7);
         let left = state.demo_ops.store.pending_raid(c, chrono::Utc::now()).expect("the unfought one");
         assert_eq!((left.commander_id, left.section_id), (unfought, Some(second)));
+    }
+
+    // ---- BP-18a-1b-2: the second op, route half. C1/S1 are the member's first (the join's);
+    // C2/S2 are written one second later, so they sort second (`(created_at, id)`).
+
+    /// A second Commander for the member, created 1 s after the first. Tests that seed one never
+    /// call `fight_logged*` (`commander_of` asserts exactly one).
+    async fn second_commander(state: &AppState, campaign: Uuid) -> Uuid {
+        let all = state.commander_repo.list_commanders_for_member(campaign, &WALLET).await.expect("list");
+        let first = all.first().expect("the first Commander");
+        let mut c = crate::commander_gen::generate_commander(WALLET.to_vec(), campaign, 43);
+        c.created_at = first.created_at + chrono::Duration::seconds(1);
+        let id = c.commander_id;
+        state.commander_repo.create_commander(c).await.expect("create_commander");
+        let all = state.commander_repo.list_commanders_for_member(campaign, &WALLET).await.expect("list");
+        assert_eq!(all.iter().map(|c| c.commander_id).collect::<Vec<_>>(), vec![first.commander_id, id], "C2 sorts second");
+        id
+    }
+
+    /// A second Section for the member (8 soldiers), created 1 s after the first, which is
+    /// written first when there is none. Returns `(S1, S2)`.
+    async fn second_section(state: &AppState, campaign: Uuid) -> (Uuid, Uuid) {
+        let first = member_section(state, campaign).await;
+        let created = state.section_repo.get_section(first).await.unwrap().expect("the first").created_at;
+        let mut s = crate::repository::section::starter_section(campaign, WALLET.to_vec());
+        s.created_at = created + chrono::Duration::seconds(1);
+        let id = s.section_id;
+        state.section_repo.create_section(s).await.expect("create_section");
+        assert_eq!(member_section(state, campaign).await, first, "S1 stays first");
+        (first, id)
+    }
+
+    /// A contract campaign: `Active`, the sector seeded, one Commander.
+    async fn contract_campaign(state: &Arc<AppState>) -> Uuid {
+        let c = campaign_with(state, WALLET, true, Some(GATEWAY)).await;
+        seed_sector(state, &c).await;
+        seed_commander(state, c.campaign_id).await;
+        c.campaign_id
+    }
+
+    async fn start_body(state: &Arc<AppState>, campaign: Uuid, body: serde_json::Value) -> (StatusCode, serde_json::Value, Vec<u8>) {
+        post(state, campaign, "start", Some(&body.to_string())).await
+    }
+
+    async fn next_body(state: &Arc<AppState>, campaign: Uuid, body: serde_json::Value) -> (StatusCode, serde_json::Value, Vec<u8>) {
+        post(state, campaign, "next", Some(&body.to_string())).await
+    }
+
+    /// A dig campaign with a contract out (S1/C1) and a Crew-alone dig beside it, both on site.
+    /// Returns the campaign and S1.
+    async fn contract_and_crew_alone(state: &Arc<AppState>) -> (Uuid, Uuid) {
+        let (c, _) = dig_campaign(state, false).await;
+        let s1 = member_section(state, c).await;
+        let (status, body, _) = start(state, c, SITE).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body, _) = start_alone(state, c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        state.demo_ops.store.rewind_op(c, 120);
+        (c, s1)
+    }
+
+    fn err(body: &serde_json::Value) -> Option<&str> {
+        body["error"].as_str()
+    }
+
+    /// T1 (§5 a): with C1/S1 on a contract, a start that names S2 takes the free Commander C2.
+    #[tokio::test]
+    async fn ops_start_names_a_second_squad() {
+        let state = Arc::new(session_state());
+        let c = contract_campaign(&state).await;
+        second_commander(&state, c).await;
+        let (_, s2) = second_section(&state, c).await;
+        let (status, body, _) = start(&state, c, SITE).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body, _) = start_body(&state, c, serde_json::json!({ "site_id": NEXT_SITE, "section_id": s2 })).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// T2 (§5 b): a contract (S1/C1) and a Crew-alone dig; the guard sent by name (S2) takes the
+    /// free Commander C2.
+    #[tokio::test]
+    async fn ops_escort_names_its_section_and_takes_a_free_commander() {
+        let state = Arc::new(session_state());
+        let (c, _) = dig_campaign(&state, false).await;
+        second_commander(&state, c).await;
+        let (_, s2) = second_section(&state, c).await;
+        assert_eq!(start(&state, c, SITE).await.0, StatusCode::OK);
+        assert_eq!(start_alone(&state, c).await.0, StatusCode::OK);
+        state.demo_ops.store.rewind_op(c, 120);
+        let (status, body, _) = post(&state, c, &format!("escort?section_id={s2}"), None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["active_op"]["dig"]["escort_at"].is_string(), "{body}");
+    }
+
+    /// T3 (§5 c): the same state; a bare escort sends the first free Section (S2) and the free
+    /// Commander (C2).
+    #[tokio::test]
+    async fn ops_escort_sends_the_first_free_section() {
+        let state = Arc::new(session_state());
+        let (c, _) = dig_campaign(&state, false).await;
+        second_commander(&state, c).await;
+        second_section(&state, c).await;
+        assert_eq!(start(&state, c, SITE).await.0, StatusCode::OK);
+        assert_eq!(start_alone(&state, c).await.0, StatusCode::OK);
+        state.demo_ops.store.rewind_op(c, 120);
+        let (status, body, _) = post(&state, c, "escort", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["active_op"]["dig"]["escort_at"].is_string(), "{body}");
+    }
+
+    /// T4: both keys sent is `400 unknown section` on return, next and start (one contract out).
+    #[tokio::test]
+    async fn ops_selector_with_both_keys_is_400() {
+        let state = Arc::new(session_state());
+        let c = contract_campaign(&state).await;
+        let s1 = member_section(&state, c).await;
+        assert_eq!(start(&state, c, SITE).await.0, StatusCode::OK);
+        let (status, body, _) = post(&state, c, &format!("return?section_id={s1}&slot=dig"), None).await;
+        assert_eq!((status, err(&body)), (StatusCode::BAD_REQUEST, Some("unknown section")));
+        let (status, body, _) = next_body(&state, c, serde_json::json!({ "site_id": NEXT_SITE, "section_id": s1, "slot": "dig" })).await;
+        assert_eq!((status, err(&body)), (StatusCode::BAD_REQUEST, Some("unknown section")));
+        let (status, body, _) = start_body(&state, c, serde_json::json!({ "site_id": NEXT_SITE, "section_id": s1, "slot": "dig" })).await;
+        assert_eq!((status, err(&body)), (StatusCode::BAD_REQUEST, Some("unknown section")));
+    }
+
+    /// T5: `slot` selects only the dig, and only on return and next.
+    #[tokio::test]
+    async fn ops_selector_slot_is_dig_only_where_it_selects() {
+        let state = Arc::new(session_state());
+        let c = contract_campaign(&state).await;
+        member_section(&state, c).await;
+        let (status, body, _) = post(&state, c, "return?slot=contract", None).await;
+        assert_eq!((status, err(&body)), (StatusCode::BAD_REQUEST, Some("unknown section")));
+        let (status, body, _) = post(&state, c, "escort?slot=dig", None).await;
+        assert_eq!((status, err(&body)), (StatusCode::BAD_REQUEST, Some("unknown section")));
+        let (status, body, _) = start_body(&state, c, serde_json::json!({ "site_id": SITE, "slot": "dig" })).await;
+        assert_eq!((status, err(&body)), (StatusCode::BAD_REQUEST, Some("unknown section")));
+    }
+
+    /// T6 (§5 d): another wallet's real Section in the same campaign is not the member's, on
+    /// every route (no op out, so each call reaches the selector).
+    #[tokio::test]
+    async fn ops_selector_names_only_the_members_sections() {
+        let state = Arc::new(session_state());
+        let c = contract_campaign(&state).await;
+        member_section(&state, c).await;
+        let foreign = crate::repository::section::starter_section(c, OTHER.to_vec());
+        let f = foreign.section_id;
+        state.section_repo.create_section(foreign).await.expect("create_section");
+        let (status, body, _) = start_body(&state, c, serde_json::json!({ "site_id": SITE, "section_id": f })).await;
+        assert_eq!((status, err(&body)), (StatusCode::BAD_REQUEST, Some("unknown section")), "start");
+        let (status, body, _) = post(&state, c, &format!("return?section_id={f}"), None).await;
+        assert_eq!((status, err(&body)), (StatusCode::BAD_REQUEST, Some("unknown section")), "return");
+        let (status, body, _) = next_body(&state, c, serde_json::json!({ "site_id": NEXT_SITE, "section_id": f })).await;
+        assert_eq!((status, err(&body)), (StatusCode::BAD_REQUEST, Some("unknown section")), "next");
+        let (status, body, _) = post(&state, c, &format!("escort?section_id={f}"), None).await;
+        assert_eq!((status, err(&body)), (StatusCode::BAD_REQUEST, Some("unknown section")), "escort");
+    }
+
+    /// T7: an id that doesn't parse is our `400`; a non-string in the body is axum's `422`.
+    #[tokio::test]
+    async fn ops_selector_an_unparsed_id_is_400() {
+        let state = Arc::new(session_state());
+        let c = contract_campaign(&state).await;
+        member_section(&state, c).await;
+        let (status, body, _) = start_body(&state, c, serde_json::json!({ "site_id": SITE, "section_id": "nope" })).await;
+        assert_eq!((status, err(&body)), (StatusCode::BAD_REQUEST, Some("unknown section")), "start");
+        let (status, body, _) = next_body(&state, c, serde_json::json!({ "site_id": NEXT_SITE, "section_id": "nope" })).await;
+        assert_eq!((status, err(&body)), (StatusCode::BAD_REQUEST, Some("unknown section")), "next");
+        let (status, body, _) = post(&state, c, "return?section_id=nope", None).await;
+        assert_eq!((status, err(&body)), (StatusCode::BAD_REQUEST, Some("unknown section")), "return");
+        let (status, body, _) = post(&state, c, "escort?section_id=nope", None).await;
+        assert_eq!((status, err(&body)), (StatusCode::BAD_REQUEST, Some("unknown section")), "escort");
+        let (status, _, _) = start_body(&state, c, serde_json::json!({ "site_id": SITE, "section_id": 5 })).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// T8: a repeated query key is `400 unknown section`, our text (N10: axum's own rejection is
+    /// a 400 too, so the text is what decides).
+    #[tokio::test]
+    async fn ops_selector_a_repeated_key_is_400() {
+        let state = Arc::new(session_state());
+        let c = contract_campaign(&state).await;
+        let (status, body, _) = post(&state, c, "return?section_id=a&section_id=b", None).await;
+        assert_eq!((status, err(&body)), (StatusCode::BAD_REQUEST, Some("unknown section")), "return");
+        let (status, body, _) = post(&state, c, "escort?section_id=a&section_id=b", None).await;
+        assert_eq!((status, err(&body)), (StatusCode::BAD_REQUEST, Some("unknown section")), "escort");
+    }
+
+    /// T9 (§5 e): a Crew-alone dig takes no squad.
+    #[tokio::test]
+    async fn ops_start_a_crew_alone_takes_no_squad() {
+        let state = Arc::new(session_state());
+        let (c, _) = dig_campaign(&state, false).await;
+        let s1 = member_section(&state, c).await;
+        let (status, body, _) = start_body(&state, c, serde_json::json!({ "site_id": DIG, "escort": false, "section_id": s1 })).await;
+        assert_eq!((status, err(&body)), (StatusCode::BAD_REQUEST, Some("a Crew alone takes no squad")));
+        assert!(state.demo_ops.store.op_view(c, chrono::Utc::now()).is_none(), "no op starts");
+    }
+
+    /// T10 (§5 f): two ops out, a return or a next that names no squad is `400 say which squad`.
+    #[tokio::test]
+    async fn ops_two_ops_a_bare_return_or_next_says_which() {
+        let state = Arc::new(session_state());
+        let (c, _) = contract_and_crew_alone(&state).await;
+        let (status, body, _) = post(&state, c, "return", None).await;
+        assert_eq!((status, err(&body)), (StatusCode::BAD_REQUEST, Some("say which squad")), "return");
+        let (status, body, _) = next(&state, c, NEXT_SITE).await;
+        assert_eq!((status, err(&body)), (StatusCode::BAD_REQUEST, Some("say which squad")), "next");
+    }
+
+    /// T11 (§5 g; one Section, one Commander): `?section_id=S1` names the dig S1 guards, the
+    /// contract S1 leads beside a Crew-alone dig, and nothing when S1 only stands at home (A4).
+    #[tokio::test]
+    async fn ops_return_by_section_names_its_op() {
+        let state = Arc::new(session_state());
+        // (i) a guarded dig.
+        let (c, _) = dig_campaign(&state, false).await;
+        let s1 = member_section(&state, c).await;
+        dig_on_site(&state, c, 2).await;
+        let (status, body, _) = post(&state, c, &format!("return?section_id={s1}"), None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!((body["active_op"]["kind"].as_str(), body["active_op"]["leg"].as_str()), (Some("dig"), Some("homeward")));
+        // (ii) a contract S1 leads, beside a Crew-alone dig: the contract goes home, the dig stays.
+        let (c, s1) = contract_and_crew_alone(&state).await;
+        let (status, body, _) = post(&state, c, &format!("return?section_id={s1}"), None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!((body["active_op"]["kind"].as_str(), body["active_op"]["leg"].as_str()), (Some("dig"), Some("outbound")));
+        // (iii) a Crew-alone dig alone: its home Section names nothing (G-F).
+        let (c, _) = dig_campaign(&state, false).await;
+        let s1 = member_section(&state, c).await;
+        alone_on_site(&state, c, 2).await;
+        let (status, body, _) = post(&state, c, &format!("return?section_id={s1}"), None).await;
+        assert_eq!((status, err(&body)), (StatusCode::CONFLICT, Some("no op under way")));
+    }
+
+    /// T12 (§5 h): `?slot=dig` brings the Crew home and leaves the contract out.
+    #[tokio::test]
+    async fn ops_return_by_slot_names_the_dig() {
+        let state = Arc::new(session_state());
+        let (c, _) = contract_and_crew_alone(&state).await;
+        let (status, body, _) = post(&state, c, "return?slot=dig", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!((body["active_op"]["kind"].as_str(), body["active_op"]["leg"].as_str()), (Some("dig"), Some("homeward")));
+    }
+
+    /// T13 (§5 i, reversed): S2 leads the contract and S1, the member's first, is at 0; a bare
+    /// next reads the moving op's Section (S2, 8 soldiers) and goes.
+    #[tokio::test]
+    async fn ops_next_reads_the_moving_squads_section() {
+        let state = Arc::new(session_state());
+        let c = contract_campaign(&state).await;
+        let (s1, s2) = second_section(&state, c).await;
+        let (status, body, _) = start_body(&state, c, serde_json::json!({ "site_id": SITE, "section_id": s2 })).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        state.demo_ops.store.rewind_op(c, 120);
+        state.section_repo.update_headcount(s1, 0).await.expect("update_headcount");
+        let (status, body, _) = next(&state, c, NEXT_SITE).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// T14: no `more_ops` key with no op or with one.
+    #[tokio::test]
+    async fn ops_more_ops_is_absent_with_one_op_or_none() {
+        let state = Arc::new(session_state());
+        let c = contract_campaign(&state).await;
+        let (status, body) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.get("more_ops").is_none(), "no op: {body}");
+        let (status, body, _) = start(&state, c, SITE).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.get("more_ops").is_none(), "one op: {body}");
+    }
+
+    /// T15: a contract beside a Crew-alone dig: the dig is `active_op`, the contract `more_ops`.
+    #[tokio::test]
+    async fn ops_more_ops_lists_the_other_op() {
+        let state = Arc::new(session_state());
+        let (c, s1) = contract_and_crew_alone(&state).await;
+        let (status, body) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["active_op"]["kind"], "dig");
+        let more = body["more_ops"].as_array().expect("more_ops");
+        assert_eq!(more.len(), 1, "{body}");
+        assert_eq!(more[0]["section_id"], s1.to_string());
+        assert_eq!(more[0]["op"]["kind"], "contract");
     }
 }
