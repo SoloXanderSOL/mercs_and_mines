@@ -454,10 +454,12 @@ function sectionRows(s) {
       rows.push(line(COMPANY_COPY.back));
     }
   }
-  // BP-18b-1: a Section an op holds is led by that op's Commander; any other by the campaign's.
+  // BP-18b-1: a Section an op holds is led by that op's Commander. BP-18b-2b (R9): any other by the Commander its
+  // start would send (demo_ops.js's mirror), else the campaign's when none is free.
   const leaderId = view.leaderOf(s.section_id);
   const r = roster();
-  const c = (leaderId && r && Array.isArray(r.commanders) ? r.commanders.find(x => x.commander_id === leaderId) : null) || campaignCommander();
+  const free = leaderId ? null : view.freeLead();
+  const c = (leaderId && r && Array.isArray(r.commanders) ? r.commanders.find(x => x.commander_id === leaderId) : null) || (free) || campaignCommander();
   if (c) rows.push(line(fill(COMPANY_COPY.led, { name: c.name, xp: xpLine(c.xp, c.rank), n: c.stress }), true));
   rows.push(line(COMPANY_COPY.kit, true), line(fill(COMPANY_COPY.bank, { n: credits })));
   if (b.wounded > 0 && b.healing === 0) {
@@ -623,7 +625,7 @@ export function dressBriefing() {
 }
 
 // `d`: demo_ops.js's deps (main.js's $, getRoster, ...); `v`: demo_ops.js's view of its state
-// (adopted, credits, out, sectionOut, leaderOf, fightSection, company, hired, clearHired, hire, held, serverNow,
+// (adopted, credits, out, sectionOut, leaderOf, freeLead, fightSection, company, hired, clearHired, hire, held, serverNow,
 // bay, bayOf, squadOf, trophies, notice, clearNotice, heal, replace).
 export function mountCompany(d, v) {
   deps = d;

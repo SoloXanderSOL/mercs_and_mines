@@ -34,6 +34,10 @@
 // shown op (shownKey: 'dig' or a contract's section_id), and Other squad switches it when two or more are
 // out. Every strip route names the shown op. A contract's fight latches per op (wonBy), and an op whose
 // Commander can't lead offers no Fight.
+//
+// BP-18b-2b: with two Sections and no op out, a start's Go or Guarded opens a squad picker. With an op out, Other
+// squad also reaches a Section at home (shownKey 'home:<section_id>', under which shownOp() is null), whose start
+// sheet sends it. Every such sheet names the Commander the start sends (the server's prefer_free, mirrored).
 
 import { request, ApiError, store, getMissions, getRoster } from './api.js';
 import { onMapCreated } from './hexmap.js';
@@ -102,6 +106,15 @@ const COPY = {
   outCrew: 'the Crew',
   noLead: "{name} can't lead this fight. Another Commander takes over when one is free.",
   taken: 'The other squad holds that contract.',
+  // BP-18b-2b (Wiki copy)
+  leads: 'Leads: {name}',
+  noneFree: 'No Commander is free to lead.',
+  atBase: '{name} is at base. Tap a site to send them.',
+  digHeld: 'The Crew is already at a dig. One dig at a time.',
+  outOne: 'Out: {a} at {x}.',
+  outThree: 'Out: {a} at {x}, {b} at {y}, {c} at {z}.',
+  pickFit: '{name} · {n} fit',
+  pickEmpty: '{name} · no soldiers',
 };
 
 // Refusals the client keys on by exact text (routes/ops.rs; a server reword changes this block in the same brick).
@@ -253,7 +266,8 @@ let sites = [];
 let gateway = null;
 let op = null;          // the server's active_op, kept until a homeward leg arrives
 let lastBody = null;    // BP-18b-2a: the last adopted body, for opsOut()
-let shownKey = null;    // BP-18b-2a: the op the strip shows, by opKey
+let shownKey = null;    // BP-18b-2a: the op the strip shows, by opKey; BP-18b-2b: or 'home:<section_id>', a Section at home
+let picker = false;     // BP-18b-2b: the squad picker is up on the open sheet
 let prevOps = null;     // BP-18b-2a: the last body's ops by opKey, { kind, leg, fought }, for the per-op latch
 let wonBy = new Map();  // BP-18b-2a: the pay each latched contract reports, by opKey
 let offset = 0;         // server clock minus browser clock, from the last adopted body
@@ -356,27 +370,53 @@ const homeClear = o => o.leg === 'homeward' && !(o.dig && o.dig.ambush) && progr
 const opsOut = () => [op, ...((lastBody && lastBody.more_ops) || []).map(m => m.op)].filter(o => o && !homeClear(o));
 // An op's key: the dig is 'dig', a contract its Section.
 const opKey = o => (o.kind === 'dig' ? 'dig' : o.section_id || null);
-// The op the strip shows: the one shownKey names, else active_op (the first out).
-const shownOp = () => { const all = opsOut(); return all.find(o => opKey(o) === shownKey) || all[0] || null; };
+// BP-18b-2b: the Section a home key names, else null.
+const homeKey = () => (typeof shownKey === 'string' && shownKey.startsWith('home:') ? shownKey.slice(5) : null);
+// The op the strip shows: the one shownKey names, else active_op (the first out); none under a home key (R2).
+const shownOp = () => { if (homeKey() !== null) return null; const all = opsOut(); return all.find(o => opKey(o) === shownKey) || all[0] || null; };
 // What the strip shows of an op mid-leg: how many ops are out (Other squad and the out line follow it), which op,
 // its leg and whether it has arrived (`p`: its progress).
 const phaseOf = (o, p) => `${opsOut().length}:${opKey(o)}:${o.leg}:${p >= 1}`;
-// "Other squad" ends every strip of an op while two or more are out (R5).
-const withOther = acts => (opsOut().length >= 2 ? [...acts, [COPY.other, otherSquad]] : acts);
+// BP-18b-2b: the roster's Sections and Commanders (main.js's kept roster), in roster order.
+const rosterSections = () => { const r = deps.getRoster(); return r && Array.isArray(r.sections) ? r.sections : []; };
+const rosterCommanders = () => { const r = deps.getRoster(); return r && Array.isArray(r.commanders) ? r.commanders : []; };
+// BP-18b-2b (R2): the Sections at home: soldiers, and no op out carries them.
+function homeSquads() {
+  const held = new Set(opsOut().map(o => o.section_id).filter(Boolean));
+  return rosterSections().filter(s => (s.headcount > 0) && (!held.has(s.section_id)));
+}
+// BP-18b-2b (R2, Linux H4): Other squad shows with two ops out, or with one op out and a Section at home of two or more.
+const canOther = () => opsOut().length >= 2 || ((rosterSections().length >= 2) && homeSquads().length >= 1 && (opsOut().length >= 1));
+// The home phase draw() compares (R4): an op landing home redraws the out line and Other squad.
+const homePhase = () => `home:${opsOut().length}:${homeSquads().length}`;
+// "Other squad" ends every strip of an op while canOther() holds (R5 of BP-18b-2a; R2).
+const withOther = acts => (canOther() ? [...acts, [COPY.other, otherSquad]] : acts);
+// BP-18b-2b (R8, Reviewer BP-18b-1 F3): the Commander a named start sends, as the server's prefer_free picks it: the
+// first usable one (unusableLead's test) that no op out carries; null when none is free (a named start then answers
+// 409 every Commander is out).
+function freeLead() {
+  const busy = new Set(opsOut().map(o => o.commander_id).filter(Boolean));
+  return rosterCommanders().find(c => (!c.is_kia && !(c.is_shattered || c.stress >= 100)) && (!busy.has(c.commander_id))) || null;
+}
+// The sheet's first line with two or more Commanders: who leads, or that nobody is free; [] with one.
+const leadLines = () => (rosterCommanders().length >= 2 ? [freeLead() ? fill(COPY.leads, { name: freeLead().name }) : COPY.noneFree] : []);
+const noneFree = () => rosterCommanders().length >= 2 && !freeLead();
 // The roster's Commander an op names, when KIA or Shattered (as battle.js's patchRoster keeps them); else null.
 function unusableLead(o) {
   const roster = deps.getRoster();
   const c = o && o.commander_id && roster && Array.isArray(roster.commanders) ? roster.commanders.find(x => x.commander_id === o.commander_id) : null;
   return c && (c.is_kia || c.is_shattered || c.stress >= 100) ? c : null;
 }
-// The out line with two ops out: each op's Section name (the Crew for a Crew-alone dig) and its site.
+// The out line: each op's Section name (the Crew for a Crew-alone dig) and its site, in opsOut() order. Two or three
+// ops anywhere; one op only under a home key (the home hub and home sheets, BP-18b-2b R5).
 function outLine() {
   const all = opsOut();
-  if (all.length !== 2) return '';
-  const roster = deps.getRoster();
-  const sections = roster && Array.isArray(roster.sections) ? roster.sections : [];
+  const sections = rosterSections();
   const who = o => (o.section_id ? (sections.find(s => s.section_id === o.section_id) || {}).name || '' : COPY.outCrew);
-  return fill(COPY.outTwo, { a: who(all[0]), x: opTitle(all[0]), b: who(all[1]), y: opTitle(all[1]) });
+  if (all.length === 1 && homeKey() !== null) return fill(COPY.outOne, { a: who(all[0]), x: opTitle(all[0]) });
+  if (all.length === 2) return fill(COPY.outTwo, { a: who(all[0]), x: opTitle(all[0]), b: who(all[1]), y: opTitle(all[1]) });
+  if ((all.length === 3)) return fill(COPY.outThree, { a: who(all[0]), x: opTitle(all[0]), b: who(all[1]), y: opTitle(all[1]), c: who(all[2]), z: opTitle(all[2]) });
+  return '';
 }
 // The Crew fight line (spec check F2): every result but a raid held is the op's last fight and shows as is;
 // a raid held can be followed by another fight, so it shows only outbound while no guard stands.
@@ -430,8 +470,8 @@ function el(tag, className, text) {
   return node;
 }
 
-// `lines`: up to three strings; `acts`: up to four [text, onClick, disabled] buttons. The out line follows
-// the lines whenever two ops are out (BP-18b-2a).
+// `lines`: up to four strings (BP-18b-2b: a sheet's Leads line is the fourth node); `acts`: up to four
+// [text, onClick, disabled] buttons. The out line follows the lines (outLine decides when, BP-18b-2a/2b).
 function setStrip(title, lines, acts, danger) {
   titleNode.hidden = !title;
   titleNode.textContent = title || '';
@@ -477,6 +517,7 @@ function refresh() {
     hideStrip();
     hideDig(dig);
     if (so) shownPhase = phaseOf(so, progress(so));
+    else if (homeKey() !== null) shownPhase = homePhase(); // BP-18b-2b: no redraw per frame under a sheet
     if (so && progress(so) < 1) shownSecs = secsLeft(so);
     if (baseOpen) {
       list.node.hidden = true;
@@ -530,7 +571,13 @@ function refresh() {
     }
     return setStrip('', [fill(COPY.onSite, { title }), rate], withOther([[COPY.ret, sendReturn]]));
   }
+  const home = homeKey();
+  if (home !== null) shownPhase = homePhase(); // BP-18b-2b (R4): draw redraws a home key's strip or sheet on a change
   if (selected) return showSheet(selected);
+  if (home !== null) { // BP-18b-2b (R5): the home hub
+    const s = rosterSections().find(x => x.section_id === home);
+    return setStrip('', [fill(COPY.atBase, { name: s ? s.name : '' }), rate], withOther([]));
+  }
   if (bankNote) return setStrip('', [bankNote, rate], [[BASE_COPY.button, openBase], [COPY.close, close]]);
   if (crewNote) return setStrip('', [crewNote, rate], [[COPY.close, close]]);
   if (noDigOpen) return setStrip('', [COPY.noDig, rate], [[COPY.close, close]]);
@@ -577,23 +624,62 @@ function armGuard(o) {
 }
 
 function showSheet(site) {
+  if (picker) return showPicker(site);
   const lines = [fill(COPY.distance, { n: Math.round(site.distance) }), fill(COPY.travel, { n: Math.round(site.travel_secs) })];
+  // BP-18b-2b (R7, Linux H2): one dig at a time, so a dig pin offers no start while a dig is out.
+  if (site.kind === 'dig' && (opsOut().some(o => o.kind === 'dig'))) {
+    if (COPY.digReward[site.tier]) lines.push(COPY.digReward[site.tier]);
+    return setStrip(titleOf(site), [COPY.digHeld, ...lines], withOther([[COPY.close, close]]));
+  }
+  // BP-18b-2b (R8): who leads, first, with two or more Commanders; nobody free disables the squad's start.
+  const head = leadLines();
+  const off = (noneFree());
   if (site.kind === 'dig') {
     if (COPY.digReward[site.tier]) lines.push(COPY.digReward[site.tier]);
   } else {
     // The reward is the mission's, from the cached list; without it the line is left out.
+    const at = head.length + lines.length;
     getMissions().then(ms => {
       const m = ms && ms[site.mission_id];
-      if (!m || shownOp() || selected !== site) return;
+      if (!m || shownOp() || picker || selected !== site) return;
       const text = m.ore_reward > 0
         ? fill(COPY.reward, { credits: m.credit_reward, ore: m.ore_reward })
         : fill(COPY.rewardNoOre, { credits: m.credit_reward });
-      lineNodes[2].textContent = text;
-      lineNodes[2].hidden = false;
+      lineNodes[at].textContent = text;
+      lineNodes[at].hidden = false;
     }, () => {});
   }
-  const go = site.kind === 'dig' ? [[COPY.goGuarded, sendStart], [COPY.goAlone, sendAlone]] : [[COPY.go, sendStart]];
-  setStrip(titleOf(site), lines, [...go, [COPY.close, close]]);
+  const go = site.kind === 'dig' ? [[COPY.goGuarded, startGo, off], [COPY.goAlone, sendAlone]] : [[COPY.go, startGo, off]];
+  setStrip(titleOf(site), [...head, ...lines], withOther([...go, [COPY.close, close]]));
+}
+
+// BP-18b-2b (R6): the picker opens on a start with no op out and two or more Sections.
+const pickerOn = () => opsOut().length === 0 && (rosterSections().length >= 2);
+
+// A start sheet's Go or Guarded: a home key sends its Section (R7); else the picker, else today's body.
+function startGo() {
+  if (!selected) return;
+  const home = homeKey();
+  if (home !== null) return sendStart(home);
+  if (pickerOn()) {
+    picker = true;
+    return refresh();
+  }
+  sendStart(null);
+}
+
+// The picker: one button per Section in roster order (its fit count, or disabled with no soldiers), then Cancel.
+function showPicker(site) {
+  const off = noneFree();
+  const acts = rosterSections().map(s => (s.headcount > 0
+    ? [fill(COPY.pickFit, { name: s.name, n: fitToFight({ section: s }) }), () => sendStart(s.section_id), off]
+    : [fill(COPY.pickEmpty, { name: s.name }), null, true]));
+  setStrip(titleOf(site), leadLines(), [...acts, [COPY.cancel, cancelPicker]]);
+}
+
+function cancelPicker() {
+  picker = false;
+  refresh();
 }
 
 // Next mission's three steps: the prompt, the chosen site's hop, and the ore-on-site confirm.
@@ -618,12 +704,16 @@ function startPick() {
   refresh();
 }
 
-// BP-18b-2a: Other squad moves the strip to the next op out, in opsOut() order, wrapping.
+// BP-18b-2a: Other squad moves the strip to the next op out, in opsOut() order, wrapping. BP-18b-2b (R2): then to each
+// Section at home; leaving a key closes its sheet and picker.
 function otherSquad() {
-  const all = opsOut();
-  if (all.length < 2) return;
-  const i = all.indexOf(shownOp());
-  shownKey = opKey(all[(i + 1) % all.length]);
+  if (!canOther()) return;
+  const keys = [...opsOut().map(opKey), ...homeSquads().map(s => 'home:' + s.section_id)];
+  const so = shownOp();
+  const i = keys.indexOf(homeKey() !== null ? shownKey : so ? opKey(so) : null);
+  shownKey = keys[(i + 1) % keys.length];
+  selected = null;
+  picker = false;
   picking = false;
   pickSite = null;
   confirming = false;
@@ -660,9 +750,11 @@ function goNext() {
 
 function close() {
   selected = null;
+  picker = false;
   noDigOpen = false;
   bankNote = null; crewNote = null;
   notice = '';
+  if (homeKey() !== null) return refresh(); // BP-18b-2b: back to the home hub
   hideStrip();
 }
 
@@ -672,6 +764,7 @@ function openBase() {
   baseOpen = true;
   listOpen = false;
   selected = null;
+  picker = false;
   noDigOpen = false;
   bankNote = null; crewNote = null;
   refresh();
@@ -695,6 +788,7 @@ function openList() {
   closeLegend();
   listOpen = true;
   baseOpen = false;
+  picker = false;
   noDigOpen = false;
   bankNote = null; crewNote = null;
   refresh();
@@ -738,6 +832,7 @@ function listPick(site) {
     return refresh();
   }
   selected = site;
+  picker = false;
   noDigOpen = false;
   bankNote = null; crewNote = null;
   refresh();
@@ -1041,7 +1136,7 @@ function draw(ctx, m) {
   if (so) {
     const p = at(so);
     if (phaseOf(so, p) !== shownPhase || (p < 1 && !isAmbush(so) && secsLeft(so) !== shownSecs)) refresh();
-  }
+  } else if (homeKey() !== null && homePhase() !== shownPhase) refresh(); // BP-18b-2b (R4)
   if (opsOut().some(o => !isAmbush(o) && progress(o) < 1) && hubShown()) m.requestFrame();
   ctx.restore();
 }
@@ -1073,6 +1168,7 @@ function tap(x, y) {
     return;
   }
   selected = pick(x, y);
+  picker = false;
   noDigOpen = false;
   bankNote = null; crewNote = null;
   notice = '';
@@ -1097,8 +1193,13 @@ function adopt(body, built, spent = 0) {
   const wasCredits = credits;
   op = body.active_op || null;
   lastBody = body;
-  // BP-18b-2a: the shown op stays while it is out, else falls back to active_op's.
-  if (!opsOut().some(o => opKey(o) === shownKey)) shownKey = op ? opKey(op) : null;
+  // BP-18b-2a: the shown op stays while it is out, else falls back to active_op's. BP-18b-2b (R3): a home key stays
+  // while its Section is still at home and Other squad can reach it.
+  const home = homeKey();
+  if (home !== null) {
+    if (!((homeSquads().some(s => s.section_id === home) && canOther()))) shownKey = op ? opKey(op) : null;
+  } else if (!opsOut().some(o => opKey(o) === shownKey)) shownKey = op ? opKey(op) : null;
+  if (picker && (opsOut().length > 0 || rosterSections().length < 2)) picker = false; // R6: no picker beside an op
   banked = Number(body.ore_banked) || 0;
   credits = Number(body.credits_banked) || 0;
   base = body.base || {};
@@ -1155,21 +1256,24 @@ function adopt(body, built, spent = 0) {
 // The stored roster is read again (a meltdown cost Crew heads; a fight cost soldiers), so the Crew
 // line, a reload's reveal and the next squad (main.js's roster, through deps.setRoster) all show
 // the new headcount. Every Section at 0 ends the run (BP-18b-1). Under the roster limiters, not the ops ones.
+// BP-18b-2b (R10): resolves true once the new roster is kept, false on a failure or a campaign switch.
 async function rereadRoster() {
   const id = campaignId;
   try {
     const body = await getRoster(id);
-    if (id !== campaignId) return;
+    if (id !== campaignId) return false;
     store.setRoster(id, body);
     deps.setRoster(body);
     const sections = Array.isArray(body.sections) ? body.sections : [];
     if (sections.length > 0 && sections.every(s => s.headcount === 0)) {
-      if (hubShown()) return endOfRun('soldiers');
-      endOnHub = 'soldiers'; // off the hub (an AAR may be showing): the end of run waits for it
-      return;
+      if (hubShown()) endOfRun('soldiers');
+      else endOnHub = 'soldiers'; // off the hub (an AAR may be showing): the end of run waits for it
+      return true;
     }
     refresh();
+    return true;
   } catch { /* the line keeps the old count; the next roster load corrects it */ }
+  return false;
 }
 
 // One board read after a contract's fight, once the server has put it back on the board (A3).
@@ -1304,9 +1408,16 @@ async function send(path, body, built, spentOf, beforeAdopt, afterAdopt) {
   deps.handleError(err, retry);
 }
 
-function sendStart() {
+// `sectionId`: the Section the picker or a home sheet sends (BP-18b-2b), else null for today's body. A named start's
+// 200 shows the op it started (R3): a guarded dig beside a contract becomes active_op, and contracts sort by Section.
+function sendStart(sectionId) {
   if (!selected) return;
-  send(opsPath(campaignId) + '/start', { site_id: selected.site_id });
+  picker = false;
+  if (!sectionId) return send(opsPath(campaignId) + '/start', { site_id: selected.site_id });
+  const key = selected.kind === 'dig' ? 'dig' : sectionId;
+  send(opsPath(campaignId) + '/start', { site_id: selected.site_id, section_id: sectionId }, undefined, undefined, res => {
+    if ((res && res.active_op)) shownKey = key;
+  });
 }
 
 // BP-17b: the Crew goes alone. Guarded keeps the body above, so the escorted start is byte-identical.
@@ -1390,14 +1501,18 @@ function sendNext(site) {
 
 // BP-18b-1: the squad hire (no body). A 200 re-reads the roster (the new Section and Commander), then the
 // Company screen redraws with the hired line; its two 409s become the hire block's lines (send's ask map).
+// BP-18b-2b (R10, Reviewer BP-18b-1 F4): the line only once the re-read has landed, and only on the Company screen
+// that asked; nothing retries a skipped one (the next roster read shows the Section; a second hire answers the cap).
 function sendHire() {
   if (held() || !campaignId) return;
   companyNotice = null;
   companyAsk = { action: 'hire', target: 'company' };
   const price = Number(company.hire && company.hire.credits) || 0; // BP-18b-2a: its spend, so a contract its body latches reports its pay
   send(opsPath(campaignId) + '/hire', undefined, false, () => price, undefined, () => {
-    hiredNote = true;
-    rereadRoster().then(() => redrawCompany());
+    rereadRoster().then(ok => {
+      if ((ok) && (!deps.$('screen-reveal').hidden)) hiredNote = true;
+      redrawCompany();
+    });
   });
 }
 
@@ -1411,6 +1526,7 @@ function watch() {
   new MutationObserver(() => {
     const shown = !hub.hidden;
     if (shown && !hubWasShown) fightPick = null; // BP-18b-2a (F1, R4): afterAar has read it; the next fight's opener sets it
+    if (shown !== hubWasShown) picker = false; // BP-18b-2b (R6): the picker never outlives the hub
     if (shown && !hubWasShown && endOnHub) { // a Section lost while away ends the run now, before any read
       const kind = endOnHub;
       endOnHub = null;
@@ -1464,6 +1580,7 @@ function attach(m) {
   op = null;
   lastBody = null;
   shownKey = null;
+  picker = false;
   prevOps = null;
   wonBy = new Map();
   offset = 0;
@@ -1533,7 +1650,7 @@ export function mountOps(d) {
   strip.hidden = true;
   titleNode = el('h2', 'ops-title');
   dig = createDigPanel();
-  lineNodes = [el('p', 'ops-line'), el('p', 'ops-line'), el('p', 'ops-line')];
+  lineNodes = [el('p', 'ops-line'), el('p', 'ops-line'), el('p', 'ops-line'), el('p', 'ops-line')]; // BP-18b-2b: a fourth (a sheet's Leads line)
   outNode = el('p', 'ops-line'); // BP-18b-2a: the out line with two ops out
   outNode.hidden = true;
   actions = el('div', 'ops-actions');
@@ -1578,6 +1695,7 @@ export function mountOps(d) {
     out: () => Boolean(op),
     sectionOut: id => opsOut().some(o => o.section_id && o.section_id === id), // every op (F5); not busy on an unguarded dig (section_busy)
     leaderOf: id => { const o = opsOut().find(x => x.section_id && x.section_id === id); return o ? o.commander_id || null : null; }, // BP-18b-1: "Led by" an op's Commander; every op (F5)
+    freeLead, // BP-18b-2b (R9): "Led by" for a Section at home: the Commander its start would send
     fightSection,
     company: () => company,
     hired: () => hiredNote,
