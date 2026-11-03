@@ -504,6 +504,43 @@ async fn latch_pending_raid(state: &AppState, campaign_id: Uuid, now: DateTime<U
     Ok(())
 }
 
+/// Hands a pending Section fight whose Commander is KIA or Shattered to a free usable one
+/// (BP-18b-2a, Linux H1 option (A)), so a guarded dig with raiders waiting is never stuck behind
+/// a Commander who can't deploy. The Crew's own fights are skipped (no Commander fights them).
+/// **Order:** per pending battle, the recorded Commander's read (`500` on failure; a usable one,
+/// or no record, ends that iteration), then `usable_commander` with `prefer_free` (`500` on a failed read; its
+/// `409 no Commander left` ends that iteration, and the run's end stays the client's), then the
+/// store's re-lead setter, which writes only if the battle is still pending on the same Commander
+/// and the new one is still free. A dropped future loses nothing: a drop before the setter
+/// changes nothing, and a drop after it leaves the op re-led with nothing paid yet.
+async fn relead_unusable(state: &AppState, campaign_id: Uuid, wallet: &[u8], now: DateTime<Utc>, route: &str) -> Result<(), AppError> {
+    for pending in state.demo_ops.store.pending_raids(campaign_id, now) {
+        if pending.crew.is_some() {
+            continue;
+        }
+        let old = pending.commander_id;
+        let recorded = state
+            .commander_repo
+            .get_commander(old)
+            .await
+            .map_err(|e| internal_error(format!("{route}: get_commander failed for commander {old} of campaign {campaign_id}: {e}")))?;
+        // No record: nothing to judge, as the latch reads no deployments for it.
+        let Some(recorded) = recorded else {
+            continue;
+        };
+        if !recorded.is_kia && !recorded.is_shattered {
+            continue;
+        }
+        let new = match usable_commander(state, campaign_id, wallet, true, now, route).await {
+            Ok(id) => id,
+            Err((StatusCode::CONFLICT, _)) => continue,
+            Err(e) => return Err(e),
+        };
+        state.demo_ops.store.relead_op(campaign_id, &pending.trigger, old, new);
+    }
+    Ok(())
+}
+
 /// A member's ops board, `GET /api/campaign/:campaign_id/ops` (BP-8a-1, demo-only). Order:
 /// `401` (no session) → `429` per address (`ops_ip`) → `429` per wallet (`ops_wallet`) →
 /// `404` (unknown campaign) → `403` (not a member) → `409` (not `Active`; the campaign's
@@ -515,6 +552,7 @@ async fn latch_pending_raid(state: &AppState, campaign_id: Uuid, now: DateTime<U
 ///   board uncached.
 /// - A retire that lands between the state check and the insert leaves an entry behind; the
 ///   campaign's next read drops it, and the reaper's prune within 5 minutes.
+/// - A pending fight whose Commander is KIA or Shattered passes to a free usable Commander first (`relead_unusable`, BP-18b-2a).
 /// - A pending raid is latched after the board (`latch_pending_raid`; `500` on a failed read).
 async fn get_ops_board(
     AuthSession(token): AuthSession,
@@ -527,12 +565,13 @@ async fn get_ops_board(
         return Ok(r);
     }
     let now = Utc::now();
-    let (campaign, gateway, _) = ops_member(&state, &token, campaign_id, "get_ops_board").await?;
+    let (campaign, gateway, wallet) = ops_member(&state, &token, campaign_id, "get_ops_board").await?;
     let Some(gw) = gateway else {
         let view = OpsView { campaign_id, gateway: None, sites: &[], active_op: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), company: CompanyBody::new(CompanyView::default(), 1), now: ops_time(now), crew_fight: None, more_ops: Vec::new() };
         return Ok(Json(view).into_response());
     };
     let board = load_board(&state, &campaign, gw, now, false, "get_ops_board").await?;
+    relead_unusable(&state, campaign_id, &wallet, now, "get_ops_board").await?;
     latch_pending_raid(&state, campaign_id, now, "get_ops_board").await?;
     Ok(ops_response(&state, campaign_id, gw, &board, now))
 }
@@ -4056,6 +4095,105 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["active_op"]["section_id"], guard.to_string(), "{body}");
         assert_eq!(body["active_op"]["commander_id"], led[0].to_string(), "{body}");
+    }
+
+    /// A real `POST /api/mission/resolve` with `commander` and `section` (BP-18b-2a).
+    async fn mission_with(state: &Arc<AppState>, commander: Uuid, section: Uuid) -> (StatusCode, serde_json::Value) {
+        let body = serde_json::json!({
+            "squad": { "units": rookies(8) },
+            "mission_id": "GUARD_DUTY",
+            "commander_id": commander,
+            "section_ids": [section],
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/mission/resolve")
+            .header("authorization", "Bearer t")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = with_test_peer(crate::routes::router(Arc::clone(state)), TEST_PEER).oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+    }
+
+    /// The Commander the store records on the pending battle of `kind` (BP-18b-2a).
+    fn pending_lead(state: &AppState, campaign: Uuid, kind: crate::demo_ops::BattleKind) -> Option<Uuid> {
+        state.demo_ops.store.pending_raids(campaign, chrono::Utc::now()).into_iter().find(|p| p.trigger.kind == kind).map(|p| p.commander_id)
+    }
+
+    /// BP-18b-2a (H1 option (A)): a guarded dig S1/C1 with a raid pending and C2 free. A read keeps
+    /// a healthy C1; once C1 is Shattered, the next read hands the raid to C2, whose fight (with
+    /// S1) the mission route takes, and the read after it has no raid.
+    #[tokio::test]
+    async fn ops_relead_a_shattered_guard() {
+        use crate::demo_ops::BattleKind;
+        let state = Arc::new(session_state());
+        let (c, _) = dig_campaign(&state, false).await;
+        let c1 = commander_of_first(&state, c).await;
+        let c2 = second_commander(&state, c).await;
+        let (s1, _s2) = second_section(&state, c).await;
+        dig_on_site(&state, c, 7).await;
+        let (status, body, _) = drill(&state, c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["active_op"]["dig"]["raid"], serde_json::json!({"mission_id": "GUARD_DUTY"}), "{body}");
+        let (status, body) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(pending_lead(&state, c, BattleKind::Raid), Some(c1), "a healthy guard keeps the raid");
+        state.commander_repo.set_shattered(c1).await.expect("set_shattered");
+        let (status, body) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(pending_lead(&state, c, BattleKind::Raid), Some(c2), "the free Commander takes the raid");
+        let (status, m) = mission_with(&state, c2, s1).await;
+        assert_eq!(status, StatusCode::OK, "{m}");
+        let (status, body) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["active_op"]["dig"]["raid"].is_null(), "{body}");
+    }
+
+    /// BP-18b-2a: C1 Shattered guarding a dig with a raid pending, and C2 leading S2's contract.
+    /// No usable Commander is free, so a read leaves the dig on C1 and the contract on C2.
+    #[tokio::test]
+    async fn ops_relead_waits_for_a_free_commander() {
+        use crate::demo_ops::BattleKind;
+        let state = Arc::new(session_state());
+        let (c, _) = dig_campaign(&state, false).await;
+        let c1 = commander_of_first(&state, c).await;
+        let c2 = second_commander(&state, c).await;
+        let (_s1, s2) = second_section(&state, c).await;
+        dig_on_site(&state, c, 7).await;
+        let (status, body, _) = drill(&state, c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body, _) = start_body(&state, c, serde_json::json!({ "site_id": SITE, "section_id": s2 })).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        state.commander_repo.set_shattered(c1).await.expect("set_shattered");
+        let (status, body) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(pending_lead(&state, c, BattleKind::Raid), Some(c1), "the dig waits on C1");
+        assert_eq!(state.demo_ops.store.busy_commanders(c, &[c1, c2], chrono::Utc::now()), vec![c1, c2], "C2 still leads the contract");
+    }
+
+    /// BP-18b-2a: an arrived, unfought contract S1/C1 with C2 free. A read keeps a healthy C1; once
+    /// C1 is Shattered, the next read records C2.
+    #[tokio::test]
+    async fn ops_relead_a_shattered_contract_leader() {
+        use crate::demo_ops::BattleKind;
+        let state = Arc::new(session_state());
+        let c = contract_campaign(&state).await;
+        let c1 = commander_of_first(&state, c).await;
+        let c2 = second_commander(&state, c).await;
+        second_section(&state, c).await;
+        let (status, body, _) = start(&state, c, SITE).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        state.demo_ops.store.rewind_op(c, 600);
+        let (status, body) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(pending_lead(&state, c, BattleKind::Contract), Some(c1), "a healthy leader keeps the fight");
+        state.commander_repo.set_shattered(c1).await.expect("set_shattered");
+        let (status, body) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(pending_lead(&state, c, BattleKind::Contract), Some(c2), "the free Commander takes the fight");
     }
 
     /// The member's first Commander (the one `dig_campaign` seeds).

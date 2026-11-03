@@ -942,6 +942,7 @@ pub struct ActiveOpView {
     /// The squad the op sends into its fights (BP-18b-1): a contract's Section and Commander, or a dig's guard once one is named (`escort_at` set). Absent on a Crew-alone dig, so its keys stand.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub section_id: Option<Uuid>,
+    /// See section_id.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commander_id: Option<Uuid>,
 }
@@ -2344,6 +2345,45 @@ impl DemoOpsStore {
         commanders.iter().copied().filter(|c| e.commander_busy(*c)).collect()
     }
 
+    /// Re-leads a pending battle (BP-18b-2a, Linux H1 option (A)): after settling, under the lock
+    /// and with no await, writes `new` as the Commander of the op whose pending battle is
+    /// `trigger` (a guarded dig's, or a contract's), and returns whether it wrote. It writes only
+    /// while that battle is still pending, its recorded Commander is still `old`, `new != old`,
+    /// and `new` is not busy (`commander_busy`). **Orders:** an escort or a start that takes `new`
+    /// first wins (this then refuses); one that comes after sees `new` busy and picks another.
+    /// No launch lock: it writes a Commander on an op, never a Section or a headcount.
+    pub fn relead_op(&self, campaign_id: Uuid, trigger: &RaidTrigger, old: Uuid, new: Uuid) -> bool {
+        let mut inner = self.lock();
+        let Some(e) = inner.get_mut(&campaign_id) else {
+            return false;
+        };
+        // A contract's trigger is due from its arrival on, so its own time finds it.
+        let now = trigger.trigger_at;
+        if new == old || e.commander_busy(new) {
+            return false;
+        }
+        if trigger.kind == BattleKind::Contract {
+            let Some(key) = e.slot_keys().into_iter().find(|k| e.slot(*k).is_some_and(|op| contract_trigger(op, now) == Some(*trigger))) else {
+                return false;
+            };
+            match e.slot_mut(key).and_then(|op| op.contract.as_mut()) {
+                Some(c) if c.commander_id == old => {
+                    c.commander_id = new;
+                    true
+                }
+                _ => false,
+            }
+        } else {
+            match e.dig.as_mut().and_then(|op| op.dig.as_mut()) {
+                Some(d) if d.raid == Some(*trigger) && d.commander_id == old => {
+                    d.commander_id = new;
+                    true
+                }
+                _ => false,
+            }
+        }
+    }
+
     /// The Section on the op `squad` selects (BP-18a-1b-2, next's at-0 check), after settling, by
     /// `OpsEntry::select`: `Some` of the slot's Section (a contract's key, a guarded dig's guard,
     /// BP-18a-2), itself `None` for an op with no Section or an unguarded dig; `None` when the
@@ -3136,7 +3176,7 @@ mod tests {
         assert_eq!((d.drills, d.ore_on_site, d.next_ore, d.ended_by), (2, 0, 0, Some(OpEnd::WalkedAway)));
     }
 
-    /// The dig's exact keys; nothing names the seed, the Crew, the Commander or the trigger,
+    /// The dig's exact keys; nothing names the seed, the Crew or the trigger (the op's only Commander key is `commander_id`),
     /// with a raid pending (seed 7 raids on drill 1).
     #[test]
     fn ops_dig_view_has_exactly_its_keys() {
