@@ -508,7 +508,9 @@ async fn latch_pending_raid(state: &AppState, campaign_id: Uuid, now: DateTime<U
 /// (BP-18b-2a, Linux H1 option (A)), so a guarded dig with raiders waiting is never stuck behind
 /// a Commander who can't deploy. The Crew's own fights are skipped (no Commander fights them).
 /// **Order:** per pending battle, the recorded Commander's read (`500` on failure; a usable one,
-/// or no record, ends that iteration), then `usable_commander` with `prefer_free` (`500` on a failed read; its
+/// or no record, ends that iteration), then that Commander's deployments (`500` on failure, or on
+/// a resolved record with no known outcome; any fight of theirs for this trigger, finished or still
+/// active, ends that iteration: the latch applies it, W1), then `usable_commander` with `prefer_free` (`500` on a failed read; its
 /// `409 no Commander left` ends that iteration, and the run's end stays the client's), then the
 /// store's re-lead setter, which writes only if the battle is still pending on the same Commander
 /// and the new one is still free. A dropped future loses nothing: a drop before the setter
@@ -529,6 +531,16 @@ async fn relead_unusable(state: &AppState, campaign_id: Uuid, wallet: &[u8], now
             continue;
         };
         if !recorded.is_kia && !recorded.is_shattered {
+            continue;
+        }
+        // W1 (Reviewer BP-18b-2a F1): never infer "unfought" from "unusable". A fight that Shattered or killed
+        // this Commander commits its close and the flag together, so its record is read here; that battle is
+        // the latch's, finished or not, and keeps its Commander.
+        let deps = state.commander_repo.list_deployments_by_commander(old).await.map_err(|e| {
+            internal_error(format!("{route}: list_deployments_by_commander failed for commander {old} of campaign {campaign_id}: {e}"))
+        })?;
+        let result = raid_result(&deps, &pending.trigger).map_err(|e| internal_error(format!("{route}: raid of campaign {campaign_id}: {e}")))?;
+        if result.is_some() || raid_fight(&deps, &pending.trigger).is_some() {
             continue;
         }
         let new = match usable_commander(state, campaign_id, wallet, true, now, route).await {
@@ -4194,6 +4206,38 @@ mod tests {
         let (status, body) = get(&state, Some("t"), c).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(pending_lead(&state, c, BattleKind::Contract), Some(c2), "the free Commander takes the fight");
+    }
+
+    /// BP-18b-2a rework (W1, Reviewer F1): a guarded dig S1/C1 with a raid pending and C2 free. C1
+    /// fights it (S1), then is Shattered. The next read latches C1's fight instead of re-leading:
+    /// no raid, the fight's pay banked in the store (the mission route's report, which the latch's
+    /// recompute equals), and C2 never recorded on the dig.
+    #[tokio::test]
+    async fn ops_relead_skips_a_battle_its_commander_fought() {
+        let state = Arc::new(session_state());
+        let (c, _) = dig_campaign(&state, false).await;
+        let c1 = commander_of_first(&state, c).await;
+        let c2 = second_commander(&state, c).await;
+        let (s1, _s2) = second_section(&state, c).await;
+        dig_on_site(&state, c, 7).await;
+        let (status, body, _) = drill(&state, c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["active_op"]["dig"]["raid"], serde_json::json!({"mission_id": "GUARD_DUTY"}), "{body}");
+        let before = state.demo_ops.store.ops_state(c, chrono::Utc::now()).credits_banked;
+        let (status, m) = mission_with(&state, c1, s1).await;
+        assert_eq!(status, StatusCode::OK, "{m}");
+        let pay = m["report"]["rewards"]["credits"].as_u64().expect("the fight's pay");
+        state.commander_repo.set_shattered(c1).await.expect("set_shattered");
+        let (status, body) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["active_op"]["dig"]["raid"].is_null(), "{body}");
+        let after = state.demo_ops.store.ops_state(c, chrono::Utc::now()).credits_banked;
+        assert_eq!(u64::from(after - before), pay, "C1's fight is paid");
+        let led = state.demo_ops.store.busy_commanders(c, &[c1, c2], chrono::Utc::now());
+        assert!(!led.contains(&c2), "C2 is never recorded on the dig");
+        if !body["active_op"].is_null() {
+            assert_eq!(led, vec![c1], "the dig keeps C1");
+        }
     }
 
     /// The member's first Commander (the one `dig_campaign` seeds).

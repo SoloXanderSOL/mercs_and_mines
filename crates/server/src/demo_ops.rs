@@ -2345,19 +2345,21 @@ impl DemoOpsStore {
         commanders.iter().copied().filter(|c| e.commander_busy(*c)).collect()
     }
 
-    /// Re-leads a pending battle (BP-18b-2a, Linux H1 option (A)): after settling, under the lock
-    /// and with no await, writes `new` as the Commander of the op whose pending battle is
+    /// Re-leads a pending battle (BP-18b-2a, Linux H1 option (A)): under the lock and with no
+    /// await, writes `new` as the Commander of the op whose pending battle is
     /// `trigger` (a guarded dig's, or a contract's), and returns whether it wrote. It writes only
     /// while that battle is still pending, its recorded Commander is still `old`, `new != old`,
     /// and `new` is not busy (`commander_busy`). **Orders:** an escort or a start that takes `new`
     /// first wins (this then refuses); one that comes after sees `new` busy and picks another.
-    /// No launch lock: it writes a Commander on an op, never a Section or a headcount.
+    /// No launch lock: it writes a Commander on an op, never a Section or a headcount. It does not
+    /// settle: it finds the battle by the trigger's own time, which needs none, because the caller's
+    /// `pending_raids` settled the entry just before, a contract's trigger depends only on its leg,
+    /// `arrive_at` and result, and a dig compares its raid by value (Reviewer BP-18b-2a F2).
     pub fn relead_op(&self, campaign_id: Uuid, trigger: &RaidTrigger, old: Uuid, new: Uuid) -> bool {
         let mut inner = self.lock();
         let Some(e) = inner.get_mut(&campaign_id) else {
             return false;
         };
-        // A contract's trigger is due from its arrival on, so its own time finds it.
         let now = trigger.trigger_at;
         if new == old || e.commander_busy(new) {
             return false;
