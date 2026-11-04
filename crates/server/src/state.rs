@@ -157,7 +157,7 @@ impl AppState {
             crew_repo:           crews.clone(),
             live_campaigns:      Arc::new(crate::demo_address_cap::InMemoryLiveCampaigns::new(campaigns.clone())),
             crew_loss:           Arc::new(crate::demo_crew_loss::InMemoryCrewLoss::new(crews.clone())), // (BP-8b-1a, demo-only)
-            section_loss: Arc::new(crate::demo_section_loss::InMemorySectionLoss::new(sections.clone())), // (BP-11a-1, demo-only)
+            section_loss: Arc::new(crate::demo_section_loss::InMemorySectionLoss::new(sections.clone(), commanders.clone())), // (BP-11a-1, BP-20a-2, demo-only)
             campaign_join_repo:  Arc::new(InMemoryCampaignJoinRepository::new(
                 campaigns, memberships, commanders, foremen, sections, crews,
             )),

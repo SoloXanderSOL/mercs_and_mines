@@ -3572,6 +3572,50 @@ async fn pg_bench_commanders_skips_kia_shattered_and_busy() {
     assert_eq!(got, vec![(40, false), (100, true), (40, false), (35, false), (0, false)]);
 }
 
+/// BP-20a-2 (demo-only, `breakpoint`) — D1: `strain_commander` by 10 on 95, a Shattered 100, a
+/// KIA 40 and 20 → 99 (capped, never Shattered), left (the cap would lower 100), left, 30.
+/// Collects, cleans, then asserts.
+#[tokio::test]
+async fn pg_strain_commander_caps_at_99_and_skips_kia_and_shattered() {
+    use mercs_server::demo_section_loss::{PostgresSectionLoss, SectionLoss};
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    let wallet = [116u8; 32];
+    clean_wallet_4g1(&pool, &wallet).await;
+    let campaign_id = seed_account_and_campaign(&pool, wallet, 0x20A2_i64).await;
+    let repo = PostgresCommanderRepository::new(pool.clone());
+    let loss = PostgresSectionLoss::new(pool.clone());
+
+    let mut created = Vec::new();
+    let mut ids = Vec::new();
+    for (seed, stress, shattered, kia) in [(1u32, 95, false, false), (2, 100, true, false), (3, 40, false, true), (4, 20, false, false)] {
+        let mut c = mercs_server::commander_gen::generate_commander(wallet.to_vec(), campaign_id, seed);
+        c.stress = stress;
+        c.is_shattered = shattered;
+        c.is_kia = kia;
+        ids.push(c.commander_id);
+        created.push(repo.create_commander(c).await);
+    }
+    let mut strained = Vec::new();
+    for id in &ids {
+        strained.push(loss.strain_commander(*id, 10).await);
+    }
+    let mut got = Vec::new();
+    for id in &ids {
+        got.push(repo.get_commander(*id).await.map(|r| r.map(|r| (r.stress, r.is_shattered))));
+    }
+
+    clean_wallet_4g1(&pool, &wallet).await;
+
+    assert!(created.iter().all(|c| c.is_ok()), "create_commander failed: {created:?}");
+    let strained: Vec<Option<i16>> = strained.into_iter().map(|s| s.expect("strain_commander")).collect();
+    assert_eq!(strained, vec![Some(99), None, None, Some(30)]);
+    let got: Vec<(i16, bool)> = got.into_iter().map(|g| g.unwrap().expect("the Commander")).collect();
+    assert_eq!(got, vec![(99, false), (100, true), (40, false), (30, false)]);
+}
+
 /// 7a-1 — `0022`'s CHECKs refuse a Commander-only flaw and a Commander-only specialization.
 #[tokio::test]
 async fn test_foreman_records_reject_non_canon_roster_values() {

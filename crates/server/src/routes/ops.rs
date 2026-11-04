@@ -44,8 +44,9 @@ use crate::demo_ops::{
 use crate::commander_gen::generate_commander;
 use crate::demo_ops::{HireHold, HireRefusal, DEMO_HIRE_CAP, DEMO_HIRE_CREDITS, DEMO_WAGE_CREDITS_PER_MIN};
 use crate::demo_ops::{RouteKind, RoutePath};
+use crate::demo_ops::{hazard_warning, HazardDue, TripReport};
 use crate::repository::section::starter_section;
-use crate::repository::{outcome_db_str, CampaignInstance, CampaignLifecycle, DeploymentRecord, SectionRecord, SectorState};
+use crate::repository::{outcome_db_str, CampaignInstance, CampaignLifecycle, DeploymentRecord, RepositoryError, SectionRecord, SectorState};
 use crate::state::AppState;
 
 use super::sector::GatewayHex;
@@ -98,6 +99,9 @@ pub struct OpsView<'a> {
     /// same shape as `active_op`, in key order; absent with one op or none.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub more_ops: Vec<MoreOp>,
+    /// The latest landed hazard trips (BP-20a-2), newest last, at most 3; absent when there are none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub trip_reports: Vec<TripReport>,
 }
 
 /// A board site as sent (BP-20a-1): the site's own keys, flattened, then its ways, Fast first.
@@ -114,6 +118,9 @@ pub struct RouteView<'a> {
     pub route: RouteKind,
     #[serde(flatten)]
     pub way: &'a RoutePath,
+    /// BP-20a-2: `hazard_warning` of the way's kinds; absent on a clean way.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 /// The body's sites with their ways from `board` (BP-20a-1), by the site's hex as it stands (a
@@ -124,8 +131,8 @@ fn site_views<'a>(sites: &'a [OpsSite], board: &'a OpsBoard) -> Vec<SiteView<'a>
         .iter()
         .map(|site| {
             let routes = board.routes.get(&(site.q, site.r)).map_or_else(Vec::new, |w| {
-                std::iter::once(RouteView { route: RouteKind::Fast, way: &w.fast })
-                    .chain(w.safe.iter().map(|way| RouteView { route: RouteKind::Safe, way }))
+                std::iter::once(RouteView { route: RouteKind::Fast, way: &w.fast, warning: hazard_warning(&w.fast_kinds) })
+                    .chain(w.safe.iter().map(|way| RouteView { route: RouteKind::Safe, way, warning: hazard_warning(&w.safe_kinds) }))
                     .collect()
             });
             SiteView { site, routes }
@@ -333,7 +340,7 @@ async fn load_board(
 }
 
 fn ops_response(state: &AppState, campaign_id: Uuid, gw: (i32, i32), board: &OpsBoard, now: DateTime<Utc>) -> Response {
-    let (s, more_ops, squads) = state.demo_ops.store.ops_body(campaign_id, now);
+    let (s, more_ops, squads, trip_reports) = state.demo_ops.store.ops_body(campaign_id, now);
     // BP-11a-3: the sites as they stand (a fought contract off the board, a returned one moved);
     // the route's own board only when the campaign has no entry (a store full of ops).
     let sites = site_views(s.sites.as_deref().unwrap_or(&board.sites), board);
@@ -349,6 +356,7 @@ fn ops_response(state: &AppState, campaign_id: Uuid, gw: (i32, i32), board: &Ops
         now: ops_time(now),
         crew_fight: s.crew_fight,
         more_ops,
+        trip_reports,
     };
     Json(view).into_response()
 }
@@ -617,7 +625,7 @@ async fn get_ops_board(
     let now = Utc::now();
     let (campaign, gateway, wallet) = ops_member(&state, &token, campaign_id, "get_ops_board").await?;
     let Some(gw) = gateway else {
-        let view = OpsView { campaign_id, gateway: None, sites: Vec::new(), active_op: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), company: CompanyBody::new(CompanyView::default(), 1), now: ops_time(now), crew_fight: None, more_ops: Vec::new() };
+        let view = OpsView { campaign_id, gateway: None, sites: Vec::new(), active_op: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), company: CompanyBody::new(CompanyView::default(), 1), now: ops_time(now), crew_fight: None, more_ops: Vec::new(), trip_reports: Vec::new() };
         return Ok(Json(view).into_response());
     };
     let board = load_board(&state, &campaign, gw, now, false, "get_ops_board").await?;
@@ -773,9 +781,11 @@ async fn post_ops_start(
 ///    owed: no read. No Foreman: the tally is dropped, with nobody to credit. A KIA Foreman: the
 ///    write answers `Ok(false)` and the tally is dropped. A failed read or write: the tally is
 ///    put back (`restore_foreman_due`) with one warning, and the next ops read retries.
-/// 2. **The Foreman's bench** (BP-19b), unless the dig slot holds the Foreman: `bench_foremen`,
+/// 2. **The hazards** (BP-20a-2): what landed trips' hazards owe the roster
+///    (`settle_leaders_hazards`): wounds, Commander stress and Crew morale.
+/// 3. **The Foreman's bench** (BP-19b), unless the dig slot holds the Foreman: `bench_foremen`,
 ///    whose clear binds `STRESS_STRAINED_MAX` (ODQ-73).
-/// 3. **The Commanders' bench** (BP-19b): `bench_commanders`, every Commander the store does not
+/// 4. **The Commanders' bench** (BP-19b): `bench_commanders`, every Commander the store does not
 ///    hold busy.
 ///
 /// No bench minute claimed: no bench statement. A failed bench write is dropped with one
@@ -787,6 +797,7 @@ pub(crate) async fn settle_leaders(state: &Arc<AppState>, campaign_id: Uuid, wal
         let state = task_state;
         let claim = state.demo_ops.store.take_leader_claim(campaign_id, now);
         settle_leaders_dig(&state, campaign_id, &wallet, claim.due).await;
+        settle_leaders_hazards(&state, campaign_id, claim.hazards.clone(), now).await;
         settle_leaders_bench(&state, campaign_id, &wallet, &claim).await;
     });
     if let Err(e) = handle.await {
@@ -813,6 +824,56 @@ async fn settle_leaders_dig(state: &AppState, campaign_id: Uuid, wallet: &[u8], 
     if let Err(e) = state.foreman_repo.settle_foreman_dig(foreman.foreman_id, due.stress, due.xp).await {
         state.demo_ops.store.restore_foreman_due(campaign_id, due);
         tracing::warn!(%campaign_id, error = %e, "settle_leaders: settle_foreman_dig failed; tally put back");
+    }
+}
+
+/// `settle_leaders`' hazard part (BP-20a-2), after the dig settlement and before the bench
+/// (Reviewer BP-19b: a new leader write goes after the settlement): each Section's wounded into
+/// its sickbay, cut to the headcount read here (`wound_section`); each Commander's stress
+/// (`strain_commander`: capped at 99, never Shattering, skipping the KIA and the Shattered);
+/// each Crew's morale (`meltdown_loss` with no heads). A failed write puts its part back
+/// (`restore_hazard_due`) with one warning; an unknown id is dropped. Every part is a loss to the
+/// player, so a lost one favours them. No launch lock: the wound writes the store's bay, never a
+/// Section row, and every order against the Section writers is benign (spec check item 6).
+async fn settle_leaders_hazards(state: &AppState, campaign_id: Uuid, due: HazardDue, now: DateTime<Utc>) {
+    if due == HazardDue::default() {
+        return;
+    }
+    let mut back = HazardDue::default();
+    let mut failed: Option<String> = None;
+    for (&section_id, &n) in &due.wounded {
+        match state.section_repo.get_section(section_id).await {
+            Ok(Some(section)) => {
+                let cap = u8::try_from(section.headcount.max(0)).unwrap_or(8);
+                state.demo_ops.store.wound_section(campaign_id, section_id, u8::try_from(n).unwrap_or(u8::MAX), cap, now);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                back.wounded.insert(section_id, n);
+                failed.get_or_insert_with(|| format!("get_section({section_id}): {e}"));
+            }
+        }
+    }
+    for (&commander_id, &n) in &due.stress {
+        let stress = i16::try_from(n.min(100)).unwrap_or(100);
+        if let Err(e) = state.section_loss.strain_commander(commander_id, stress).await {
+            back.stress.insert(commander_id, n);
+            failed.get_or_insert_with(|| format!("strain_commander({commander_id}): {e}"));
+        }
+    }
+    for (&crew_id, &n) in &due.morale {
+        let morale = i16::try_from(n.min(100)).unwrap_or(100);
+        match state.crew_loss.meltdown_loss(crew_id, 0, morale).await {
+            Ok(_) | Err(RepositoryError::NotFound) => {}
+            Err(e) => {
+                back.morale.insert(crew_id, n);
+                failed.get_or_insert_with(|| format!("meltdown_loss({crew_id}, 0, {morale}): {e}"));
+            }
+        }
+    }
+    if let Some(error) = failed {
+        state.demo_ops.store.restore_hazard_due(campaign_id, &back);
+        tracing::warn!(%campaign_id, %error, "settle_leaders: a hazard write failed; its part put back");
     }
 }
 
@@ -892,10 +953,6 @@ enum Pick<'a> {
     Section(&'a str),
 }
 
-/// A selector's two keys checked against each other (BP-18a-1b-2), in this order: both sent ->
-/// `400 unknown section`; then `slot`: `"dig"` where `slot_ok` (return, next) names the dig, and
-/// any other value, or any `slot` where it is not (start, escort), is `400 unknown section`;
-/// then `section_id`, checked against the member's Sections by `named_section`.
 /// BP-20a-1: `route` on a start: `"fast"` (or absent) or `"safe"`; anything else is `None`, the
 /// route's `400 unknown route`.
 fn parse_route(route: Option<&str>) -> Option<RouteKind> {
@@ -906,6 +963,10 @@ fn parse_route(route: Option<&str>) -> Option<RouteKind> {
     }
 }
 
+/// A selector's two keys checked against each other (BP-18a-1b-2), in this order: both sent ->
+/// `400 unknown section`; then `slot`: `"dig"` where `slot_ok` (return, next) names the dig, and
+/// any other value, or any `slot` where it is not (start, escort), is `400 unknown section`;
+/// then `section_id`, checked against the member's Sections by `named_section`.
 fn selector_shape<'a>(section_id: Option<&'a str>, slot: Option<&str>, slot_ok: bool) -> Result<Pick<'a>, AppError> {
     if section_id.is_some() && slot.is_some() {
         return Err(bad_request("unknown section"));
@@ -2272,6 +2333,10 @@ mod tests {
         }
 
         async fn add_soldiers(&self, _: Uuid, _: Uuid, _: &[u8], _: i16) -> Result<Option<i16>, RepositoryError> {
+            Err(RepositoryError::Internal("db down".into()))
+        }
+
+        async fn strain_commander(&self, _: Uuid, _: i16) -> Result<Option<i16>, RepositoryError> {
             Err(RepositoryError::Internal("db down".into()))
         }
     }
@@ -4935,5 +5000,89 @@ mod tests {
         let (report, _) = replay_report(&state, &deps[0], "test").await.expect("replay_report");
         response["report"]["commander_name"] = serde_json::Value::Null;
         assert_eq!(serde_json::to_value(&report).unwrap(), response["report"]);
+    }
+
+    // ---- BP-20a-2: hazards on the way (§4e C3). Map 42 from `ROUTE_GATEWAY`: `TWO_WAY_DIG`'s
+    // Fast way crosses one ToxicZone (pre-flight row 4), its Safe way none.
+
+    async fn crew_morale(state: &AppState, crew: Uuid) -> i16 {
+        state.crew_repo.get_crew(crew).await.unwrap().expect("the Crew").morale
+    }
+
+    /// R1 (W5): the board names the gas on the Fast way, and says nothing on the clean Safe way.
+    #[tokio::test]
+    async fn ops_board_warns_by_kind_on_a_hazard_way() {
+        let state = Arc::new(session_state());
+        let c = route_campaign(&state).await;
+        let (status, body) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let site = body["sites"].as_array().expect("sites").iter().find(|s| s["site_id"] == TWO_WAY_DIG).expect("the dig").clone();
+        let routes = site["routes"].as_array().expect("routes");
+        assert_eq!((routes[0]["route"].as_str(), routes[0]["warning"].as_str()), (Some("fast"), Some("gas")), "{site}");
+        assert_eq!(routes[1]["route"], "safe");
+        assert!(routes[1].get("warning").is_none(), "{site}");
+    }
+
+    /// R2: knob 100, `TWO_WAY_DIG` the Fast way (escorted by default), one drill on seed 2 then
+    /// walked home as `ops_return_after_a_drill_walks_away_from_the_ore` does: the landing read
+    /// reports gas out and home and drains the Crew's 10 morale; the next read drains nothing.
+    #[tokio::test]
+    async fn ops_landing_reports_and_drains_a_digs_hazards() {
+        let mut state = session_state();
+        state.demo_ops.store.set_hazard_pct(100);
+        let state = Arc::new(state);
+        let c = route_campaign(&state).await;
+        let crew = state.crew_repo.list_crews_for_member(c, &WALLET).await.expect("crews")[0].crew_id;
+        let before = crew_morale(&state, crew).await;
+        let (status, started, _) = start(&state, c, TWO_WAY_DIG).await;
+        assert_eq!(status, StatusCode::OK, "{started}");
+        state.demo_ops.store.rewind_op(c, secs_between(&started["active_op"]));
+        state.demo_ops.store.set_op_seed(c, 2);
+        assert_eq!(drill(&state, c).await.0, StatusCode::OK);
+        let (status, body, _) = post(&state, c, "return", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        state.demo_ops.store.rewind_op(c, secs_between(&body["active_op"]));
+        let (status, body) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let reports = body["trip_reports"].as_array().expect("trip_reports");
+        assert_eq!(reports.len(), 1, "{body}");
+        let hits: Vec<(&str, &str)> = reports[0]["hits"].as_array().expect("hits").iter().map(|h| (h["hazard"].as_str().unwrap(), h["leg"].as_str().unwrap())).collect();
+        assert_eq!(hits, vec![("gas", "out"), ("gas", "home")]);
+        assert_eq!(crew_morale(&state, crew).await, before - 10);
+        let (status, body) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(crew_morale(&state, crew).await, before - 10, "drained once");
+        assert_eq!(body["trip_reports"].as_array().map(|r| r.len()), Some(1));
+        assert_eq!(body["trip_reports"][0]["seq"], 1);
+    }
+
+    /// R3 (F-E): a put-back tally is drained by the next read: the Commander's stress, the wounded
+    /// cut to the Section's 2 soldiers (the bay read as `ops_defeat_wounds_one_and_heal_waits_for_credits`
+    /// does) and the Crew's morale; the read after moves nothing.
+    #[tokio::test]
+    async fn ops_read_drains_a_hazard_tally_once() {
+        let state = Arc::new(session_state());
+        let (c, crew) = dig_campaign(&state, false).await;
+        let section = member_section(&state, c).await;
+        assert_eq!(get(&state, Some("t"), c).await.0, StatusCode::OK, "the entry exists");
+        state.section_repo.update_headcount(section, 2).await.expect("update_headcount");
+        let commander = commander_of(&state, c).await;
+        let stress = || async { state.commander_repo.get_commander(commander).await.unwrap().expect("the Commander").stress };
+        let (s, m) = (stress().await, crew_morale(&state, crew).await);
+        state.demo_ops.store.restore_hazard_due(
+            c,
+            &HazardDue {
+                stress: std::collections::BTreeMap::from([(commander, 10)]),
+                wounded: std::collections::BTreeMap::from([(section, 3)]),
+                morale: std::collections::BTreeMap::from([(crew, 5)]),
+            },
+        );
+        for read in 0..2 {
+            let (status, body) = get(&state, Some("t"), c).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(stress().await, s + 10, "read {read}");
+            assert_eq!(body["company"]["sections"][0]["wounded"], 2, "read {read}: {body}");
+            assert_eq!(crew_morale(&state, crew).await, m - 5, "read {read}");
+        }
     }
 }

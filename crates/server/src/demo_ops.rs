@@ -126,6 +126,121 @@ pub const DEMO_AMBUSH_CAP_PCT: u32 = 50;
 /// BP-20a-1 (D6): haul-ambush points per second the chosen way takes over the Fast one, inside
 /// the same cap; a Fast trip's odds are unchanged.
 pub const DEMO_AMBUSH_PCT_PER_DETOUR_SEC: u32 = 2;
+/// BP-20a-2 (§4e C3): the chance, in percent, that a hazard hex hits a trip, per hex per leg.
+/// Every store starts at 0 (`DemoOpsStore::set_hazard_pct`), so no test rolls unless it asks;
+/// `main.rs` sets this one in production.
+pub const DEMO_HAZARD_PCT: u32 = 35;
+/// Stress a gas hit puts on the trip's leader (a contract's Commander, a dig's Foreman).
+pub const DEMO_HAZARD_GAS_STRESS: u32 = 10;
+/// Stress a ruins hit puts on a dig's Foreman (on a contract, ruins are a wound).
+pub const DEMO_HAZARD_RUINS_STRESS: u32 = 5;
+/// Morale a gas or ruins hit costs a Crew (it has no sickbay, so a road takes no heads).
+pub const DEMO_HAZARD_MORALE: u32 = 5;
+/// The hazard rolls come from `Rng::new(op_seed + this)` (wrapping), draw k for the k-th hex
+/// rolled (out, then home). Draw k of `Rng::new(s)` runs on state `s + k × 0x6D2B_79F5`, so the
+/// nearest other streams (the Crew fight's ahead, the ambush's behind) are 2²⁹ draws away; a
+/// trip reads twice its way's hazards here, every other stream at most 26.
+pub const DEMO_HAZARD_SEED_OFFSET: u32 = 0x2000_0000;
+/// BP-20a-2: the leg a hazard hit came on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HazardLeg {
+    Out,
+    Home,
+}
+
+/// One hazard that hit (BP-20a-2) and what it cost: `stress` is the trip's leader's (the
+/// Commander's on a contract, the Foreman's on a dig); `ore` came off the cart.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct HazardHit {
+    pub hazard: Hazard,
+    pub leg: HazardLeg,
+    pub ore: u32,
+    pub stress: u32,
+    pub wounded: u32,
+    pub morale: u32,
+}
+
+/// A landed trip that crossed a hazard (BP-20a-2): its hits in travel order, none when it went
+/// clean. `seq` counts the entry's reports from 1, so the client shows each once.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct TripReport {
+    pub seq: u32,
+    pub site_id: String,
+    pub route: RouteKind,
+    pub hits: Vec<HazardHit>,
+}
+
+/// BP-20a-2 (W1): who a trip's hazards hit. A contract's fall on its Section and Commander; a
+/// dig's, guarded or not, on its Crew and Foreman (a dig is the Crew's trip; the escort walks free).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HazardPayer {
+    Section,
+    Crew,
+}
+
+/// BP-20a-2 (W1, F-C, F-D): what one hit costs. A Section has no morale and a Crew no sickbay, so
+/// a Section's hits are wounds (gas also stresses its Commander) and a Crew's are its Foreman's
+/// stress and its morale; a crust that gives tips a quarter of the cart, on the way home only
+/// (nothing rides out).
+fn hazard_cost(hazard: Hazard, payer: HazardPayer, leg: HazardLeg, carried: u32) -> HazardHit {
+    let mut hit = HazardHit { hazard, leg, ore: 0, stress: 0, wounded: 0, morale: 0 };
+    match (payer, hazard) {
+        (HazardPayer::Section, Hazard::Gas) => (hit.stress, hit.wounded) = (DEMO_HAZARD_GAS_STRESS, 1),
+        (HazardPayer::Section, Hazard::Crust | Hazard::Ruins) => hit.wounded = 1,
+        (HazardPayer::Crew, Hazard::Gas) => (hit.stress, hit.morale) = (DEMO_HAZARD_GAS_STRESS, DEMO_HAZARD_MORALE),
+        (HazardPayer::Crew, Hazard::Ruins) => (hit.stress, hit.morale) = (DEMO_HAZARD_RUINS_STRESS, DEMO_HAZARD_MORALE),
+        (HazardPayer::Crew, Hazard::Crust) => {
+            if leg == HazardLeg::Home {
+                hit.ore = carried / 4;
+            }
+        }
+    }
+    hit
+}
+
+/// BP-20a-2 (W3, F-J): a landed trip's hits. One d100 per hazard hex, out in path order then home
+/// in travel order (the way reversed), on its own stream (`DEMO_HAZARD_SEED_OFFSET`); a roll at
+/// most `pct` hits. `None` (no report) when the knob is 0 or the trip crossed no hazard; an empty
+/// list is a clean trip. `carried` is what the cart holds at the landing; each crust hit on the
+/// way home takes a quarter of what is still on it.
+fn hazard_hits(op_seed: u32, pct: u32, payer: HazardPayer, out: &[Hazard], home: &[Hazard], carried: u32) -> Option<Vec<HazardHit>> {
+    if pct == 0 || (out.is_empty() && home.is_empty()) {
+        return None;
+    }
+    let mut rng = Rng::new(op_seed.wrapping_add(DEMO_HAZARD_SEED_OFFSET));
+    let mut left = carried;
+    let mut hits = Vec::new();
+    let legs = out.iter().map(|h| (HazardLeg::Out, *h)).chain(home.iter().rev().map(|h| (HazardLeg::Home, *h)));
+    for (leg, hazard) in legs {
+        if rng.roll_d100() <= pct {
+            let hit = hazard_cost(hazard, payer, leg, left);
+            left -= hit.ore;
+            hits.push(hit);
+        }
+    }
+    Some(hits)
+}
+
+/// BP-20a-2 (W5): the vague warning on a way before setting off: each kind it crosses, once, in
+/// the order met; never a count, odds or a price. `None` on a clean way.
+pub fn hazard_warning(kinds: &[Hazard]) -> Option<String> {
+    let mut words: Vec<&str> = Vec::new();
+    for k in kinds {
+        let w = match k {
+            Hazard::Gas => "gas",
+            Hazard::Crust => "soft crust",
+            Hazard::Ruins => "ruins",
+        };
+        if !words.contains(&w) {
+            words.push(w);
+        }
+    }
+    (!words.is_empty()).then(|| words.join(", "))
+}
+
+/// BP-20a-2: the newest landed hazard trips an entry keeps (`OpsEntry::trip_reports`).
+const TRIP_REPORTS_KEPT: usize = 3;
 /// The ambush rolls from `Rng::new(op_seed + this)` (wrapping). Draw k of `Rng::new(s)` runs on
 /// state `s + k × 0x6D2B_79F5`, so a drill's stream would reach this one only at its 2³¹st draw; a
 /// dig reads at most 24 there (12 drills × 2: heat 10 at least, threshold 115 at most).
@@ -227,11 +342,23 @@ fn passable(terrain: &HashMap<String, HexTerrain>, q: i32, r: i32) -> Option<&He
     terrain.get(&format!("{q},{r}")).filter(|t| !t.is_impassable())
 }
 
-/// BP-20a-1 (§4e C3): the three hazards a route can cross. Exhaustive on purpose (no `_` arm):
-/// a new `HexTerrain` variant stops this compiling until someone says whether it is one.
-pub fn is_hazard(t: &HexTerrain) -> bool {
+/// BP-20a-2 (§4e C3): a hazard hex by the word the player reads: toxic gas (Director
+/// 2026-11-04), a crust that gives, ruins that fall.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Hazard {
+    Gas,
+    Crust,
+    Ruins,
+}
+
+/// BP-20a-2: a terrain's hazard, the one classifier (`is_hazard` reads it). Exhaustive on purpose
+/// (no `_` arm): a new `HexTerrain` variant stops this compiling until someone says whether it is one.
+pub fn hazard_of(t: &HexTerrain) -> Option<Hazard> {
     match t {
-        HexTerrain::ToxicZone | HexTerrain::CooledMagma | HexTerrain::RuinedCity => true,
+        HexTerrain::ToxicZone => Some(Hazard::Gas),
+        HexTerrain::CooledMagma => Some(Hazard::Crust),
+        HexTerrain::RuinedCity => Some(Hazard::Ruins),
         HexTerrain::AshenPlains
         | HexTerrain::ScorchedDesert
         | HexTerrain::CityState
@@ -239,8 +366,13 @@ pub fn is_hazard(t: &HexTerrain) -> bool {
         | HexTerrain::MagmaFlow
         | HexTerrain::VolcanicCaldera
         | HexTerrain::Mountain
-        | HexTerrain::Ravine => false,
+        | HexTerrain::Ravine => None,
     }
+}
+
+/// BP-20a-1 (§4e C3): whether a route counts the hex as a hazard; `hazard_of` decides.
+pub fn is_hazard(t: &HexTerrain) -> bool {
+    hazard_of(t).is_some()
 }
 
 /// BP-20a-1: which way a trip goes. Fast orders paths by (seconds, hazards), Safe by (hazards,
@@ -277,6 +409,10 @@ pub struct RoutePath {
 pub struct SiteRoutes {
     pub fast: RoutePath,
     pub safe: Option<RoutePath>,
+    /// BP-20a-2: the hazards each way crosses, in path order (`way_hazards`); `safe_kinds` is
+    /// empty with no Safe way.
+    pub fast_kinds: Vec<Hazard>,
+    pub safe_kinds: Vec<Hazard>,
 }
 
 /// The six axial neighbour offsets (BP-20a-1; private, so no keeper file is touched).
@@ -338,6 +474,13 @@ fn route_search(terrain: &HashMap<String, HexTerrain>, gateway: (i32, i32), targ
     out
 }
 
+/// BP-20a-2 (F-A): the hazards a way crosses, in path order: every hex entered but the site (the
+/// last), the gateway's neighbour (`path[0]`) included. Its length is the way's `hazards` (H1).
+fn way_hazards(terrain: &HashMap<String, HexTerrain>, way: &RoutePath) -> Vec<Hazard> {
+    let entered = way.path.len().saturating_sub(1);
+    way.path[..entered].iter().filter_map(|&(q, r)| passable(terrain, q, r).and_then(hazard_of)).collect()
+}
+
 /// BP-20a-1 (§4e C3): a Fast and a Safe way from `gateway` to each of `targets`, one bounded
 /// search per `RouteKind`. A target with no path is absent; Safe is kept only where it crosses
 /// fewer hazards than Fast.
@@ -350,7 +493,8 @@ pub fn board_routes(terrain: &HashMap<String, HexTerrain>, gateway: (i32, i32), 
         let Some(fast) = fast_ways.remove(&hex) else { continue };
         let safe = safe_ways.remove(&hex);
         let safe = safe.filter(|s| s.hazards < fast.hazards);
-        out.insert(hex, SiteRoutes { fast, safe });
+        let (fast_kinds, safe_kinds) = (way_hazards(terrain, &fast), safe.as_ref().map_or_else(Vec::new, |s| way_hazards(terrain, s)));
+        out.insert(hex, SiteRoutes { fast, safe, fast_kinds, safe_kinds });
     }
     out
 }
@@ -803,20 +947,46 @@ pub struct ForemanDue {
 }
 
 /// What one ops read claims for the leaders (BP-19b), under one lock: the Foreman's drained
-/// tally, the whole bench minutes since `bench_at`, whether the dig slot holds the Foreman, and
-/// the Commanders the store holds busy.
+/// tally, the whole bench minutes since `bench_at`, whether the dig slot holds the Foreman, the
+/// Commanders the store holds busy, and the drained hazard tally (BP-20a-2, `hazards`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LeaderClaim {
     pub due: ForemanDue,
     pub bench_mins: u32,
     pub foreman_out: bool,
     pub busy: Vec<Uuid>,
+    pub hazards: HazardDue,
 }
 
 impl ForemanDue {
     fn add(&mut self, other: ForemanDue) {
         self.stress = self.stress.saturating_add(other.stress);
         self.xp = self.xp.saturating_add(other.xp);
+    }
+}
+
+/// What landed trips' hazards owe the roster (BP-20a-2), summed in the entry until a read drains
+/// it (`take_leader_claim`): stress by Commander, wounded by Section, morale by Crew. A zero is
+/// never inserted, so the tally is at its default exactly when nothing is owed (the keep list
+/// tests it by value).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HazardDue {
+    pub stress: BTreeMap<Uuid, u32>,
+    pub wounded: BTreeMap<Uuid, u32>,
+    pub morale: BTreeMap<Uuid, u32>,
+}
+
+impl HazardDue {
+    /// Adds `other`, skipping zeros, saturating.
+    fn add(&mut self, other: &HazardDue) {
+        for (mine, theirs) in [(&mut self.stress, &other.stress), (&mut self.wounded, &other.wounded), (&mut self.morale, &other.morale)] {
+            for (id, n) in theirs {
+                if *n > 0 {
+                    let v = mine.entry(*id).or_insert(0);
+                    *v = v.saturating_add(*n);
+                }
+            }
+        }
     }
 }
 
@@ -1210,6 +1380,23 @@ struct ActiveOp {
     dig: Option<DigState>,
     /// The contract (BP-11a-2): its mission, its lead and its fight's result; `None` on a dig.
     contract: Option<ContractState>,
+    /// BP-20a-2: fixed at the start; `rewind_op` needs no new time field.
+    hazards: OpHazards,
+}
+
+/// BP-20a-2 (W4): the hazards an op's legs cross, each in path order (gateway to site), and the
+/// odds it rolls at, fixed at the start. A start's legs both cross its way; a next's hop crosses
+/// nothing (a straight hop with no path), and its way home is the target's Fast way.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct OpHazards {
+    out: Vec<Hazard>,
+    home: Vec<Hazard>,
+    pct: u32,
+}
+
+/// BP-20a-2: who pays the op's hazards (block C's `HazardPayer`).
+fn hazard_payer(op: &ActiveOp) -> HazardPayer {
+    if op.contract.is_some() { HazardPayer::Section } else { HazardPayer::Crew }
 }
 
 /// The op as the client sees it. Times are RFC 3339 with milliseconds; `arrived` is
@@ -1459,6 +1646,14 @@ struct OpsEntry {
     /// its slot (`DigState::settlement`), drained by `take_foreman_due`, put back by
     /// `restore_foreman_due` after a failed write. On the keep list, tested by value.
     foreman_due: ForemanDue,
+    /// What landed trips' hazards owe the roster (BP-20a-2): on the keep list, tested by value;
+    /// drained by `take_leader_claim`, put back by `restore_hazard_due`.
+    hazard_due: HazardDue,
+    /// The landed hazard trips (BP-20a-2): newest last, at most 3; display only, off the keep
+    /// list, never cleared by a start.
+    trip_reports: Vec<TripReport>,
+    /// The last report's `seq` (BP-20a-2): 0 until the first.
+    trip_seq: u32,
 }
 
 impl OpsEntry {
@@ -1647,25 +1842,72 @@ impl OpsEntry {
         self.settle_contracts(now);
         self.settle_sickbay(now);
         let mut arrivals: Vec<(DateTime<Utc>, u32)> = Vec::new();
-        if let Some(arrival) = self.dig.as_mut().and_then(|op| settle_op(op, now)) {
-            arrivals.push(arrival);
-            // BP-19a: the dig's homeward leg arrived (`DigClose::Home`), with what it carried.
-            if let Some(d) = self.dig.as_ref().and_then(|op| op.dig.as_ref()) {
-                self.foreman_due.add(d.settlement(DigClose::Home, arrival.1));
+        if let Some((arrived_at, carried)) = self.dig.as_mut().and_then(|op| settle_op(op, now)) {
+            if let Some(op) = self.dig.take() {
+                // BP-20a-2: the trip's hazards first, so the cart is cut before it banks.
+                let carried = self.land_hazards(&op, carried);
+                // BP-19a: the dig's homeward leg arrived (`DigClose::Home`), with what it carried.
+                if let Some(d) = op.dig.as_ref() {
+                    self.foreman_due.add(d.settlement(DigClose::Home, carried));
+                }
+                arrivals.push((arrived_at, carried));
             }
-            self.dig = None;
         }
-        self.contracts_out.retain(|_, op| match settle_op(op, now) {
-            Some(arrival) => {
-                arrivals.push(arrival);
-                false
+        let mut landed: Vec<(Option<Uuid>, DateTime<Utc>, u32)> = Vec::new();
+        for (key, op) in self.contracts_out.iter_mut() {
+            if let Some((arrived_at, carried)) = settle_op(op, now) {
+                landed.push((*key, arrived_at, carried));
             }
-            None => true,
-        });
+        }
+        for (key, arrived_at, carried) in landed {
+            if let Some(op) = self.contracts_out.remove(&key) {
+                let carried = self.land_hazards(&op, carried);
+                arrivals.push((arrived_at, carried));
+            }
+        }
         for (arrived_at, carried) in arrivals {
             self.ore_banked = self.ore_banked.saturating_add(carried);
             self.moved_at = self.moved_at.max(Some(arrived_at));
         }
+    }
+
+    /// BP-20a-2 (W3): a landing op's hazards, rolled at the landing (`hazard_hits`). A dig's
+    /// Foreman stress goes into `foreman_due`; the rest of the trip's costs into `hazard_due`
+    /// (morale by the Crew; a contract's stress by its Commander and wounds by its Section, the
+    /// ids taken as `next_op_for`'s `moving` takes them); the report is kept, newest last.
+    /// Returns what still rides on the cart. No hazard crossed, or the knob at 0: no report.
+    fn land_hazards(&mut self, op: &ActiveOp, carried: u32) -> u32 {
+        let payer = hazard_payer(op);
+        let Some(hits) = hazard_hits(op.op_seed, op.hazards.pct, payer, &op.hazards.out, &op.hazards.home, carried) else {
+            return carried;
+        };
+        let sum = |f: fn(&HazardHit) -> u32| hits.iter().fold(0u32, |acc, h| acc.saturating_add(f(h)));
+        let (ore, stress, wounded, morale) = (sum(|h| h.ore), sum(|h| h.stress), sum(|h| h.wounded), sum(|h| h.morale));
+        let mut trip = HazardDue::default();
+        match payer {
+            HazardPayer::Crew => {
+                self.foreman_due.add(ForemanDue { stress, xp: 0 });
+                if let Some(d) = op.dig.as_ref() {
+                    trip.morale.insert(d.crew_id, morale);
+                }
+            }
+            HazardPayer::Section => {
+                let lead = op.contract.as_ref().map(|c| (c.commander_id, c.section_id)).or_else(|| op.dig.as_ref().map(|d| (d.commander_id, d.section_id)));
+                if let Some((commander_id, section_id)) = lead {
+                    trip.stress.insert(commander_id, stress);
+                    if let Some(s) = section_id {
+                        trip.wounded.insert(s, wounded);
+                    }
+                }
+            }
+        }
+        self.hazard_due.add(&trip);
+        self.trip_seq += 1;
+        self.trip_reports.push(TripReport { seq: self.trip_seq, site_id: op.site_id.clone(), route: op.route, hits });
+        if self.trip_reports.len() > TRIP_REPORTS_KEPT {
+            self.trip_reports.remove(0);
+        }
+        carried.saturating_sub(ore)
     }
 
     /// The board refresh (BP-11a-3): a contract finished at least 45 s ago returns at another
@@ -1883,10 +2125,10 @@ pub struct OpsSnapshot {
 /// A new op (BP-11a-4), built for a start (`start_op`) and for a next (`next_op`): outbound to
 /// `site`, standing at the site's hex (`at`) once there. The leg takes `leg_secs`; home from the
 /// site takes the chosen way's seconds, the site's `travel_secs` (its Fast way) plus
-/// `detour_secs` (BP-20a-1: 0 on Fast). A dig starts fresh and a contract gets a fresh
+/// `detour_secs` (BP-20a-1: 0 on Fast), crossing `hazards` (BP-20a-2). A dig starts fresh and a contract gets a fresh
 /// `ContractState` with no result, so nothing carries over from an earlier op.
 #[allow(clippy::too_many_arguments)]
-fn new_op(site: &OpsSite, op_seed: u32, dig: Option<DigStart>, contract: Option<ContractStart>, route: RouteKind, detour_secs: u32, leg_secs: u32, now: DateTime<Utc>) -> ActiveOp {
+fn new_op(site: &OpsSite, op_seed: u32, dig: Option<DigStart>, contract: Option<ContractStart>, route: RouteKind, detour_secs: u32, hazards: OpHazards, leg_secs: u32, now: DateTime<Utc>) -> ActiveOp {
     ActiveOp {
         site_id: site.site_id.clone(),
         at: (site.q, site.r),
@@ -1915,6 +2157,7 @@ fn new_op(site: &OpsSite, op_seed: u32, dig: Option<DigStart>, contract: Option<
             crew_heads_lost: 0,
         }),
         contract: contract.and_then(|c| site.mission_id.map(|mission_id| ContractState { mission_id, commander_id: c.commander_id, section_id: c.section_id, result: None })),
+        hazards,
     }
 }
 
@@ -1964,7 +2207,8 @@ fn new_op(site: &OpsSite, op_seed: u32, dig: Option<DigStart>, contract: Option<
 ///   `travel_secs` after the pull: an accepted overcount;
 /// - the eviction takes only an entry with no op in any slot, no banked ore, no banked credits, no
 ///   building, no sickbay off the default, no trophy, no replace in flight (BP-12a-1,
-///   BP-12a-2) and no undrained Foreman tally (BP-19a, `foreman_due` off the default);
+///   BP-12a-2), no undrained Foreman tally (BP-19a, `foreman_due` off the default) and no
+///   undrained hazard tally (BP-20a-2, tested by value);
 /// - **the Foreman's tally (BP-19a):** every place a dig leaves its slot (the homeward arrival in
 ///   `settle_arrival`, a Crew wipe in `drill_op` or `latch_crew`, a guard wipe in `latch_raid`,
 ///   a dig left by `next_op_for`) adds `DigState::settlement` into `foreman_due` in the same
@@ -1987,6 +2231,10 @@ pub struct DemoOpsStore {
     inner: Mutex<HashMap<Uuid, OpsEntry>>,
     cap: usize,
     evict_warn: RateWarn,
+    /// The hazard chance in percent per hex per leg (BP-20a-2), copied onto each op at its start.
+    /// Every store starts at 0, so no test rolls unless it asks; production sets its own once,
+    /// in `main.rs`, before the state is shared.
+    hazard_pct: u32,
 }
 
 impl Default for DemoOpsStore {
@@ -1997,7 +2245,12 @@ impl Default for DemoOpsStore {
 
 impl DemoOpsStore {
     pub fn new(cap: usize) -> Self {
-        Self { inner: Mutex::new(HashMap::new()), cap, evict_warn: RateWarn::new() }
+        Self { inner: Mutex::new(HashMap::new()), cap, evict_warn: RateWarn::new(), hazard_pct: 0 }
+    }
+
+    /// Sets the hazard chance (BP-20a-2) for the ops started from now on.
+    pub fn set_hazard_pct(&mut self, pct: u32) {
+        self.hazard_pct = pct;
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, OpsEntry>> {
@@ -2006,8 +2259,9 @@ impl DemoOpsStore {
 
     /// Makes room for a new entry: below the cap, nothing; at it, evicts the least recently
     /// touched entry that holds no op in any slot (BP-18a-1a), no banked ore, no banked credits, no building, no sickbay
-    /// off the default, no trophy, no replace in flight (BP-12a-1, BP-12a-2) and no undrained
-    /// Foreman tally (BP-19a, tested by value), and journals
+    /// off the default, no trophy, no replace in flight (BP-12a-1, BP-12a-2), no undrained
+    /// Foreman tally (BP-19a, tested by value) and no undrained hazard tally (BP-20a-2, tested by
+    /// value), and journals
     /// (first, then at most hourly). The sickbay is tested by value, never by presence: a latch
     /// can leave a bay at the default until the entry's next settle (Reviewer BP-12a-1 F1).
     /// `false` when every entry holds one of them. An entry whose only state is a finished contract can go
@@ -2019,7 +2273,7 @@ impl DemoOpsStore {
         }
         let victim = inner
             .iter()
-            .filter(|(_, e)| e.dig.is_none() && e.contracts_out.is_empty() && e.ore_banked == 0 && e.credits_banked == 0 && e.base == OpsBase::default() && e.sickbay.values().all(|b| *b == SickBay::default()) && e.trophies.is_empty() && e.credits_in_flight == 0 && e.foreman_due == ForemanDue::default())
+            .filter(|(_, e)| e.dig.is_none() && e.contracts_out.is_empty() && e.ore_banked == 0 && e.credits_banked == 0 && e.base == OpsBase::default() && e.sickbay.values().all(|b| *b == SickBay::default()) && e.trophies.is_empty() && e.credits_in_flight == 0 && e.foreman_due == ForemanDue::default() && e.hazard_due == HazardDue::default())
             .min_by_key(|(_, e)| e.touched)
             .map(|(id, _)| *id);
         let Some(id) = victim else {
@@ -2059,7 +2313,7 @@ impl DemoOpsStore {
         if !self.make_room(&mut inner) {
             return false;
         }
-        inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, dig: None, contracts_out: BTreeMap::new(), moved_at: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), contracts: HashMap::new(), sickbay: HashMap::new(), trophies: Vec::new(), credits_in_flight: 0, crew_fight: None, wages_at: now, bench_at: now, squads: 1, hire_in_flight: false, foreman_due: ForemanDue::default() });
+        inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, dig: None, contracts_out: BTreeMap::new(), moved_at: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), contracts: HashMap::new(), sickbay: HashMap::new(), trophies: Vec::new(), credits_in_flight: 0, crew_fight: None, wages_at: now, bench_at: now, squads: 1, hire_in_flight: false, foreman_due: ForemanDue::default(), hazard_due: HazardDue::default(), trip_reports: Vec::new(), trip_seq: 0 });
         true
     }
 
@@ -2114,7 +2368,7 @@ impl DemoOpsStore {
             if !self.make_room(&mut inner) {
                 return Err(StartRefusal::Full);
             }
-            inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, dig: None, contracts_out: BTreeMap::new(), moved_at: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), contracts: HashMap::new(), sickbay: HashMap::new(), trophies: Vec::new(), credits_in_flight: 0, crew_fight: None, wages_at: now, bench_at: now, squads: 1, hire_in_flight: false, foreman_due: ForemanDue::default() });
+            inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, dig: None, contracts_out: BTreeMap::new(), moved_at: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), contracts: HashMap::new(), sickbay: HashMap::new(), trophies: Vec::new(), credits_in_flight: 0, crew_fight: None, wages_at: now, bench_at: now, squads: 1, hire_in_flight: false, foreman_due: ForemanDue::default(), hazard_due: HazardDue::default(), trip_reports: Vec::new(), trip_seq: 0 });
         }
         let Some(e) = inner.get_mut(&campaign_id) else {
             return Err(StartRefusal::Full);
@@ -2138,7 +2392,14 @@ impl DemoOpsStore {
             },
             None => (site.travel_secs, 0, RouteKind::Fast),
         };
-        let op = new_op(site, op_seed, dig, contract, route, detour_secs, leg_secs, now);
+        // BP-20a-2 (W4): the chosen way's hazards, both legs; none where the board has no ways.
+        let kinds = match e.board.routes.get(&(site.q, site.r)) {
+            Some(w) if route == RouteKind::Safe => w.safe_kinds.clone(),
+            Some(w) => w.fast_kinds.clone(),
+            None => Vec::new(),
+        };
+        let hazards = OpHazards { out: kinds.clone(), home: kinds, pct: self.hazard_pct };
+        let op = new_op(site, op_seed, dig, contract, route, detour_secs, hazards, leg_secs, now);
         let key = slot_of(&op);
         let taken = op.contract.as_ref().is_some_and(|c| e.mission_held(c.mission_id, None)) || (key != SlotKey::Dig && e.slot(key).is_some());
         if taken {
@@ -2290,7 +2551,10 @@ impl DemoOpsStore {
             dig = dig.map(|d| DigStart { commander_id, section_id, ..d });
             contract = contract.map(|_| ContractStart { commander_id, section_id });
         }
-        let next = new_op(site, op_seed, dig, contract, RouteKind::Fast, 0, leg_secs, now);
+        // BP-20a-2 (W4): the hop crosses nothing; home is the target's Fast way.
+        let home = e.board.routes.get(&(site.q, site.r)).map_or_else(Vec::new, |w| w.fast_kinds.clone());
+        let hazards = OpHazards { out: Vec::new(), home, pct: self.hazard_pct };
+        let next = new_op(site, op_seed, dig, contract, RouteKind::Fast, 0, hazards, leg_secs, now);
         let target = slot_of(&next);
         if target == SlotKey::Dig && e.dig.is_some() && key != SlotKey::Dig {
             return Err(NextRefusal::DigHeld);
@@ -2628,9 +2892,10 @@ impl DemoOpsStore {
         };
         e.settle_arrival(now);
         let due = std::mem::take(&mut e.foreman_due);
+        let hazards = std::mem::take(&mut e.hazard_due);
         let mins = (now - e.bench_at).num_minutes().max(0);
         e.bench_at += Duration::minutes(mins);
-        LeaderClaim { due, bench_mins: u32::try_from(mins).unwrap_or(u32::MAX), foreman_out: e.dig.is_some(), busy: e.busy_commander_ids() }
+        LeaderClaim { due, bench_mins: u32::try_from(mins).unwrap_or(u32::MAX), foreman_out: e.dig.is_some(), busy: e.busy_commander_ids(), hazards }
     }
 
     /// The tally half of `take_leader_claim` (BP-19a's tests). Test-only: it discards the bench
@@ -2646,6 +2911,25 @@ impl DemoOpsStore {
         let mut inner = self.lock();
         if let Some(e) = inner.get_mut(&campaign_id) {
             e.foreman_due.add(due);
+        }
+    }
+
+    /// Puts a drained hazard tally back after its write failed (BP-20a-2), so the next read
+    /// retries. No entry (evicted or wiped since the drain): the tally is lost, a named residual.
+    pub fn restore_hazard_due(&self, campaign_id: Uuid, due: &HazardDue) {
+        let mut inner = self.lock();
+        if let Some(e) = inner.get_mut(&campaign_id) {
+            e.hazard_due.add(due);
+        }
+    }
+
+    /// A hazard's wounded join `section_id`'s sickbay (BP-20a-2), cut to `cap` survivors (the
+    /// headcount the drain read), after settling. No entry: nothing (a named residual).
+    pub fn wound_section(&self, campaign_id: Uuid, section_id: Uuid, wounded: u8, cap: u8, now: DateTime<Utc>) {
+        let mut inner = self.lock();
+        if let Some(e) = inner.get_mut(&campaign_id) {
+            e.settle_arrival(now);
+            e.sickbay.entry(section_id).or_default().take_wounded(wounded, cap);
         }
     }
 
@@ -2676,18 +2960,19 @@ impl DemoOpsStore {
     /// always the primary (`slot_keys` is dig-first), so it is never here. Empty with one op or
     /// none. A second return, never a field on `OpsSnapshot`, which a test compares whole.
     pub fn ops_state_all(&self, campaign_id: Uuid, now: DateTime<Utc>) -> (OpsSnapshot, Vec<MoreOp>) {
-        let (snapshot, more_ops, _) = self.ops_body(campaign_id, now);
+        let (snapshot, more_ops, _, _) = self.ops_body(campaign_id, now);
         (snapshot, more_ops)
     }
 
     /// `ops_state_all` and the squads the wages count (BP-18a-2), from one lock: the body's
-    /// `company.wages`. A campaign with no entry counts one squad (every demo member joins with
+    /// `company.wages`; and the landed hazard trips (BP-20a-2, the body's `trip_reports`), a return
+    /// beside the snapshot, never a field on `OpsSnapshot`. A campaign with no entry counts one squad (every demo member joins with
     /// one), and pays nothing until it has an entry.
-    pub fn ops_body(&self, campaign_id: Uuid, now: DateTime<Utc>) -> (OpsSnapshot, Vec<MoreOp>, u8) {
+    pub fn ops_body(&self, campaign_id: Uuid, now: DateTime<Utc>) -> (OpsSnapshot, Vec<MoreOp>, u8, Vec<TripReport>) {
         let mut inner = self.lock();
         let Some(e) = inner.get_mut(&campaign_id) else {
             let none = OpsSnapshot { sites: None, op: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), company: CompanyView::default(), crew_fight: None };
-            return (none, Vec::new(), 1);
+            return (none, Vec::new(), 1, Vec::new());
         };
         e.settle_arrival(now);
         let primary = e.primary_key();
@@ -2712,7 +2997,7 @@ impl DemoOpsStore {
             company: e.company(),
             crew_fight: e.crew_fight,
         };
-        (snapshot, more_ops, e.squads)
+        (snapshot, more_ops, e.squads, e.trip_reports.clone())
     }
 
     /// Which of `sections` the store holds busy (BP-18a-1b-2, `OpsEntry::section_busy`), after
@@ -3234,10 +3519,11 @@ mod tests {
         assert_eq!(digs(&far), vec![], "d = 13 is out of range");
     }
 
-    /// The ring around gateway (5, 0) holds a Mountain vein (d = 2), a passable vein (d = 3),
-    /// a Mountain hex (d = 3), a Safe Zone hex (d = 3), and exactly four other passable hexes.
+    /// Around gateway (5, 0): a Mountain vein (d = 2) is no dig site, and a Safe Zone hex
+    /// (2, 0) (d = 3), reached by a plains corridor, is no contract hex; the pool is the five
+    /// other passable hexes 3 to 6 out.
     #[test]
-    fn ops_board_skips_impassable_vein_and_safe_zone_hexes() {
+    fn ops_board_skips_an_impassable_vein_and_a_safe_zone_hex() {
         let t = map(&[
             ((7, 0), HexTerrain::Mountain),
             ((5, 3), A),
@@ -3254,9 +3540,13 @@ mod tests {
             ((6, 0), A),
             ((7, -1), A),
             ((8, -1), A),
+            ((4, 0), A),
+            ((3, 0), A),
         ]);
         let b = ops_board(&t, &[vein(7, 0, 1), vein(5, 3, 1)], (5, 0), Uuid::nil());
         assert_eq!(digs(&b), vec![(5, 3, 1)], "the Mountain vein is no dig site");
+        let pool: Vec<(i32, i32)> = b.contract_pool.iter().map(|p| (p.0, p.1)).collect();
+        assert_eq!(pool, vec![(8, -1), (8, 0), (9, 0), (10, 0), (11, 0)], "(2, 0) is reachable but in the Safe Zone");
     }
 
     #[test]
@@ -4173,7 +4463,7 @@ mod tests {
     fn ops_detour_raises_the_haul_ambush() {
         let site = dig(1);
         let mut routes = HashMap::new();
-        routes.insert((9, 1), SiteRoutes { fast: way(10, 1, &[(9, 1)]), safe: Some(way(12, 0, &[(9, 1)])) });
+        routes.insert((9, 1), SiteRoutes { fast: way(10, 1, &[(9, 1)]), safe: Some(way(12, 0, &[(9, 1)])), fast_kinds: vec![], safe_kinds: vec![] });
         let b = Arc::new(OpsBoard { sites: vec![site.clone()], contract_pool: vec![], routes });
         let store = DemoOpsStore::new(4);
         let (safe, fast) = (Uuid::from_u128(1), Uuid::from_u128(2));
@@ -5613,5 +5903,202 @@ mod tests {
         pulled(&store, a, 2, 2);
         let c = store.take_leader_claim(a, at(25));
         assert!(c.foreman_out, "a homeward haul not yet arrived");
+    }
+
+    // ---- BP-20a-2: hazards on the way (§4e C3).
+
+    /// T1 (F-A): the kinds a way crosses, in path order, the site never and the gateway's
+    /// neighbour always; their count is the way's `hazards`. (c) is `routes_go_round_a_toxic_zone`'s map.
+    #[test]
+    fn hazard_kinds_follow_the_way_and_skip_the_site() {
+        let check = |w: &SiteRoutes| {
+            assert_eq!(w.fast_kinds.len(), w.fast.hazards as usize);
+            if let Some(s) = &w.safe {
+                assert_eq!(w.safe_kinds.len(), s.hazards as usize);
+            }
+        };
+        let t = map(&[((6, 0), A), ((7, 0), A), ((8, 0), HexTerrain::ToxicZone)]);
+        let w = &board_routes(&t, (5, 0), &[(8, 0)])[&(8, 0)];
+        assert_eq!((w.fast_kinds.clone(), w.safe_kinds.clone()), (vec![], vec![]), "the site's own gas never counts");
+        check(w);
+        let t = map(&[((6, 0), HexTerrain::RuinedCity), ((7, 0), A)]);
+        let w = &board_routes(&t, (5, 0), &[(7, 0)])[&(7, 0)];
+        assert_eq!((w.fast_kinds.clone(), w.safe_kinds.clone()), (vec![Hazard::Ruins], vec![]), "path[0] counts");
+        check(w);
+        let w = &board_routes(&detour_map(HexTerrain::ToxicZone, A), (5, 0), &[(9, 0)])[&(9, 0)];
+        assert_eq!((w.fast_kinds.clone(), w.safe_kinds.clone()), (vec![Hazard::Gas], vec![]));
+        check(w);
+    }
+
+    fn hit(hazard: Hazard, leg: HazardLeg, ore: u32, stress: u32, wounded: u32, morale: u32) -> HazardHit {
+        HazardHit { hazard, leg, ore, stress, wounded, morale }
+    }
+
+    /// T2 (F-J): seed 1's hazard draws are 21, 7, 17, 51 (measured with a Python port of `rng.rs`):
+    /// out Gas misses, out Ruins hits, home Ruins (travel order: the way reversed) hits, home Gas misses.
+    #[test]
+    fn hazard_hits_roll_out_then_home_in_travel_order() {
+        use Hazard::{Gas, Ruins};
+        assert_eq!(
+            hazard_hits(1, 20, HazardPayer::Crew, &[Gas, Ruins], &[Gas, Ruins], 0),
+            Some(vec![hit(Ruins, HazardLeg::Out, 0, 5, 0, 5), hit(Ruins, HazardLeg::Home, 0, 5, 0, 5)])
+        );
+    }
+
+    /// T3: no knob or no hazard, no report; both, one roll per hex per leg.
+    #[test]
+    fn hazard_hits_need_a_hazard_and_a_knob() {
+        use Hazard::Gas;
+        assert_eq!(hazard_hits(9, 0, HazardPayer::Crew, &[Gas], &[Gas], 0), None);
+        assert_eq!(hazard_hits(9, 100, HazardPayer::Crew, &[], &[], 0), None);
+        assert_eq!(hazard_hits(9, 100, HazardPayer::Crew, &[Gas], &[Gas], 0).map(|h| h.len()), Some(2));
+    }
+
+    /// T4 (W1): every roll hits at 100; a Section's hits are wounds (gas also stress), a Crew's
+    /// are stress and morale, and a crust takes a quarter of the cart on the way home only.
+    #[test]
+    fn hazard_costs_by_payer_and_leg() {
+        use Hazard::{Crust, Gas, Ruins};
+        use HazardLeg::{Home, Out};
+        assert_eq!(
+            hazard_hits(3, 100, HazardPayer::Section, &[Gas, Crust, Ruins], &[], 0),
+            Some(vec![hit(Gas, Out, 0, 10, 1, 0), hit(Crust, Out, 0, 0, 1, 0), hit(Ruins, Out, 0, 0, 1, 0)])
+        );
+        assert_eq!(
+            hazard_hits(3, 100, HazardPayer::Crew, &[Gas, Crust, Ruins], &[Crust], 40),
+            Some(vec![hit(Gas, Out, 0, 10, 0, 5), hit(Crust, Out, 0, 0, 0, 0), hit(Ruins, Out, 0, 5, 0, 5), hit(Crust, Home, 10, 0, 0, 0)])
+        );
+    }
+
+    /// T5 (W5): each kind once, in the order met; nothing on a clean way.
+    #[test]
+    fn hazard_warning_names_each_kind_once() {
+        assert_eq!(hazard_warning(&[Hazard::Gas, Hazard::Ruins, Hazard::Gas]), Some("gas, ruins".to_string()));
+        assert_eq!(hazard_warning(&[Hazard::Crust]), Some("soft crust".to_string()));
+        assert_eq!(hazard_warning(&[]), None);
+    }
+
+    /// A board holding `sites`, with a Fast way only to `at` crossing `kinds`.
+    fn hazard_board(sites: Vec<OpsSite>, at: (i32, i32), kinds: Vec<Hazard>) -> Arc<OpsBoard> {
+        let mut routes = HashMap::new();
+        let hazards = kinds.len() as u32;
+        routes.insert(at, SiteRoutes { fast: way(10, hazards, &[at]), safe: None, fast_kinds: kinds, safe_kinds: vec![] });
+        Arc::new(OpsBoard { sites, contract_pool: vec![], routes })
+    }
+
+    /// A store at cap 2 with the hazard knob at `pct`.
+    fn hazard_store(pct: u32) -> DemoOpsStore {
+        let mut store = DemoOpsStore::new(2);
+        store.set_hazard_pct(pct);
+        store
+    }
+
+    /// T6: `ops_detour_raises_the_haul_ambush`'s Fast flow (seed 57, one drill, 20 ore, pulled at
+    /// 20 s, no ambush, home at 30 s), the Crew alone, over crust then gas, every roll a hit,
+    /// against a twin at 0: nothing is owed on the way out; at the landing the home crust takes
+    /// 5 of 20, the Foreman owes 20 more and the Crew 10 morale.
+    #[test]
+    fn a_dig_pays_its_hazards_when_it_lands() {
+        use Hazard::{Crust, Gas};
+        use HazardLeg::{Home, Out};
+        let a = Uuid::from_u128(1);
+        let site = dig(1);
+        let (hot, twin) = (hazard_store(100), hazard_store(0));
+        for store in [&hot, &twin] {
+            let crew = DigStart { crew_id: CREW, commander_id: COMMANDER, threshold: 100, section_id: None, escort: false };
+            let b = hazard_board(vec![site.clone()], (9, 1), vec![Crust, Gas]);
+            store.start_op(a, (5, 0), b, &site, 57, Some(crew), None, at(0)).expect("start");
+            assert_eq!(store.take_leader_claim(a, at(10)).hazards, HazardDue::default(), "nothing owed on the way out");
+            assert!(store.ops_body(a, at(10)).3.is_empty());
+            assert_eq!(store.drill_op(a, at(13)), Ok(DrillOutcome::Drilled));
+            assert_eq!(store.pull_op(a, at(20)), Ok(()));
+        }
+        assert_eq!((hot.ops_state(a, at(30)).ore_banked, twin.ops_state(a, at(30)).ore_banked), (15, 20));
+        let (hot_claim, twin_claim) = (hot.take_leader_claim(a, at(30)), twin.take_leader_claim(a, at(30)));
+        assert_eq!(hot_claim.due.stress, twin_claim.due.stress + 20);
+        assert_eq!(hot_claim.hazards, HazardDue { morale: BTreeMap::from([(CREW, 10)]), ..HazardDue::default() });
+        assert_eq!(
+            hot.ops_body(a, at(31)).3,
+            vec![TripReport {
+                seq: 1,
+                site_id: site.site_id.clone(),
+                route: RouteKind::Fast,
+                hits: vec![hit(Crust, Out, 0, 0, 0, 0), hit(Gas, Out, 0, 10, 0, 5), hit(Gas, Home, 0, 10, 0, 5), hit(Crust, Home, 5, 0, 0, 0)],
+            }]
+        );
+    }
+
+    /// T7: `ops_store_eviction_skips_banked_credits`' flow (latched at 12 s, back at 13 s, home at
+    /// 23 s) with `SECTION` sent, over gas both ways: the Commander owes 20 stress and the Section 2
+    /// wounded; nothing is banked by the road.
+    #[test]
+    fn a_contract_owes_its_section_and_commander_when_it_lands() {
+        let store = hazard_store(100);
+        let a = Uuid::from_u128(1);
+        let lead = ContractStart { commander_id: COMMANDER, section_id: Some(SECTION) };
+        store.start_op(a, (5, 0), hazard_board(vec![site()], (8, 0), vec![Hazard::Gas]), &site(), 7, None, Some(lead), at(0)).expect("start");
+        let t = RaidTrigger { trigger_at: at(10), mission_id: "GUARD_DUTY", kind: BattleKind::Contract };
+        assert!(store.latch_raid(a, &t, RaidResult::Held, FightPay::credits(0), at(12)));
+        store.return_op(a, at(13)).expect("return");
+        assert_eq!(store.ops_state(a, at(23)).ore_banked, 0);
+        assert_eq!(
+            store.take_leader_claim(a, at(23)).hazards,
+            HazardDue { stress: BTreeMap::from([(COMMANDER, 20)]), wounded: BTreeMap::from([(SECTION, 2)]), morale: BTreeMap::new() }
+        );
+        let reports = store.ops_body(a, at(24)).3;
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].hits, vec![hit(Hazard::Gas, HazardLeg::Out, 0, 10, 1, 0), hit(Hazard::Gas, HazardLeg::Home, 0, 10, 1, 0)]);
+    }
+
+    /// T8 (W1): an escorted dig over gas, walked away and home: the Crew pays, the escort's
+    /// Section and Commander nothing.
+    #[test]
+    fn a_guarded_dig_charges_the_crew_not_the_escort() {
+        let store = hazard_store(100);
+        let a = Uuid::from_u128(1);
+        let site = dig(1);
+        let crew = DigStart { crew_id: CREW, commander_id: COMMANDER, threshold: 100, section_id: Some(SECTION), escort: true };
+        store.start_op(a, (5, 0), hazard_board(vec![site.clone()], (9, 1), vec![Hazard::Gas]), &site, 2, Some(crew), None, at(0)).expect("start");
+        assert_eq!(store.return_op(a, at(11)), Ok(()));
+        assert_eq!(
+            store.take_leader_claim(a, at(21)).hazards,
+            HazardDue { stress: BTreeMap::new(), wounded: BTreeMap::new(), morale: BTreeMap::from([(CREW, 10)]) }
+        );
+    }
+
+    /// T9 (W4): an escorted dig at `dig(1)` (no ways on the board) hops to `dig(3)`, whose Fast
+    /// way crosses gas: the hop (4 s) crosses nothing, the way home rolls once.
+    #[test]
+    fn a_next_hop_rolls_only_its_way_home() {
+        let store = hazard_store(100);
+        let a = Uuid::from_u128(1);
+        let (from, to) = (dig(1), dig(3));
+        let crew = DigStart { crew_id: CREW, commander_id: COMMANDER, threshold: 100, section_id: None, escort: true };
+        let b = hazard_board(vec![from.clone(), to.clone()], (9, 3), vec![Hazard::Gas]);
+        store.start_op(a, (5, 0), b, &from, 2, Some(crew), None, at(0)).expect("start");
+        assert_eq!(store.next_op(a, &to, 2, Some(crew), None, at(10)), Ok(()));
+        assert_eq!(store.return_op(a, at(14)), Ok(()));
+        let reports = store.ops_body(a, at(24)).3;
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].hits, vec![hit(Hazard::Gas, HazardLeg::Home, 0, 10, 0, 5)]);
+    }
+
+    /// T10 (`make_room_keeps_an_undrained_foreman_due` is the model): (a) a put-back tally of zeros
+    /// leaves the entry at the default, so it is evicted; (b) an undrained tally keeps it until drained.
+    #[test]
+    fn make_room_keeps_an_undrained_hazard_tally() {
+        let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let store = DemoOpsStore::new(1);
+        assert!(store.put_board(a, (5, 0), board(), at(0)));
+        store.restore_hazard_due(a, &HazardDue { stress: BTreeMap::from([(COMMANDER, 0)]), wounded: BTreeMap::from([(SECTION, 0)]), morale: BTreeMap::from([(CREW, 0)]) });
+        assert_eq!(store.start_op(b, (5, 0), board(), &site(), 7, None, Some(LEAD), at(1)), Ok(()));
+        assert!(store.board(a, (5, 0), at(2)).is_none(), "a zero tally keeps nothing");
+
+        let store = DemoOpsStore::new(1);
+        assert!(store.put_board(a, (5, 0), board(), at(0)));
+        store.restore_hazard_due(a, &HazardDue { morale: BTreeMap::from([(CREW, 5)]), ..HazardDue::default() });
+        assert_eq!(store.start_op(b, (5, 0), board(), &site(), 7, None, Some(LEAD), at(1)), Err(StartRefusal::Full));
+        assert_eq!(store.take_leader_claim(a, at(2)).hazards.morale, BTreeMap::from([(CREW, 5)]));
+        assert_eq!(store.start_op(b, (5, 0), board(), &site(), 7, None, Some(LEAD), at(3)), Ok(()));
     }
 }

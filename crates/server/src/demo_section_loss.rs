@@ -1,6 +1,7 @@
 //! The Section's fight losses (BP-11a-1; Breakpoint plan §4e). A raid or ambush fight costs
 //! the Section that fought one soldier per KIA or MIA in the recomputed report, the demo's
-//! Section headcount writers, the latch's loss and replace's add (BP-12a-2), written here and
+//! Section headcount writers, the latch's loss and replace's add (BP-12a-2), and a hazard's
+//! Commander stress (BP-20a-2), written here and
 //! nowhere else: `SectionRepository` is keeper and stays untouched. Demo-only: the `dev`
 //! port deletes this file, its `lib.rs` line, its `AppState` field and its `main.rs` line,
 //! each marked with this brick's tag.
@@ -15,7 +16,7 @@ use async_trait::async_trait;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::repository::{RepositoryError, SectionRepository};
+use crate::repository::{CommanderRepository, RepositoryError, SectionRepository};
 
 /// Takes soldiers from a Section, and adds them back (BP-12a-2).
 #[async_trait]
@@ -30,6 +31,11 @@ pub trait SectionLoss: Send + Sync {
     /// concurrent add waits on the row and re-checks `headcount + $2 <= 8` against the committed
     /// row, so two adds can't pass 8 together.
     async fn add_soldiers(&self, section_id: Uuid, campaign_id: Uuid, player_wallet: &[u8], soldiers: i16) -> Result<Option<i16>, RepositoryError>;
+
+    /// Adds a hazard's `stress` to a Commander, capped at 99 so a road never Shatters one
+    /// (BP-20a-2, W2), and returns the stress now. `Ok(None)` for a KIA or Shattered Commander,
+    /// left as is (the cap would lower a Shattered 100, F-G), or an unknown id.
+    async fn strain_commander(&self, commander_id: Uuid, stress: i16) -> Result<Option<i16>, RepositoryError>;
 }
 
 pub struct PostgresSectionLoss {
@@ -68,17 +74,30 @@ impl SectionLoss for PostgresSectionLoss {
         .await
         .map_err(|e| RepositoryError::Internal(e.to_string()))
     }
+
+    async fn strain_commander(&self, commander_id: Uuid, stress: i16) -> Result<Option<i16>, RepositoryError> {
+        sqlx::query_scalar!(
+            "UPDATE commander_records SET stress = LEAST(stress + $2, 99), updated_at = now() WHERE commander_id = $1 AND NOT is_kia AND NOT is_shattered RETURNING stress",
+            commander_id,
+            stress,
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Internal(e.to_string()))
+    }
 }
 
-/// The in-memory mirror, over the same Section store as `AppState::section_repo`. A read then
-/// a write, not one atomic step: tests drive one write at a time.
+/// The in-memory mirror, over the same Section store as `AppState::section_repo` (and, since
+/// BP-20a-2, the same Commander store as `AppState::commander_repo`). A read then a write, not one
+/// atomic step: tests drive one write at a time.
 pub struct InMemorySectionLoss {
     sections: Arc<dyn SectionRepository + Send + Sync>,
+    commanders: Arc<dyn CommanderRepository + Send + Sync>,
 }
 
 impl InMemorySectionLoss {
-    pub fn new(sections: Arc<dyn SectionRepository + Send + Sync>) -> Self {
-        Self { sections }
+    pub fn new(sections: Arc<dyn SectionRepository + Send + Sync>, commanders: Arc<dyn CommanderRepository + Send + Sync>) -> Self {
+        Self { sections, commanders }
     }
 }
 
@@ -103,12 +122,24 @@ impl SectionLoss for InMemorySectionLoss {
         self.sections.create_section(s).await?;
         Ok(Some(left))
     }
+
+    async fn strain_commander(&self, commander_id: Uuid, stress: i16) -> Result<Option<i16>, RepositoryError> {
+        let Some(c) = self.commanders.get_commander(commander_id).await? else {
+            return Ok(None);
+        };
+        if c.is_kia || c.is_shattered {
+            return Ok(None);
+        }
+        let now = c.stress.saturating_add(stress).min(99);
+        self.commanders.update_stress(commander_id, now).await?;
+        Ok(Some(now))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::repository::{InMemorySectionRepository, SectionRecord};
+    use crate::repository::{InMemoryCommanderRepository, InMemorySectionRepository, SectionRecord};
 
     /// BP-12a-2: the mirror refuses on exactly the Postgres statement's terms, each deciding
     /// alone: room (7 + 2 > 8), the campaign, the wallet, the id. In-memory bytes 254 (the owner)
@@ -116,7 +147,7 @@ mod tests {
     #[tokio::test]
     async fn in_memory_add_soldiers_refuses_on_the_same_terms() {
         let sections: Arc<dyn SectionRepository + Send + Sync> = Arc::new(InMemorySectionRepository::new());
-        let loss = InMemorySectionLoss::new(Arc::clone(&sections));
+        let loss = InMemorySectionLoss::new(Arc::clone(&sections), Arc::new(InMemoryCommanderRepository::new()));
         let (a, b) = (Uuid::from_u128(0xA), Uuid::from_u128(0xB));
         let (owner, other) = ([254u8; 32], [255u8; 32]);
         let s = Uuid::from_u128(0x5EC);

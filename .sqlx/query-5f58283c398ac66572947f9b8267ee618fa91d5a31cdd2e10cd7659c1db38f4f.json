@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE commander_records SET stress = LEAST(stress + $2, 99), updated_at = now() WHERE commander_id = $1 AND NOT is_kia AND NOT is_shattered RETURNING stress",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "stress",
+        "type_info": "Int2"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int2"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "5f58283c398ac66572947f9b8267ee618fa91d5a31cdd2e10cd7659c1db38f4f"
+}
