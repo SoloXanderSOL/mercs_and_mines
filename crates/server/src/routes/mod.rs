@@ -522,6 +522,10 @@ async fn post_mission_resolve(
         return Err(refusal);
     }
 
+    // (BP-19b, demo-only) The finished digs, then the bench, settle before the re-read below
+    // reads this Commander's stress into the roll (C5). Never fails the route.
+    crate::routes::ops::settle_leaders(&state, rec.campaign_id, &wallet, Utc::now()).await;
+
     // Everything the log needs is fixed before any write. The seed is the server's only.
     let seed = generate_seed();
     let now = Utc::now();

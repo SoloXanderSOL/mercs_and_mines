@@ -28,13 +28,14 @@ use sim_engine::game_types::{BattleReport, LootDrop, Squad};
 use sim_engine::missions::missions;
 use sim_engine::resolver::resolve_mission_with_modifiers;
 use sim_engine::rng::generate_seed;
+use sim_engine::constants::STRESS_STRAINED_MAX;
 use sim_engine::roster::ForemanSpecialization;
 use uuid::Uuid;
 
 use crate::api_types::MissionResolveRequest;
 use crate::auth::AuthSession;
 use crate::demo_ops::{
-    fight_losses, fight_wounded, foreman_threshold, ForemanDue, ForemanRead, DEMO_HEAT_THRESHOLD, ops_board, ops_time, raid_fight, raid_result, ActiveOpView, BaseBuilding,
+    fight_losses, fight_wounded, foreman_threshold, ForemanDue, ForemanRead, LeaderClaim, DEMO_BENCH_STRESS_PER_MIN, DEMO_HEAT_THRESHOLD, ops_board, ops_time, raid_fight, raid_result, ActiveOpView, BaseBuilding,
     BuildRefusal, CompanyView, ContractStart, CrewFightView, DigStart, DrillOutcome, DrillRefusal, EscortRefusal, FightPay,
     HealRefusal, MoreOp, NextRefusal, OpSquad, OpsBase, OpsBoard, OpsSite, PullRefusal, RaidResult, ReplaceHold, ReplaceRefusal,
     ReturnRefusal, StartRefusal, DEMO_CREW_FIGHT_MORALE_LOSS, DEMO_MELTDOWN_MORALE_LOSS, DEMO_REPLACE_MERC_CREDITS,
@@ -585,7 +586,7 @@ async fn get_ops_board(
     let board = load_board(&state, &campaign, gw, now, false, "get_ops_board").await?;
     relead_unusable(&state, campaign_id, &wallet, now, "get_ops_board").await?;
     latch_pending_raid(&state, campaign_id, now, "get_ops_board").await?;
-    settle_foreman(&state, campaign_id, &wallet, now).await;
+    settle_leaders(&state, campaign_id, &wallet, now).await;
     Ok(ops_response(&state, campaign_id, gw, &board, now))
 }
 
@@ -709,53 +710,85 @@ async fn post_ops_start(
         Err(StartRefusal::Taken) => return Err(conflict("another squad has that contract")),
         Err(StartRefusal::CommanderBusy) => return Err(conflict("every Commander is out")),
     }
-    settle_foreman(&state, campaign_id, &wallet, now).await;
+    settle_leaders(&state, campaign_id, &wallet, now).await;
     Ok(ops_response(&state, campaign_id, gw, &board, now))
 }
 
-/// Writes what finished digs owe the member's first Foreman (BP-19a, demo-only). Runs in a
-/// spawned task, which this helper awaits: the drain (`take_foreman_due`, the exactly-once claim)
-/// and the write (`settle_foreman_dig`, row-locked) both run inside it, so a handler dropped at
-/// the await loses nothing (before the task starts the tally stays in the entry for the next
-/// read; once it starts it finishes). Nothing owed: no read. A member with no Foreman: the tally
-/// is dropped, with nobody to credit. A KIA Foreman: the write answers `Ok(false)` and the tally
-/// is dropped. A failed read or write: the tally is put back (`restore_foreman_due`) with one
-/// warning, and the next ops read retries. It never fails the route: the body carries no
-/// Foreman, and a stalled write must not take the ops screen down.
-async fn settle_foreman(state: &Arc<AppState>, campaign_id: Uuid, wallet: &[u8], now: DateTime<Utc>) {
+/// Settles the member's leaders on an ops read (BP-19a, BP-19b; demo-only). Runs in a spawned
+/// task, which this helper awaits: the claim (`take_leader_claim`, which drains the Foreman's
+/// tally and claims the bench minutes, both exactly once under the store lock) and every write
+/// run inside it, so a handler dropped at the await loses nothing (before the task starts the
+/// tally and the minutes stay in the entry for the next read; once it starts it finishes). It
+/// never fails the route: the body carries no leader stress, and a stalled write must not take
+/// the ops screen down. In this order (BP-19b spec check item 4: the clear and the cap read the
+/// settled row):
+/// 1. **The settlement** (BP-19a): what finished digs owe the member's first Foreman. Nothing
+///    owed: no read. No Foreman: the tally is dropped, with nobody to credit. A KIA Foreman: the
+///    write answers `Ok(false)` and the tally is dropped. A failed read or write: the tally is
+///    put back (`restore_foreman_due`) with one warning, and the next ops read retries.
+/// 2. **The Foreman's bench** (BP-19b), unless the dig slot holds the Foreman: `bench_foremen`,
+///    whose clear binds `STRESS_STRAINED_MAX` (ODQ-73).
+/// 3. **The Commanders' bench** (BP-19b): `bench_commanders`, every Commander the store does not
+///    hold busy.
+///
+/// No bench minute claimed: no bench statement. A failed bench write is dropped with one
+/// warning, never restored (`bench_at` has already moved; a named residual).
+pub(crate) async fn settle_leaders(state: &Arc<AppState>, campaign_id: Uuid, wallet: &[u8], now: DateTime<Utc>) {
     let task_state = Arc::clone(state);
     let wallet = wallet.to_vec();
     let handle = tokio::spawn(async move {
         let state = task_state;
-        let due = state.demo_ops.store.take_foreman_due(campaign_id, now);
-        if due == ForemanDue::default() {
-            return;
-        }
-        let foremen = match state.foreman_repo.list_foremen_for_member(campaign_id, &wallet).await {
-            Ok(f) => f,
-            Err(e) => {
-                state.demo_ops.store.restore_foreman_due(campaign_id, due);
-                tracing::warn!(%campaign_id, error = %e, "settle_foreman: list_foremen_for_member failed; tally put back");
-                return;
-            }
-        };
-        let Some(foreman) = foremen.first() else {
-            return;
-        };
-        if let Err(e) = state.foreman_repo.settle_foreman_dig(foreman.foreman_id, due.stress, due.xp).await {
-            state.demo_ops.store.restore_foreman_due(campaign_id, due);
-            tracing::warn!(%campaign_id, error = %e, "settle_foreman: settle_foreman_dig failed; tally put back");
-        }
+        let claim = state.demo_ops.store.take_leader_claim(campaign_id, now);
+        settle_leaders_dig(&state, campaign_id, &wallet, claim.due).await;
+        settle_leaders_bench(&state, campaign_id, &wallet, &claim).await;
     });
     if let Err(e) = handle.await {
-        tracing::warn!(%campaign_id, error = %e, "settle_foreman: task failed");
+        tracing::warn!(%campaign_id, error = %e, "settle_leaders: task failed");
+    }
+}
+
+/// `settle_leaders`' settlement part (BP-19a's body): its early exits end this part only.
+async fn settle_leaders_dig(state: &AppState, campaign_id: Uuid, wallet: &[u8], due: ForemanDue) {
+    if due == ForemanDue::default() {
+        return;
+    }
+    let foremen = match state.foreman_repo.list_foremen_for_member(campaign_id, wallet).await {
+        Ok(f) => f,
+        Err(e) => {
+            state.demo_ops.store.restore_foreman_due(campaign_id, due);
+            tracing::warn!(%campaign_id, error = %e, "settle_leaders: list_foremen_for_member failed; tally put back");
+            return;
+        }
+    };
+    let Some(foreman) = foremen.first() else {
+        return;
+    };
+    if let Err(e) = state.foreman_repo.settle_foreman_dig(foreman.foreman_id, due.stress, due.xp).await {
+        state.demo_ops.store.restore_foreman_due(campaign_id, due);
+        tracing::warn!(%campaign_id, error = %e, "settle_leaders: settle_foreman_dig failed; tally put back");
+    }
+}
+
+/// `settle_leaders`' bench part (BP-19b): the Foreman unless out, then the Commanders.
+async fn settle_leaders_bench(state: &AppState, campaign_id: Uuid, wallet: &[u8], claim: &LeaderClaim) {
+    if claim.bench_mins == 0 {
+        return;
+    }
+    let shed = i16::try_from(DEMO_BENCH_STRESS_PER_MIN.saturating_mul(claim.bench_mins).min(100)).unwrap_or(100);
+    if !claim.foreman_out {
+        if let Err(e) = state.foreman_repo.bench_foremen(campaign_id, wallet, shed, i16::from(STRESS_STRAINED_MAX)).await {
+            tracing::warn!(%campaign_id, error = %e, "settle_leaders: bench_foremen failed; the minutes are lost");
+        }
+    }
+    if let Err(e) = state.commander_repo.bench_commanders(campaign_id, wallet, &claim.busy, shed).await {
+        tracing::warn!(%campaign_id, error = %e, "settle_leaders: bench_commanders failed; the minutes are lost");
     }
 }
 
 /// A dig's Crew, threshold (BP-8b-1a) and Commander (BP-8b-1b). The Crew is the member's first
 /// by the lister's order (a demo member holds one, the join's); `409` when it has no heads left,
 /// since only a new run brings a fresh one. BP-19a: the digs already finished are settled on the
-/// Foreman first (`settle_foreman`), then the first Foreman's stress band, rank and
+/// Foreman first (`settle_leaders`: the finished digs, then the bench), then the first Foreman's stress band, rank and
 /// Specialisation set the threshold (`foreman_threshold`); no Foreman means the plain
 /// threshold. The Commander, who fights the dig's
 /// raids, is the first usable one (not KIA, not Shattered: the mission route's refusals), or
@@ -763,7 +796,7 @@ async fn settle_foreman(state: &Arc<AppState>, campaign_id: Uuid, wallet: &[u8],
 /// member a second (BP-18a-2), so the client names the Commander it fights with. `409` when
 /// none is usable. The Crew is checked first, so a member with neither hears about the Crew.
 async fn dig_start(state: &Arc<AppState>, campaign_id: Uuid, wallet: &[u8], prefer_free: bool, now: DateTime<Utc>, route: &str) -> Result<DigStart, AppError> {
-    settle_foreman(state, campaign_id, wallet, now).await;
+    settle_leaders(state, campaign_id, wallet, now).await;
     let crews = state.crew_repo.list_crews_for_member(campaign_id, wallet).await.map_err(|e| {
         internal_error(format!("{route}: list_crews_for_member failed for campaign {campaign_id}: {e}"))
     })?;
@@ -907,7 +940,7 @@ async fn post_ops_return(
         Err(ReturnRefusal::RaidPending) => return Err(conflict("raiders at the site")),
         Err(ReturnRefusal::SayWhich) => return Err(bad_request("say which squad")),
     }
-    settle_foreman(&state, campaign_id, &wallet, now).await;
+    settle_leaders(&state, campaign_id, &wallet, now).await;
     Ok(ops_response(&state, campaign_id, gw, &board, now))
 }
 
@@ -1001,7 +1034,7 @@ async fn post_ops_next(
         Err(NextRefusal::DigHeld) => return Err(conflict("an op is already under way")),
         Err(NextRefusal::Taken) => return Err(conflict("another squad has that contract")),
     }
-    settle_foreman(&state, campaign_id, &wallet, now).await;
+    settle_leaders(&state, campaign_id, &wallet, now).await;
     Ok(ops_response(&state, campaign_id, gw, &board, now))
 }
 
@@ -1064,7 +1097,7 @@ async fn post_ops_drill(
         Err(DrillRefusal::RaidPending) => return Err(conflict("raiders at the site")),
     }
     drop(launch);
-    settle_foreman(&state, campaign_id, &wallet, now).await;
+    settle_leaders(&state, campaign_id, &wallet, now).await;
     Ok(ops_response(&state, campaign_id, gw, &board, now))
 }
 
@@ -1146,7 +1179,7 @@ async fn post_ops_escort(
         Err(EscortRefusal::SectionBusy) => return Err(conflict("that squad is out")),
         Err(EscortRefusal::CommanderBusy) => return Err(conflict("every Commander is out")),
     }
-    settle_foreman(&state, campaign_id, &wallet, now).await;
+    settle_leaders(&state, campaign_id, &wallet, now).await;
     Ok(ops_response(&state, campaign_id, gw, &board, now))
 }
 
@@ -1187,7 +1220,7 @@ async fn post_ops_pull(
         Err(PullRefusal::NothingToHaul) => return Err(conflict("nothing to haul: return instead")),
         Err(PullRefusal::RaidPending) => return Err(conflict("raiders at the site")),
     }
-    settle_foreman(&state, campaign_id, &wallet, now).await;
+    settle_leaders(&state, campaign_id, &wallet, now).await;
     Ok(ops_response(&state, campaign_id, gw, &board, now))
 }
 
@@ -1234,7 +1267,7 @@ async fn post_ops_build(
         Err(BuildRefusal::AlreadyBuilt) => return Err(conflict("already built")),
         Err(BuildRefusal::NotEnoughOre) => return Err(conflict("not enough banked ore")),
     }
-    settle_foreman(&state, campaign_id, &wallet, now).await;
+    settle_leaders(&state, campaign_id, &wallet, now).await;
     Ok(ops_response(&state, campaign_id, gw, &board, now))
 }
 
@@ -1281,7 +1314,7 @@ async fn post_ops_heal(
         Err(HealRefusal::AlreadyHealing) => return Err(conflict("already healing")),
         Err(HealRefusal::NotEnoughCredits) => return Err(conflict("not enough banked credits")),
     }
-    settle_foreman(&state, campaign_id, &wallet, now).await;
+    settle_leaders(&state, campaign_id, &wallet, now).await;
     Ok(ops_response(&state, campaign_id, gw, &board, now))
 }
 
@@ -1362,7 +1395,7 @@ async fn post_ops_replace(
         Ok(result) => result?,
         Err(e) => return Err(internal_error(format!("post_ops_replace: task failed for campaign {campaign_id}: {e}"))),
     }
-    settle_foreman(&state, campaign_id, &wallet, now).await;
+    settle_leaders(&state, campaign_id, &wallet, now).await;
     Ok(ops_response(&state, campaign_id, gw, &board, now))
 }
 
@@ -1454,7 +1487,7 @@ async fn post_ops_hire(
         Ok(result) => result?,
         Err(e) => return Err(internal_error(format!("post_ops_hire: task failed for campaign {campaign_id}: {e}"))),
     }
-    settle_foreman(&state, campaign_id, &wallet, now).await;
+    settle_leaders(&state, campaign_id, &wallet, now).await;
     Ok(ops_response(&state, campaign_id, gw, &board, now))
 }
 
@@ -2695,7 +2728,7 @@ mod tests {
         let got: Vec<(i32, i32, String)> = [false, true]
             .into_iter()
             .map(|gunsmith| {
-                let i = crate::demo_roll::RollInputs { rank: 1, specialization: CommanderSpecialization::Cannoneer, fatal_flaw: CommanderFlaw::Paranoid, gunsmith };
+                let i = crate::demo_roll::RollInputs { rank: 1, specialization: CommanderSpecialization::Cannoneer, fatal_flaw: CommanderFlaw::Paranoid, gunsmith, stress: 0 };
                 let rows = crate::demo_roll::roll_modifiers(Some(&i), None, mission);
                 let r = resolve_mission_with_modifiers(&squad, mission, &rows, "2026-11-02T00:00:00Z", Some(13), &config.sim);
                 (r.score_breakdown.raw_roll, r.score_breakdown.total_score, format!("{:?}", r.outcome))
@@ -4654,5 +4687,137 @@ mod tests {
         let (status, body, _) = start(&state, c, DIG).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["active_op"]["dig"]["threshold"], 95, "{body}");
+    }
+
+    // ---- BP-19b: the bench and the Commander's stress rows.
+
+    /// Posts `GUARD_DUTY` for `commander_id` with the member's Section and 8 Rookies; returns the
+    /// status and the body.
+    async fn post_guard_duty(state: &Arc<AppState>, campaign: Uuid, commander_id: Uuid) -> (StatusCode, serde_json::Value) {
+        let section = member_section(state, campaign).await;
+        let body = serde_json::json!({
+            "squad": { "units": rookies(8) },
+            "mission_id": "GUARD_DUTY",
+            "commander_id": commander_id,
+            "section_ids": [section],
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/mission/resolve")
+            .header("authorization", "Bearer t")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = with_test_peer(crate::routes::router(Arc::clone(state)), TEST_PEER).oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).expect("JSON"))
+    }
+
+    /// A response's roll rows as `(key, points)`.
+    fn roll_rows(response: &serde_json::Value) -> Vec<(String, i64)> {
+        response["report"]["score_breakdown"]["modifiers"]
+            .as_array()
+            .expect("modifiers")
+            .iter()
+            .map(|m| (m["key"].as_str().expect("key").to_string(), m["points"].as_i64().expect("points")))
+            .collect()
+    }
+
+    /// R1 (C5 at `dig_start`): a plain rank-1 Foreman at 35 (Strained) rests a minute before the
+    /// start, so the start's own settle benches it to 30 (Rested) before the band is read:
+    /// threshold 100, not 95.
+    #[tokio::test]
+    async fn ops_bench_sheds_a_resting_foreman_before_dig_start() {
+        let state = Arc::new(session_state());
+        let c = foreman_campaign(&state, 35, false, false).await;
+        assert_eq!(get(&state, Some("t"), c).await.0, StatusCode::OK);
+        state.demo_ops.store.rewind_bench(c, 60);
+        let (status, body, _) = start(&state, c, DIG).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["active_op"]["dig"]["threshold"], 100, "{body}");
+        assert_eq!(first_foreman(&state, c).await.stress, 30);
+    }
+
+    /// R2 (C5 at the mission route): the seed-42 Commander (Cannoneer) at 35 with no op rests a
+    /// minute; the mission route benches it to 30 before the re-read, so the roll has the Rested
+    /// +5 and no stress row, and the log holds `"stress": 30`.
+    #[tokio::test]
+    async fn mission_route_benches_the_commander_before_the_roll() {
+        let state = Arc::new(session_state());
+        let c = campaign_with(&state, WALLET, true, Some(GATEWAY)).await;
+        seed_sector(&state, &c).await;
+        assert_eq!(get(&state, Some("t"), c.campaign_id).await.0, StatusCode::OK);
+        let mut commander = crate::commander_gen::generate_commander(WALLET.to_vec(), c.campaign_id, 42);
+        commander.stress = 35;
+        let commander_id = commander.commander_id;
+        state.commander_repo.create_commander(commander).await.expect("create_commander");
+        state.demo_ops.store.rewind_bench(c.campaign_id, 60);
+        let (status, response) = post_guard_duty(&state, c.campaign_id, commander_id).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        let rows = roll_rows(&response);
+        assert!(rows.contains(&("specialization".to_string(), 5)), "{rows:?}");
+        assert!(!rows.iter().any(|(k, _)| k == "stress"), "{rows:?}");
+        let deps = state.commander_repo.list_deployments_by_commander(commander_id).await.expect("deployments");
+        let entries = state.input_log_repo.get_entries_by_session(&deps[0].session_id).await.expect("entries");
+        assert_eq!(entries[0].payload["roll_inputs"]["stress"], 30);
+    }
+
+    /// R3 (order): a Shattered Foreman at 75; seed 2's one-drill haul (+13) has landed, unread,
+    /// and a minute has passed. One read settles the dig first (88), then benches (83): still
+    /// Shattered. Bench first would clear the flag at 70.
+    #[tokio::test]
+    async fn ops_settles_the_dig_before_the_bench() {
+        let state = Arc::new(session_state());
+        let c = foreman_campaign(&state, 75, true, false).await;
+        dig_on_site(&state, c, 2).await;
+        assert_eq!(drill(&state, c).await.0, StatusCode::OK);
+        let (status, body, _) = pull(&state, c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        state.demo_ops.store.rewind_op(c, dig_secs(&state, c).await);
+        state.demo_ops.store.rewind_bench(c, 60);
+        let (status, body) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["active_op"].is_null(), "home: {body}");
+        let f = first_foreman(&state, c).await;
+        assert_eq!((f.stress, f.is_shattered), (83, true));
+    }
+
+    /// R4: a Foreman at 40 out on a dig sheds nothing while a minute passes.
+    #[tokio::test]
+    async fn ops_bench_skips_a_foreman_out_on_a_dig() {
+        let state = Arc::new(session_state());
+        let c = foreman_campaign(&state, 40, false, false).await;
+        let (status, body, _) = start(&state, c, DIG).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        state.demo_ops.store.rewind_bench(c, 60);
+        assert_eq!(get(&state, Some("t"), c).await.0, StatusCode::OK);
+        assert_eq!(first_foreman(&state, c).await.stress, 40);
+    }
+
+    /// R5: the Commander at 40 with no ops entry (the claim is empty) fights Guard Duty: the log
+    /// holds `"stress": 40` and the rows +2 and −3; with the record then set to 0, the replay
+    /// still rebuilds the route's report, because it reads the log.
+    #[tokio::test]
+    async fn mission_route_logs_stress_and_the_replay_reads_the_log() {
+        let state = Arc::new(session_state());
+        let c = campaign_with(&state, WALLET, true, Some(GATEWAY)).await;
+        let mut commander = crate::commander_gen::generate_commander(WALLET.to_vec(), c.campaign_id, 42);
+        commander.stress = 40;
+        let commander_id = commander.commander_id;
+        state.commander_repo.create_commander(commander).await.expect("create_commander");
+        let (status, mut response) = post_guard_duty(&state, c.campaign_id, commander_id).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        let rows = roll_rows(&response);
+        assert!(rows.contains(&("specialization".to_string(), 2)), "{rows:?}");
+        assert!(rows.contains(&("stress".to_string(), -3)), "{rows:?}");
+        let deps = state.commander_repo.list_deployments_by_commander(commander_id).await.expect("deployments");
+        assert_eq!(deps.len(), 1);
+        let entries = state.input_log_repo.get_entries_by_session(&deps[0].session_id).await.expect("entries");
+        assert_eq!(entries[0].payload["roll_inputs"]["stress"], 40);
+        state.commander_repo.update_stress(commander_id, 0).await.expect("update_stress");
+        let (report, _) = replay_report(&state, &deps[0], "test").await.expect("replay_report");
+        response["report"]["commander_name"] = serde_json::Value::Null;
+        assert_eq!(serde_json::to_value(&report).unwrap(), response["report"]);
     }
 }

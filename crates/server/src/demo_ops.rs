@@ -42,6 +42,7 @@ use std::time::Instant;
 
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde::Serialize;
+use sim_engine::constants::{MAX_STRESS, STRESS_BREAKING_POINT_MIN, STRESS_STRAINED_MIN};
 use sim_engine::game_types::{LootDrop, QualityGrade, UnitBattleResult, UnitStatus};
 use sim_engine::missions::missions;
 use sim_engine::rng::{generate_seed, Rng};
@@ -575,9 +576,12 @@ pub const DEMO_FOREMAN_XP_LANDED: u32 = 25;
 pub const DEMO_FOREMAN_XP_DRIVEN_OFF: u32 = 15;
 /// Foreman XP for a dig left by choice with nothing landed (BP-19a).
 pub const DEMO_FOREMAN_XP_LEFT: u32 = 8;
+/// Stress a benched leader sheds per whole minute (BP-19b; canon's −5% a day, demo-sized to a minute).
+pub const DEMO_BENCH_STRESS_PER_MIN: u32 = 5;
 
 /// A leader's stress band (BP-19a; `Commander_Stress_System` §2): 0–30, 31–70, 71–99, and 100 or
 /// the flag.
+/// The cuts are `sim-engine`'s (`constants.rs`), the one copy; the Foreman bench's clear binds `STRESS_STRAINED_MAX` (BP-19b).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StressBand {
     Rested,
@@ -587,11 +591,11 @@ pub enum StressBand {
 }
 
 pub fn stress_band(stress: i16, is_shattered: bool) -> StressBand {
-    if is_shattered || stress >= 100 {
+    if is_shattered || stress >= i16::from(MAX_STRESS) {
         StressBand::Shattered
-    } else if stress >= 71 {
+    } else if stress >= i16::from(STRESS_BREAKING_POINT_MIN) {
         StressBand::BreakingPoint
-    } else if stress >= 31 {
+    } else if stress >= i16::from(STRESS_STRAINED_MIN) {
         StressBand::Strained
     } else {
         StressBand::Rested
@@ -634,6 +638,17 @@ pub fn dig_threshold(coolant_jockey: bool) -> u32 {
 pub struct ForemanDue {
     pub stress: u32,
     pub xp: u32,
+}
+
+/// What one ops read claims for the leaders (BP-19b), under one lock: the Foreman's drained
+/// tally, the whole bench minutes since `bench_at`, whether the dig slot holds the Foreman, and
+/// the Commanders the store holds busy.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LeaderClaim {
+    pub due: ForemanDue,
+    pub bench_mins: u32,
+    pub foreman_out: bool,
+    pub busy: Vec<Uuid>,
 }
 
 impl ForemanDue {
@@ -1255,6 +1270,10 @@ struct OpsEntry {
     /// carries. Not on the keep list (it is never at a default), and `rewind_op` leaves it, so
     /// a route test that rewinds an op pays no wages.
     wages_at: DateTime<Utc>,
+    /// The bench (BP-19b): the instant up to which this entry's idle leaders have shed stress.
+    /// Starts at the entry's creation and moves by whole minutes only (`take_leader_claim`). Not
+    /// on the keep list (it is never at a default), and `rewind_op` leaves it.
+    bench_at: DateTime<Utc>,
     /// The squads (Sections) the wages count (BP-18a-2): 1 at creation (every demo member joins
     /// with one Section), then the route's recount under the launch lock (`finish_hire`).
     squads: u8,
@@ -1320,10 +1339,18 @@ impl OpsEntry {
         self.contracts_out.contains_key(&Some(s)) || self.guarded_dig().is_some_and(|d| d.section_id == Some(s))
     }
 
+    /// The Commanders the store holds busy (BP-19b, extracted from `commander_busy`): every
+    /// contract's lead, then the guarded dig's. A Crew-alone dig's Commander is not busy (A4).
+    fn busy_commander_ids(&self) -> Vec<Uuid> {
+        let mut ids: Vec<Uuid> = self.contracts_out.values().filter_map(|op| op.contract.as_ref().map(|k| k.commander_id)).collect();
+        ids.extend(self.guarded_dig().map(|d| d.commander_id));
+        ids
+    }
+
     /// A Commander is busy (BP-18a-1b-1) while it leads a contract, or a guarded dig. Defined
-    /// once; every site calls it.
+    /// once (`busy_commander_ids`, BP-19b); every site calls it.
     fn commander_busy(&self, c: Uuid) -> bool {
-        self.contracts_out.values().any(|op| op.contract.as_ref().is_some_and(|k| k.commander_id == c)) || self.guarded_dig().is_some_and(|d| d.commander_id == c)
+        self.busy_commander_ids().contains(&c)
     }
 
     /// Whether a slot other than `except` holds a contract of `mission` (BP-18a-1b-1).
@@ -1856,7 +1883,7 @@ impl DemoOpsStore {
         if !self.make_room(&mut inner) {
             return false;
         }
-        inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, dig: None, contracts_out: BTreeMap::new(), moved_at: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), contracts: HashMap::new(), sickbay: HashMap::new(), trophies: Vec::new(), credits_in_flight: 0, crew_fight: None, wages_at: now, squads: 1, hire_in_flight: false, foreman_due: ForemanDue::default() });
+        inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, dig: None, contracts_out: BTreeMap::new(), moved_at: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), contracts: HashMap::new(), sickbay: HashMap::new(), trophies: Vec::new(), credits_in_flight: 0, crew_fight: None, wages_at: now, bench_at: now, squads: 1, hire_in_flight: false, foreman_due: ForemanDue::default() });
         true
     }
 
@@ -1906,7 +1933,7 @@ impl DemoOpsStore {
             if !self.make_room(&mut inner) {
                 return Err(StartRefusal::Full);
             }
-            inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, dig: None, contracts_out: BTreeMap::new(), moved_at: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), contracts: HashMap::new(), sickbay: HashMap::new(), trophies: Vec::new(), credits_in_flight: 0, crew_fight: None, wages_at: now, squads: 1, hire_in_flight: false, foreman_due: ForemanDue::default() });
+            inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, dig: None, contracts_out: BTreeMap::new(), moved_at: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), contracts: HashMap::new(), sickbay: HashMap::new(), trophies: Vec::new(), credits_in_flight: 0, crew_fight: None, wages_at: now, bench_at: now, squads: 1, hire_in_flight: false, foreman_due: ForemanDue::default() });
         }
         let Some(e) = inner.get_mut(&campaign_id) else {
             return Err(StartRefusal::Full);
@@ -2399,16 +2426,28 @@ impl DemoOpsStore {
         true
     }
 
-    /// Drains what finished digs owe the Foreman (BP-19a), after settling, so a homeward leg that
-    /// has arrived but not yet been read lands inside the drain. The `take` under the lock is
-    /// the exactly-once claim: a second drain sees the default. No entry owes nothing.
-    pub fn take_foreman_due(&self, campaign_id: Uuid, now: DateTime<Utc>) -> ForemanDue {
+    /// Drains what finished digs owe the Foreman (BP-19a) and claims the bench (BP-19b), after
+    /// settling, so a homeward leg that has arrived but not yet been read lands inside the
+    /// drain and the dig slot the bench reads is the settled one. The `take` and the advance of
+    /// `bench_at` under the lock are the exactly-once claims: a second claim at the same `now`
+    /// sees the default tally and 0 minutes. No entry claims nothing.
+    pub fn take_leader_claim(&self, campaign_id: Uuid, now: DateTime<Utc>) -> LeaderClaim {
         let mut inner = self.lock();
         let Some(e) = inner.get_mut(&campaign_id) else {
-            return ForemanDue::default();
+            return LeaderClaim::default();
         };
         e.settle_arrival(now);
-        std::mem::take(&mut e.foreman_due)
+        let due = std::mem::take(&mut e.foreman_due);
+        let mins = (now - e.bench_at).num_minutes().max(0);
+        e.bench_at += Duration::minutes(mins);
+        LeaderClaim { due, bench_mins: u32::try_from(mins).unwrap_or(u32::MAX), foreman_out: e.dig.is_some(), busy: e.busy_commander_ids() }
+    }
+
+    /// The tally half of `take_leader_claim` (BP-19a's tests). Test-only: it discards the bench
+    /// claim, so production never calls it.
+    #[cfg(test)]
+    pub fn take_foreman_due(&self, campaign_id: Uuid, now: DateTime<Utc>) -> ForemanDue {
+        self.take_leader_claim(campaign_id, now).due
     }
 
     /// Puts a drained tally back after its write failed (BP-19a), so the next read retries. No
@@ -2865,6 +2904,15 @@ impl DemoOpsStore {
     pub(crate) fn rewind_wages(&self, campaign_id: Uuid, secs: i64) {
         if let Some(e) = self.lock().get_mut(&campaign_id) {
             e.wages_at -= Duration::seconds(secs);
+        }
+    }
+
+    /// Moves the campaign's bench clock `secs` into the past (BP-19b), so a route test benches
+    /// its leaders without sleeping. `rewind_op` leaves it.
+    #[cfg(test)]
+    pub(crate) fn rewind_bench(&self, campaign_id: Uuid, secs: i64) {
+        if let Some(e) = self.lock().get_mut(&campaign_id) {
+            e.bench_at -= Duration::seconds(secs);
         }
     }
 
@@ -5182,5 +5230,52 @@ mod tests {
         store.restore_foreman_due(a, due(16, 25));
         assert_eq!(store.take_foreman_due(a, at(1)), due(16, 25));
         assert_eq!(store.take_foreman_due(a, at(2)), ForemanDue::default());
+    }
+
+    // ---- BP-19b: the bench claim. Every entry is made at `at(0)`, so `bench_at` starts there.
+
+    /// S1: whole minutes only, claimed once; the anchor moves by whole minutes, so a part-minute
+    /// carries (61 s claims 1 and leaves `bench_at` at 60 s; 3 min 1 s then claims 2).
+    #[test]
+    fn bench_claim_takes_whole_minutes_once() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        assert!(store.put_board(a, (5, 0), board(), at(0)));
+        assert_eq!(store.take_leader_claim(a, at(59)).bench_mins, 0);
+        assert_eq!(store.take_leader_claim(a, at(61)).bench_mins, 1);
+        assert_eq!(store.take_leader_claim(a, at(61)).bench_mins, 0, "claimed once");
+        assert_eq!(store.take_leader_claim(a, at(181)).bench_mins, 2);
+    }
+
+    /// S2: the claim reports the dig slot (the Foreman out) and the busy leads: none with no op; a
+    /// guarded dig holds the Foreman and its Commander; a Crew-alone dig holds the Foreman only; a
+    /// contract holds its lead only; a homeward haul not yet arrived still holds the Foreman.
+    #[test]
+    fn bench_claim_reports_the_dig_and_the_busy_leads() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        assert!(store.put_board(a, (5, 0), board(), at(0)));
+        let c = store.take_leader_claim(a, at(1));
+        assert_eq!((c.foreman_out, c.busy), (false, vec![]), "no op");
+
+        let b = Uuid::from_u128(2);
+        on_site(&store, b, 1, 1000, 7);
+        let c = store.take_leader_claim(b, at(11));
+        assert_eq!((c.foreman_out, c.busy), (true, vec![COMMANDER]), "a guarded dig");
+
+        let store = DemoOpsStore::new(2);
+        alone(&store, a, 7);
+        let c = store.take_leader_claim(a, at(11));
+        assert_eq!((c.foreman_out, c.busy), (true, vec![]), "a Crew-alone dig");
+
+        let store = DemoOpsStore::new(2);
+        assert_eq!(named(&store, a, &site(), C1, S1, at(0)), Ok(()));
+        let c = store.take_leader_claim(a, at(1));
+        assert_eq!((c.foreman_out, c.busy), (false, vec![C1]), "a contract out");
+
+        let store = DemoOpsStore::new(2);
+        pulled(&store, a, 2, 2);
+        let c = store.take_leader_claim(a, at(25));
+        assert!(c.foreman_out, "a homeward haul not yet arrived");
     }
 }

@@ -3483,6 +3483,95 @@ async fn test_foreman_record_round_trips() {
     clean_wallet_4g1(&pool, &wallet).await;
 }
 
+/// BP-19b (demo-only, `breakpoint`) — D1: `bench_foremen` at `clear_at` 70, in one member. Shed
+/// 5: Shattered 75 → 70, cleared; Shattered 76 → 71, still Shattered; plain 70 → 65, the flag
+/// still false; KIA 40 and plain 0 untouched; 3 rows. Then a Shattered 100: shed 25 → 75, still
+/// Shattered; shed 5 → 70, cleared. Collects, cleans, then asserts.
+#[tokio::test]
+async fn pg_bench_foremen_clears_at_70() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    let wallet = [114u8; 32];
+    clean_wallet_4g1(&pool, &wallet).await;
+    let campaign_id = seed_account_and_campaign(&pool, wallet, 0x19B1_i64).await;
+    let repo = PostgresForemanRepository::new(pool.clone());
+
+    let mut created = Vec::new();
+    let mut ids = Vec::new();
+    for (stress, shattered, kia) in [(75, true, false), (76, true, false), (70, false, false), (40, false, true), (0, false, false)] {
+        let mut f = hand_built_foreman(wallet, campaign_id);
+        f.stress = stress;
+        f.is_shattered = shattered;
+        f.is_kia = kia;
+        ids.push(f.foreman_id);
+        created.push(repo.create_foreman(f).await);
+    }
+    let touched = repo.bench_foremen(campaign_id, &wallet, 5, 70).await;
+    let mut got = Vec::new();
+    for id in &ids {
+        got.push(repo.get_foreman(*id).await.map(|r| r.map(|r| (r.stress, r.is_shattered))));
+    }
+    let mut full = hand_built_foreman(wallet, campaign_id);
+    full.stress = 100;
+    full.is_shattered = true;
+    let full_id = full.foreman_id;
+    created.push(repo.create_foreman(full).await);
+    let five = repo.bench_foremen(campaign_id, &wallet, 25, 70).await;
+    let after_five = repo.get_foreman(full_id).await.map(|r| r.map(|r| (r.stress, r.is_shattered)));
+    let six = repo.bench_foremen(campaign_id, &wallet, 5, 70).await;
+    let after_six = repo.get_foreman(full_id).await.map(|r| r.map(|r| (r.stress, r.is_shattered)));
+
+    clean_wallet_4g1(&pool, &wallet).await;
+
+    assert!(created.iter().all(|c| c.is_ok()), "create_foreman failed: {created:?}");
+    assert_eq!(touched.expect("bench_foremen"), 3);
+    let got: Vec<(i16, bool)> = got.into_iter().map(|g| g.unwrap().expect("the Foreman")).collect();
+    assert_eq!(got, vec![(70, false), (71, true), (65, false), (40, false), (0, false)]);
+    assert!(five.is_ok() && six.is_ok(), "bench_foremen failed: {five:?} {six:?}");
+    assert_eq!(after_five.unwrap(), Some((75, true)), "five benched minutes");
+    assert_eq!(after_six.unwrap(), Some((70, false)), "the sixth clears");
+}
+
+/// BP-19b (demo-only, `breakpoint`) — D2: `bench_commanders`, shed 5, in one member: KIA 40,
+/// Shattered 100, busy 40, idle 40 and idle 0 → 40, 100 (flag still set), 40, 35, 0; one row.
+/// No `is_starter` Commander (`create_commander` inserts `Hired`). Collects, cleans, then asserts.
+#[tokio::test]
+async fn pg_bench_commanders_skips_kia_shattered_and_busy() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    let wallet = [115u8; 32];
+    clean_wallet_4g1(&pool, &wallet).await;
+    let campaign_id = seed_account_and_campaign(&pool, wallet, 0x19B2_i64).await;
+    let repo = PostgresCommanderRepository::new(pool.clone());
+
+    let mut created = Vec::new();
+    let mut ids = Vec::new();
+    for (seed, stress, shattered, kia) in [(1u32, 40, false, true), (2, 100, true, false), (3, 40, false, false), (4, 40, false, false), (5, 0, false, false)] {
+        let mut c = mercs_server::commander_gen::generate_commander(wallet.to_vec(), campaign_id, seed);
+        c.stress = stress;
+        c.is_shattered = shattered;
+        c.is_kia = kia;
+        ids.push(c.commander_id);
+        created.push(repo.create_commander(c).await);
+    }
+    let touched = repo.bench_commanders(campaign_id, &wallet, &[ids[2]], 5).await;
+    let mut got = Vec::new();
+    for id in &ids {
+        got.push(repo.get_commander(*id).await.map(|r| r.map(|r| (r.stress, r.is_shattered))));
+    }
+
+    clean_wallet_4g1(&pool, &wallet).await;
+
+    assert!(created.iter().all(|c| c.is_ok()), "create_commander failed: {created:?}");
+    assert_eq!(touched.expect("bench_commanders"), 1);
+    let got: Vec<(i16, bool)> = got.into_iter().map(|g| g.unwrap().expect("the Commander")).collect();
+    assert_eq!(got, vec![(40, false), (100, true), (40, false), (35, false), (0, false)]);
+}
+
 /// 7a-1 — `0022`'s CHECKs refuse a Commander-only flaw and a Commander-only specialization.
 #[tokio::test]
 async fn test_foreman_records_reject_non_canon_roster_values() {
@@ -4849,6 +4938,9 @@ impl CommanderRepository for ShatterOnStart {
     async fn list_commanders_for_member(&self, campaign_id: uuid::Uuid, player_wallet: &[u8]) -> Result<Vec<CommanderRecord>, mercs_server::repository::RepositoryError> {
         self.inner.list_commanders_for_member(campaign_id, player_wallet).await
     }
+    async fn bench_commanders(&self, campaign_id: uuid::Uuid, player_wallet: &[u8], busy: &[uuid::Uuid], shed: i16) -> Result<u64, mercs_server::repository::RepositoryError> {
+        self.inner.bench_commanders(campaign_id, player_wallet, busy, shed).await
+    }
     async fn delete_commanders_by_campaign(&self, campaign_id: uuid::Uuid) -> Result<u64, mercs_server::repository::RepositoryError> {
         self.inner.delete_commanders_by_campaign(campaign_id).await
     }
@@ -5006,7 +5098,7 @@ async fn mission_resolve_end_to_end_writes_effects() {
 
     // The log: header with the version and the real campaign, and the request body.
     let config = logs.get_session_config(&sid).await.unwrap().expect("no session_configs header");
-    assert_eq!(config.build_version, "0.3.2", "R7 bump must reach the logged build_version");
+    assert_eq!(config.build_version, "0.3.3", "R7 bump must reach the logged build_version");
     assert_eq!(config.campaign_id, campaign_id);
     let entries = logs.get_entries_by_session(&sid).await.unwrap();
     assert_eq!(entries.len(), 1);

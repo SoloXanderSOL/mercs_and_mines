@@ -21,6 +21,7 @@ use sim_engine::game_types::{MissionCategory, MissionDefinition, RollModifier};
 use sim_engine::missions::missions;
 use sim_engine::roster::{CommanderFlaw, CommanderSpecialization};
 
+use crate::demo_ops::{stress_band, StressBand};
 use crate::repository::commander::CommanderRecord;
 
 /// The player's approach on the briefing (BP-14a). On the wire: `"Assault" | "Flank" | "DigIn"`.
@@ -165,23 +166,32 @@ fn flaw_line(flaw: CommanderFlaw, points: i32) -> &'static str {
 /// The Gunsmith's points on the roll (BP-16, §4e C1: mercs hit harder), last of the rows.
 pub const DEMO_GUNSMITH_ROLL_POINTS: i32 = 10;
 
+/// The stress row while Strained (BP-19b): Command Presence at half, on the roll.
+pub const DEMO_STRAINED_ROLL_CUT: i32 = 3;
+/// The stress row from Breaking Point (BP-19b): Command Presence inverted.
+pub const DEMO_BREAKING_ROLL_CUT: i32 = 10;
+
 /// The record Commander's roll inputs as they were at fight time (BP-14a), logged in
 /// `session_start` as `roll_inputs`. `gunsmith` (BP-16): whether the Gunsmith stood at the
 /// campaign's base when the route read it; logged only when true (`"gunsmith": true`), so an
 /// absent key, every log before BP-16, reads as no Gunsmith and replays unchanged.
+/// `stress` (BP-19b): the record's stress at fight time, before this fight's +10; logged only
+/// when above 0, so an absent key (every log before BP-19b) reads as 0, Rested, and replays
+/// unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RollInputs {
     pub rank: i16,
     pub specialization: CommanderSpecialization,
     pub fatal_flaw: CommanderFlaw,
     pub gunsmith: bool,
+    pub stress: i16,
 }
 
 impl RollInputs {
     /// `None` for a rank outside 1..=5 or a trait off the roster (the route answers `500`). The
     /// record knows nothing of the base: `gunsmith` is false, and the route sets it.
     pub fn from_record(rec: &CommanderRecord) -> Option<Self> {
-        Self::parse(rec.rank as i64, &rec.specialization, &rec.fatal_flaw)
+        Self::parse(rec.rank as i64, &rec.specialization, &rec.fatal_flaw).map(|i| Self { stress: rec.stress, ..i })
     }
 
     pub fn to_json(&self) -> Value {
@@ -193,6 +203,9 @@ impl RollInputs {
         if self.gunsmith {
             v["gunsmith"] = json!(true);
         }
+        if self.stress > 0 {
+            v["stress"] = json!(self.stress);
+        }
         v
     }
 
@@ -203,8 +216,12 @@ impl RollInputs {
             None => false,
             Some(g) => g.as_bool()?,
         };
+        let stress = match v.get("stress") {
+            None => 0,
+            Some(s) => i16::try_from(s.as_i64()?).ok().filter(|s| (0..=100).contains(s))?,
+        };
         let inputs = Self::parse(v["rank"].as_i64()?, v["specialization"].as_str()?, v["fatal_flaw"].as_str()?)?;
-        Some(Self { gunsmith, ..inputs })
+        Some(Self { gunsmith, stress, ..inputs })
     }
 
     fn parse(rank: i64, specialization: &str, fatal_flaw: &str) -> Option<Self> {
@@ -216,12 +233,13 @@ impl RollInputs {
             specialization: CommanderSpecialization::from_db_str(specialization)?,
             fatal_flaw: CommanderFlaw::from_db_str(fatal_flaw)?,
             gunsmith: false,
+            stress: 0,
         })
     }
 }
 
-/// The fight's rows, in a fixed order (approach, rank, Specialisation, Flaw, then the Gunsmith,
-/// BP-16); a 0-point row is
+/// The fight's rows, in a fixed order (approach, rank, Specialisation, stress (BP-19b), Flaw,
+/// then the Gunsmith, BP-16); a 0-point row is
 /// left out. `inputs` is `None` for a fight logged before BP-14a: it resolved with no rows.
 pub fn roll_modifiers(inputs: Option<&RollInputs>, approach: Option<MissionApproach>, mission: &MissionDefinition) -> Vec<RollModifier> {
     let mut rows = Vec::new();
@@ -237,8 +255,20 @@ pub fn roll_modifiers(inputs: Option<&RollInputs>, approach: Option<MissionAppro
     }
     if let Some(i) = inputs {
         push("commander_rank", format!("Commander rank {}", i.rank), rank_points(i.rank));
-        let spec = if spec_suits(i.specialization, &mission.category) { 5 } else { 0 };
-        push("specialization", format!("{}: suits this job", i.specialization.as_str()), spec);
+        let band = stress_band(i.stress, false);
+        let (spec_points, spec_label) = match band {
+            StressBand::Rested => (5, "suits this job"),
+            StressBand::Strained => (2, "suits this job, at half while Strained"),
+            StressBand::BreakingPoint | StressBand::Shattered => (0, "suits this job"),
+        };
+        let spec = if spec_suits(i.specialization, &mission.category) { spec_points } else { 0 };
+        push("specialization", format!("{}: {}", i.specialization.as_str(), spec_label), spec);
+        let (stress_points, stress_word) = match band {
+            StressBand::Rested => (0, "Rested"),
+            StressBand::Strained => (-DEMO_STRAINED_ROLL_CUT, "Strained"),
+            StressBand::BreakingPoint | StressBand::Shattered => (-DEMO_BREAKING_ROLL_CUT, "Breaking Point"),
+        };
+        push("stress", format!("Commander stress {}: {}", i.stress, stress_word), stress_points);
         let flaw = flaw_points(i.fatal_flaw, approach, approach_row, mission.difficulty);
         push("fatal_flaw", format!("{}: {}", i.fatal_flaw.as_str(), flaw_line(i.fatal_flaw, flaw)), flaw);
         let gunsmith = if i.gunsmith { DEMO_GUNSMITH_ROLL_POINTS } else { 0 };
@@ -371,7 +401,7 @@ mod tests {
     /// its category, no approach, and a fight logged before BP-14a.
     #[test]
     fn roll_modifiers_build_the_rows_in_order() {
-        let i = RollInputs { rank: 3, specialization: CommanderSpecialization::Cannoneer, fatal_flaw: F::Paranoid, gunsmith: false };
+        let i = RollInputs { rank: 3, specialization: CommanderSpecialization::Cannoneer, fatal_flaw: F::Paranoid, gunsmith: false, stress: 0 };
         let got = roll_modifiers(Some(&i), Some(A::Flank), mission("GUARD_DUTY"));
         assert_eq!(rows(&got), [("approach", -15), ("commander_rank", 4), ("specialization", 5), ("fatal_flaw", -10)]);
         let labels: Vec<&str> = got.iter().map(|r| r.label.as_str()).collect();
@@ -385,9 +415,9 @@ mod tests {
         assert_eq!(rows(&g), [("approach", -15), ("commander_rank", 4), ("specialization", 5), ("fatal_flaw", -10), ("gunsmith", 10)]);
         assert_eq!(g[4].label, "Gunsmith (your base)");
 
-        let i = RollInputs { rank: 1, specialization: CommanderSpecialization::Cannoneer, fatal_flaw: F::Embezzler, gunsmith: false };
+        let i = RollInputs { rank: 1, specialization: CommanderSpecialization::Cannoneer, fatal_flaw: F::Embezzler, gunsmith: false, stress: 0 };
         assert_eq!(rows(&roll_modifiers(Some(&i), None, mission("SUPPLY_RAID"))), [("fatal_flaw", -3)]);
-        let i = RollInputs { rank: 2, specialization: CommanderSpecialization::Breacher, fatal_flaw: F::TheGambler, gunsmith: false };
+        let i = RollInputs { rank: 2, specialization: CommanderSpecialization::Breacher, fatal_flaw: F::TheGambler, gunsmith: false, stress: 0 };
         assert_eq!(rows(&roll_modifiers(Some(&i), Some(A::Flank), mission("BLACK_SITE_RAID"))),
                    [("approach", 15), ("commander_rank", 2), ("specialization", 5), ("fatal_flaw", 15)]);
         assert_eq!(rows(&roll_modifiers(None, Some(A::DigIn), mission("GUARD_DUTY"))), [("approach", 15)]);
@@ -398,7 +428,7 @@ mod tests {
     fn roll_inputs_round_trip_and_refuse_what_was_never_written() {
         let rec = crate::commander_gen::generate_commander(vec![7; 32], uuid::Uuid::nil(), 42);
         let i = RollInputs::from_record(&rec).expect("a generated Commander is on the roster");
-        assert_eq!(i, RollInputs { rank: 1, specialization: CommanderSpecialization::Cannoneer, fatal_flaw: F::Paranoid, gunsmith: false });
+        assert_eq!(i, RollInputs { rank: 1, specialization: CommanderSpecialization::Cannoneer, fatal_flaw: F::Paranoid, gunsmith: false, stress: 0 });
         assert_eq!(i.to_json(), json!({ "rank": 1, "specialization": "Cannoneer", "fatal_flaw": "Paranoid" }));
         assert_eq!(RollInputs::from_json(&i.to_json()), Some(i), "a log from before BP-16 has no key");
         let g = RollInputs { gunsmith: true, ..i };
@@ -415,6 +445,50 @@ mod tests {
             json!({ "rank": 3, "specialization": "Cannoneer", "fatal_flaw": "Paranoid", "gunsmith": 1 }),
         ] {
             assert_eq!(RollInputs::from_json(&bad), None, "{bad}");
+        }
+    }
+
+    /// Y1 (BP-19b): the Specialisation and stress rows by band, at the cuts 30/31, 70/71 and 99,
+    /// on Guard Duty with a Cannoneer (suits it), flanking at rank 3 as in the rows test: Rested
+    /// +5 and no stress row; Strained +2 and −3; from Breaking Point no Specialisation row and
+    /// −10. The stress row sits right after Specialisation (after rank when that is omitted). An
+    /// unsuited mission at 40 shows the stress row alone.
+    #[test]
+    fn stress_rows_follow_the_band() {
+        let base = RollInputs { rank: 3, specialization: CommanderSpecialization::Cannoneer, fatal_flaw: F::Paranoid, gunsmith: false, stress: 0 };
+        let at = |stress: i16| roll_modifiers(Some(&RollInputs { stress, ..base }), Some(A::Flank), mission("GUARD_DUTY"));
+        assert_eq!(rows(&at(30)), [("approach", -15), ("commander_rank", 4), ("specialization", 5), ("fatal_flaw", -10)]);
+        for s in [31, 70] {
+            let got = at(s);
+            assert_eq!(rows(&got), [("approach", -15), ("commander_rank", 4), ("specialization", 2), ("stress", -3), ("fatal_flaw", -10)], "{s}");
+            assert_eq!(got[2].label, "Cannoneer: suits this job, at half while Strained");
+            assert_eq!(got[3].label, format!("Commander stress {s}: Strained"));
+        }
+        for s in [71, 99] {
+            let got = at(s);
+            assert_eq!(rows(&got), [("approach", -15), ("commander_rank", 4), ("stress", -10), ("fatal_flaw", -10)], "{s}");
+            assert_eq!(got[2].label, format!("Commander stress {s}: Breaking Point"));
+        }
+        let i = RollInputs { rank: 1, specialization: CommanderSpecialization::Cannoneer, fatal_flaw: F::Embezzler, gunsmith: false, stress: 40 };
+        assert_eq!(rows(&roll_modifiers(Some(&i), None, mission("SUPPLY_RAID"))), [("stress", -3), ("fatal_flaw", -3)]);
+    }
+
+    /// Y2 (BP-19b): `stress` is logged only above 0; an absent key reads as 0 with the same rows
+    /// as an explicit 0; anything `to_json` can't write is refused.
+    #[test]
+    fn roll_inputs_stress_is_logged_only_above_0() {
+        let i = RollInputs { rank: 1, specialization: CommanderSpecialization::Cannoneer, fatal_flaw: F::Paranoid, gunsmith: false, stress: 0 };
+        assert!(i.to_json().get("stress").is_none());
+        let s = RollInputs { stress: 40, ..i };
+        assert_eq!(s.to_json()["stress"], json!(40));
+        assert_eq!(RollInputs::from_json(&s.to_json()), Some(s));
+        let absent = RollInputs::from_json(&json!({ "rank": 1, "specialization": "Cannoneer", "fatal_flaw": "Paranoid" })).expect("absent");
+        let zero = RollInputs::from_json(&json!({ "rank": 1, "specialization": "Cannoneer", "fatal_flaw": "Paranoid", "stress": 0 })).expect("zero");
+        assert_eq!(absent.stress, 0);
+        assert_eq!(roll_modifiers(Some(&absent), None, mission("GUARD_DUTY")), roll_modifiers(Some(&zero), None, mission("GUARD_DUTY")));
+        for bad in [json!(101), json!(-1), json!("x")] {
+            let v = json!({ "rank": 1, "specialization": "Cannoneer", "fatal_flaw": "Paranoid", "stress": bad });
+            assert_eq!(RollInputs::from_json(&v), None, "{v}");
         }
     }
 }

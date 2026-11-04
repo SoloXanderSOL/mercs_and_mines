@@ -62,6 +62,12 @@ pub trait ForemanRepository: Send + Sync {
     /// (Shattered at 100, never cleared here), xp added, rank `max(rank, rank_for_xp(xp))`.
     /// `Ok(false)` and nothing written for an unknown or KIA Foreman.
     async fn settle_foreman_dig(&self, foreman_id: Uuid, stress: u32, xp: u32) -> Result<bool, RepositoryError>;
+    /// **Demo-only (BP-19b, `breakpoint`; dropped at the port).** The bench: one member's
+    /// Foremen that are not KIA and above 0 shed `shed` stress, floor 0, in one statement, and a
+    /// Shattered one's flag clears once the new stress is `clear_at` or below (ODQ-73, a demo
+    /// exemption; the caller binds `STRESS_STRAINED_MAX`). Member-scoped (F4). Returns the rows
+    /// touched.
+    async fn bench_foremen(&self, campaign_id: Uuid, player_wallet: &[u8], shed: i16, clear_at: i16) -> Result<u64, RepositoryError>;
 }
 
 // ── PostgresForemanRepository ────────────────────────────────────────────────
@@ -258,6 +264,23 @@ impl ForemanRepository for PostgresForemanRepository {
         tx.commit().await.map_err(|e| RepositoryError::Internal(e.to_string()))?;
         Ok(true)
     }
+
+    async fn bench_foremen(&self, campaign_id: Uuid, player_wallet: &[u8], shed: i16, clear_at: i16) -> Result<u64, RepositoryError> {
+        let result = sqlx::query!(
+            "UPDATE foreman_records SET stress = GREATEST(stress - $3, 0),
+       is_shattered = is_shattered AND GREATEST(stress - $3, 0) > $4, updated_at = now()
+ WHERE campaign_id = $1 AND player_wallet = $2 AND NOT is_kia AND stress > 0",
+            campaign_id,
+            player_wallet,
+            shed,
+            // `GREATEST(smallint, 0)` is `integer`, so Postgres types `$4` as `integer`.
+            i32::from(clear_at),
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        Ok(result.rows_affected())
+    }
 }
 
 // ── InMemoryForemanRepository ────────────────────────────────────────────────
@@ -324,6 +347,22 @@ impl ForemanRepository for InMemoryForemanRepository {
         r.updated_at = Utc::now();
         Ok(true)
     }
+
+    async fn bench_foremen(&self, campaign_id: Uuid, player_wallet: &[u8], shed: i16, clear_at: i16) -> Result<u64, RepositoryError> {
+        let mut touched = 0;
+        for mut r in self.store.iter_mut() {
+            if r.campaign_id == campaign_id && r.player_wallet == player_wallet && !r.is_kia && r.stress > 0 {
+                // The clear reads the new stress, never the assigned field (Postgres `SET` reads
+                // the old row, H6).
+                let new_stress = (r.stress - shed).max(0);
+                r.is_shattered = r.is_shattered && new_stress > clear_at;
+                r.stress = new_stress;
+                r.updated_at = Utc::now();
+                touched += 1;
+            }
+        }
+        Ok(touched)
+    }
 }
 
 #[cfg(test)]
@@ -360,5 +399,44 @@ mod tests {
         let mut want = vec![a.foreman_id, b.foreman_id];
         want.sort();
         assert_eq!(listed, want, "list returns only this campaign's Foremen");
+    }
+
+    /// M1 (BP-19b): the bench mirror at `clear_at` 70. Shed 5: Shattered 75 → 70, cleared;
+    /// Shattered 76 → 71, still Shattered; plain 70 → 65, the flag still false; KIA 40 and plain
+    /// 0 untouched; 3 rows. Then a Shattered 100: shed 25 → 75, still Shattered; shed 5 → 70,
+    /// cleared.
+    #[tokio::test]
+    async fn in_memory_bench_foremen_clears_at_70() {
+        let repo = InMemoryForemanRepository::new();
+        let campaign_id = Uuid::new_v4();
+        let wallet = vec![7u8; 32];
+        let mut ids = Vec::new();
+        for (seed, stress, shattered, kia) in [(1, 75, true, false), (2, 76, true, false), (3, 70, false, false), (4, 40, false, true), (5, 0, false, false)] {
+            let mut f = crate::foreman_gen::generate_foreman(wallet.clone(), campaign_id, seed);
+            f.stress = stress;
+            f.is_shattered = shattered;
+            f.is_kia = kia;
+            ids.push(f.foreman_id);
+            repo.create_foreman(f).await.unwrap();
+        }
+        assert_eq!(repo.bench_foremen(campaign_id, &wallet, 5, 70).await.unwrap(), 3);
+        let mut got = Vec::new();
+        for id in &ids {
+            let r = repo.get_foreman(*id).await.unwrap().unwrap();
+            got.push((r.stress, r.is_shattered));
+        }
+        assert_eq!(got, vec![(70, false), (71, true), (65, false), (40, false), (0, false)]);
+
+        let mut f = crate::foreman_gen::generate_foreman(wallet.clone(), campaign_id, 6);
+        f.stress = 100;
+        f.is_shattered = true;
+        let id = f.foreman_id;
+        repo.create_foreman(f).await.unwrap();
+        repo.bench_foremen(campaign_id, &wallet, 25, 70).await.unwrap();
+        let r = repo.get_foreman(id).await.unwrap().unwrap();
+        assert_eq!((r.stress, r.is_shattered), (75, true), "five benched minutes");
+        repo.bench_foremen(campaign_id, &wallet, 5, 70).await.unwrap();
+        let r = repo.get_foreman(id).await.unwrap().unwrap();
+        assert_eq!((r.stress, r.is_shattered), (70, false), "the sixth clears");
     }
 }

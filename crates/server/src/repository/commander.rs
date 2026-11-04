@@ -233,6 +233,11 @@ pub trait CommanderRepository: Send + Sync {
     /// One member's Commanders in `campaign_id`, KIA and Shattered included, oldest first
     /// (`created_at`, then `commander_id`). The roster route's read (BP-2b-2).
     async fn list_commanders_for_member(&self, campaign_id: Uuid, player_wallet: &[u8]) -> Result<Vec<CommanderRecord>, RepositoryError>;
+    /// **Demo-only (BP-19b, `breakpoint`; dropped at the port).** The bench: one member's
+    /// Commanders that are not KIA, not Shattered, not in `busy` and above 0 shed `shed` stress,
+    /// floor 0, in one statement. It never writes `is_shattered` (C6: the flag stays until paid
+    /// Rehabilitation). Returns the rows touched.
+    async fn bench_commanders(&self, campaign_id: Uuid, player_wallet: &[u8], busy: &[Uuid], shed: i16) -> Result<u64, RepositoryError>;
 
     /// Records an `active` deployment and its Sections. In one transaction it first aborts
     /// every `active` deployment older than `STALE_DEPLOYMENT_AFTER` that is this
@@ -625,6 +630,22 @@ impl CommanderRepository for PostgresCommanderRepository {
         }).collect())
     }
 
+    async fn bench_commanders(&self, campaign_id: Uuid, player_wallet: &[u8], busy: &[Uuid], shed: i16) -> Result<u64, RepositoryError> {
+        let result = sqlx::query!(
+            "UPDATE commander_records SET stress = GREATEST(stress - $4, 0), updated_at = now()
+ WHERE campaign_id = $1 AND player_wallet = $2 AND commander_id <> ALL($3)
+   AND NOT is_kia AND NOT is_shattered AND stress > 0",
+            campaign_id,
+            player_wallet,
+            busy,
+            shed,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        Ok(result.rows_affected())
+    }
+
     async fn delete_commanders_by_campaign(&self, campaign_id: Uuid) -> Result<u64, RepositoryError> {
         let result = sqlx::query!(
             "DELETE FROM commander_records WHERE campaign_id = $1",
@@ -927,6 +948,17 @@ impl CommanderRepository for InMemoryCommanderRepository {
             .collect();
         rows.sort_by_key(|r| (r.created_at, r.commander_id));
         Ok(rows)
+    }
+
+    async fn bench_commanders(&self, campaign_id: Uuid, player_wallet: &[u8], busy: &[Uuid], shed: i16) -> Result<u64, RepositoryError> {
+        let mut touched = 0;
+        for mut r in self.store.iter_mut() {
+            if r.campaign_id == campaign_id && r.player_wallet == player_wallet && !busy.contains(&r.commander_id) && !r.is_kia && !r.is_shattered && r.stress > 0 {
+                r.stress = (r.stress - shed).max(0);
+                touched += 1;
+            }
+        }
+        Ok(touched)
     }
 
     async fn delete_commanders_by_campaign(&self, campaign_id: Uuid) -> Result<u64, RepositoryError> {
@@ -1501,5 +1533,32 @@ mod tests {
         assert!(matches!(r, Err(RepositoryError::NotFound)), "set_shattered: {:?}", r);
         let r = repo.set_kia(id).await;
         assert!(matches!(r, Err(RepositoryError::NotFound)), "set_kia: {:?}", r);
+    }
+
+    /// M2 (BP-19b): the bench mirror, shed 5, in one member: KIA 40, Shattered 100, busy 40,
+    /// idle 40 and idle 0 → 40, 100 (flag still set), 40, 35, 0; one row touched.
+    #[tokio::test]
+    async fn in_memory_bench_commanders_skips_kia_shattered_and_busy() {
+        let repo = InMemoryCommanderRepository::new();
+        let campaign_id = Uuid::new_v4();
+        let wallet = vec![7u8; 32];
+        let mut ids = Vec::new();
+        for (stress, shattered, kia) in [(40, false, true), (100, true, false), (40, false, false), (40, false, false), (0, false, false)] {
+            let mut c = stub_commander(Uuid::new_v4());
+            c.campaign_id = campaign_id;
+            c.player_wallet = wallet.clone();
+            c.stress = stress;
+            c.is_shattered = shattered;
+            c.is_kia = kia;
+            ids.push(c.commander_id);
+            repo.create_commander(c).await.unwrap();
+        }
+        assert_eq!(repo.bench_commanders(campaign_id, &wallet, &[ids[2]], 5).await.unwrap(), 1);
+        let mut got = Vec::new();
+        for id in &ids {
+            let r = repo.get_commander(*id).await.unwrap().unwrap();
+            got.push((r.stress, r.is_shattered));
+        }
+        assert_eq!(got, vec![(40, false), (100, true), (40, false), (35, false), (0, false)]);
     }
 }
