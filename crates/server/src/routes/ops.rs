@@ -43,6 +43,7 @@ use crate::demo_ops::{
 };
 use crate::commander_gen::generate_commander;
 use crate::demo_ops::{HireHold, HireRefusal, DEMO_HIRE_CAP, DEMO_HIRE_CREDITS, DEMO_WAGE_CREDITS_PER_MIN};
+use crate::demo_ops::{RouteKind, RoutePath};
 use crate::repository::section::starter_section;
 use crate::repository::{outcome_db_str, CampaignInstance, CampaignLifecycle, DeploymentRecord, SectionRecord, SectorState};
 use crate::state::AppState;
@@ -83,7 +84,7 @@ pub fn router() -> Router<Arc<AppState>> {
 pub struct OpsView<'a> {
     pub campaign_id: Uuid,
     pub gateway: Option<GatewayHex>,
-    pub sites: &'a [OpsSite],
+    pub sites: Vec<SiteView<'a>>,
     pub active_op: Option<ActiveOpView>,
     pub ore_banked: u32,
     pub credits_banked: u32,
@@ -97,6 +98,39 @@ pub struct OpsView<'a> {
     /// same shape as `active_op`, in key order; absent with one op or none.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub more_ops: Vec<MoreOp>,
+}
+
+/// A board site as sent (BP-20a-1): the site's own keys, flattened, then its ways, Fast first.
+#[derive(Serialize)]
+pub struct SiteView<'a> {
+    #[serde(flatten)]
+    pub site: &'a OpsSite,
+    pub routes: Vec<RouteView<'a>>,
+}
+
+/// One way as sent: `{"route": "fast" | "safe", "secs": …, "path": [[q, r], …]}`.
+#[derive(Serialize)]
+pub struct RouteView<'a> {
+    pub route: RouteKind,
+    #[serde(flatten)]
+    pub way: &'a RoutePath,
+}
+
+/// The body's sites with their ways from `board` (BP-20a-1), by the site's hex as it stands (a
+/// returned contract's pool hex is on the board's routes too). A site with no entry sends
+/// `routes: []`.
+fn site_views<'a>(sites: &'a [OpsSite], board: &'a OpsBoard) -> Vec<SiteView<'a>> {
+    sites
+        .iter()
+        .map(|site| {
+            let routes = board.routes.get(&(site.q, site.r)).map_or_else(Vec::new, |w| {
+                std::iter::once(RouteView { route: RouteKind::Fast, way: &w.fast })
+                    .chain(w.safe.iter().map(|way| RouteView { route: RouteKind::Safe, way }))
+                    .collect()
+            });
+            SiteView { site, routes }
+        })
+        .collect()
 }
 
 /// `company` as the client sees it (BP-18a-2): the store's sickbays and shelf (`CompanyView`,
@@ -144,6 +178,9 @@ pub struct OpsStartRequest {
     /// BP-18a-1b-2: `"dig"` names the dig on `ops/next`; any `slot` on `ops/start` is `400
     /// unknown section` (a start's slot is its site's kind, Linux Q1).
     pub slot: Option<String>,
+    /// BP-20a-1: `"fast"` (or absent) or `"safe"` on `ops/start`; ignored on `ops/next` (a hop
+    /// takes the target's Fast way). A non-string is axum's `422`.
+    pub route: Option<String>,
 }
 
 /// `ops/return`'s and `ops/escort`'s query (BP-18a-1b-2): `?section_id=` names the squad by its
@@ -299,7 +336,7 @@ fn ops_response(state: &AppState, campaign_id: Uuid, gw: (i32, i32), board: &Ops
     let (s, more_ops, squads) = state.demo_ops.store.ops_body(campaign_id, now);
     // BP-11a-3: the sites as they stand (a fought contract off the board, a returned one moved);
     // the route's own board only when the campaign has no entry (a store full of ops).
-    let sites = s.sites.as_deref().unwrap_or(&board.sites);
+    let sites = site_views(s.sites.as_deref().unwrap_or(&board.sites), board);
     let view = OpsView {
         campaign_id,
         gateway: Some(GatewayHex { q: gw.0, r: gw.1 }),
@@ -580,7 +617,7 @@ async fn get_ops_board(
     let now = Utc::now();
     let (campaign, gateway, wallet) = ops_member(&state, &token, campaign_id, "get_ops_board").await?;
     let Some(gw) = gateway else {
-        let view = OpsView { campaign_id, gateway: None, sites: &[], active_op: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), company: CompanyBody::new(CompanyView::default(), 1), now: ops_time(now), crew_fight: None, more_ops: Vec::new() };
+        let view = OpsView { campaign_id, gateway: None, sites: Vec::new(), active_op: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), company: CompanyBody::new(CompanyView::default(), 1), now: ops_time(now), crew_fight: None, more_ops: Vec::new() };
         return Ok(Json(view).into_response());
     };
     let board = load_board(&state, &campaign, gw, now, false, "get_ops_board").await?;
@@ -616,7 +653,8 @@ fn no_soldiers(sections: &[SectionRecord]) -> AppError {
 /// failed read) → `400` unknown site → `400` unknown section (both `section_id` and `slot`, or
 /// any `slot`: a start's slot is its site's kind) → the member's Sections read (`500` on
 /// failure) → `400` unknown section (a `section_id` that doesn't parse or isn't the member's) →
-/// `400` a Crew alone takes no squad (a `section_id` with `escort: false`) → for a dig, the
+/// `400` a Crew alone takes no squad (a `section_id` with `escort: false`) → `400` unknown route
+/// → `400` no safe route to that site (BP-20a-1) → for a dig, the
 /// Crew, Foreman and Commander reads (`500` on failure), `409` no Crew left and `409` no
 /// Commander left; for a contract, the Commander read (`500` on failure) and `409` no Commander
 /// left → `409` no soldiers left when the Section sent (the named one, else the first with
@@ -636,7 +674,8 @@ fn no_soldiers(sections: &[SectionRecord]) -> AppError {
 /// - The site is looked up as it stands (BP-11a-3): a fought contract is `400 unknown site`
 ///   (before `409` an op is under way) until it returns 45 s later at another hex. A return
 ///   landing between the lookup and the start sends the team to the old pin (accepted).
-/// - The leg: `depart_at = now`, `arrive_at = now + the site's travel_secs`.
+/// - The leg: `depart_at = now`, `arrive_at = now + the chosen way's seconds` (BP-20a-1: `route`
+///   `"fast"` or absent takes the site's `travel_secs`, `"safe"` the Safe way's).
 /// - The op's seed is drawn here from OS entropy and handed to the store, which never sends it;
 ///   the drill rolls from it.
 /// - A dig reads its Crew, threshold and Commander once, here (`dig_start`); a contract reads its Commander (`usable_commander`).
@@ -687,6 +726,14 @@ async fn post_ops_start(
     if named.is_some() && !escort {
         return Err(bad_request("a Crew alone takes no squad"));
     }
+    // BP-20a-1: the way, after every other 400. Absent = Fast, so a start that sends no `route`
+    // is unchanged; Safe only where the board offers it.
+    let Some(route) = parse_route(req.route.as_deref()) else {
+        return Err(bad_request("unknown route"));
+    };
+    if route == RouteKind::Safe && board.routes.get(&(site.q, site.r)).is_none_or(|w| w.safe.is_none()) {
+        return Err(bad_request("no safe route to that site"));
+    }
     let dig = if site.kind == "dig" { Some(dig_start(&state, campaign_id, &wallet, escort, now, "post_ops_start").await?) } else { None };
     let lead = if site.kind == "contract" { Some(usable_commander(&state, campaign_id, &wallet, true, now, "post_ops_start").await?) } else { None };
     // BP-11a-1: the Section sent is the named one, else the member's first with soldiers, else
@@ -702,7 +749,7 @@ async fn post_ops_start(
     let contract = lead.map(|commander_id| ContractStart { commander_id, section_id: first_section.map(|s| s.section_id) });
     let dig = dig.map(|d| DigStart { section_id: first_section.map(|s| s.section_id), escort, ..d });
     let op_seed = generate_seed();
-    match state.demo_ops.store.start_op_for(campaign_id, gw, Arc::clone(&board), &site, op_seed, dig, contract, named.is_some(), now) {
+    match state.demo_ops.store.start_op_for(campaign_id, gw, Arc::clone(&board), &site, op_seed, dig, contract, named.is_some(), route, now) {
         Ok(()) => {}
         Err(StartRefusal::Busy) => return Err(conflict("an op is already under way")),
         Err(StartRefusal::Full) => return Err(service_unavailable("the ops board is full")),
@@ -849,6 +896,16 @@ enum Pick<'a> {
 /// `400 unknown section`; then `slot`: `"dig"` where `slot_ok` (return, next) names the dig, and
 /// any other value, or any `slot` where it is not (start, escort), is `400 unknown section`;
 /// then `section_id`, checked against the member's Sections by `named_section`.
+/// BP-20a-1: `route` on a start: `"fast"` (or absent) or `"safe"`; anything else is `None`, the
+/// route's `400 unknown route`.
+fn parse_route(route: Option<&str>) -> Option<RouteKind> {
+    match route.unwrap_or("fast") {
+        "fast" => Some(RouteKind::Fast),
+        "safe" => Some(RouteKind::Safe),
+        _ => None,
+    }
+}
+
 fn selector_shape<'a>(section_id: Option<&'a str>, slot: Option<&str>, slot_ok: bool) -> Result<Pick<'a>, AppError> {
     if section_id.is_some() && slot.is_some() {
         return Err(bad_request("unknown section"));
@@ -1668,7 +1725,7 @@ mod tests {
         assert!(body["active_op"].is_null());
         assert_eq!(body["ore_banked"], 0);
         let expected = ops_board(&stored.terrain, &stored.magma_veins, GATEWAY, c.campaign_id);
-        assert_eq!(body["sites"], serde_json::to_value(&expected.sites).unwrap());
+        assert_eq!(body["sites"], serde_json::to_value(site_views(&expected.sites, &expected)).unwrap());
         assert_eq!(body["sites"].as_array().unwrap().iter().filter(|s| s["kind"] == "contract").count(), 4);
         state.sector_repo.delete_sector(c.sector_id).await.unwrap();
         let (again, body2) = get(&state, Some("t"), c.campaign_id).await;
@@ -2025,6 +2082,65 @@ mod tests {
         seed_sector(state, &c).await;
         let crew = seed_crew(state, c.campaign_id, coolant).await;
         (c.campaign_id, crew)
+    }
+
+    /// BP-20a-1: map 42 from gateway (5, −3). `dig:13,-9`'s Fast way crosses a ToxicZone in
+    /// 16 s and its Safe way none in 17 s; `dig:9,-7`'s Fast way is clean (one way only).
+    const ROUTE_GATEWAY: (i32, i32) = (5, -3);
+    const TWO_WAY_DIG: &str = "dig:13,-9";
+    const ONE_WAY_DIG: &str = "dig:9,-7";
+
+    async fn route_campaign(state: &Arc<AppState>) -> Uuid {
+        let c = campaign_with(state, WALLET, true, Some(ROUTE_GATEWAY)).await;
+        seed_sector(state, &c).await;
+        seed_crew(state, c.campaign_id, false).await;
+        c.campaign_id
+    }
+
+    async fn start_on(state: &Arc<AppState>, campaign: Uuid, site_id: &str, route: &str) -> (StatusCode, serde_json::Value, Vec<u8>) {
+        post(state, campaign, "start", Some(&serde_json::json!({ "site_id": site_id, "route": route }).to_string())).await
+    }
+
+    #[tokio::test]
+    async fn ops_start_defaults_to_the_fast_route() {
+        let state = Arc::new(session_state());
+        let c = route_campaign(&state).await;
+        let (status, body, _) = start(&state, c, TWO_WAY_DIG).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let op = &body["active_op"];
+        assert_eq!(secs_between(op), 16);
+        assert!(op.get("route").is_none(), "{op}");
+    }
+
+    #[tokio::test]
+    async fn ops_start_takes_the_safe_route() {
+        let state = Arc::new(session_state());
+        let c = route_campaign(&state).await;
+        let (status, body) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let site = body["sites"].as_array().expect("sites").iter().find(|s| s["site_id"] == TWO_WAY_DIG).expect("the dig").clone();
+        let routes = site["routes"].as_array().expect("routes");
+        assert_eq!(routes.len(), 2, "{site}");
+        assert_eq!((routes[0]["route"].as_str(), routes[0]["secs"].as_u64()), (Some("fast"), Some(16)));
+        assert_eq!((routes[1]["route"].as_str(), routes[1]["secs"].as_u64()), (Some("safe"), Some(17)));
+        for r in routes {
+            assert_eq!(r["path"].as_array().expect("a path").last(), Some(&serde_json::json!([13, -9])), "{r}");
+        }
+        let (status, body, _) = start_on(&state, c, TWO_WAY_DIG, "safe").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let op = &body["active_op"];
+        assert_eq!(secs_between(op), 17);
+        assert_eq!(op["route"], "safe");
+    }
+
+    #[tokio::test]
+    async fn ops_start_refuses_an_unknown_and_a_missing_route() {
+        let state = Arc::new(session_state());
+        let c = route_campaign(&state).await;
+        let (status, body, _) = start_on(&state, c, TWO_WAY_DIG, "scenic").await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::BAD_REQUEST, Some("unknown route")));
+        let (status, body, _) = start_on(&state, c, ONE_WAY_DIG, "safe").await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::BAD_REQUEST, Some("no safe route to that site")));
     }
 
     /// The drill's refusals in its order, on a contract and on a dig.
@@ -3838,11 +3954,11 @@ mod tests {
         let (status, body, _) = start(&state, c, SITE).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let now = chrono::Utc::now();
-        let empty = OpsBoard { sites: vec![], contract_pool: vec![] };
+        let empty = OpsBoard { sites: vec![], contract_pool: vec![], routes: HashMap::new() };
         let next_site = state.demo_ops.store.site(c, &empty, NEXT_SITE, now).expect("the second contract");
         let unfought = Uuid::from_u128(0xD2);
         let lead = ContractStart { commander_id: unfought, section_id: Some(second) };
-        state.demo_ops.store.start_op_for(c, GATEWAY, Arc::new(empty), &next_site, 7, None, Some(lead), true, now).expect("the second op");
+        state.demo_ops.store.start_op_for(c, GATEWAY, Arc::new(empty), &next_site, 7, None, Some(lead), true, RouteKind::Fast, now).expect("the second op");
         state.demo_ops.store.rewind_op(c, 120);
         fight_logged(&state, c, SUCCESS_SEED, None).await;
         let (status, body) = get(&state, Some("t"), c).await;

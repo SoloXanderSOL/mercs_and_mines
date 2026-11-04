@@ -466,7 +466,7 @@ mod tests {
     }
 
     fn ops_board() -> Arc<crate::demo_ops::OpsBoard> {
-        Arc::new(crate::demo_ops::OpsBoard { sites: vec![], contract_pool: vec![] })
+        Arc::new(crate::demo_ops::OpsBoard { sites: vec![], contract_pool: vec![], routes: std::collections::HashMap::new() })
     }
 
     fn ops_site() -> crate::demo_ops::OpsSite {

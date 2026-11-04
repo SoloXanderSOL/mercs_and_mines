@@ -123,6 +123,9 @@ pub const DEMO_RAID_MISSION: &str = "GUARD_DUTY";
 pub const DEMO_AMBUSH_BASE_PCT: u32 = 10;
 pub const DEMO_AMBUSH_PCT_PER_50: u32 = 5;
 pub const DEMO_AMBUSH_CAP_PCT: u32 = 50;
+/// BP-20a-1 (D6): haul-ambush points per second the chosen way takes over the Fast one, inside
+/// the same cap; a Fast trip's odds are unchanged.
+pub const DEMO_AMBUSH_PCT_PER_DETOUR_SEC: u32 = 2;
 /// The ambush rolls from `Rng::new(op_seed + this)` (wrapping). Draw k of `Rng::new(s)` runs on
 /// state `s + k × 0x6D2B_79F5`, so a drill's stream would reach this one only at its 2³¹st draw; a
 /// dig reads at most 24 there (12 drills × 2: heat 10 at least, threshold 115 at most).
@@ -193,7 +196,7 @@ pub struct OpsSite {
     pub r: i32,
     /// Hexes from the gateway.
     pub distance: u32,
-    /// One way, from the gateway: `distance × DEMO_SECS_PER_HEX × the site's terrain modifier`.
+    /// One way, from the gateway: the Fast way's seconds (BP-20a-1, `board_routes`).
     pub travel_secs: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tier: Option<u8>,
@@ -212,12 +215,144 @@ pub struct OpsBoard {
     /// (BP-11a-3): where a fought contract returns after 45 s. Never sent.
     #[serde(skip)]
     pub contract_pool: Vec<(i32, i32, u32, u32)>,
+    /// BP-20a-1: the ways to every site hex on the board and every pool hex (so a returned
+    /// contract finds its way), by hex. Sent through the route's `SiteView`, never from here.
+    #[serde(skip)]
+    pub routes: HashMap<(i32, i32), SiteRoutes>,
 }
 
 /// The hex's terrain if the hex is on the map and passable. A hex missing from the map is
 /// impassable, as in `map_gen`.
 fn passable(terrain: &HashMap<String, HexTerrain>, q: i32, r: i32) -> Option<&HexTerrain> {
     terrain.get(&format!("{q},{r}")).filter(|t| !t.is_impassable())
+}
+
+/// BP-20a-1 (§4e C3): the three hazards a route can cross. Exhaustive on purpose (no `_` arm):
+/// a new `HexTerrain` variant stops this compiling until someone says whether it is one.
+pub fn is_hazard(t: &HexTerrain) -> bool {
+    match t {
+        HexTerrain::ToxicZone | HexTerrain::CooledMagma | HexTerrain::RuinedCity => true,
+        HexTerrain::AshenPlains
+        | HexTerrain::ScorchedDesert
+        | HexTerrain::CityState
+        | HexTerrain::GunOutpost
+        | HexTerrain::MagmaFlow
+        | HexTerrain::VolcanicCaldera
+        | HexTerrain::Mountain
+        | HexTerrain::Ravine => false,
+    }
+}
+
+/// BP-20a-1: which way a trip goes. Fast orders paths by (seconds, hazards), Safe by (hazards,
+/// seconds), so Fast is clean wherever a clean path ties (H3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RouteKind {
+    Fast,
+    Safe,
+}
+
+/// The order a route search keeps (H3).
+fn route_key(kind: RouteKind, secs: u32, hazards: u32) -> (u32, u32) {
+    match kind {
+        RouteKind::Fast => (secs, hazards),
+        RouteKind::Safe => (hazards, secs),
+    }
+}
+
+/// One way to a site (BP-20a-1): its one-way seconds (each hex entered costs `travel_secs(1, …)`
+/// of its terrain, the gateway excluded, the site included), the hazards crossed strictly
+/// between the gateway and the site (the site's own terrain never counts, H1; never sent), and
+/// the hexes entered, the site last.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct RoutePath {
+    pub secs: u32,
+    #[serde(skip)]
+    pub hazards: u32,
+    pub path: Vec<(i32, i32)>,
+}
+
+/// A site's ways (BP-20a-1): Fast always; Safe only where it crosses fewer hazards.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SiteRoutes {
+    pub fast: RoutePath,
+    pub safe: Option<RoutePath>,
+}
+
+/// The six axial neighbour offsets (BP-20a-1; private, so no keeper file is touched).
+const HEX_NEIGHBOURS: [(i32, i32); 6] = [(1, 0), (-1, 0), (0, 1), (0, -1), (1, -1), (-1, 1)];
+
+/// One route search from `gateway` (BP-20a-1): a Dijkstra over `passable` hexes keyed by
+/// `route_key(kind, …)`, the heap ordered by `(key, q, r)` ascending and a hex relaxed only by a
+/// strictly lower key, so a tie goes to the predecessor popped first. It stops once every
+/// target is settled. Returns each reachable target's path; the predecessor map is dropped.
+fn route_search(terrain: &HashMap<String, HexTerrain>, gateway: (i32, i32), targets: &HashSet<(i32, i32)>, kind: RouteKind) -> HashMap<(i32, i32), RoutePath> {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+    // hex → (secs, hazards entered, predecessor); hazards include the hex's own terrain.
+    let mut best: HashMap<(i32, i32), (u32, u32, (i32, i32))> = HashMap::new();
+    let mut heap = BinaryHeap::new();
+    best.insert(gateway, (0, 0, gateway));
+    heap.push(Reverse((route_key(kind, 0, 0), gateway.0, gateway.1)));
+    let mut left = targets.len();
+    let mut settled: HashSet<(i32, i32)> = HashSet::new();
+    while let Some(Reverse((key, q, r))) = heap.pop() {
+        if left == 0 {
+            break;
+        }
+        let Some(&(secs, hazards, _)) = best.get(&(q, r)) else { continue };
+        if route_key(kind, secs, hazards) != key || !settled.insert((q, r)) {
+            continue;
+        }
+        if targets.contains(&(q, r)) {
+            left -= 1;
+        }
+        for (dq, dr) in HEX_NEIGHBOURS {
+            let n = (q + dq, r + dr);
+            let Some(t) = passable(terrain, n.0, n.1) else { continue };
+            let (ns, nh) = (secs + travel_secs(1, t), hazards + u32::from(is_hazard(t)));
+            let nk = route_key(kind, ns, nh);
+            if best.get(&n).is_none_or(|&(s, h, _)| nk < route_key(kind, s, h)) {
+                best.insert(n, (ns, nh, (q, r)));
+                heap.push(Reverse((nk, n.0, n.1)));
+            }
+        }
+    }
+    let mut out = HashMap::new();
+    for &target in targets {
+        if !settled.contains(&target) {
+            continue;
+        }
+        let Some(&(secs, hazards, _)) = best.get(&target) else { continue };
+        let own = passable(terrain, target.0, target.1).is_some_and(is_hazard);
+        let mut path = Vec::new();
+        let mut at = target;
+        while at != gateway {
+            path.push(at);
+            at = best[&at].2;
+        }
+        path.reverse();
+        // Saturating: a target on the gateway itself entered nothing, its own hex included.
+        out.insert(target, RoutePath { secs, hazards: hazards.saturating_sub(u32::from(own)), path });
+    }
+    out
+}
+
+/// BP-20a-1 (§4e C3): a Fast and a Safe way from `gateway` to each of `targets`, one bounded
+/// search per `RouteKind`. A target with no path is absent; Safe is kept only where it crosses
+/// fewer hazards than Fast.
+pub fn board_routes(terrain: &HashMap<String, HexTerrain>, gateway: (i32, i32), targets: &[(i32, i32)]) -> HashMap<(i32, i32), SiteRoutes> {
+    let wanted: HashSet<(i32, i32)> = targets.iter().copied().collect();
+    let mut fast_ways = route_search(terrain, gateway, &wanted, RouteKind::Fast);
+    let mut safe_ways = route_search(terrain, gateway, &wanted, RouteKind::Safe);
+    let mut out = HashMap::new();
+    for hex in wanted {
+        let Some(fast) = fast_ways.remove(&hex) else { continue };
+        let safe = safe_ways.remove(&hex);
+        let safe = safe.filter(|s| s.hazards < fast.hazards);
+        out.insert(hex, SiteRoutes { fast, safe });
+    }
+    out
 }
 
 /// One-way travel time to a passable hex. Every passable modifier is 0.5, 1, 1.5 or 2, so
@@ -235,14 +370,14 @@ pub fn ops_site_seed(campaign_id: Uuid) -> u32 {
         .fold(0, |acc, w| acc ^ u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
 }
 
-fn dig_site(v: &MagmaVeinNode, distance: u32, terrain: &HexTerrain) -> OpsSite {
+fn dig_site(v: &MagmaVeinNode, distance: u32, travel_secs: u32) -> OpsSite {
     OpsSite {
         site_id: format!("dig:{},{}", v.q, v.r),
         kind: "dig",
         q: v.q,
         r: v.r,
         distance,
-        travel_secs: travel_secs(distance, terrain),
+        travel_secs,
         tier: Some(v.tier),
         mission_id: None,
         name: None,
@@ -259,6 +394,11 @@ fn dig_site(v: &MagmaVeinNode, distance: u32, terrain: &HexTerrain) -> OpsSite {
 ///   a partial Fisher–Yates for the first `OPS_CONTRACT_MISSIONS.len()` with
 ///   `Rng::new(ops_site_seed(campaign_id))`. Fewer candidates → fewer contracts. The sorted
 ///   candidates, before the shuffle, are the board's `contract_pool` (BP-11a-3).
+/// - **Routes (BP-20a-1, Variant B):** `board_routes` runs once over every candidate above (the
+///   veins in range and the contract hexes), and a candidate with no path from the gateway
+///   leaves before the tier picks and the shuffle. A site's `travel_secs` (and the pool's fourth
+///   field) is its Fast way's seconds; `distance` stays the straight line. The board keeps the
+///   ways of its site hexes and its pool hexes only.
 pub fn ops_board(
     terrain: &HashMap<String, HexTerrain>,
     veins: &[MagmaVeinNode],
@@ -268,7 +408,7 @@ pub fn ops_board(
     let (gq, gr) = gateway;
     let dist = |q: i32, r: i32| hex_axial_distance(gq, gr, q, r);
 
-    let mut tier1: Vec<(u32, &MagmaVeinNode, &HexTerrain)> = veins
+    let mut tier1: Vec<(u32, &MagmaVeinNode)> = veins
         .iter()
         .filter(|v| v.tier == 1)
         .filter_map(|v| {
@@ -276,12 +416,11 @@ pub fn ops_board(
             if d < OPS_DIG_TIER1_MIN_HEXES || d > OPS_DIG_TIER1_MAX_HEXES {
                 return None;
             }
-            passable(terrain, v.q, v.r).map(|t| (d, v, t))
+            passable(terrain, v.q, v.r).map(|_| (d, v))
         })
         .collect();
-    tier1.sort_by_key(|(d, v, _)| (*d, v.q, v.r));
 
-    let tier3 = veins
+    let mut tier3: Vec<(u32, &MagmaVeinNode)> = veins
         .iter()
         .filter(|v| v.tier == 3)
         .filter_map(|v| {
@@ -289,20 +428,13 @@ pub fn ops_board(
             if d > OPS_DIG_TIER3_MAX_HEXES {
                 return None;
             }
-            passable(terrain, v.q, v.r).map(|t| (d, v, t))
+            passable(terrain, v.q, v.r).map(|_| (d, v))
         })
-        .min_by_key(|(d, v, _)| (*d, v.q, v.r));
-
-    let mut sites: Vec<OpsSite> = tier1
-        .iter()
-        .take(OPS_TIER1_SITES)
-        .chain(tier3.iter())
-        .map(|(d, v, t)| dig_site(v, *d, t))
         .collect();
 
     let vein_hexes: HashSet<(i32, i32)> = veins.iter().map(|v| (v.q, v.r)).collect();
     let reach = OPS_CONTRACT_MAX_HEXES as i32;
-    let mut candidates: Vec<(i32, i32, u32, &HexTerrain)> = Vec::new();
+    let mut candidates: Vec<(i32, i32, u32)> = Vec::new();
     for q in gq - reach..=gq + reach {
         for r in gr - reach..=gr + reach {
             let d = dist(q, r);
@@ -312,13 +444,38 @@ pub fn ops_board(
             if hex_axial_distance(q, r, 0, 0) <= SAFE_ZONE_RADIUS || vein_hexes.contains(&(q, r)) {
                 continue;
             }
-            if let Some(t) = passable(terrain, q, r) {
-                candidates.push((q, r, d, t));
+            if passable(terrain, q, r).is_some() {
+                candidates.push((q, r, d));
             }
         }
     }
-    candidates.sort_by_key(|(q, r, _, _)| (*q, *r));
-    let contract_pool = candidates.iter().map(|&(q, r, d, t)| (q, r, d, travel_secs(d, t))).collect();
+
+    // BP-20a-1 (Variant B): one route search over every candidate; an unreachable one leaves
+    // here, beside `passable`, before the tier picks and the contract shuffle.
+    let targets: Vec<(i32, i32)> = tier1
+        .iter()
+        .chain(tier3.iter())
+        .map(|(_, v)| (v.q, v.r))
+        .chain(candidates.iter().map(|&(q, r, _)| (q, r)))
+        .collect();
+    let mut routes = board_routes(terrain, gateway, &targets);
+    tier1.retain(|(_, v)| routes.contains_key(&(v.q, v.r)));
+    tier3.retain(|(_, v)| routes.contains_key(&(v.q, v.r)));
+    candidates.retain(|&(q, r, _)| routes.contains_key(&(q, r)));
+    let fast_secs = |q: i32, r: i32| routes.get(&(q, r)).map_or(0, |w| w.fast.secs);
+
+    tier1.sort_by_key(|(d, v)| (*d, v.q, v.r));
+    let tier3 = tier3.into_iter().min_by_key(|(d, v)| (*d, v.q, v.r));
+
+    let mut sites: Vec<OpsSite> = tier1
+        .iter()
+        .take(OPS_TIER1_SITES)
+        .chain(tier3.iter())
+        .map(|(d, v)| dig_site(v, *d, fast_secs(v.q, v.r)))
+        .collect();
+
+    candidates.sort_by_key(|(q, r, _)| (*q, *r));
+    let contract_pool: Vec<(i32, i32, u32, u32)> = candidates.iter().map(|&(q, r, d)| (q, r, d, fast_secs(q, r))).collect();
     let n = candidates.len();
     let picks = OPS_CONTRACT_MISSIONS.len().min(n);
     let mut rng = Rng::new(ops_site_seed(campaign_id));
@@ -326,20 +483,22 @@ pub fn ops_board(
         let j = i + rng.roll_int(0, (n - 1 - i) as u32) as usize;
         candidates.swap(i, j);
     }
-    for (&(q, r, d, t), &mission_id) in candidates.iter().take(picks).zip(OPS_CONTRACT_MISSIONS.iter()) {
+    for (&(q, r, d), &mission_id) in candidates.iter().take(picks).zip(OPS_CONTRACT_MISSIONS.iter()) {
         sites.push(OpsSite {
             site_id: format!("contract:{mission_id}"),
             kind: "contract",
             q,
             r,
             distance: d,
-            travel_secs: travel_secs(d, t),
+            travel_secs: fast_secs(q, r),
             tier: None,
             mission_id: Some(mission_id),
             name: missions().get(mission_id).map(|m| m.name.clone()),
         });
     }
-    OpsBoard { sites, contract_pool }
+    let kept: HashSet<(i32, i32)> = sites.iter().map(|s| (s.q, s.r)).chain(contract_pool.iter().map(|p| (p.0, p.1))).collect();
+    routes.retain(|hex, _| kept.contains(hex));
+    OpsBoard { sites, contract_pool, routes }
 }
 
 /// Which way the team is travelling.
@@ -1036,8 +1195,14 @@ struct ActiveOp {
     leg: OpLeg,
     depart_at: DateTime<Utc>,
     arrive_at: DateTime<Utc>,
-    /// The site's one-way time; both legs take it, so the trip is symmetric (§4d: "each way").
+    /// The chosen way's one-way time (BP-20a-1: the Fast way's, or the Safe way's on a Safe
+    /// start); both legs take it, so the trip retraces its way (§4d: "each way").
     travel_secs: u32,
+    /// The way the op went (BP-20a-1), fixed at the start; a next's op is always `Fast`.
+    route: RouteKind,
+    /// Seconds the chosen way takes over the Fast one (BP-20a-1): 0 on Fast. `pull_op` raises
+    /// the haul's ambush by each of them, inside the cap (D6).
+    detour_secs: u32,
     /// Drawn by `generate_seed()` at `ops/start`, never derived from the campaign id and never
     /// sent or logged. `drill_op` rolls from it (`drill_roll`), and `pull_op` (`ambush_d100`).
     op_seed: u32,
@@ -1073,6 +1238,9 @@ pub struct ActiveOpView {
     /// See section_id.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commander_id: Option<Uuid>,
+    /// BP-20a-1: `"safe"` when the op went the Safe way; absent on Fast, so the op's keys stand.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route: Option<RouteKind>,
 }
 
 /// A hex as the ops routes send it: `{"q": …, "r": …}`.
@@ -1628,6 +1796,7 @@ impl OpsEntry {
                 }),
                 section_id,
                 commander_id,
+                route: (op.route == RouteKind::Safe).then_some(RouteKind::Safe),
             }
         })
     }
@@ -1713,9 +1882,11 @@ pub struct OpsSnapshot {
 
 /// A new op (BP-11a-4), built for a start (`start_op`) and for a next (`next_op`): outbound to
 /// `site`, standing at the site's hex (`at`) once there. The leg takes `leg_secs`; home from the
-/// site takes its own `travel_secs`. A dig starts fresh and a contract gets a fresh
+/// site takes the chosen way's seconds, the site's `travel_secs` (its Fast way) plus
+/// `detour_secs` (BP-20a-1: 0 on Fast). A dig starts fresh and a contract gets a fresh
 /// `ContractState` with no result, so nothing carries over from an earlier op.
-fn new_op(site: &OpsSite, op_seed: u32, dig: Option<DigStart>, contract: Option<ContractStart>, leg_secs: u32, now: DateTime<Utc>) -> ActiveOp {
+#[allow(clippy::too_many_arguments)]
+fn new_op(site: &OpsSite, op_seed: u32, dig: Option<DigStart>, contract: Option<ContractStart>, route: RouteKind, detour_secs: u32, leg_secs: u32, now: DateTime<Utc>) -> ActiveOp {
     ActiveOp {
         site_id: site.site_id.clone(),
         at: (site.q, site.r),
@@ -1723,7 +1894,9 @@ fn new_op(site: &OpsSite, op_seed: u32, dig: Option<DigStart>, contract: Option<
         leg: OpLeg::Outbound,
         depart_at: now,
         arrive_at: now + Duration::seconds(i64::from(leg_secs)),
-        travel_secs: site.travel_secs,
+        travel_secs: site.travel_secs + detour_secs,
+        route,
+        detour_secs,
         op_seed,
         dig: dig.map(|d| DigState {
             tier: site.tier.unwrap_or(1),
@@ -1788,7 +1961,7 @@ fn new_op(site: &OpsSite, op_seed: u32, dig: Option<DigStart>, contract: Option<
 ///   homeward arrival, a drill, a latch, a build, a heal and a replace each write `moved_at`. Reading the board or the op
 ///   does not, nor does the ambush's reveal; a read that latches a battle does. While an
 ///   ambush waits, `moved_since` still counts the leg's passed `arrive_at`, at most
-///   `travel_secs` (≤ 48 s) after the pull: an accepted overcount;
+///   `travel_secs` after the pull: an accepted overcount;
 /// - the eviction takes only an entry with no op in any slot, no banked ore, no banked credits, no
 ///   building, no sickbay off the default, no trophy, no replace in flight (BP-12a-1,
 ///   BP-12a-2) and no undrained Foreman tally (BP-19a, `foreman_due` off the default);
@@ -1890,7 +2063,7 @@ impl DemoOpsStore {
         true
     }
 
-    /// `start_op_for` with no squad named (`named: false`): today's start.
+    /// `start_op_for` with no squad named (`named: false`), the Fast way: today's start.
     pub fn start_op(
         &self,
         campaign_id: Uuid,
@@ -1902,10 +2075,14 @@ impl DemoOpsStore {
         contract: Option<ContractStart>,
         now: DateTime<Utc>,
     ) -> Result<(), StartRefusal> {
-        self.start_op_for(campaign_id, gateway, board, site, op_seed, dig, contract, false, now)
+        self.start_op_for(campaign_id, gateway, board, site, op_seed, dig, contract, false, RouteKind::Fast, now)
     }
 
-    /// Starts the outbound leg to `site`: `depart_at = now`, `arrive_at = now + travel_secs`.
+    /// Starts the outbound leg to `site`: `depart_at = now`, `arrive_at = now + the chosen
+    /// way's seconds` (BP-20a-1): the site's hex is looked up in the entry's board routes, and
+    /// `route` Safe with a Safe way there takes the Safe way's seconds, its detour over the Fast
+    /// one stored for the haul's ambush; anything else takes the Fast way's (stored as `Fast`). A
+    /// board with no ways for the hex (the store tests' own boards) takes the site's `travel_secs`.
     /// A campaign with no entry is cached with `board` first (`Full` when every entry at the cap
     /// holds an op). A dig passes `dig` (its tier comes from the site); a contract passes
     /// `contract` (BP-11a-2; its mission comes from the site). The squad (Section and Commander)
@@ -1929,6 +2106,7 @@ impl DemoOpsStore {
         dig: Option<DigStart>,
         contract: Option<ContractStart>,
         named: bool,
+        route: RouteKind,
         now: DateTime<Utc>,
     ) -> Result<(), StartRefusal> {
         let mut inner = self.lock();
@@ -1952,7 +2130,15 @@ impl DemoOpsStore {
         if named && lead.and_then(|(_, s)| s).is_some_and(|s| e.section_busy(s)) {
             return Err(StartRefusal::SectionBusy);
         }
-        let op = new_op(site, op_seed, dig, contract, site.travel_secs, now);
+        // BP-20a-1: the way, from the entry's board; Safe only where the board offers it.
+        let (leg_secs, detour_secs, route) = match e.board.routes.get(&(site.q, site.r)) {
+            Some(w) => match (route, &w.safe) {
+                (RouteKind::Safe, Some(safe)) => (safe.secs, safe.secs.saturating_sub(w.fast.secs), RouteKind::Safe),
+                _ => (w.fast.secs, 0, RouteKind::Fast),
+            },
+            None => (site.travel_secs, 0, RouteKind::Fast),
+        };
+        let op = new_op(site, op_seed, dig, contract, route, detour_secs, leg_secs, now);
         let key = slot_of(&op);
         let taken = op.contract.as_ref().is_some_and(|c| e.mission_held(c.mission_id, None)) || (key != SlotKey::Dig && e.slot(key).is_some());
         if taken {
@@ -2024,7 +2210,8 @@ impl DemoOpsStore {
     /// - `next_op_for` with no squad named: it acts on the one op out (`SayWhich` with two).
     /// - The leg runs from `op.at`, never from a board lookup: the hop's hexes at the target's
     ///   seconds per hex (`travel_secs / distance`, distance at least 1), at least 1 s. Home from
-    ///   there is the target's own `travel_secs`.
+    ///   there is the target's own `travel_secs` (its Fast way: a next's op is always Fast,
+    ///   BP-20a-1; a `route` on `ops/next` is ignored).
     /// - The old op goes whole: the ore on a dig's site is walked away from, as `return_op` (the
     ///   body then shows no `ended_by`), and an unfought contract stays on the board unfinished.
     /// - CF2: a new contract's trigger is the new leg's arrival (`contract_trigger` unchanged),
@@ -2103,7 +2290,7 @@ impl DemoOpsStore {
             dig = dig.map(|d| DigStart { commander_id, section_id, ..d });
             contract = contract.map(|_| ContractStart { commander_id, section_id });
         }
-        let next = new_op(site, op_seed, dig, contract, leg_secs, now);
+        let next = new_op(site, op_seed, dig, contract, RouteKind::Fast, 0, leg_secs, now);
         let target = slot_of(&next);
         if target == SlotKey::Dig && e.dig.is_some() && key != SlotKey::Dig {
             return Err(NextRefusal::DigHeld);
@@ -2251,7 +2438,7 @@ impl DemoOpsStore {
         op.leg = OpLeg::Homeward;
         op.depart_at = now;
         op.arrive_at = now + Duration::seconds(i64::from(op.travel_secs));
-        if ambush_d100(op.op_seed) <= base.haul_ambush_pct(load) {
+        if ambush_d100(op.op_seed) <= (base.haul_ambush_pct(load) + op.detour_secs * DEMO_AMBUSH_PCT_PER_DETOUR_SEC).min(DEMO_AMBUSH_CAP_PCT) {
             dig.ambush_at = Some(now + Duration::milliseconds(i64::from(op.travel_secs) * 500));
         }
         e.moved_at = Some(now);
@@ -2658,7 +2845,8 @@ impl DemoOpsStore {
     }
 
     /// Sends the Section to guard an unescorted dig (BP-17a, "go guard the dig"): it stands
-    /// guard from `now + travel_secs` (`escort_at`) and fights every battle born from then on;
+    /// guard from `now + travel_secs` (`escort_at`; `op.travel_secs` is the chosen way's seconds,
+    /// BP-20a-1) and fights every battle born from then on;
     /// `commander_id` and `section_id` (read by the route) become the dig's. Allowed while
     /// outbound (no fight can come before the arrival). Writes `moved_at` (a departure).
     /// Refusals in order: `NoOp` → `Contract` → `AlreadyHomeward` → `AlreadyEscorted` →
@@ -3017,7 +3205,8 @@ mod tests {
     /// Exactly one tier-1 vein in the 2–6 ring (d = 6), one inside it (d = 1), one outside (d = 7).
     #[test]
     fn ops_board_tier1_ring_is_2_to_6() {
-        let t = map(&[((6, 0), A), ((11, 0), A), ((12, 0), A)]);
+        // BP-20a-1 (Variant B): a plains corridor (7, 0) … (10, 0); `digs` is dig-only.
+        let t = map(&[((6, 0), A), ((11, 0), A), ((12, 0), A), ((7, 0), A), ((8, 0), A), ((9, 0), A), ((10, 0), A)]);
         let veins = [vein(6, 0, 1), vein(11, 0, 1), vein(12, 0, 1)];
         let b = ops_board(&t, &veins, (5, 0), Uuid::nil());
         assert_eq!(digs(&b), vec![(11, 0, 1)]);
@@ -3025,7 +3214,8 @@ mod tests {
 
     #[test]
     fn ops_board_takes_the_two_nearest_tier1_veins() {
-        let t = map(&[((8, 0), A), ((5, 3), A), ((9, 0), A), ((10, 0), A)]);
+        // BP-20a-1 (Variant B): plains corridors (6, 0), (7, 0) and (5, 1), (5, 2).
+        let t = map(&[((8, 0), A), ((5, 3), A), ((9, 0), A), ((10, 0), A), ((6, 0), A), ((7, 0), A), ((5, 1), A), ((5, 2), A)]);
         let veins = [vein(10, 0, 1), vein(9, 0, 1), vein(8, 0, 1), vein(5, 3, 1)];
         let b = ops_board(&t, &veins, (5, 0), Uuid::nil());
         assert_eq!(digs(&b), vec![(5, 3, 1), (8, 0, 1)], "d = 3 twice, ties by (q, r)");
@@ -3033,7 +3223,11 @@ mod tests {
 
     #[test]
     fn ops_board_tier3_is_the_nearest_within_12() {
-        let t = map(&[((14, 0), A), ((15, 0), A), ((18, 0), A)]);
+        // BP-20a-1 (Variant B): a plains corridor (6, 0) … (17, 0), so (18, 0) is out of range,
+        // not unreachable; `digs` is dig-only.
+        let mut hexes = vec![((14, 0), A), ((15, 0), A), ((18, 0), A)];
+        hexes.extend((6..=13).chain(16..=17).map(|q| ((q, 0), A)));
+        let t = map(&hexes);
         let b = ops_board(&t, &[vein(15, 0, 3), vein(14, 0, 3), vein(18, 0, 3)], (5, 0), Uuid::nil());
         assert_eq!(digs(&b), vec![(14, 0, 3)]);
         let far = ops_board(&t, &[vein(18, 0, 3)], (5, 0), Uuid::nil());
@@ -3053,12 +3247,16 @@ mod tests {
             ((9, 0), A),
             ((10, 0), A),
             ((11, 0), A),
+            // BP-20a-1 (Variant B): plains corridors from the gateway; (8, -1) is a fifth contract
+            // candidate, so the pin is dig-only.
+            ((5, 1), A),
+            ((5, 2), A),
+            ((6, 0), A),
+            ((7, -1), A),
+            ((8, -1), A),
         ]);
         let b = ops_board(&t, &[vein(7, 0, 1), vein(5, 3, 1)], (5, 0), Uuid::nil());
         assert_eq!(digs(&b), vec![(5, 3, 1)], "the Mountain vein is no dig site");
-        let mut got = contracts(&b);
-        got.sort();
-        assert_eq!(got, vec![(8, 0), (9, 0), (10, 0), (11, 0)]);
     }
 
     #[test]
@@ -3116,15 +3314,19 @@ mod tests {
     }
 
     #[test]
-    fn ops_travel_secs_uses_the_destination_terrain() {
-        let t = map(&[((17, 0), HexTerrain::CooledMagma), ((7, 0), HexTerrain::CityState)]);
+    fn ops_travel_secs_is_the_fast_path_sum() {
+        // BP-20a-1: AshenPlains at (6, 0) and (8, 0) … (16, 0); each hex entered costs its own
+        // terrain's seconds: 2 + 1, and 2 + 1 + 9 × 2 + 4.
+        let mut hexes = vec![((17, 0), HexTerrain::CooledMagma), ((7, 0), HexTerrain::CityState), ((6, 0), A)];
+        hexes.extend((8..=16).map(|q| ((q, 0), A)));
+        let t = map(&hexes);
         let b = ops_board(&t, &[vein(17, 0, 3), vein(7, 0, 1)], (5, 0), Uuid::nil());
-        let secs: Vec<(String, u32)> = b.sites.iter().map(|s| (s.site_id.clone(), s.travel_secs)).collect();
-        assert_eq!(secs, vec![("dig:7,0".to_string(), 2), ("dig:17,0".to_string(), 48)]);
+        let secs: Vec<(String, u32)> = b.sites.iter().filter(|s| s.kind == "dig").map(|s| (s.site_id.clone(), s.travel_secs)).collect();
+        assert_eq!(secs, vec![("dig:7,0".to_string(), 3), ("dig:17,0".to_string(), 25)]);
     }
 
     fn board() -> Arc<OpsBoard> {
-        Arc::new(OpsBoard { sites: vec![], contract_pool: vec![] })
+        Arc::new(OpsBoard { sites: vec![], contract_pool: vec![], routes: HashMap::new() })
     }
 
     /// A contract site 10 s out.
@@ -3876,6 +4078,116 @@ mod tests {
         assert_eq!(store.pending_raid(b, at(25)).map(|p| p.trigger), Some(ambush_trigger(25)));
     }
 
+    /// BP-20a-1: the line (6, 0) (7, 0) (8, 0) (9, 0) with `mid` at (7, 0), and a one-hex detour
+    /// round it through (7, −1) and (8, −1); `detour` stands at (7, −1).
+    fn detour_map(mid: HexTerrain, detour: HexTerrain) -> HashMap<String, HexTerrain> {
+        map(&[((6, 0), A), ((7, 0), mid), ((8, 0), A), ((9, 0), A), ((7, -1), detour), ((8, -1), A)])
+    }
+
+    fn way(secs: u32, hazards: u32, path: &[(i32, i32)]) -> RoutePath {
+        RoutePath { secs, hazards, path: path.to_vec() }
+    }
+
+    const LINE: [(i32, i32); 4] = [(6, 0), (7, 0), (8, 0), (9, 0)];
+    const DETOUR: [(i32, i32); 5] = [(6, 0), (7, -1), (8, -1), (8, 0), (9, 0)];
+
+    #[test]
+    fn routes_go_round_a_toxic_zone() {
+        let w = board_routes(&detour_map(HexTerrain::ToxicZone, A), (5, 0), &[(9, 0)]);
+        let w = &w[&(9, 0)];
+        assert_eq!(w.fast, way(8, 1, &LINE));
+        assert_eq!(w.safe, Some(way(10, 0, &DETOUR)));
+    }
+
+    #[test]
+    fn routes_go_round_a_ruined_city() {
+        let w = board_routes(&detour_map(HexTerrain::RuinedCity, A), (5, 0), &[(9, 0)]);
+        let w = &w[&(9, 0)];
+        assert_eq!(w.fast, way(9, 1, &LINE));
+        assert_eq!(w.safe, Some(way(10, 0, &DETOUR)));
+    }
+
+    #[test]
+    fn routes_go_round_cooled_magma() {
+        let mut hexes = vec![((6, 0), A), ((7, 0), HexTerrain::CooledMagma), ((8, 0), A), ((9, 0), A)];
+        hexes.extend([(6, -1), (7, -2), (8, -2), (9, -2), (9, -1)].map(|h| (h, A)));
+        let w = board_routes(&map(&hexes), (5, 0), &[(9, 0)]);
+        let w = &w[&(9, 0)];
+        assert_eq!(w.fast, way(10, 1, &LINE));
+        assert_eq!(w.safe, Some(way(12, 0, &[(6, -1), (7, -2), (8, -2), (9, -2), (9, -1), (9, 0)])));
+    }
+
+    /// H3: the line through CooledMagma and the detour both take 10 s, so Fast is the clean one
+    /// and no Safe way is offered. The path is not pinned (N3c leaves this passing).
+    #[test]
+    fn fast_takes_the_clean_way_on_a_tie() {
+        let w = board_routes(&detour_map(HexTerrain::CooledMagma, A), (5, 0), &[(9, 0)]);
+        let w = &w[&(9, 0)];
+        assert_eq!((w.fast.secs, w.fast.hazards, &w.safe), (10, 0, &None));
+    }
+
+    #[test]
+    fn routes_offer_one_way_with_no_detour() {
+        let t = map(&[((6, 0), A), ((7, 0), HexTerrain::ToxicZone), ((8, 0), A), ((9, 0), A)]);
+        let w = board_routes(&t, (5, 0), &[(9, 0)]);
+        let w = &w[&(9, 0)];
+        assert_eq!((w.fast.secs, w.fast.hazards, &w.safe), (8, 1, &None));
+    }
+
+    #[test]
+    fn routes_never_cross_impassable() {
+        let w = board_routes(&detour_map(HexTerrain::ToxicZone, HexTerrain::MagmaFlow), (5, 0), &[(9, 0)]);
+        let w = &w[&(9, 0)];
+        assert_eq!(w.fast, way(8, 1, &LINE));
+        assert_eq!(w.safe, None);
+    }
+
+    /// Two 4 s ways to (7, −1); the tie goes to the smaller predecessor, (6, −1).
+    #[test]
+    fn routes_break_ties_on_the_smaller_hex() {
+        let t = map(&[((6, 0), A), ((6, -1), A), ((7, -1), A)]);
+        let w = board_routes(&t, (5, 0), &[(7, -1)]);
+        assert_eq!(w[&(7, -1)].fast, way(4, 0, &[(6, -1), (7, -1)]));
+    }
+
+    /// H1: the site's own ToxicZone is not crossed on the way.
+    #[test]
+    fn routes_never_count_the_site_itself() {
+        let t = map(&[((6, 0), A), ((7, 0), A), ((8, 0), A), ((9, 0), HexTerrain::ToxicZone)]);
+        let w = board_routes(&t, (5, 0), &[(9, 0)]);
+        let w = &w[&(9, 0)];
+        assert_eq!((w.fast.secs, w.fast.hazards, &w.safe), (8, 0, &None));
+    }
+
+    #[test]
+    fn routes_leave_an_unreachable_site_out() {
+        let t = map(&[((6, 0), A), ((9, 0), A)]);
+        let w = board_routes(&t, (5, 0), &[(6, 0), (9, 0)]);
+        assert!(w.contains_key(&(6, 0)));
+        assert!(!w.contains_key(&(9, 0)));
+    }
+
+    /// D6 on seed 57 (ambush d100 13), one drill (20 ore, 10 %): the Safe way's 2 s over the Fast
+    /// one adds 2 × 2 points, 14 ≥ 13, so the haul is ambushed; the Fast way's 10 % is not.
+    #[test]
+    fn ops_detour_raises_the_haul_ambush() {
+        let site = dig(1);
+        let mut routes = HashMap::new();
+        routes.insert((9, 1), SiteRoutes { fast: way(10, 1, &[(9, 1)]), safe: Some(way(12, 0, &[(9, 1)])) });
+        let b = Arc::new(OpsBoard { sites: vec![site.clone()], contract_pool: vec![], routes });
+        let store = DemoOpsStore::new(4);
+        let (safe, fast) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        for (a, route) in [(safe, RouteKind::Safe), (fast, RouteKind::Fast)] {
+            let crew = DigStart { crew_id: CREW, commander_id: COMMANDER, threshold: 100, section_id: None, escort: true };
+            store.start_op_for(a, (5, 0), Arc::clone(&b), &site, 57, Some(crew), None, false, route, at(0)).expect("start");
+            assert_eq!(store.drill_op(a, at(13)), Ok(DrillOutcome::Drilled));
+            assert_eq!(store.pull_op(a, at(20)), Ok(()));
+        }
+        // Safe: 12 s home, so the ambush fires at the leg's midpoint, 26 s.
+        assert_eq!(store.pending_raid(safe, at(26)).map(|p| p.trigger), Some(ambush_trigger(26)));
+        assert_eq!(store.pending_raid(fast, at(25)), None);
+    }
+
     /// `b` is not listed but was touched after the listing (a launch that raced the prune).
     #[test]
     fn ops_store_retain_drops_unlisted_but_keeps_entries_touched_after_the_listing() {
@@ -4334,7 +4646,7 @@ mod tests {
                 name: Some(format!("name of {m}")),
             })
             .collect();
-        Arc::new(OpsBoard { sites, contract_pool: pool.iter().map(|&(q, r)| (q, r, 4, 8)).collect() })
+        Arc::new(OpsBoard { sites, contract_pool: pool.iter().map(|&(q, r)| (q, r, 4, 8)).collect(), routes: HashMap::new() })
     }
 
     /// The `GUARD_DUTY` contract's trigger once the team has arrived at 10 s.
@@ -4701,7 +5013,7 @@ mod tests {
     /// A contract to `site` led by `commander` and Section `section`, started with the squad named.
     fn named(store: &DemoOpsStore, a: Uuid, site: &OpsSite, commander: Uuid, section: Uuid, now: DateTime<Utc>) -> Result<(), StartRefusal> {
         let lead = ContractStart { commander_id: commander, section_id: Some(section) };
-        store.start_op_for(a, (5, 0), board(), site, 7, None, Some(lead), true, now)
+        store.start_op_for(a, (5, 0), board(), site, 7, None, Some(lead), true, RouteKind::Fast, now)
     }
 
     /// With a Crew-alone dig and a contract out, a return that names no squad can't pick; naming
@@ -4832,8 +5144,8 @@ mod tests {
         let a = Uuid::from_u128(1);
         let b = contract_board(&[(8, 0), (10, 0), (3, 4)]);
         let lead = |c, s| Some(ContractStart { commander_id: c, section_id: Some(s) });
-        assert_eq!(store.start_op_for(a, (5, 0), Arc::clone(&b), &b.sites[0], 7, None, lead(C1, S1), true, at(0)), Ok(()));
-        assert_eq!(store.start_op_for(a, (5, 0), Arc::clone(&b), &b.sites[2], 7, None, lead(C2, S2), true, at(0)), Ok(()));
+        assert_eq!(store.start_op_for(a, (5, 0), Arc::clone(&b), &b.sites[0], 7, None, lead(C1, S1), true, RouteKind::Fast, at(0)), Ok(()));
+        assert_eq!(store.start_op_for(a, (5, 0), Arc::clone(&b), &b.sites[2], 7, None, lead(C2, S2), true, RouteKind::Fast, at(0)), Ok(()));
         let supply = RaidTrigger { trigger_at: at(10), mission_id: "SUPPLY_RAID", kind: BattleKind::Contract };
         assert!(store.latch_raid(a, &supply, RaidResult::Held, FightPay::credits(0), at(11)));
         assert!(store.latch_raid(a, &guard_duty_arrival(), RaidResult::Held, FightPay::credits(0), at(20)));
