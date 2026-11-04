@@ -1421,9 +1421,14 @@ function sendStart(sectionId) {
 }
 
 // BP-17b: the Crew goes alone. Guarded keeps the body above, so the escorted start is byte-identical.
+// BP-18b-2b rework (W1, Reviewer F1): from a home sheet the Section stays home, so the home key would hold the sheet
+// over the dig just started; a 200 names the dig instead. The body is unchanged.
 function sendAlone() {
   if (!selected) return;
-  send(opsPath(campaignId) + '/start', { site_id: selected.site_id, escort: false });
+  const home = homeKey() !== null;
+  send(opsPath(campaignId) + '/start', { site_id: selected.site_id, escort: false }, undefined, undefined, res => {
+    if ((home) && res && res.active_op) shownKey = 'dig';
+  });
 }
 
 // "Go guard the dig" (§4e B2): the Section walks out and stands guard after the site's travel time.
