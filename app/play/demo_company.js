@@ -123,7 +123,7 @@ const COMPANY_COPY = {
   sectionLoss: 'Losses come off this number. Replacements cost credits.',
   crewTitle: 'Mining Crew',
   crewMiners: 'Miners: {n} / 8',
-  crewMorale: 'Morale: {m} / 100. A meltdown or a lost Crew fight costs miners and 10 morale.',
+  crewMorale: 'Morale: {m} / 100. Meltdowns, lost Crew fights and bad roads all cost morale.', // BP-20b (Wiki copy)
   crewForeman: 'Foreman: {name}, {spec}',
   close: 'Close',
   // BP-12b (Wiki copy)
@@ -243,6 +243,7 @@ function el(tag, className, text) {
 let deps = null;
 let view = null;      // demo_ops.js's state and requests (BP-12b), registered at the mount
 let fromHub = false;  // the reveal about to render was opened by the hub's Your Company
+let companyUp = false; // BP-20b (Reviewer BP-19c F3): the reveal on screen is Your Company, not an entry reveal
 let card = null;      // the stats card: { node, title, lines }
 let traitsLine = null; // the briefing's trait lines, created on the first briefing
 let shown = null;     // the card on screen: { kind, index }, or null
@@ -299,6 +300,7 @@ function dressReveal(container) {
   cardNode.dataset.company = '1';
   hideCard();
   const opened = fromHub;
+  companyUp = opened; // BP-20b (F3)
   if (fromHub) {
     fromHub = false;
     const heading = container.querySelector('.reveal-heading');
@@ -384,7 +386,7 @@ function drawHire() {
 // After a squad hire's roster re-read (demo_ops.js): the open Company screen is drawn again from the new
 // roster through the hub's own Your Company path, so the new Section's chip and the hire block both redraw.
 export function redrawCompany() {
-  if (!deps || deps.$('screen-reveal').hidden) return;
+  if (!deps || !companyUp || deps.$('screen-reveal').hidden) return; // BP-20b (F3): never Back off an entry reveal
   deps.$('btn-back').click();
 }
 
@@ -696,7 +698,7 @@ export function mountCompany(d, v) {
   // hidden on every call), a Back that rendered no reveal leaves no stale fromHub, and the card
   // (with its tick) closes. Created before the content observer, so a Back's own render, which
   // shows the reveal before this runs, keeps the flag.
-  new MutationObserver(() => { if (screen.hidden) { fromHub = false; hideCard(); view.clearHired(); } }).observe(screen, { attributes: true, attributeFilter: ['hidden'] });
+  new MutationObserver(() => { if (screen.hidden) { fromHub = false; companyUp = false; hideCard(); view.clearHired(); } }).observe(screen, { attributes: true, attributeFilter: ['hidden'] });
   new MutationObserver(() => dressReveal(reveal)).observe(reveal, { childList: true, subtree: true });
   reveal.addEventListener('click', chipAction);
   reveal.addEventListener('keydown', chipAction);

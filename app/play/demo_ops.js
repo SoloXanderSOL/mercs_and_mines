@@ -115,6 +115,22 @@ const COPY = {
   outThree: 'Out: {a} at {x}, {b} at {y}, {c} at {z}.',
   pickFit: '{name} · {n} fit',
   pickEmpty: '{name} · no soldiers',
+  // BP-20b (Wiki copy): the ways and the trip report. A way's warning is the server's own word list, verbatim.
+  travelWays: 'Two ways there. Home retraces the way you pick.',
+  wayFast: 'Fast',
+  waySafe: 'Safe',
+  way: '{way} · {s} s',
+  wayWarn: '{way} · {s} s · {warning}',
+  tripClean: '{title}: the trip went clean. Nobody is sure who to thank.',
+  tripHit: '{title}: {what}. {cost}.',
+  tripHarmless: 'No harm done',
+  hazard: { gas: 'toxic gas', crust: 'the crust gave way', ruins: 'falling masonry' },
+  costWounded: '{n} wounded',
+  costStress: '{who} stress up {n}',
+  costMorale: 'Crew morale down {n}',
+  costOre: '{n} ore lost',
+  whoCommander: 'Commander',
+  whoForeman: 'Foreman',
 };
 
 // Refusals the client keys on by exact text (routes/ops.rs; a server reword changes this block in the same brick).
@@ -175,7 +191,7 @@ const NO_CREW = 'no Crew left to dig: start a new run';
 
 const REFRESH_READ_MS = 46000; // the server's DEMO_SITE_REFRESH_SECS 45 + 1
 
-const COLOUR = { dig: '#ff8c2a', ring: '#ffd27a', contract: '#6fd3ff', edge: '#0b0b0c', marker: '#ffffff', route: 'rgba(255, 255, 255, 0.7)' };
+const COLOUR = { dig: '#ff8c2a', ring: '#ffd27a', contract: '#6fd3ff', edge: '#0b0b0c', marker: '#ffffff', route: 'rgba(255, 255, 255, 0.7)', preview: 'rgba(255, 210, 122, 0.8)' };
 
 const CSS = `
 .ops-strip { position: absolute; left: 3cqw; right: 3cqw; bottom: 17cqw; padding: 3cqw; display: flex; flex-direction: column; gap: 1.5cqw; text-align: left; background: rgba(11, 11, 12, 0.94); border: 0.4cqw solid var(--panel-edge); border-radius: 2cqw; }
@@ -184,6 +200,9 @@ const CSS = `
 .ops-line { margin: 0; font-size: 3.9cqw; line-height: 1.35; }
 .ops-actions { display: flex; gap: 2cqw; margin-top: 1cqw; }
 .ops-actions .btn { flex: 1; width: auto; max-width: none; min-height: 11cqw; padding: 0 2cqw; font-size: 4.4cqw; }
+.ops-ways { display: flex; gap: 2cqw; }
+.ops-ways[hidden], .ops-ways .btn[hidden] { display: none; }
+.ops-ways .btn { flex: 1; width: auto; max-width: none; min-height: 11cqw; padding: 0 2cqw; font-size: 4cqw; }
 .ops-list[hidden] { display: none; }
 .ops-list-rows { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 1.5cqw; }
 .ops-list-row { width: 100%; max-width: none; display: flex; flex-direction: column; align-items: flex-start; gap: 0.6cqw; padding: 2cqw 2.5cqw; text-align: left; }
@@ -321,6 +340,13 @@ let baseOpen = false;   // the base sheet is showing
 let justBuilt = null;   // the building the last adopted POST put up, for its moment on the sheet
 let titles = new Map(); // site_id → { title, mission_id }, from every adopted board, kept for the campaign
 let walk = null;        // { depart_at, q, r }: where the leg leaving at depart_at set out from (after a Next)
+let ways = new Map();   // BP-20b: "q,r" → the board's ways to that hex ({ route, secs, path, warning? }), kept for the campaign
+let way = 'fast';       // BP-20b: the way picked on the open sheet; back to 'fast' whenever a sheet opens on another site
+let waySite = null;     // BP-20b: the site_id that pick belongs to
+let tripNote = null;    // BP-20b: the trip report's lines (one per unseen report, at most 2), until Close
+let tripPending = null; // BP-20b: { seq, site_id } of the newest report behind tripNote, written as seen when shown
+let tripSeen = null;    // BP-20b (Reviewer BP-20a-2 F1): { seq, site_id } of the newest report shown, mirrored in sessionStorage
+let tripTop = null;     // BP-20b: "seq:site_id" of the newest report in the last adopted body (the roster trigger's latch)
 let nextFrom = null;    // the team's hex while an ops/next is in flight
 let picking = false;    // Next mission: choosing the next site
 let pickSite = null;    // the site chosen for Next
@@ -336,6 +362,7 @@ let endOnHub = null;   // a Section-at-0 end of run waiting for the hub, so it n
 let listOpen = false;   // the contracts list is showing
 
 let strip = null, titleNode = null, lineNodes = [], outNode = null, actions = null, buttons = [];
+let waysRow = null, wayButtons = []; // BP-20b: the ways row and its two buttons
 let dig = null, bankChip = null, endNote = null, baseButton = null, baseSheet = null;
 let list = null;
 const handlers = [null, null, null, null];
@@ -454,6 +481,126 @@ function legEnds(o) {
   return [walk && walk.depart_at === o.depart_at ? walk : gateway, o.at];
 }
 
+// BP-20b: the way an op walks, from the board's ways at its hex: Safe when the op says so, else Fast (a Next'd op's
+// way home is the target's Fast way, as the server walks it). Null when the board never showed that hex's ways.
+function wayOf(o) {
+  const rs = ways.get(`${o.at.q},${o.at.r}`);
+  return rs ? rs.find(w => w.route === (o.route || 'fast')) || null : null;
+}
+
+// BP-20b: the hexes an op's leg runs through, in travel order: the gateway then the way's path out, reversed home.
+// A Next's hop is straight (the server walks no path there), and so is a leg whose way the board never showed.
+function wayPoints(o) {
+  const ends = legEnds(o);
+  const w = wayOf(o);
+  if (!w || !gateway || (o.leg === 'outbound' && ends[0] !== gateway)) return ends;
+  const pts = [gateway, ...w.path.map(([q, r]) => ({ q, r }))];
+  return o.leg === 'outbound' ? pts : pts.reverse();
+}
+
+// BP-20b (F-C1): the point a share p of the way along pts, an equal share per hex (display only: the server's
+// seconds per hex follow the terrain). Two points give the straight line exactly as before.
+function alongPath(pts, p) {
+  const f = Math.min(1, Math.max(0, p)) * (pts.length - 1);
+  const i = Math.min(pts.length - 2, Math.floor(f));
+  const t = f - i;
+  return { q: pts[i].q + (pts[i + 1].q - pts[i].q) * t, r: pts[i].r + (pts[i + 1].r - pts[i].r) * t };
+}
+
+// BP-20b: one dashed line through hexes; with two hexes, the route line as before, call for call.
+function strokeWay(ctx, m, pts, colour, width) {
+  ctx.setLineDash([4, 4]);
+  ctx.lineWidth = width;
+  ctx.strokeStyle = colour;
+  ctx.beginPath();
+  pts.forEach((h, i) => {
+    const [x, y] = m.hexToScreen(h.q, h.r);
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+  ctx.setLineDash([]);
+}
+
+// BP-20b: the way an open sheet shows on the map: the picked one on this site, else Fast.
+function previewWay(site) {
+  const rs = Array.isArray(site.routes) ? site.routes : [];
+  return rs.find(w => w.route === (site.site_id === waySite ? way : 'fast')) || null;
+}
+
+// BP-20b: a site offering both ways gets the ways row; the pick goes back to Fast when a sheet opens on another site.
+function wayChoice(site) {
+  if (site.site_id !== waySite) { waySite = site.site_id; way = 'fast'; }
+  const rs = Array.isArray(site.routes) ? site.routes : [];
+  return rs.length === 2 ? rs : null;
+}
+
+// BP-20b: the start body's way. Only a Safe pick on a site still offering Safe sends one; absent is Fast, so every
+// other start body is byte-identical to before. Next mission sends none (its hop takes Fast by ruling).
+function wayBody(site) {
+  const rs = site && Array.isArray(site.routes) ? site.routes : [];
+  return way === 'safe' && site.site_id === waySite && rs.some(w => w.route === 'safe') ? { route: 'safe' } : {};
+}
+
+// BP-20b: the ways row: a button per way with its seconds and the server's warning, verbatim (never odds or a
+// count). The pick is marked, and tapping one redraws the sheet and its way on the map.
+function setWays(choice) {
+  waysRow.hidden = !choice;
+  wayButtons.forEach((b, i) => {
+    const w = choice ? choice[i] : null;
+    b.hidden = !w;
+    if (!w) return;
+    const name = w.route === 'safe' ? COPY.waySafe : COPY.wayFast;
+    const warn = w.warning;
+    b.textContent = warn ? fill(COPY.wayWarn, { way: name, s: Math.round(w.secs), warning: warn }) : fill(COPY.way, { way: name, s: Math.round(w.secs) });
+    b.dataset.route = w.route;
+    b.classList.toggle('btn-primary', w.route === way);
+    b.setAttribute('aria-pressed', String(w.route === way));
+    b.disabled = held();
+  });
+}
+
+// BP-20b (Reviewer BP-20a-2 F1): the shown report's key, per campaign, in sessionStorage like the card's (it
+// survives a reload and dies with the tab); tripSeen is its mirror for private mode.
+const tripKey = id => `mm.demo.trip.${id}`;
+function loadTripSeen(id) {
+  try { return JSON.parse(sessionStorage.getItem(tripKey(id)) || 'null'); } catch { return null; }
+}
+
+// BP-20b: one line per report: what hit, each kind once in the order met, and what it cost in all, as the server
+// sent it. The stress is a Foreman's on a dig and a Commander's on a contract, read from site_id (a fought
+// contract may have left the board).
+function tripLine(r) {
+  const title = opTitle(r);
+  const hits = Array.isArray(r.hits) ? r.hits : [];
+  if (hits.length === 0) return fill(COPY.tripClean, { title });
+  const what = [];
+  for (const h of hits) {
+    const word = COPY.hazard[h.hazard] || h.hazard;
+    if (!what.includes(word)) what.push(word);
+  }
+  const sum = k => hits.reduce((n, h) => n + (Number(h[k]) || 0), 0);
+  const who = r.site_id.startsWith('dig:') ? COPY.whoForeman : COPY.whoCommander;
+  const cost = [];
+  if (sum('wounded') > 0) cost.push(fill(COPY.costWounded, { n: sum('wounded') }));
+  if (sum('stress') > 0) cost.push(fill(COPY.costStress, { who, n: sum('stress') }));
+  if (sum('morale') > 0) cost.push(fill(COPY.costMorale, { n: sum('morale') }));
+  if (sum('ore') > 0) cost.push(fill(COPY.costOre, { n: sum('ore') }));
+  return fill(COPY.tripHit, { title, what: what.join(', '), cost: cost.length > 0 ? cost.join(', ') : COPY.tripHarmless });
+}
+
+// BP-20b: the report's lines for the hub strip, written as seen as they are shown (F1: at the showing, never at
+// adopt, since a start's 200 can carry a report under a travelling strip).
+function tripShown() {
+  if (!tripNote) return [];
+  if (tripPending) {
+    tripSeen = tripPending;
+    tripPending = null;
+    try { sessionStorage.setItem(tripKey(campaignId), JSON.stringify(tripSeen)); } catch { /* the mirror holds it */ }
+  }
+  return tripNote;
+}
+
 function saveWalk(departAt, from) {
   walk = { depart_at: departAt, q: from.q, r: from.r };
   try { sessionStorage.setItem(walkKey(campaignId), JSON.stringify(walk)); } catch { /* memory only */ }
@@ -478,7 +625,7 @@ function el(tag, className, text) {
 
 // `lines`: up to four strings (BP-18b-2b: a sheet's Leads line is the fourth node); `acts`: up to four
 // [text, onClick, disabled] buttons. The out line follows the lines (outLine decides when, BP-18b-2a/2b).
-function setStrip(title, lines, acts, danger) {
+function setStrip(title, lines, acts, danger, choice) {
   titleNode.hidden = !title;
   titleNode.textContent = title || '';
   titleNode.classList.toggle('danger', Boolean(danger));
@@ -496,6 +643,7 @@ function setStrip(title, lines, acts, danger) {
     b.textContent = a ? a[0] : '';
     b.disabled = Boolean(a && (a[2] || held()));
   });
+  setWays(choice); // BP-20b: the ways row shows only on a start sheet offering both ways
   actions.hidden = acts.length === 0;
   strip.hidden = false;
 }
@@ -584,8 +732,10 @@ function refresh() {
     const s = rosterSections().find(x => x.section_id === home);
     return setStrip('', [fill(COPY.atBase, { name: s ? s.name : '' }), rate], withOther([]));
   }
-  if (bankNote) return setStrip('', [bankNote, rate], [[BASE_COPY.button, openBase], [COPY.close, close]]);
-  if (crewNote) return setStrip('', [crewNote, rate], [[COPY.close, close]]);
+  const trip = tripShown(); // BP-20b: the trip report rides the bank or wipe note, or stands alone
+  if (bankNote) return setStrip('', [bankNote, ...trip, rate], [[BASE_COPY.button, openBase], [COPY.close, close]]);
+  if (crewNote) return setStrip('', [crewNote, ...trip, rate], [[COPY.close, close]]);
+  if (trip.length > 0) return setStrip('', [...trip, rate], [[COPY.close, close]]);
   if (noDigOpen) return setStrip('', [COPY.noDig, rate], [[COPY.close, close]]);
   if (rate) return setStrip('', [rate], notice ? [[COPY.close, close]] : []);
   hideStrip();
@@ -637,6 +787,8 @@ function showSheet(site) {
     if (COPY.digReward[site.tier]) lines.push(COPY.digReward[site.tier]);
     return setStrip(titleOf(site), [COPY.digHeld, ...lines], withOther([[COPY.close, close]]));
   }
+  const two = wayChoice(site); // BP-20b: both ways offered, so their times sit on the way buttons
+  if (two) lines[1] = COPY.travelWays;
   // BP-18b-2b (R8): who leads, first, with two or more Commanders; nobody free disables the squad's start.
   const head = leadLines();
   const off = (noneFree());
@@ -656,7 +808,7 @@ function showSheet(site) {
     }, () => {});
   }
   const go = site.kind === 'dig' ? [[COPY.goGuarded, startGo, off], [COPY.goAlone, sendAlone]] : [[COPY.go, startGo, off]];
-  setStrip(titleOf(site), [...head, ...lines], withOther([...go, [COPY.close, close]]));
+  setStrip(titleOf(site), [...head, ...lines], withOther([...go, [COPY.close, close]]), false, two);
 }
 
 // BP-18b-2b (R6): the picker opens on a start with no op out and two or more Sections.
@@ -755,10 +907,11 @@ function goNext() {
 }
 
 function close() {
+  if (map) map.requestFrame(); // BP-20b: the sheet's way leaves the map
   selected = null;
   picker = false;
   noDigOpen = false;
-  bankNote = null; crewNote = null;
+  bankNote = null; crewNote = null; tripNote = null;
   notice = '';
   if (homeKey() !== null) return refresh(); // BP-18b-2b: back to the home hub
   hideStrip();
@@ -772,7 +925,7 @@ function openBase() {
   selected = null;
   picker = false;
   noDigOpen = false;
-  bankNote = null; crewNote = null;
+  bankNote = null; crewNote = null; tripNote = null;
   refresh();
 }
 
@@ -796,7 +949,7 @@ function openList() {
   baseOpen = false;
   picker = false;
   noDigOpen = false;
-  bankNote = null; crewNote = null;
+  bankNote = null; crewNote = null; tripNote = null;
   refresh();
 }
 
@@ -838,9 +991,10 @@ function listPick(site) {
     return refresh();
   }
   selected = site;
+  if (map) map.requestFrame(); // BP-20b: the sheet's way on the map
   picker = false;
   noDigOpen = false;
-  bankNote = null; crewNote = null;
+  bankNote = null; crewNote = null; tripNote = null;
   refresh();
 }
 
@@ -1079,19 +1233,13 @@ function draw(ctx, m) {
   const all = opsOut();
   const order = [...all.filter(o => o !== shown), ...(shown ? [shown] : [])];
   for (const o of order) {
-    const ends = gateway ? legEnds(o) : null;
-    if (!ends) continue;
-    const [gx, gy] = m.hexToScreen(ends[0].q, ends[0].r);
-    const [sx, sy] = m.hexToScreen(ends[1].q, ends[1].r);
-    ctx.setLineDash([4, 4]);
-    ctx.lineWidth = Math.max(1, s * 0.1);
-    ctx.strokeStyle = COLOUR.route;
-    ctx.beginPath();
-    ctx.moveTo(gx, gy);
-    ctx.lineTo(sx, sy);
-    ctx.stroke();
-    ctx.setLineDash([]);
+    const pts = gateway ? wayPoints(o) : null;
+    if (!pts) continue;
+    strokeWay(ctx, m, pts, COLOUR.route, Math.max(1, s * 0.1)); // BP-20b: the way it walks, else the straight line
   }
+  // BP-20b: an open sheet shows its way (the picked one) in its own colour, under the pins.
+  const pw = !shown && selected && gateway ? previewWay(selected) : null;
+  if (pw) strokeWay(ctx, m, [gateway, ...pw.path.map(([q, r]) => ({ q, r }))], COLOUR.preview, Math.max(1, s * 0.1));
   for (const st of sites) {
     const [x, y] = m.hexToScreen(st.q, st.r);
     if (onScreen(x, y)) pin(ctx, st, x, y, r, line);
@@ -1105,7 +1253,11 @@ function draw(ctx, m) {
     const p = at(op);
     const home = !ambush && op.leg === 'homeward' && p >= 1;
     if (home && !(op.dig && op.dig.carried > 0)) {
-      op = null; // home with nothing to bank: the server clears it on its next read, so nothing is sent
+      // BP-20b (F-D1): a way that crossed a hazard has a trip report waiting, so its landing reads once (op is
+      // cleared below, so no later frame sends it again). Skipped while a call is in flight: the next read brings it.
+      const w = wayOf(op);
+      if (!held() && w && w.warning) load();
+      op = null; // home with nothing to bank: the server clears it on its next read
       selected = null;
       refresh();
     } else {
@@ -1121,9 +1273,8 @@ function draw(ctx, m) {
   // The markers: two whose centres are less than a radius apart (both at the gateway) sit side by side.
   const mr = Math.max(5, s * 0.45);
   const spots = gateway ? order.map(o => {
-    const [from, to] = legEnds(o);
-    const p = at(o);
-    const [x, y] = m.hexToScreen(from.q + (to.q - from.q) * p, from.r + (to.r - from.r) * p);
+    const h = alongPath(wayPoints(o), at(o)); // BP-20b (F-C1): the marker walks the drawn way
+    const [x, y] = m.hexToScreen(h.q, h.r);
     return { x, y };
   }) : [];
   for (const sp of spots) {
@@ -1174,9 +1325,10 @@ function tap(x, y) {
     return;
   }
   selected = pick(x, y);
+  if (map) map.requestFrame(); // BP-20b: the sheet's way on the map
   picker = false;
   noDigOpen = false;
-  bankNote = null; crewNote = null;
+  bankNote = null; crewNote = null; tripNote = null;
   notice = '';
   if (selected) showSheet(selected);
   else refresh();
@@ -1193,6 +1345,7 @@ function adopt(body, built, spent = 0) {
   offset = Date.parse(body.now) - Date.now();
   sites = Array.isArray(body.sites) ? body.sites : [];
   for (const s of sites) titles.set(s.site_id, { title: titleOf(s), mission_id: s.mission_id || null });
+  for (const s of sites) if (Array.isArray(s.routes) && s.routes.length > 0) ways.set(`${s.q},${s.r}`, s.routes); // BP-20b
   gateway = body.gateway || null;
   const before = op;
   const was = banked;
@@ -1230,6 +1383,17 @@ function adopt(body, built, spent = 0) {
   }
   if (op) crewNote = null;
   else if (before && crewFight && crewFight.result === 'wiped') crewNote = DIG_COPY.crewWiped; // the wipe's own body: before is the op it cleared
+  // BP-20b (Reviewer BP-20a-2 F1): each report shows once by (campaign, seq). A newest seq below the one shown, or the
+  // same seq at another site, is a reset (a restart, an eviction, a wipe), never "seen". The two newest unseen show.
+  const reports = Array.isArray(body.trip_reports) ? body.trip_reports : [];
+  const top = reports.length > 0 ? reports[reports.length - 1] : null;
+  const reset = Boolean(tripSeen && top && (top.seq < tripSeen.seq || (top.seq === tripSeen.seq && top.site_id !== tripSeen.site_id)));
+  const shownTo = tripSeen && !reset ? tripSeen.seq : 0;
+  const unseen = reports.filter(r => r.seq > shownTo).slice(-2);
+  if (unseen.length > 0) { tripNote = unseen.map(tripLine); tripPending = { seq: top.seq, site_id: top.site_id }; }
+  const topKey = top ? `${top.seq}:${top.site_id}` : null;
+  const tripNew = topKey !== null && topKey !== tripTop; // a new report moved a leader's stress or a Crew's morale
+  tripTop = topKey;
   if (!op && gateway && !noDigOffered && !sites.some(st => st.kind === 'dig')) {
     noDigOffered = true;
     noDigOpen = true;
@@ -1257,7 +1421,7 @@ function adopt(body, built, spent = 0) {
   refresh();
   if (melted) { flash(strip); rereadRoster(); }
   if (raidLatched || latched.length > 0 || crewLoss) rereadRoster();
-  const owed = digLeft || rosterDue; // BP-19c: once per held → empty, per campaign entry, per hub return after an AAR
+  const owed = digLeft || rosterDue || tripNew; // BP-19c: once per held → empty, per campaign entry, per hub return after an AAR; BP-20b: per new trip report
   rosterDue = false;
   if (owed && !melted && !(raidLatched || latched.length > 0 || crewLoss)) freshRoster(); // a reread above already came
   if (latched.length > 0) armRefresh();
@@ -1435,9 +1599,9 @@ async function send(path, body, built, spentOf, beforeAdopt, afterAdopt) {
 function sendStart(sectionId) {
   if (!selected) return;
   picker = false;
-  if (!sectionId) return send(opsPath(campaignId) + '/start', { site_id: selected.site_id });
+  if (!sectionId) return send(opsPath(campaignId) + '/start', { site_id: selected.site_id, ...wayBody(selected) });
   const key = selected.kind === 'dig' ? 'dig' : sectionId;
-  send(opsPath(campaignId) + '/start', { site_id: selected.site_id, section_id: sectionId }, undefined, undefined, res => {
+  send(opsPath(campaignId) + '/start', { site_id: selected.site_id, section_id: sectionId, ...wayBody(selected) }, undefined, undefined, res => {
     if ((res && res.active_op)) shownKey = key;
   });
 }
@@ -1448,7 +1612,7 @@ function sendStart(sectionId) {
 function sendAlone() {
   if (!selected) return;
   const home = homeKey() !== null;
-  send(opsPath(campaignId) + '/start', { site_id: selected.site_id, escort: false }, undefined, undefined, res => {
+  send(opsPath(campaignId) + '/start', { site_id: selected.site_id, escort: false, ...wayBody(selected) }, undefined, undefined, res => {
     if ((home) && res && res.active_op) shownKey = 'dig';
   });
 }
@@ -1629,7 +1793,7 @@ function attach(m) {
   adoptedFor = null;
   companyAsk = null;
   companyNotice = null;
-  bankNote = null; crewNote = null;
+  bankNote = null; crewNote = null; tripNote = null;
   notice = '';
   seenBattle = null;
   legKey = null;
@@ -1639,6 +1803,12 @@ function attach(m) {
   baseOpen = false;
   justBuilt = null;
   titles = new Map();
+  ways = new Map(); // BP-20b
+  way = 'fast';
+  waySite = null;
+  tripPending = null;
+  tripTop = null;
+  tripSeen = campaignId ? loadTripSeen(campaignId) : null;
   walk = campaignId ? loadWalk(campaignId) : null;
   nextFrom = null;
   picking = false;
@@ -1698,7 +1868,15 @@ export function mountOps(d) {
     actions.append(b);
   });
   buttons[3].hidden = true;
-  strip.append(titleNode, dig.node, ...lineNodes, outNode, actions);
+  waysRow = el('div', 'ops-ways'); // BP-20b
+  waysRow.hidden = true;
+  wayButtons = [el('button', 'btn'), el('button', 'btn')];
+  wayButtons.forEach(b => {
+    b.type = 'button';
+    b.addEventListener('click', () => { way = b.dataset.route === 'safe' ? 'safe' : 'fast'; refresh(); if (map) map.requestFrame(); });
+    waysRow.append(b);
+  });
+  strip.append(titleNode, dig.node, ...lineNodes, outNode, waysRow, actions);
   bankChip = el('div', 'ops-banked');
   bankChip.hidden = true;
   baseButton = el('button', 'ops-base', BASE_COPY.button);
