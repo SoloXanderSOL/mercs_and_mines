@@ -181,4 +181,8 @@ export function renderBase(v, s, built, paid) {
 
 export function hideBase(v) {
   v.node.hidden = true;
+  // BP-21b rework (Reviewer BP-21b F1): display:none restarts a CSS animation when the sheet shows again, so a
+  // class left on would replay the last pop and every slam on each reopen. replay() removes before it adds.
+  v.pop.classList.remove('shown');
+  for (const { slot } of v.slots) slot.classList.remove('just');
 }
