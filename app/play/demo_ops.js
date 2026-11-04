@@ -15,7 +15,9 @@
 //
 // BP-10b: the Base button opens demo_base.js's sheet, where banked ore buys the five buildings
 // (POST ops/build, one per tap). Nothing can be built while any op is out, so the sheet says so
-// rather than offering a build the server would refuse (Reviewer BP-10a CF2).
+// rather than offering a build the server would refuse (Reviewer BP-10a CF2). BP-21b: a paid
+// building goes up over the server's seconds, one at a time: the sheet counts down to the body's
+// construction.done_at, and one read at that moment (on the hub, sheet open or not) stands it.
 //
 // BP-11b-1: the op is never looked up through the board (a fought contract leaves it and returns
 // elsewhere): the team stands at `active_op.at`, its title comes from a cache of every site seen,
@@ -190,6 +192,8 @@ const NO_COMMANDER = 'no Commander left to lead: start a new run';
 const NO_CREW = 'no Crew left to dig: start a new run';
 
 const REFRESH_READ_MS = 46000; // the server's DEMO_SITE_REFRESH_SECS 45 + 1
+const BUILD_READ_SLACK_MS = 250; // BP-21b: the completion read goes out this long after done_at (the server stands it at or after)
+const BUILD_REREAD_MS = 1000;    // BP-21b (Reviewer BP-21a F5): the one re-read's least delay, for a body after done_at that still names it
 
 const COLOUR = { dig: '#ff8c2a', ring: '#ffd27a', contract: '#6fd3ff', edge: '#0b0b0c', marker: '#ffffff', route: 'rgba(255, 255, 255, 0.7)', preview: 'rgba(255, 210, 122, 0.8)' };
 
@@ -337,7 +341,14 @@ let throttleSecs = 0;
 let hubWasShown = false;
 let base = {};          // the server's base: which buildings stand
 let baseOpen = false;   // the base sheet is showing
-let justBuilt = null;   // the building the last adopted POST put up, for its moment on the sheet
+let justBuilt = null;   // BP-21b: the building the last adopted body showed standing for the first time, for its moment on the sheet
+let justPaid = null;    // BP-21b: the building the last adopted build POST paid for, for the sheet's pop
+let construction = null; // BP-21b: the last adopted body's construction ({ building, done_at }), null when none
+let buildKept = null;   // BP-21b: the construction of the body before it, so a building standing is seen as a transition (Reviewer BP-21a F2)
+let readArmed = null;   // BP-21b: the done_at the completion read is armed for (once per done_at)
+let readTimer = null;   // BP-21b: that read's timer
+let rereadFor = null;   // BP-21b (Reviewer BP-21a F5): the done_at that has had its one re-read
+let baseTick = null;    // BP-21b: the base sheet's countdown redraw (display only, no read)
 let titles = new Map(); // site_id → { title, mission_id }, from every adopted board, kept for the campaign
 let walk = null;        // { depart_at, q, r }: where the leg leaving at depart_at set out from (after a Next)
 let ways = new Map();   // BP-20b: "q,r" → the board's ways to that hex ({ route, secs, path, warning? }), kept for the campaign
@@ -675,8 +686,10 @@ function refresh() {
     if (so && progress(so) < 1) shownSecs = secsLeft(so);
     if (baseOpen) {
       list.node.hidden = true;
-      renderBase(baseSheet, { base, banked, credits, out: Boolean(op), held: held(), rate }, justBuilt);
+      renderBase(baseSheet, { base, banked, credits, out: Boolean(op), held: held(), rate, going: goingUp() }, justBuilt, justPaid);
       justBuilt = null;
+      justPaid = null;
+      armBaseTick();
     } else {
       hideBase(baseSheet);
       renderList();
@@ -777,6 +790,36 @@ function armGuard(o) {
   const wait = Date.parse(o.dig.escort_at) - serverNow();
   if (!(wait > 0)) return;
   guardTimer = setTimeout(() => { guardTimer = null; refresh(); }, Math.min(1000, wait));
+}
+
+// BP-21b: the building going up, for the sheet: { id, left }, whole seconds to done_at on the server's clock, or null.
+function goingUp() {
+  if (!construction) return null;
+  return { id: construction.building, left: Math.max(0, Math.ceil((Date.parse(construction.done_at) - serverNow()) / 1000)) };
+}
+
+// BP-21b: nothing else redraws an idle sheet, so while it is open and a building is going up a display timer
+// redraws it on each of done_at's second boundaries. It reads nothing; closing the sheet stops it at its next fire.
+function armBaseTick() {
+  if (baseTick !== null || !baseOpen || !construction) return;
+  const wait = Date.parse(construction.done_at) - serverNow();
+  if (!(wait > 0)) return;
+  baseTick = setTimeout(() => { baseTick = null; refresh(); }, Math.min(1000, wait % 1000 || 1000));
+}
+
+// BP-21b: one read when the building going up is due to stand. adopt arms it once per done_at (and once more
+// for F5's re-read). It goes out on the hub only, sheet open or not, since the dig panel's raid risk follows a
+// Radio Shack too (BP-21a R3 (b)); a held moment or another screen retries every 500 ms (Reviewer BP-11b-1 F1).
+function armBuildRead(delay) {
+  if (readTimer !== null) clearTimeout(readTimer);
+  readTimer = setTimeout(buildTick, Math.max(0, delay));
+}
+
+function buildTick() {
+  readTimer = null;
+  if (!construction || construction.done_at !== readArmed) return;
+  if (held() || !campaignId || !hubShown()) { readTimer = setTimeout(buildTick, 500); return; }
+  load();
 }
 
 function showSheet(site) {
@@ -1362,7 +1405,28 @@ function adopt(body, built, spent = 0) {
   banked = Number(body.ore_banked) || 0;
   credits = Number(body.credits_banked) || 0;
   base = body.base || {};
-  justBuilt = built && base[built] === true && baseOpen ? built : null; // a moment only for a sheet still open when the build lands (Reviewer BP-10b F1)
+  // BP-21b: a paid building goes up over the server's seconds. Its moment plays on the body that first shows it
+  // standing, while the sheet is open (Reviewer BP-10b F1): its own POST's (an instant build) or any body after one
+  // that named it (Reviewer BP-21a F2: the completion read, a settle, the mission route). The first body after
+  // attach has no construction before it, so a reload never plays it, and a reopen adopts nothing (b13).
+  buildKept = construction;
+  construction = body.construction && typeof body.construction.building === 'string' && typeof body.construction.done_at === 'string' ? body.construction : null;
+  const stood = buildKept && base[buildKept.building] === true ? buildKept.building : null;
+  justBuilt = baseOpen ? (built && base[built] === true ? built : stood) : null;
+  justPaid = baseOpen && built && (base[built] === true || Boolean(construction && construction.building === built)) ? built : null;
+  // The completion read, once per done_at. A body that still names it after the read went out (Reviewer BP-21a F5)
+  // gets one re-read, timed from that body's own now; after that the next refresh carries it. Never a loop.
+  if (!construction) {
+    if (readTimer !== null) clearTimeout(readTimer);
+    readTimer = null;
+    readArmed = null;
+  } else if (construction.done_at !== readArmed) {
+    readArmed = construction.done_at;
+    armBuildRead(Date.parse(construction.done_at) - serverNow() + BUILD_READ_SLACK_MS);
+  } else if (readTimer === null && rereadFor !== construction.done_at) {
+    rereadFor = construction.done_at;
+    armBuildRead(Math.max(BUILD_REREAD_MS, Date.parse(construction.done_at) - Date.parse(body.now) + BUILD_READ_SLACK_MS));
+  }
   notice = '';
   crewFight = body.crew_fight || null;
   const crewNow = JSON.stringify(crewFight);
@@ -1520,7 +1584,8 @@ async function load() {
 }
 
 // One POST; a refusal other than a stale campaign re-reads the board once and shows its state.
-// `built`: the building a build POST asks for, so its success gets the sheet's moment.
+// `built`: the building a build POST asks for, so its success gets the sheet's pop, and its moment once a body
+// shows it standing (BP-21b).
 // `spentOf(res)`: what a heal or replace spent, from its own body (H4). `beforeAdopt(res)`: run
 // on a 200 before the body is adopted (replace patches the kept roster there, BP-12b). `afterAdopt(res)`:
 // run on a 200 after it (the squad hire re-reads the roster, BP-18b-1).
@@ -1759,7 +1824,7 @@ function writeEndNote() {
   const camp = store.campaign();
   let text = '';
   if (camp && camp.campaign_id === campaignId) {
-    const built = Object.keys(base).some(k => base[k] === true);
+    const built = Object.keys(base).some(k => base[k] === true) || Boolean(construction); // BP-21b: one going up counts
     if (banked > 0 || credits > 0) text = built ? BASE_COPY.endBase : DIG_COPY.endBanked;
     else if (op && op.dig && op.dig.ore_on_site + op.dig.carried > 0) text = built ? BASE_COPY.endBaseOut : DIG_COPY.endOut;
     else if (built) text = BASE_COPY.endBaseOnly;
@@ -1802,6 +1867,15 @@ function attach(m) {
   base = {};
   baseOpen = false;
   justBuilt = null;
+  justPaid = null; // BP-21b
+  construction = null;
+  buildKept = null;
+  readArmed = null;
+  rereadFor = null;
+  if (readTimer !== null) clearTimeout(readTimer);
+  readTimer = null;
+  if (baseTick !== null) clearTimeout(baseTick);
+  baseTick = null;
   titles = new Map();
   ways = new Map(); // BP-20b
   way = 'fast';

@@ -2,8 +2,8 @@
 //
 // Pure rendering for demo_ops.js: the five building slots, their art, cost and effect lines, and
 // the moment a building goes up. It makes no calls and holds no state; demo_ops.js owns the
-// board, the bank and every POST. The server sends only which buildings stand (`base`, five
-// bools); the costs and the copy live here, and the harness pins the costs to the server's
+// board, the bank and every POST. The server sends which buildings stand (`base`, five bools) and
+// the one going up (`construction`, BP-21b); the costs and the copy live here, and the harness pins the costs to the server's
 // (Reviewer BP-10a CF1). Every string goes in through textContent.
 
 import { bankedLine } from './demo_dig.js';
@@ -41,6 +41,12 @@ export const BASE_COPY = {
   out: 'A squad is out. Build when every squad is home.',
   planned: 'PLANNED',
   operational: 'OPERATIONAL',
+  // BP-21b (Wiki copy): a paid building goes up over the demo's seconds, counted down after the tap and never
+  // before it (BP-21a R6: no shipped string states a build time; the game's own run to minutes and hours).
+  going: 'GOING UP',
+  left: 'Ready in {n} s',
+  due: 'Nearly up',
+  oneAtATime: 'One building goes up at a time.',
   pop: '−{n} ore',
   close: 'Close',
   endBase: 'Banked ore and credits do not transfer. The base stays on the old books.',
@@ -138,26 +144,36 @@ export function createBase(onBuild, onClose) {
   return { node, bankedEl, pop, note, slots };
 }
 
-// `s`: { base, banked, credits, out, held, rate } from demo_ops.js; `built`: the id this render's response
-// built, or null. A building is bought once; while the team is out nothing can be built.
-export function renderBase(v, s, built) {
+// `s`: { base, banked, credits, out, held, rate, going } from demo_ops.js; `going` (BP-21b): the building going up,
+// { id, left } with whole seconds left on the server's clock, or null. `built`: the building this render shows
+// standing for the first time (its moment), or null; `paid`: the building whose ore this render's build POST took
+// (its pop), or null. A building is bought once and goes up over time, one at a time; while a squad is out
+// nothing can be built.
+export function renderBase(v, s, built, paid) {
   v.bankedEl.textContent = bankedLine(s.banked, s.credits);
   let note = s.rate || (s.out ? BASE_COPY.out : '');
+  let done = '';
+  const lock = Boolean(s.going); // one at a time: the server answers `already building` (BP-21a)
   for (const { b, slot, stamp, button } of v.slots) {
     const up = s.base[b.id] === true;
+    const going = !up && lock && s.going.id === b.id;
     slot.classList.toggle('built', up);
-    stamp.textContent = up ? BASE_COPY.operational : BASE_COPY.planned;
+    stamp.textContent = up ? BASE_COPY.operational : going ? BASE_COPY.going : BASE_COPY.planned;
     button.hidden = up;
     const short = b.cost - s.banked;
-    button.textContent = !s.out && short > 0 ? fill(BASE_COPY.short, { n: short }) : fill(BASE_COPY.build, { cost: b.cost });
-    button.disabled = up || s.out || short > 0 || s.held;
-    if (up && b.id === built) {
-      replay(slot, 'just');
+    if (going) button.textContent = s.going.left > 0 ? fill(BASE_COPY.left, { n: s.going.left }) : BASE_COPY.due;
+    else button.textContent = !s.out && short > 0 ? fill(BASE_COPY.short, { n: short }) : fill(BASE_COPY.build, { cost: b.cost });
+    button.disabled = up || going || lock || s.out || short > 0 || s.held;
+    if (b.id === paid) {
       v.pop.textContent = fill(BASE_COPY.pop, { n: b.cost });
       replay(v.pop, 'shown');
-      if (!s.rate) note = b.done;
+    }
+    if (up && b.id === built) {
+      replay(slot, 'just');
+      done = b.done;
     }
   }
+  if (!s.rate) note = done || note || (lock ? BASE_COPY.oneAtATime : '');
   v.note.textContent = note;
   v.note.hidden = !note;
   v.node.hidden = false;
