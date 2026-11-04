@@ -582,7 +582,10 @@ pub const DEMO_BENCH_STRESS_PER_MIN: u32 = 5;
 /// A leader's stress band (BP-19a; `Commander_Stress_System` §2): 0–30, 31–70, 71–99, and 100 or
 /// the flag.
 /// The cuts are `sim-engine`'s (`constants.rs`), the one copy; the Foreman bench's clear binds `STRESS_STRAINED_MAX` (BP-19b).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The roster sends it (BP-19c, demo-only) as `rested`, `strained`, `breaking_point` or `shattered`; the client
+/// maps it to a word and never computes one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StressBand {
     Rested,
     Strained,
@@ -5081,6 +5084,27 @@ mod tests {
         for ((stress, is_shattered, rank, coolant_jockey), want) in rows {
             let f = ForemanRead { stress, is_shattered, rank, coolant_jockey };
             assert_eq!(foreman_threshold(f), want, "{f:?}");
+        }
+    }
+
+    /// BP-19c: the band at every cut (`Commander_Stress_System` §2: 0–30, 31–70, 71–99, and 100
+    /// or the flag). (100, false) decides the 100 term alone (the stores flag a row at 100, so no
+    /// route reaches it); (40, true) and (0, true) decide the flag alone.
+    #[test]
+    fn stress_band_cuts_and_the_flag() {
+        let rows = [
+            (0, false, StressBand::Rested),
+            (30, false, StressBand::Rested),
+            (31, false, StressBand::Strained),
+            (70, false, StressBand::Strained),
+            (71, false, StressBand::BreakingPoint),
+            (99, false, StressBand::BreakingPoint),
+            (100, false, StressBand::Shattered),
+            (40, true, StressBand::Shattered),
+            (0, true, StressBand::Shattered),
+        ];
+        for (stress, is_shattered, want) in rows {
+            assert_eq!(stress_band(stress, is_shattered), want, "({stress}, {is_shattered})");
         }
     }
 

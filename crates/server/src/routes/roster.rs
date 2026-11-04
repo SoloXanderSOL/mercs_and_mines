@@ -13,6 +13,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::auth::AuthSession;
+use crate::demo_ops::{stress_band, StressBand};
 use crate::repository::{CampaignLifecycle, CommanderRecord, CrewRecord, ForemanRecord, SectionRecord};
 use crate::state::AppState;
 
@@ -50,6 +51,8 @@ pub struct CommanderView {
     pub is_shattered: bool,
     pub is_kia: bool,
     pub commander_grade: Option<String>,
+    /// Demo-only (BP-19c): `stress_band(stress, is_shattered)`. Dropped at the 11-18 port.
+    pub band: StressBand,
 }
 
 #[derive(Serialize)]
@@ -65,6 +68,8 @@ pub struct ForemanView {
     pub foreman_grade: String,
     pub is_shattered: bool,
     pub is_kia: bool,
+    /// Demo-only (BP-19c): `stress_band(stress, is_shattered)`. Dropped at the 11-18 port.
+    pub band: StressBand,
 }
 
 #[derive(Serialize)]
@@ -98,6 +103,7 @@ impl From<CommanderRecord> for CommanderView {
             is_shattered: r.is_shattered,
             is_kia: r.is_kia,
             commander_grade: r.commander_grade,
+            band: stress_band(r.stress, r.is_shattered),
         }
     }
 }
@@ -116,6 +122,7 @@ impl From<ForemanRecord> for ForemanView {
             foreman_grade: r.foreman_grade,
             is_shattered: r.is_shattered,
             is_kia: r.is_kia,
+            band: stress_band(r.stress, r.is_shattered),
         }
     }
 }
@@ -418,11 +425,11 @@ mod tests {
         assert_eq!(keys(&body), set(&["campaign_id", "commanders", "foremen", "sections", "crews"]));
         assert_eq!(keys(&body["commanders"][0]), set(&[
             "commander_id", "name", "rank", "xp", "stress", "origin", "specialization", "fatal_flaw",
-            "veteran_trait", "is_shattered", "is_kia", "commander_grade",
+            "veteran_trait", "is_shattered", "is_kia", "commander_grade", "band",
         ]));
         assert_eq!(keys(&body["foremen"][0]), set(&[
             "foreman_id", "name", "rank", "xp", "stress", "origin", "specialization", "fatal_flaw",
-            "foreman_grade", "is_shattered", "is_kia",
+            "foreman_grade", "is_shattered", "is_kia", "band",
         ]));
         assert_eq!(keys(&body["sections"][0]), set(&["section_id", "name", "headcount", "xp"]));
         assert_eq!(keys(&body["crews"][0]), set(&["crew_id", "headcount", "xp", "morale"]));
@@ -432,6 +439,39 @@ mod tests {
         }
         assert!(!text.contains(&bs58::encode(WALLET).into_string()), "the wallet (base58) leaked");
         assert!(!text.contains(&serde_json::to_string(&WALLET.to_vec()).unwrap()), "the wallet (byte array) leaked");
+    }
+
+    /// BP-19c (demo-only): each view's `band` is the stress band at the cuts, the flag deciding
+    /// alone at 40. Expected wire strings are literals (`Commander_Stress_System` §2: 0–30, 31–70,
+    /// 71–99, Shattered). One fresh in-memory state per row, so each member has one of each.
+    #[tokio::test]
+    async fn roster_band_follows_stress_band_at_the_cuts() {
+        let rows: [(i16, bool, &str); 6] = [
+            (30, false, "rested"),
+            (31, false, "strained"),
+            (70, false, "strained"),
+            (71, false, "breaking_point"),
+            (99, false, "breaking_point"),
+            (40, true, "shattered"),
+        ];
+        for (stress, is_shattered, want) in rows {
+            let state = signed_in();
+            let c = campaign_with(&state, WALLET, CampaignLifecycle::Active).await;
+            let [commander_id, foreman_id, _, _] = seed_roster(&state, c.campaign_id, WALLET, 42).await;
+            let mut commander = state.commander_repo.get_commander(commander_id).await.unwrap().expect("seeded Commander");
+            commander.stress = stress;
+            commander.is_shattered = is_shattered;
+            state.commander_repo.create_commander(commander).await.expect("overwrite the Commander");
+            let mut foreman = state.foreman_repo.get_foreman(foreman_id).await.unwrap().expect("seeded Foreman");
+            foreman.stress = stress;
+            foreman.is_shattered = is_shattered;
+            state.foreman_repo.create_foreman(foreman).await.expect("overwrite the Foreman");
+
+            let (status, body) = get(&state, Some("t"), c.campaign_id).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["commanders"][0]["band"], want, "Commander at ({stress}, {is_shattered})");
+            assert_eq!(body["foremen"][0]["band"], want, "Foreman at ({stress}, {is_shattered})");
+        }
     }
 
     #[tokio::test]

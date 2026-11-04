@@ -304,6 +304,9 @@ let bankNote = null;    // the one-off "ore banked" line after a laden leg lands
 let crewNote = null;    // BP-17b: the one-off wiped line after a Crew wipeout clears the op
 let crewFight = null;   // BP-17b: the last adopted body's crew_fight, sticky until the next start
 let crewKept = null;    // its JSON, so a new Crew loss re-reads the roster once (spec check F1)
+let digKept = null;    // BP-19c: whether the last adopted body held a dig, from its raw ops (null before the first)
+let rosterDue = false; // BP-19c: a roster reread owed at the next adopt (campaign entry; the hub after an AAR, op out)
+let aarSeen = false;   // BP-19c: an AAR has shown since the hub was last shown
 let guardTimer = null;  // BP-17b: the arrived dig's guard countdown (spec check F4)
 let notice = '';        // a one-off refusal line (the Crew's), until the next adopted body
 let seenBattle = null;  // the raid or ambush whose briefing has opened once ('raid:<site>', 'ambush:<site>')
@@ -368,6 +371,9 @@ const squadOfOp = o => (o && (o.section_id || o.commander_id) ? { commander_id: 
 const homeClear = o => o.leg === 'homeward' && !(o.dig && o.dig.ambush) && progress(o) >= 1 && !(o.dig && o.dig.carried > 0);
 // BP-18b-2a: every op out, from the last body: active_op, then the others; the one reader of the others.
 const opsOut = () => [op, ...((lastBody && lastBody.more_ops) || []).map(m => m.op)].filter(o => o && !homeClear(o));
+// BP-19c (spec check F3): whether a body holds a dig, from its raw ops. Never opsOut(): homeClear drops a carried-0
+// arrival on the client before the server has cleared it; only a body the server built shows the slot cleared.
+const digIn = b => [b.active_op, ...(b.more_ops || []).map(m => m && m.op)].some(o => Boolean(o && o.kind === 'dig'));
 // An op's key: the dig is 'dig', a contract its Section.
 const opKey = o => (o.kind === 'dig' ? 'dig' : o.section_id || null);
 // BP-18b-2b: the Section a home key names, else null.
@@ -396,7 +402,7 @@ const withOther = acts => (canOther() ? [...acts, [COPY.other, otherSquad]] : ac
 // 409 every Commander is out).
 function freeLead() {
   const busy = new Set(opsOut().map(o => o.commander_id).filter(Boolean));
-  return rosterCommanders().find(c => (!c.is_kia && !(c.is_shattered || c.stress >= 100)) && (!busy.has(c.commander_id))) || null;
+  return rosterCommanders().find(c => !c.is_kia && !c.is_shattered && !busy.has(c.commander_id)) || null; // BP-19c: the flag alone (spec check 7)
 }
 // The sheet's first line with two or more Commanders: who leads, or that nobody is free; [] with one.
 const leadLines = () => (rosterCommanders().length >= 2 ? [freeLead() ? fill(COPY.leads, { name: freeLead().name }) : COPY.noneFree] : []);
@@ -405,7 +411,7 @@ const noneFree = () => rosterCommanders().length >= 2 && !freeLead();
 function unusableLead(o) {
   const roster = deps.getRoster();
   const c = o && o.commander_id && roster && Array.isArray(roster.commanders) ? roster.commanders.find(x => x.commander_id === o.commander_id) : null;
-  return c && (c.is_kia || c.is_shattered || c.stress >= 100) ? c : null;
+  return c && (c.is_kia || c.is_shattered) ? c : null; // BP-19c: the flag alone; patchRoster sets it at 100
 }
 // The out line: each op's Section name (the Crew for a Crew-alone dig) and its site, in opsOut() order. Two or three
 // ops anywhere; one op only under a home key (the home hub and home sheets, BP-18b-2b R5).
@@ -1209,6 +1215,9 @@ function adopt(body, built, spent = 0) {
   const crewNow = JSON.stringify(crewFight);
   const crewLoss = crewNow !== crewKept && Boolean(crewFight) && crewFight.heads_lost > 0; // a new Crew loss (spec check F1)
   crewKept = crewNow;
+  const digNow = digIn(body);
+  const digLeft = digKept === true && !digNow; // BP-19c: the server cleared a dig, after settle_leaders paid its Foreman
+  digKept = digNow;
   if (shownOp()) selected = null;
   else if (selected) selected = siteOf(selected.site_id); // the board may have moved on (Reviewer BP-9a F4)
   if (!canNext(shownOp())) { picking = false; pickSite = null; confirming = false; }
@@ -1248,6 +1257,9 @@ function adopt(body, built, spent = 0) {
   refresh();
   if (melted) { flash(strip); rereadRoster(); }
   if (raidLatched || latched.length > 0 || crewLoss) rereadRoster();
+  const owed = digLeft || rosterDue; // BP-19c: once per held → empty, per campaign entry, per hub return after an AAR
+  rosterDue = false;
+  if (owed && !melted && !(raidLatched || latched.length > 0 || crewLoss)) freshRoster(); // a reread above already came
   if (latched.length > 0) armRefresh();
   if (opsOut().some(relicWon) && hubShown() && !cardSeen(campaignId)) showCard({ commander: commanderName() }, () => deps.enterHub()); // A12: DEMO-001 after a relic win, on the hub only
   if (opening && !unusableLead(op)) fight(); // BP-18b-2a (R6): no fight opens that nobody can lead
@@ -1274,6 +1286,16 @@ async function rereadRoster() {
     return true;
   } catch { /* the line keeps the old count; the next roster load corrects it */ }
   return false;
+}
+
+// BP-19c: a roster read after a body that ran settle_leaders (every ops route does), so the bench, a landed dig's
+// stress and XP and the band words show; an open Company screen is drawn again. A failed read is owed again at the
+// next adopt.
+function freshRoster() {
+  rereadRoster().then(ok => {
+    if (ok) redrawCompany();
+    else if (campaignId) rosterDue = true;
+  });
 }
 
 // One board read after a contract's fight, once the server has put it back on the board (A3).
@@ -1538,10 +1560,17 @@ function watch() {
       hubWasShown = shown;
       return endOfRun(kind);
     }
+    if (shown && !hubWasShown && aarSeen) { // BP-19c: back from an AAR: the fight's stress and band. With an op out, the read below owes it
+      aarSeen = false;
+      if (op) rosterDue = true;
+      else freshRoster();
+    }
     if (shown && !hubWasShown && op) load(); // a contract latches on this read (Reviewer BP-11a-2 CF1); a laden haul still reads (BP-10b F3)
     hubWasShown = shown;
   }).observe(hub, { attributes: true, attributeFilter: ['hidden'] });
   new MutationObserver(() => { if (!end.hidden) writeEndNote(); }).observe(end, { attributes: true, attributeFilter: ['hidden'] });
+  const aar = deps.$('screen-aar');
+  new MutationObserver(() => { if (!aar.hidden) aarSeen = true; }).observe(aar, { attributes: true, attributeFilter: ['hidden'] }); // BP-19c
   // Missions opens the board's contracts (A2): taken before the keeper list's own listener.
   hub.addEventListener('click', e => {
     if (!(e.target instanceof Element) || !e.target.closest('#btn-missions')) return;
@@ -1623,6 +1652,9 @@ function attach(m) {
   listOpen = false;
   crewFight = null;
   crewKept = null;
+  digKept = null;
+  rosterDue = true; // BP-19c (spec check F2): the boot roster was read before any settle_leaders; the first adopt rereads
+  aarSeen = false;
   if (guardTimer !== null) clearTimeout(guardTimer);
   guardTimer = null;
   refresh();

@@ -16,6 +16,7 @@
 // shelf's lines, and ticks the heal countdown (no network call) while the card is open.
 
 import { store } from './api.js';
+import { bandWord } from './demo_dig.js'; // BP-19c
 
 const RANK_XP = [100, 400, 1100, 2600]; // commander_gen.rs:132 RANK_THRESHOLDS (ranks 2..=5); harness k3 holds its own copy
 export const HEAL_CREDITS = 40;           // demo_ops.rs DEMO_HEAL_CREDITS; harness y14 holds its own copy
@@ -35,6 +36,24 @@ const RANK_LINES = {
   3: 'Rank 3. +4 on every roll. A death on the relic dig or the Black Site now goes down as glorious.',
   4: 'Rank 4. +6 on every roll. Cleared for 64 Sections. Command admires the optimism.',
   5: 'Rank 5. Top rank, +8 on every roll. Any death now goes down as glorious.',
+};
+
+// BP-19c: what a Foreman's rank changes in this build: +2 on the dig's heat limit a rank above 1, none when Shattered
+// (demo_ops.rs DEMO_FOREMAN_RANK_THRESHOLD, foreman_threshold). Shown on the Crew card by current rank.
+const FOREMAN_RANK_LINES = {
+  2: 'Rank 2. The heat limit is 2 higher. The rig runs hotter before it melts.',
+  3: 'Rank 3. The heat limit is 4 higher.',
+  4: 'Rank 4. The heat limit is 6 higher.',
+  5: 'Rank 5. Top rank, the heat limit is 8 higher.',
+};
+// BP-19c (Reviewer BP-19a: the copy that explains a tired Foreman's shorter heat bar): what a band does to the dig's
+// heat limit, keyed by the roster's band (demo_ops.rs foreman_threshold: DEMO_STRAINED_THRESHOLD_CUT 5,
+// DEMO_BREAKING_THRESHOLD_CUT 10, the Coolant-Jockey's 15 halved while Strained). A retune updates the server
+// constant and this copy in one commit (Reviewer BP-16b).
+const FOREMAN_BAND_LINES = {
+  strained: 'Strained: the heat limit is 5 lower, and a Coolant-Jockey gives half the usual bonus.',
+  breaking_point: 'Breaking Point: the heat limit is 10 lower, and no Coolant-Jockey bonus.',
+  shattered: 'Shattered: the heat limit is 10 lower, with no bonus from rank or Coolant-Jockey.',
 };
 
 // A8: one plain line per trait, keyed by the wire string. Since B5 every trait moves the roll (demo_roll.rs), and
@@ -86,6 +105,14 @@ const COMPANY_COPY = {
   xpTop: '{xp} · top rank',
   stress: '{n} / 100',
   stressNote: 'At 100 they crack. The run ends there.',
+  // BP-19c (Wiki copy): the band words, the bench, and the Foreman on the Crew card.
+  stressBand: '{n} / 100 · {band}',
+  restNote: 'Rest at base sheds stress, a little every minute. The figure catches up at the next report.',
+  ledBand: 'Led by {name}. XP {xp}. Stress {n} / 100, {band}.',
+  foremanRank: 'Rank {r} · XP {xp}',
+  foremanStress: 'Stress {n} / 100',
+  foremanStressBand: 'Stress {n} / 100 · {band}',
+  foremanRecovers: 'In this demo only, rest at base brings a Shattered Foreman back to Strained at 70 stress. Command calls it a sabbatical.',
   traitsNote: 'On file. Every trait moves the odds in a fight. The battle screen shows by how much.',
   briefingCommander: 'Commanding: {name} · Stress {n} / 100',
   aarStress: 'Stress {n} / 100 (+{d})',
@@ -282,8 +309,11 @@ function dressReveal(container) {
   if (c && xpRow) xpRow.querySelector('.stat-value').textContent = xpLine(c.xp, c.rank);
   const stressRow = statRow(cardNode, 'Stress');
   if (c && stressRow) {
-    stressRow.querySelector('.stat-value').textContent = fill(COMPANY_COPY.stress, { n: c.stress });
-    cardNode.after(el('p', 'company-note', COMPANY_COPY.stressNote));
+    const band = bandWord(c.band); // BP-19c
+    stressRow.querySelector('.stat-value').textContent = fill(band ? COMPANY_COPY.stressBand : COMPANY_COPY.stress, { n: c.stress, band });
+    const note = el('p', 'company-note', COMPANY_COPY.stressNote);
+    cardNode.after(note);
+    if (band) note.after(el('p', 'company-note', COMPANY_COPY.restNote)); // the bench came with the band (0.3.3)
   }
   let last = null;
   for (const label of ['Specialisation', 'Fatal Flaw']) {
@@ -460,7 +490,8 @@ function sectionRows(s) {
   const r = roster();
   const free = leaderId ? null : view.freeLead();
   const c = (leaderId && r && Array.isArray(r.commanders) ? r.commanders.find(x => x.commander_id === leaderId) : null) || (free) || campaignCommander();
-  if (c) rows.push(line(fill(COMPANY_COPY.led, { name: c.name, xp: xpLine(c.xp, c.rank), n: c.stress }), true));
+  const band = c ? bandWord(c.band) : ''; // BP-19c
+  if (c) rows.push(line(fill(band ? COMPANY_COPY.ledBand : COMPANY_COPY.led, { name: c.name, xp: xpLine(c.xp, c.rank), n: c.stress, band }), true));
   rows.push(line(COMPANY_COPY.kit, true), line(fill(COMPANY_COPY.bank, { n: credits })));
   if (b.wounded > 0 && b.healing === 0) {
     const p = healPrice(view.base());
@@ -476,10 +507,29 @@ function sectionRows(s) {
   return { rows, ticking };
 }
 
+// BP-19c: the Foreman on the Crew card: name and Specialisation, rank and XP, stress and band. With a band (a 0.3.3
+// server, which also has the bench and the band's heat effects): what the band does to the heat limit, the rank's line
+// (none when Shattered, as foreman_threshold), then the rest line, or for a Shattered Foreman the demo's recovery line.
+// The recovery line is the Foreman's alone (ODQ-73 is a demo exemption): no Commander surface reads it.
+function foremanRows(f) {
+  const band = bandWord(f.band);
+  const rows = [
+    line(fill(COMPANY_COPY.crewForeman, { name: f.name, spec: f.specialization }), true),
+    line(fill(COMPANY_COPY.foremanRank, { r: f.rank, xp: xpLine(f.xp, f.rank) })),
+    line(fill(band ? COMPANY_COPY.foremanStressBand : COMPANY_COPY.foremanStress, { n: f.stress, band })),
+  ];
+  if (!band) return rows;
+  const shattered = f.band === 'shattered';
+  if (FOREMAN_BAND_LINES[f.band]) rows.push(line(FOREMAN_BAND_LINES[f.band], true));
+  if (!shattered && FOREMAN_RANK_LINES[f.rank]) rows.push(line(FOREMAN_RANK_LINES[f.rank], true));
+  rows.push(line(shattered ? COMPANY_COPY.foremanRecovers : COMPANY_COPY.restNote, true));
+  return rows;
+}
+
 function crewRows(w, r) {
   const rows = [line(fill(COMPANY_COPY.crewMiners, { n: w.headcount })), line(fill(COMPANY_COPY.crewMorale, { m: w.morale }))];
   const f = Array.isArray(r.foremen) ? r.foremen[0] : null;
-  if (f) rows.push(line(fill(COMPANY_COPY.crewForeman, { name: f.name, spec: f.specialization }), true));
+  if (f) rows.push(...foremanRows(f)); // BP-19c
   if (!view || !view.adopted()) return rows;
   rows.push(line(fill(COMPANY_COPY.bank, { n: view.credits() })));
   const h = Math.min(8, Math.max(0, Number(w.headcount) || 0));

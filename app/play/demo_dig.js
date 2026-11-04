@@ -19,6 +19,8 @@ export const DIG_COPY = {
   melts: 'Next drill melts the site down.',
   crew: 'Crew {heads} · Foreman {name}, {spec}',
   crewNoSpec: 'Crew {heads} · Foreman {name}',
+  crewBand: 'Crew {heads} · Foreman {name}, {spec} · {band}', // BP-19c: with the roster's band word
+  crewNoSpecBand: 'Crew {heads} · Foreman {name} · {band}',
   crewOnly: 'Crew {heads}',
   // BP-17b (Wiki copy): the escort and the Crew's own fights.
   unguarded: 'No guard. Raiders face the Crew alone.',
@@ -82,6 +84,10 @@ export const DIG_CSS = `
 `;
 
 export const fill = (text, values) => text.replace(/\{(\w+)\}/g, (m, k) => (k in values ? String(values[k]) : m));
+// BP-19c: the roster's stress band (routes/roster.rs `band`, demo_ops.rs stress_band) as its word. The client words a
+// band and never computes one (Reviewer BP-19a). A missing or unknown band (a 0.3.2 server sends none) is '' and shows nothing.
+export const BAND_WORDS = { rested: 'Rested', strained: 'Strained', breaking_point: 'Breaking Point', shattered: 'Shattered' };
+export const bandWord = b => (typeof b === 'string' && Object.prototype.hasOwnProperty.call(BAND_WORDS, b) ? BAND_WORDS[b] : '');
 
 // A9 (BP-11b-1): the one banked figure, on the chip and the Base sheet alike.
 export const bankedLine = (ore, credits) => fill(DIG_COPY.bankedLine, { ore, credits });
@@ -125,7 +131,9 @@ function crewLine(roster) {
   if (!crew) return '';
   const fm = Array.isArray(roster.foremen) ? roster.foremen[0] : null;
   if (!fm) return fill(DIG_COPY.crewOnly, { heads: crew.headcount });
-  return fill(fm.specialization ? DIG_COPY.crew : DIG_COPY.crewNoSpec, { heads: crew.headcount, name: fm.name, spec: fm.specialization });
+  const band = bandWord(fm.band); // BP-19c
+  const key = fm.specialization ? (band ? 'crewBand' : 'crew') : (band ? 'crewNoSpecBand' : 'crewNoSpec');
+  return fill(DIG_COPY[key], { heads: crew.headcount, name: fm.name, spec: fm.specialization, band });
 }
 
 // BP-17b: the line for the body's crew_fight (absent = none). It is sticky until the next start and has
