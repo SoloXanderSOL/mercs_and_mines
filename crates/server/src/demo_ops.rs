@@ -502,9 +502,17 @@ struct DigState {
     /// When the Section stands guard (BP-17a): the start for an escorted dig, `ops/escort`'s
     /// arrival for a guard sent later, `None` while the Crew is alone.
     escort_at: Option<DateTime<Utc>>,
+    /// The nominal heads the Crew's rolls took on this dig (BP-19a), for its Foreman's stress.
+    crew_heads_lost: u32,
 }
 
 impl DigState {
+    /// What this dig owes its Foreman as it leaves its slot by `close` (BP-19a), with `carried`
+    /// the ore that lands (0 when none does).
+    fn settlement(&self, close: DigClose, carried: u32) -> ForemanDue {
+        dig_settlement(self.drills, self.crew_heads_lost, self.ended_by, carried, close)
+    }
+
     /// A battle born at `t` is the Section's (BP-17a) only once the guard stands: fixed when the
     /// trigger is made, so no read's timing changes who fights it.
     fn guarded(&self, t: DateTime<Utc>) -> bool {
@@ -549,13 +557,115 @@ pub struct DigView {
     pub escort_at: Option<String>,
 }
 
-/// The meltdown threshold for a dig: `DEMO_HEAT_THRESHOLD`, or ×1.15 with a Coolant-Jockey Foreman.
-pub fn dig_threshold(coolant_jockey: bool) -> u32 {
-    if coolant_jockey {
-        DEMO_HEAT_THRESHOLD * DEMO_COOLANT_THRESHOLD_PCT / 100
+/// A Foreman's heat-threshold cut while Strained (BP-19a): Command Presence at half.
+pub const DEMO_STRAINED_THRESHOLD_CUT: u32 = 5;
+/// A Foreman's heat-threshold cut at Breaking Point and when Shattered (BP-19a): Command Presence inverted.
+pub const DEMO_BREAKING_THRESHOLD_CUT: u32 = 10;
+/// Heat threshold per Foreman rank above 1 (BP-19a), as the Commander's +2 a rank on the roll.
+pub const DEMO_FOREMAN_RANK_THRESHOLD: u32 = 2;
+/// Foreman stress for a dig, once (BP-19a): canon's deployment penalty.
+pub const DEMO_FOREMAN_DIG_STRESS: u32 = 10;
+/// Foreman stress per drill (BP-19a): pushing the Crew costs nerves.
+pub const DEMO_FOREMAN_DRILL_STRESS: u32 = 3;
+/// Foreman stress per miner lost (BP-19a): canon's +5 a casualty, on the nominal heads a roll took.
+pub const DEMO_FOREMAN_HEAD_STRESS: u32 = 5;
+/// Foreman XP for a dig whose ore lands at base (BP-19a; canon Tier 2 Success).
+pub const DEMO_FOREMAN_XP_LANDED: u32 = 25;
+/// Foreman XP for a dig driven off: a meltdown, a lost fight (BP-19a; canon Tier 2 Defeat).
+pub const DEMO_FOREMAN_XP_DRIVEN_OFF: u32 = 15;
+/// Foreman XP for a dig left by choice with nothing landed (BP-19a).
+pub const DEMO_FOREMAN_XP_LEFT: u32 = 8;
+
+/// A leader's stress band (BP-19a; `Commander_Stress_System` §2): 0–30, 31–70, 71–99, and 100 or
+/// the flag.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StressBand {
+    Rested,
+    Strained,
+    BreakingPoint,
+    Shattered,
+}
+
+pub fn stress_band(stress: i16, is_shattered: bool) -> StressBand {
+    if is_shattered || stress >= 100 {
+        StressBand::Shattered
+    } else if stress >= 71 {
+        StressBand::BreakingPoint
+    } else if stress >= 31 {
+        StressBand::Strained
     } else {
-        DEMO_HEAT_THRESHOLD
+        StressBand::Rested
     }
+}
+
+/// What a dig's threshold reads of the member's first Foreman (BP-19a).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ForemanRead {
+    pub stress: i16,
+    pub is_shattered: bool,
+    pub rank: i16,
+    pub coolant_jockey: bool,
+}
+
+/// The meltdown threshold a Foreman gives a dig (BP-19a): 100, plus the Coolant-Jockey's 15
+/// (half while Strained, none from Breaking Point), plus 2 a rank above 1 (none when Shattered),
+/// less 5 while Strained and 10 from Breaking Point.
+pub fn foreman_threshold(f: ForemanRead) -> u32 {
+    let doctrine = DEMO_HEAT_THRESHOLD * DEMO_COOLANT_THRESHOLD_PCT / 100 - DEMO_HEAT_THRESHOLD;
+    let rank = DEMO_FOREMAN_RANK_THRESHOLD * (f.rank.max(1) - 1) as u32;
+    let (spec, bonus, cut) = match stress_band(f.stress, f.is_shattered) {
+        StressBand::Rested => (doctrine, rank, 0),
+        StressBand::Strained => (doctrine / 2, rank, DEMO_STRAINED_THRESHOLD_CUT),
+        StressBand::BreakingPoint => (0, rank, DEMO_BREAKING_THRESHOLD_CUT),
+        StressBand::Shattered => (0, 0, DEMO_BREAKING_THRESHOLD_CUT),
+    };
+    let spec = if f.coolant_jockey { spec } else { 0 };
+    DEMO_HEAT_THRESHOLD + spec + bonus - cut
+}
+
+/// The meltdown threshold for a dig with a Rested rank-1 Foreman: `DEMO_HEAT_THRESHOLD`, or
+/// ×1.15 with a Coolant-Jockey. The route reads the Foreman through `foreman_threshold`.
+pub fn dig_threshold(coolant_jockey: bool) -> u32 {
+    foreman_threshold(ForemanRead { stress: 0, is_shattered: false, rank: 1, coolant_jockey })
+}
+
+/// What finished digs owe the Foreman (BP-19a), summed in the entry until a route drains it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ForemanDue {
+    pub stress: u32,
+    pub xp: u32,
+}
+
+impl ForemanDue {
+    fn add(&mut self, other: ForemanDue) {
+        self.stress = self.stress.saturating_add(other.stress);
+        self.xp = self.xp.saturating_add(other.xp);
+    }
+}
+
+/// How a dig left its slot (BP-19a): its homeward leg arrived, the Crew was wiped on site or on
+/// the haul, the escorting Section was wiped, or `ops/next` moved the team on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DigClose {
+    Home,
+    CrewWiped,
+    GuardWiped,
+    LeftForNext,
+}
+
+pub fn dig_settlement(drills: u32, crew_heads_lost: u32, ended_by: Option<OpEnd>, carried: u32, close: DigClose) -> ForemanDue {
+    let stress = DEMO_FOREMAN_DIG_STRESS + DEMO_FOREMAN_DRILL_STRESS * drills + DEMO_FOREMAN_HEAD_STRESS * crew_heads_lost;
+    let xp = match close {
+        DigClose::CrewWiped => 0,
+        DigClose::GuardWiped => DEMO_FOREMAN_XP_DRIVEN_OFF,
+        DigClose::LeftForNext => DEMO_FOREMAN_XP_LEFT,
+        DigClose::Home => match ended_by {
+            Some(OpEnd::Pulled) if carried > 0 => DEMO_FOREMAN_XP_LANDED,
+            Some(OpEnd::Meltdown | OpEnd::Retreat) => DEMO_FOREMAN_XP_DRIVEN_OFF,
+            _ => DEMO_FOREMAN_XP_LEFT,
+        },
+    };
+    ForemanDue { stress, xp }
 }
 
 /// The ore drill `n` (1-based) yields on a vein of `tier`.
@@ -1155,6 +1265,10 @@ struct OpsEntry {
     /// `latch_crew`, cleared by the next `start_op` or `next_op`. Display only, not on the keep
     /// list: an evicted entry loses only the message.
     crew_fight: Option<CrewFightView>,
+    /// What finished digs owe the member's first Foreman (BP-19a): written where a dig leaves
+    /// its slot (`DigState::settlement`), drained by `take_foreman_due`, put back by
+    /// `restore_foreman_due` after a failed write. On the keep list, tested by value.
+    foreman_due: ForemanDue,
 }
 
 impl OpsEntry {
@@ -1337,6 +1451,10 @@ impl OpsEntry {
         let mut arrivals: Vec<(DateTime<Utc>, u32)> = Vec::new();
         if let Some(arrival) = self.dig.as_mut().and_then(|op| settle_op(op, now)) {
             arrivals.push(arrival);
+            // BP-19a: the dig's homeward leg arrived (`DigClose::Home`), with what it carried.
+            if let Some(d) = self.dig.as_ref().and_then(|op| op.dig.as_ref()) {
+                self.foreman_due.add(d.settlement(DigClose::Home, arrival.1));
+            }
             self.dig = None;
         }
         self.contracts_out.retain(|_, op| match settle_op(op, now) {
@@ -1591,6 +1709,7 @@ fn new_op(site: &OpsSite, op_seed: u32, dig: Option<DigStart>, contract: Option<
             carried: 0,
             ambush_at: None,
             escort_at: d.escort.then_some(now),
+            crew_heads_lost: 0,
         }),
         contract: contract.and_then(|c| site.mission_id.map(|mission_id| ContractState { mission_id, commander_id: c.commander_id, section_id: c.section_id, result: None })),
     }
@@ -1641,8 +1760,12 @@ fn new_op(site: &OpsSite, op_seed: u32, dig: Option<DigStart>, contract: Option<
 ///   ambush waits, `moved_since` still counts the leg's passed `arrive_at`, at most
 ///   `travel_secs` (≤ 48 s) after the pull: an accepted overcount;
 /// - the eviction takes only an entry with no op in any slot, no banked ore, no banked credits, no
-///   building, no sickbay off the default, no trophy and no replace in flight (BP-12a-1,
-///   BP-12a-2);
+///   building, no sickbay off the default, no trophy, no replace in flight (BP-12a-1,
+///   BP-12a-2) and no undrained Foreman tally (BP-19a, `foreman_due` off the default);
+/// - **the Foreman's tally (BP-19a):** every place a dig leaves its slot (the homeward arrival in
+///   `settle_arrival`, a Crew wipe in `drill_op` or `latch_crew`, a guard wipe in `latch_raid`,
+///   a dig left by `next_op_for`) adds `DigState::settlement` into `foreman_due` in the same
+///   critical section, before the slot clears; only `take_foreman_due` drains it;
 /// - an entry is dropped only by `remove` (a read of a campaign that is no longer `Active`,
 ///   the reaper's retire) and the reaper's prune (`retain_campaigns`).
 ///
@@ -1680,7 +1803,8 @@ impl DemoOpsStore {
 
     /// Makes room for a new entry: below the cap, nothing; at it, evicts the least recently
     /// touched entry that holds no op in any slot (BP-18a-1a), no banked ore, no banked credits, no building, no sickbay
-    /// off the default, no trophy and no replace in flight (BP-12a-1, BP-12a-2), and journals
+    /// off the default, no trophy, no replace in flight (BP-12a-1, BP-12a-2) and no undrained
+    /// Foreman tally (BP-19a, tested by value), and journals
     /// (first, then at most hourly). The sickbay is tested by value, never by presence: a latch
     /// can leave a bay at the default until the entry's next settle (Reviewer BP-12a-1 F1).
     /// `false` when every entry holds one of them. An entry whose only state is a finished contract can go
@@ -1692,7 +1816,7 @@ impl DemoOpsStore {
         }
         let victim = inner
             .iter()
-            .filter(|(_, e)| e.dig.is_none() && e.contracts_out.is_empty() && e.ore_banked == 0 && e.credits_banked == 0 && e.base == OpsBase::default() && e.sickbay.values().all(|b| *b == SickBay::default()) && e.trophies.is_empty() && e.credits_in_flight == 0)
+            .filter(|(_, e)| e.dig.is_none() && e.contracts_out.is_empty() && e.ore_banked == 0 && e.credits_banked == 0 && e.base == OpsBase::default() && e.sickbay.values().all(|b| *b == SickBay::default()) && e.trophies.is_empty() && e.credits_in_flight == 0 && e.foreman_due == ForemanDue::default())
             .min_by_key(|(_, e)| e.touched)
             .map(|(id, _)| *id);
         let Some(id) = victim else {
@@ -1732,7 +1856,7 @@ impl DemoOpsStore {
         if !self.make_room(&mut inner) {
             return false;
         }
-        inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, dig: None, contracts_out: BTreeMap::new(), moved_at: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), contracts: HashMap::new(), sickbay: HashMap::new(), trophies: Vec::new(), credits_in_flight: 0, crew_fight: None, wages_at: now, squads: 1, hire_in_flight: false });
+        inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, dig: None, contracts_out: BTreeMap::new(), moved_at: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), contracts: HashMap::new(), sickbay: HashMap::new(), trophies: Vec::new(), credits_in_flight: 0, crew_fight: None, wages_at: now, squads: 1, hire_in_flight: false, foreman_due: ForemanDue::default() });
         true
     }
 
@@ -1782,7 +1906,7 @@ impl DemoOpsStore {
             if !self.make_room(&mut inner) {
                 return Err(StartRefusal::Full);
             }
-            inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, dig: None, contracts_out: BTreeMap::new(), moved_at: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), contracts: HashMap::new(), sickbay: HashMap::new(), trophies: Vec::new(), credits_in_flight: 0, crew_fight: None, wages_at: now, squads: 1, hire_in_flight: false });
+            inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, dig: None, contracts_out: BTreeMap::new(), moved_at: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), contracts: HashMap::new(), sickbay: HashMap::new(), trophies: Vec::new(), credits_in_flight: 0, crew_fight: None, wages_at: now, squads: 1, hire_in_flight: false, foreman_due: ForemanDue::default() });
         }
         let Some(e) = inner.get_mut(&campaign_id) else {
             return Err(StartRefusal::Full);
@@ -1958,6 +2082,11 @@ impl DemoOpsStore {
         if held_elsewhere {
             return Err(NextRefusal::Taken);
         }
+        // BP-19a: a dig left for the next site owes its Foreman as one left by choice.
+        if let Some(d) = e.slot(key).and_then(|op| op.dig.as_ref()) {
+            let due = d.settlement(DigClose::LeftForNext, d.carried);
+            e.foreman_due.add(due);
+        }
         e.clear_slot(key);
         e.insert_op(next);
         e.crew_fight = None;
@@ -2022,6 +2151,7 @@ impl DemoOpsStore {
             op.leg = OpLeg::Homeward;
             op.depart_at = now;
             op.arrive_at = now + Duration::seconds(i64::from(op.travel_secs));
+            dig.crew_heads_lost = dig.crew_heads_lost.saturating_add(heads);
             return Ok(DrillOutcome::Meltdown { crew_id: dig.crew_id, heads: heads as i16 });
         }
         dig.ore_on_site += base.ore(dig.drills, dig.tier);
@@ -2029,6 +2159,7 @@ impl DemoOpsStore {
             return Ok(DrillOutcome::Drilled);
         };
         let crew_id = dig.crew_id;
+        dig.crew_heads_lost = dig.crew_heads_lost.saturating_add(u32::try_from(heads).unwrap_or(0));
         match result {
             RaidResult::Held => {}
             RaidResult::Retreat => {
@@ -2039,7 +2170,11 @@ impl DemoOpsStore {
                 op.depart_at = now;
                 op.arrive_at = now + Duration::seconds(i64::from(op.travel_secs));
             }
-            RaidResult::Wiped => e.dig = None,
+            RaidResult::Wiped => {
+                let due = dig.settlement(DigClose::CrewWiped, dig.carried);
+                e.foreman_due.add(due);
+                e.dig = None;
+            }
         }
         e.crew_fight = Some(crew_fight_view("raid", result, heads));
         Ok(DrillOutcome::CrewFight { crew_id, heads })
@@ -2200,7 +2335,11 @@ impl DemoOpsStore {
                     op.depart_at += wait;
                     op.arrive_at += wait;
                 }
-                (_, RaidResult::Wiped) => e.dig = None,
+                (_, RaidResult::Wiped) => {
+                    let due = dig.settlement(DigClose::GuardWiped, dig.carried);
+                    e.foreman_due.add(due);
+                    e.dig = None;
+                }
             }
         }
         e.credits_banked = e.credits_banked.saturating_add(pay.credits);
@@ -2237,6 +2376,7 @@ impl DemoOpsStore {
             return false;
         }
         dig.raid = None;
+        dig.crew_heads_lost = dig.crew_heads_lost.saturating_add(u32::try_from(crew.heads).unwrap_or(0));
         match crew.result {
             RaidResult::Held | RaidResult::Retreat => {
                 if crew.result == RaidResult::Retreat {
@@ -2247,12 +2387,37 @@ impl DemoOpsStore {
                 op.depart_at += wait;
                 op.arrive_at += wait;
             }
-            RaidResult::Wiped => e.dig = None,
+            RaidResult::Wiped => {
+                let due = dig.settlement(DigClose::CrewWiped, dig.carried);
+                e.foreman_due.add(due);
+                e.dig = None;
+            }
         }
         e.crew_fight = Some(crew_fight_view("ambush", crew.result, crew.heads));
         e.moved_at = Some(now);
         e.touched = now;
         true
+    }
+
+    /// Drains what finished digs owe the Foreman (BP-19a), after settling, so a homeward leg that
+    /// has arrived but not yet been read lands inside the drain. The `take` under the lock is
+    /// the exactly-once claim: a second drain sees the default. No entry owes nothing.
+    pub fn take_foreman_due(&self, campaign_id: Uuid, now: DateTime<Utc>) -> ForemanDue {
+        let mut inner = self.lock();
+        let Some(e) = inner.get_mut(&campaign_id) else {
+            return ForemanDue::default();
+        };
+        e.settle_arrival(now);
+        std::mem::take(&mut e.foreman_due)
+    }
+
+    /// Puts a drained tally back after its write failed (BP-19a), so the next read retries. No
+    /// entry (evicted or wiped since the drain): the tally is lost, a named residual.
+    pub fn restore_foreman_due(&self, campaign_id: Uuid, due: ForemanDue) {
+        let mut inner = self.lock();
+        if let Some(e) = inner.get_mut(&campaign_id) {
+            e.foreman_due.add(due);
+        }
     }
 
     /// The op as the client sees it, after clearing an arrived homeward leg.
@@ -4820,5 +4985,202 @@ mod tests {
         store.finish_hire(hold, true, Some(2));
         assert_eq!(credits_at(&store, a, 5), 0, "kept");
         assert_eq!(store.ops_body(a, at(5)).2, 2);
+    }
+
+    // ---- BP-19a: the Foreman's settlement and the threshold bands.
+
+    fn due(stress: u32, xp: u32) -> ForemanDue {
+        ForemanDue { stress, xp }
+    }
+
+    /// Wiki's rows (BP-19a prompt, T1): `(drills, heads, ended_by, carried, close) → (stress, xp)`.
+    #[test]
+    fn dig_settlement_pays_by_how_the_dig_ended() {
+        let rows = [
+            ((2, 0, Some(OpEnd::Pulled), 40, DigClose::Home), (16, 25)),
+            ((0, 0, Some(OpEnd::Pulled), 0, DigClose::Home), (10, 8)),
+            ((3, 2, Some(OpEnd::Meltdown), 0, DigClose::Home), (29, 15)),
+            ((1, 0, Some(OpEnd::WalkedAway), 0, DigClose::Home), (13, 8)),
+            ((2, 3, Some(OpEnd::Retreat), 20, DigClose::Home), (31, 15)),
+            ((2, 8, None, 0, DigClose::CrewWiped), (56, 0)),
+            ((2, 0, None, 0, DigClose::GuardWiped), (16, 15)),
+            ((4, 0, None, 0, DigClose::LeftForNext), (22, 8)),
+        ];
+        for ((drills, heads, ended_by, carried, close), (stress, xp)) in rows {
+            assert_eq!(dig_settlement(drills, heads, ended_by, carried, close), due(stress, xp), "{drills} {heads} {ended_by:?} {carried} {close:?}");
+        }
+    }
+
+    /// Wiki's rows (BP-19a prompt, T2): `(stress, shattered, rank, coolant_jockey) → threshold`.
+    #[test]
+    fn foreman_threshold_follows_the_band_and_rank() {
+        let rows = [
+            ((30, false, 1, false), 100),
+            ((30, false, 1, true), 115),
+            ((31, false, 1, false), 95),
+            ((31, false, 1, true), 102),
+            ((70, false, 1, true), 102),
+            ((71, false, 1, false), 90),
+            ((71, false, 1, true), 90),
+            ((99, false, 1, true), 90),
+            ((100, false, 1, true), 90),
+            ((40, true, 1, false), 90),
+            ((99, false, 2, false), 92),
+            ((100, true, 2, false), 90),
+            ((0, false, 3, true), 119),
+            ((0, false, 5, false), 108),
+        ];
+        for ((stress, is_shattered, rank, coolant_jockey), want) in rows {
+            let f = ForemanRead { stress, is_shattered, rank, coolant_jockey };
+            assert_eq!(foreman_threshold(f), want, "{f:?}");
+        }
+    }
+
+    /// Seed 2, two drills (60 ore) pulled at 20 s, home at 30 s: the first drain is the landed
+    /// dig's (10 + 3 × 2, 25), the second is the default.
+    #[test]
+    fn foreman_due_drains_once() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        pulled(&store, a, 2, 2);
+        assert_eq!(store.take_foreman_due(a, at(30)), due(16, 25));
+        assert_eq!(store.take_foreman_due(a, at(31)), ForemanDue::default());
+    }
+
+    /// E1, a landed haul: seed 2, three drills (120 ore) pulled at 20 s, home at 30 s.
+    #[test]
+    fn foreman_due_landed_haul() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        pulled(&store, a, 2, 3);
+        assert_eq!(store.take_foreman_due(a, at(30)), due(10 + 3 * 3, 25));
+    }
+
+    /// E2 then E1: seed 1 melts down on its 7th drill at 20 s with 2 heads
+    /// (`ops_store_meltdown_rolls_no_raid`), home at 30 s.
+    #[test]
+    fn foreman_due_meltdown() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        on_site(&store, a, 1, 100, 1);
+        for i in 1..=6 {
+            assert_eq!(store.drill_op(a, at(10 + i)), Ok(DrillOutcome::Drilled), "drill {i}");
+        }
+        assert_eq!(store.drill_op(a, at(20)), Ok(DrillOutcome::Meltdown { crew_id: CREW, heads: 2 }));
+        assert_eq!(store.take_foreman_due(a, at(30)), due(10 + 3 * 7 + 5 * 2, 15));
+    }
+
+    /// E7 then E1: seed 2, two drills, walked away at 13 s, home at 23 s.
+    #[test]
+    fn foreman_due_walked_away() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        on_site(&store, a, 1, 100, 2);
+        store.drill_op(a, at(11)).expect("drill");
+        store.drill_op(a, at(12)).expect("drill");
+        assert_eq!(store.return_op(a, at(13)), Ok(()));
+        assert_eq!(store.take_foreman_due(a, at(23)), due(10 + 3 * 2, 8));
+    }
+
+    /// E4 then E1: seed 45 alone, drill 1 at 11 s brings raiders and the Crew falls back with 2
+    /// heads (`crew_fight_roll_pins`, `ops_unescorted_raid_is_the_crews_retreat`), home at 21 s.
+    #[test]
+    fn foreman_due_retreat_home() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        alone(&store, a, 45);
+        assert_eq!(store.drill_op(a, at(11)), Ok(DrillOutcome::CrewFight { crew_id: CREW, heads: 2 }));
+        assert_eq!(store.take_foreman_due(a, at(21)), due(10 + 3 + 5 * 2, 15));
+    }
+
+    /// E3: seed 505 alone, drill 1 at 11 s: the Crew is wiped out, 8 heads
+    /// (`crew_fight_roll_pins`, `ops_crew_wipeout_ends_the_op_and_takes_every_head`).
+    #[test]
+    fn foreman_due_crew_wiped_on_site() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        alone(&store, a, 505);
+        assert_eq!(store.drill_op(a, at(11)), Ok(DrillOutcome::CrewFight { crew_id: CREW, heads: 8 }));
+        assert_eq!(store.take_foreman_due(a, at(12)), due(10 + 3 + 40, 0));
+    }
+
+    /// E5: seed 7's raid on drill 1 (`ops_store_latch_applies_each_result`), the guard's fight
+    /// latched Wiped at 20 s.
+    #[test]
+    fn foreman_due_guard_wiped() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        on_site(&store, a, 1, 100, 7);
+        store.drill_op(a, at(11)).expect("drill");
+        assert!(store.latch_raid(a, &trigger(11), RaidResult::Wiped, FightPay::credits(0), at(20)));
+        assert_eq!(store.take_foreman_due(a, at(21)), due(10 + 3, 15));
+    }
+
+    /// E6: the haul of `ops_store_ambush_before_the_guard_stands_is_the_crews` (seed 59, two
+    /// drills, the Crew's ambush revealed at 18 s), latched as a Wipeout of 8 heads at 19 s.
+    #[test]
+    fn foreman_due_crew_wiped_on_the_haul() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        alone(&store, a, 7);
+        assert_eq!(store.escort_op(a, COMMANDER, None, at(10)), Ok(()));
+        store.set_op_seed(a, 59);
+        assert_eq!(store.drill_op(a, at(11)), Ok(DrillOutcome::Drilled));
+        assert_eq!(store.drill_op(a, at(12)), Ok(DrillOutcome::Drilled));
+        assert_eq!(store.pull_op(a, at(13)), Ok(()));
+        let pending = store.pending_raid(a, at(18)).expect("the ambush is revealed at 18 s");
+        assert!(store.latch_crew(a, &pending.trigger, CrewRoll { crew_id: CREW, result: RaidResult::Wiped, heads: 8 }, at(19)));
+        assert!(store.op_view(a, at(19)).is_none(), "the op is cleared");
+        assert_eq!(store.take_foreman_due(a, at(20)), due(10 + 3 * 2 + 5 * 8, 0));
+    }
+
+    /// E8: an escorted seed-2 dig, four drills, sent on to `site()`'s contract at 20 s; then a
+    /// contract sent on from its slot (`next_to_supply_raid`) on a fresh entry owes nothing.
+    #[test]
+    fn foreman_due_next_from_a_dig() {
+        let store = DemoOpsStore::new(4);
+        let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        on_site(&store, a, 1, 1000, 2);
+        for i in 1..=4 {
+            assert_eq!(store.drill_op(a, at(10 + i)), Ok(DrillOutcome::Drilled), "drill {i}");
+        }
+        assert_eq!(store.next_op(a, &site(), 9, None, Some(LEAD), at(20)), Ok(()));
+        assert_eq!(store.take_foreman_due(a, at(21)), due(10 + 3 * 4, 8));
+        next_to_supply_raid(&store, b);
+        assert_eq!(store.take_foreman_due(b, at(21)), ForemanDue::default());
+    }
+
+    /// Cap 2. `a` walks away from a one-drill dig (seed 2) and is home at 22 s, banking nothing:
+    /// only its tally keeps it, so the new `c` evicts the board-only `b`. Drained, `a` is the
+    /// least recently touched and goes for `d`; then `c`, a fresh insert, goes for `e`.
+    #[test]
+    fn make_room_keeps_an_undrained_foreman_due() {
+        let store = DemoOpsStore::new(2);
+        let (a, b, c, d, e) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3), Uuid::from_u128(4), Uuid::from_u128(5));
+        on_site(&store, a, 1, 100, 2);
+        store.drill_op(a, at(11)).expect("drill");
+        assert_eq!(store.return_op(a, at(12)), Ok(()));
+        assert_eq!(store.ops_snapshot(a, at(22)), (None, 0, OpsBase::default()), "home, nothing banked");
+        assert!(store.put_board(b, (5, 0), board(), at(30)));
+        assert!(store.put_board(c, (5, 0), board(), at(40)));
+        assert_eq!(store.len(), 2);
+        assert!(store.board(b, (5, 0), at(41)).is_none(), "the board-only entry is evicted");
+        assert_eq!(store.take_foreman_due(a, at(42)), due(13, 8), "the tally kept `a`");
+        assert!(store.put_board(d, (5, 0), board(), at(50)));
+        assert!(store.board(a, (5, 0), at(51)).is_none(), "drained, `a` is evicted");
+        assert!(store.put_board(e, (5, 0), board(), at(60)));
+        assert!(store.board(c, (5, 0), at(61)).is_none(), "a fresh entry is evicted");
+        assert!(store.board(d, (5, 0), at(61)).is_some() && store.board(e, (5, 0), at(61)).is_some());
+    }
+
+    /// A put-back tally is drained once.
+    #[test]
+    fn foreman_due_restore_adds_back() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        assert!(store.put_board(a, (5, 0), board(), at(0)));
+        store.restore_foreman_due(a, due(16, 25));
+        assert_eq!(store.take_foreman_due(a, at(1)), due(16, 25));
+        assert_eq!(store.take_foreman_due(a, at(2)), ForemanDue::default());
     }
 }

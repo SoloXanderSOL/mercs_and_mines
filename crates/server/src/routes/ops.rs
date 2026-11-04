@@ -34,7 +34,7 @@ use uuid::Uuid;
 use crate::api_types::MissionResolveRequest;
 use crate::auth::AuthSession;
 use crate::demo_ops::{
-    dig_threshold, fight_losses, fight_wounded, ops_board, ops_time, raid_fight, raid_result, ActiveOpView, BaseBuilding,
+    fight_losses, fight_wounded, foreman_threshold, ForemanDue, ForemanRead, DEMO_HEAT_THRESHOLD, ops_board, ops_time, raid_fight, raid_result, ActiveOpView, BaseBuilding,
     BuildRefusal, CompanyView, ContractStart, CrewFightView, DigStart, DrillOutcome, DrillRefusal, EscortRefusal, FightPay,
     HealRefusal, MoreOp, NextRefusal, OpSquad, OpsBase, OpsBoard, OpsSite, PullRefusal, RaidResult, ReplaceHold, ReplaceRefusal,
     ReturnRefusal, StartRefusal, DEMO_CREW_FIGHT_MORALE_LOSS, DEMO_MELTDOWN_MORALE_LOSS, DEMO_REPLACE_MERC_CREDITS,
@@ -585,6 +585,7 @@ async fn get_ops_board(
     let board = load_board(&state, &campaign, gw, now, false, "get_ops_board").await?;
     relead_unusable(&state, campaign_id, &wallet, now, "get_ops_board").await?;
     latch_pending_raid(&state, campaign_id, now, "get_ops_board").await?;
+    settle_foreman(&state, campaign_id, &wallet, now).await;
     Ok(ops_response(&state, campaign_id, gw, &board, now))
 }
 
@@ -708,18 +709,61 @@ async fn post_ops_start(
         Err(StartRefusal::Taken) => return Err(conflict("another squad has that contract")),
         Err(StartRefusal::CommanderBusy) => return Err(conflict("every Commander is out")),
     }
+    settle_foreman(&state, campaign_id, &wallet, now).await;
     Ok(ops_response(&state, campaign_id, gw, &board, now))
+}
+
+/// Writes what finished digs owe the member's first Foreman (BP-19a, demo-only). Runs in a
+/// spawned task, which this helper awaits: the drain (`take_foreman_due`, the exactly-once claim)
+/// and the write (`settle_foreman_dig`, row-locked) both run inside it, so a handler dropped at
+/// the await loses nothing (before the task starts the tally stays in the entry for the next
+/// read; once it starts it finishes). Nothing owed: no read. A member with no Foreman: the tally
+/// is dropped, with nobody to credit. A KIA Foreman: the write answers `Ok(false)` and the tally
+/// is dropped. A failed read or write: the tally is put back (`restore_foreman_due`) with one
+/// warning, and the next ops read retries. It never fails the route: the body carries no
+/// Foreman, and a stalled write must not take the ops screen down.
+async fn settle_foreman(state: &Arc<AppState>, campaign_id: Uuid, wallet: &[u8], now: DateTime<Utc>) {
+    let task_state = Arc::clone(state);
+    let wallet = wallet.to_vec();
+    let handle = tokio::spawn(async move {
+        let state = task_state;
+        let due = state.demo_ops.store.take_foreman_due(campaign_id, now);
+        if due == ForemanDue::default() {
+            return;
+        }
+        let foremen = match state.foreman_repo.list_foremen_for_member(campaign_id, &wallet).await {
+            Ok(f) => f,
+            Err(e) => {
+                state.demo_ops.store.restore_foreman_due(campaign_id, due);
+                tracing::warn!(%campaign_id, error = %e, "settle_foreman: list_foremen_for_member failed; tally put back");
+                return;
+            }
+        };
+        let Some(foreman) = foremen.first() else {
+            return;
+        };
+        if let Err(e) = state.foreman_repo.settle_foreman_dig(foreman.foreman_id, due.stress, due.xp).await {
+            state.demo_ops.store.restore_foreman_due(campaign_id, due);
+            tracing::warn!(%campaign_id, error = %e, "settle_foreman: settle_foreman_dig failed; tally put back");
+        }
+    });
+    if let Err(e) = handle.await {
+        tracing::warn!(%campaign_id, error = %e, "settle_foreman: task failed");
+    }
 }
 
 /// A dig's Crew, threshold (BP-8b-1a) and Commander (BP-8b-1b). The Crew is the member's first
 /// by the lister's order (a demo member holds one, the join's); `409` when it has no heads left,
-/// since only a new run brings a fresh one. The first Foreman's specialization sets the threshold
-/// (`dig_threshold`); no Foreman means the plain threshold. The Commander, who fights the dig's
+/// since only a new run brings a fresh one. BP-19a: the digs already finished are settled on the
+/// Foreman first (`settle_foreman`), then the first Foreman's stress band, rank and
+/// Specialisation set the threshold (`foreman_threshold`); no Foreman means the plain
+/// threshold. The Commander, who fights the dig's
 /// raids, is the first usable one (not KIA, not Shattered: the mission route's refusals), or
 /// with `prefer_free` the first usable one not busy (`usable_commander`); a squad hire gives a
 /// member a second (BP-18a-2), so the client names the Commander it fights with. `409` when
 /// none is usable. The Crew is checked first, so a member with neither hears about the Crew.
-async fn dig_start(state: &AppState, campaign_id: Uuid, wallet: &[u8], prefer_free: bool, now: DateTime<Utc>, route: &str) -> Result<DigStart, AppError> {
+async fn dig_start(state: &Arc<AppState>, campaign_id: Uuid, wallet: &[u8], prefer_free: bool, now: DateTime<Utc>, route: &str) -> Result<DigStart, AppError> {
+    settle_foreman(state, campaign_id, wallet, now).await;
     let crews = state.crew_repo.list_crews_for_member(campaign_id, wallet).await.map_err(|e| {
         internal_error(format!("{route}: list_crews_for_member failed for campaign {campaign_id}: {e}"))
     })?;
@@ -729,9 +773,11 @@ async fn dig_start(state: &AppState, campaign_id: Uuid, wallet: &[u8], prefer_fr
     let foremen = state.foreman_repo.list_foremen_for_member(campaign_id, wallet).await.map_err(|e| {
         internal_error(format!("{route}: list_foremen_for_member failed for campaign {campaign_id}: {e}"))
     })?;
-    let coolant = foremen.first().is_some_and(|f| f.specialization == ForemanSpecialization::CoolantJockey.as_str());
+    let threshold = foremen.first().map_or(DEMO_HEAT_THRESHOLD, |f| {
+        foreman_threshold(ForemanRead { stress: f.stress, is_shattered: f.is_shattered, rank: f.rank, coolant_jockey: f.specialization == ForemanSpecialization::CoolantJockey.as_str() })
+    });
     let commander_id = usable_commander(state, campaign_id, wallet, prefer_free, now, route).await?;
-    Ok(DigStart { crew_id: crew.crew_id, commander_id, threshold: dig_threshold(coolant), section_id: None, escort: true })
+    Ok(DigStart { crew_id: crew.crew_id, commander_id, threshold, section_id: None, escort: true })
 }
 
 /// The member's first usable Commander (BP-11a-2, extracted from `dig_start`): not KIA, not
@@ -861,6 +907,7 @@ async fn post_ops_return(
         Err(ReturnRefusal::RaidPending) => return Err(conflict("raiders at the site")),
         Err(ReturnRefusal::SayWhich) => return Err(bad_request("say which squad")),
     }
+    settle_foreman(&state, campaign_id, &wallet, now).await;
     Ok(ops_response(&state, campaign_id, gw, &board, now))
 }
 
@@ -954,6 +1001,7 @@ async fn post_ops_next(
         Err(NextRefusal::DigHeld) => return Err(conflict("an op is already under way")),
         Err(NextRefusal::Taken) => return Err(conflict("another squad has that contract")),
     }
+    settle_foreman(&state, campaign_id, &wallet, now).await;
     Ok(ops_response(&state, campaign_id, gw, &board, now))
 }
 
@@ -982,7 +1030,7 @@ async fn post_ops_drill(
         return Ok(r);
     }
     let now = Utc::now();
-    let (campaign, gateway, _) = ops_member(&state, &token, campaign_id, "post_ops_drill").await?;
+    let (campaign, gateway, wallet) = ops_member(&state, &token, campaign_id, "post_ops_drill").await?;
     let Some(gw) = gateway else {
         return Err(conflict("no op under way"));
     };
@@ -1016,6 +1064,7 @@ async fn post_ops_drill(
         Err(DrillRefusal::RaidPending) => return Err(conflict("raiders at the site")),
     }
     drop(launch);
+    settle_foreman(&state, campaign_id, &wallet, now).await;
     Ok(ops_response(&state, campaign_id, gw, &board, now))
 }
 
@@ -1097,6 +1146,7 @@ async fn post_ops_escort(
         Err(EscortRefusal::SectionBusy) => return Err(conflict("that squad is out")),
         Err(EscortRefusal::CommanderBusy) => return Err(conflict("every Commander is out")),
     }
+    settle_foreman(&state, campaign_id, &wallet, now).await;
     Ok(ops_response(&state, campaign_id, gw, &board, now))
 }
 
@@ -1122,7 +1172,7 @@ async fn post_ops_pull(
         return Ok(r);
     }
     let now = Utc::now();
-    let (campaign, gateway, _) = ops_member(&state, &token, campaign_id, "post_ops_pull").await?;
+    let (campaign, gateway, wallet) = ops_member(&state, &token, campaign_id, "post_ops_pull").await?;
     let Some(gw) = gateway else {
         return Err(conflict("no op under way"));
     };
@@ -1137,6 +1187,7 @@ async fn post_ops_pull(
         Err(PullRefusal::NothingToHaul) => return Err(conflict("nothing to haul: return instead")),
         Err(PullRefusal::RaidPending) => return Err(conflict("raiders at the site")),
     }
+    settle_foreman(&state, campaign_id, &wallet, now).await;
     Ok(ops_response(&state, campaign_id, gw, &board, now))
 }
 
@@ -1168,7 +1219,7 @@ async fn post_ops_build(
         Err(rej) => return Ok(rej.into_response()),
     };
     let now = Utc::now();
-    let (campaign, gateway, _) = ops_member(&state, &token, campaign_id, "post_ops_build").await?;
+    let (campaign, gateway, wallet) = ops_member(&state, &token, campaign_id, "post_ops_build").await?;
     let Some(gw) = gateway else {
         return Err(conflict("no gateway assigned"));
     };
@@ -1183,6 +1234,7 @@ async fn post_ops_build(
         Err(BuildRefusal::AlreadyBuilt) => return Err(conflict("already built")),
         Err(BuildRefusal::NotEnoughOre) => return Err(conflict("not enough banked ore")),
     }
+    settle_foreman(&state, campaign_id, &wallet, now).await;
     Ok(ops_response(&state, campaign_id, gw, &board, now))
 }
 
@@ -1214,7 +1266,7 @@ async fn post_ops_heal(
         Err(rej) => return Ok(rej.into_response()),
     };
     let now = Utc::now();
-    let (campaign, gateway, _) = ops_member(&state, &token, campaign_id, "post_ops_heal").await?;
+    let (campaign, gateway, wallet) = ops_member(&state, &token, campaign_id, "post_ops_heal").await?;
     let Some(gw) = gateway else {
         return Err(conflict("no gateway assigned"));
     };
@@ -1229,6 +1281,7 @@ async fn post_ops_heal(
         Err(HealRefusal::AlreadyHealing) => return Err(conflict("already healing")),
         Err(HealRefusal::NotEnoughCredits) => return Err(conflict("not enough banked credits")),
     }
+    settle_foreman(&state, campaign_id, &wallet, now).await;
     Ok(ops_response(&state, campaign_id, gw, &board, now))
 }
 
@@ -1303,11 +1356,13 @@ async fn post_ops_replace(
         Err(ReplaceRefusal::NotEnoughCredits) => return Err(conflict("not enough banked credits")),
     };
     let task_state = state.clone();
-    let handle = tokio::spawn(async move { replace_write(task_state, campaign_id, wallet, target, n, hold).await });
+    let task_wallet = wallet.clone();
+    let handle = tokio::spawn(async move { replace_write(task_state, campaign_id, task_wallet, target, n, hold).await });
     match handle.await {
         Ok(result) => result?,
         Err(e) => return Err(internal_error(format!("post_ops_replace: task failed for campaign {campaign_id}: {e}"))),
     }
+    settle_foreman(&state, campaign_id, &wallet, now).await;
     Ok(ops_response(&state, campaign_id, gw, &board, now))
 }
 
@@ -1393,11 +1448,13 @@ async fn post_ops_hire(
         Err(HireRefusal::NotEnoughCredits) => return Err(conflict("not enough banked credits")),
     };
     let task_state = state.clone();
-    let handle = tokio::spawn(async move { hire_write(task_state, campaign_id, wallet, hold).await });
+    let task_wallet = wallet.clone();
+    let handle = tokio::spawn(async move { hire_write(task_state, campaign_id, task_wallet, hold).await });
     match handle.await {
         Ok(result) => result?,
         Err(e) => return Err(internal_error(format!("post_ops_hire: task failed for campaign {campaign_id}: {e}"))),
     }
+    settle_foreman(&state, campaign_id, &wallet, now).await;
     Ok(ops_response(&state, campaign_id, gw, &board, now))
 }
 
@@ -4209,24 +4266,28 @@ mod tests {
     }
 
     /// BP-18b-2a rework (W1, Reviewer F1): a guarded dig S1/C1 with a raid pending and C2 free. C1
-    /// fights it (S1), then is Shattered. The next read latches C1's fight instead of re-leading:
-    /// no raid, the fight's pay banked in the store (the mission route's report, which the latch's
-    /// recompute equals), and C2 never recorded on the dig.
+    /// fights it (S1, planted with `fight_logged`), then is Shattered. The next read latches C1's
+    /// fight instead of re-leading: no raid, the fight's pay banked in the store (the planted
+    /// deployment's `replay_report`), C2 never recorded on the dig, and the dig kept by C1.
     #[tokio::test]
     async fn ops_relead_skips_a_battle_its_commander_fought() {
         let state = Arc::new(session_state());
         let (c, _) = dig_campaign(&state, false).await;
         let c1 = commander_of_first(&state, c).await;
-        let c2 = second_commander(&state, c).await;
         let (s1, _s2) = second_section(&state, c).await;
         dig_on_site(&state, c, 7).await;
         let (status, body, _) = drill(&state, c).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["active_op"]["dig"]["raid"], serde_json::json!({"mission_id": "GUARD_DUTY"}), "{body}");
         let before = state.demo_ops.store.ops_state(c, chrono::Utc::now()).credits_banked;
-        let (status, m) = mission_with(&state, c1, s1).await;
-        assert_eq!(status, StatusCode::OK, "{m}");
-        let pay = m["report"]["rewards"]["credits"].as_u64().expect("the fight's pay");
+        // Reviewer BP-18b-2a F2: C1's fight planted as the latch tests do (`fight_logged`, before
+        // C2 exists: `commander_of` reads the one Commander), its pay from the replay.
+        assert_eq!(fight_logged(&state, c, SUCCESS_SEED, None).await, (c1, s1));
+        let deps = state.commander_repo.list_deployments_by_commander(c1).await.expect("deployments");
+        assert_eq!(deps.len(), 1);
+        let (report, _) = replay_report(&state, &deps[0], "test").await.expect("replay_report");
+        let pay = u64::from(report.rewards.credits);
+        let c2 = second_commander(&state, c).await;
         state.commander_repo.set_shattered(c1).await.expect("set_shattered");
         let (status, body) = get(&state, Some("t"), c).await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -4235,9 +4296,7 @@ mod tests {
         assert_eq!(u64::from(after - before), pay, "C1's fight is paid");
         let led = state.demo_ops.store.busy_commanders(c, &[c1, c2], chrono::Utc::now());
         assert!(!led.contains(&c2), "C2 is never recorded on the dig");
-        if !body["active_op"].is_null() {
-            assert_eq!(led, vec![c1], "the dig keeps C1");
-        }
+        assert_eq!(led, vec![c1], "the dig keeps C1");
     }
 
     /// The member's first Commander (the one `dig_campaign` seeds).
@@ -4517,5 +4576,83 @@ mod tests {
         state.section_repo.update_headcount(s1, 0).await.expect("update_headcount");
         let (status, body, _) = next(&state, c, SITE).await;
         assert_eq!((status, err(&body)), (StatusCode::CONFLICT, Some("the guard hasn't reached the dig")));
+    }
+
+    // ---- BP-19a: the Foreman's settlement and the threshold bands.
+
+    /// A dig campaign (`dig_campaign`) whose one Foreman stands at `stress` (rank 1), Shattered
+    /// when `shattered`, a Coolant-Jockey when `coolant`. Returns the campaign.
+    async fn foreman_campaign(state: &Arc<AppState>, stress: i16, shattered: bool, coolant: bool) -> Uuid {
+        let c = campaign_with(state, WALLET, true, Some(GATEWAY)).await;
+        seed_sector(state, &c).await;
+        let mut foreman = crate::foreman_gen::generate_foreman(WALLET.to_vec(), c.campaign_id, 7);
+        let other = ForemanSpecialization::ALL.iter().map(|s| s.as_str()).find(|s| *s != "Coolant-Jockey").unwrap();
+        foreman.specialization = if coolant { "Coolant-Jockey" } else { other }.to_string();
+        foreman.stress = stress;
+        foreman.is_shattered = shattered;
+        foreman.rank = 1;
+        foreman.xp = 0;
+        state.foreman_repo.create_foreman(foreman).await.expect("create_foreman");
+        state.crew_repo.create_crew(crate::repository::CrewRecord::new_hire(c.campaign_id, WALLET.to_vec())).await.expect("create_crew");
+        seed_commander(state, c.campaign_id).await;
+        c.campaign_id
+    }
+
+    /// The member's first Foreman, as stored.
+    async fn first_foreman(state: &AppState, campaign: Uuid) -> crate::repository::ForemanRecord {
+        let all = state.foreman_repo.list_foremen_for_member(campaign, &WALLET).await.expect("list_foremen_for_member");
+        all.into_iter().next().expect("the Foreman")
+    }
+
+    /// Seed 2, two drills (60 ore), pulled and home: the first read after the arrival settles the
+    /// Foreman (stress 10 + 3 × 2, XP 25); a second read writes nothing more.
+    #[tokio::test]
+    async fn ops_landed_dig_settles_the_foreman_once() {
+        let state = Arc::new(session_state());
+        let c = foreman_campaign(&state, 0, false, false).await;
+        dig_on_site(&state, c, 2).await;
+        assert_eq!(drill(&state, c).await.0, StatusCode::OK);
+        assert_eq!(drill(&state, c).await.0, StatusCode::OK);
+        let (status, body, _) = pull(&state, c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["active_op"]["dig"]["carried"], 60, "{body}");
+        state.demo_ops.store.rewind_op(c, dig_secs(&state, c).await);
+        for read in 1..=2 {
+            let (status, body) = get(&state, Some("t"), c).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert!(body["active_op"].is_null(), "home: {body}");
+            let f = first_foreman(&state, c).await;
+            assert_eq!((f.stress, f.xp), (16, 25), "read {read}");
+        }
+    }
+
+    /// The dig's threshold reads the Foreman's band: (a) a plain Foreman at stress 40 (Strained)
+    /// gives 95; (b) a Shattered Coolant-Jockey at stress 50 gives 90 (115 before BP-19a).
+    #[tokio::test]
+    async fn ops_dig_start_reads_the_foreman_band() {
+        for (stress, shattered, coolant, want) in [(40, false, false, 95), (50, true, true, 90)] {
+            let state = Arc::new(session_state());
+            let c = foreman_campaign(&state, stress, shattered, coolant).await;
+            let (status, body, _) = start(&state, c, DIG).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["active_op"]["dig"]["threshold"], want, "stress {stress}, shattered {shattered}, coolant {coolant}");
+        }
+    }
+
+    /// A plain rank-1 Foreman at stress 25; seed 2's two-drill haul has arrived, unread. The next
+    /// start settles it first (25 + 16 = 41, Strained), so the new dig's threshold is 95.
+    #[tokio::test]
+    async fn ops_start_settles_the_last_dig_before_reading_the_band() {
+        let state = Arc::new(session_state());
+        let c = foreman_campaign(&state, 25, false, false).await;
+        dig_on_site(&state, c, 2).await;
+        assert_eq!(drill(&state, c).await.0, StatusCode::OK);
+        assert_eq!(drill(&state, c).await.0, StatusCode::OK);
+        let (status, body, _) = pull(&state, c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        state.demo_ops.store.rewind_op(c, site_secs(&body, DIG));
+        let (status, body, _) = start(&state, c, DIG).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["active_op"]["dig"]["threshold"], 95, "{body}");
     }
 }

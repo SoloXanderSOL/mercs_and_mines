@@ -10,8 +10,9 @@ use super::{AcquiredVia, RepositoryError};
 
 /// A Mining Foreman's row in `foreman_records` (migration 0022). The roster columns hold
 /// `sim_engine::roster` display strings, pinned by `0022`'s CHECKs. The career columns
-/// (rank, xp, stress, is_shattered, is_kia) mirror `commander_records` and have no writer
-/// until Phase 2 §13.
+/// (rank, xp, stress, is_shattered, is_kia) mirror `commander_records`. Their one writer is
+/// `settle_foreman_dig` (BP-19a, demo-only on `breakpoint`, dropped at the port), which writes
+/// stress, xp, rank and is_shattered; nothing writes is_kia. Phase 2 §13 owns the keeper writer.
 #[derive(Debug, Clone)]
 pub struct ForemanRecord {
     pub foreman_id:      Uuid,
@@ -56,6 +57,11 @@ pub trait ForemanRepository: Send + Sync {
     /// One member's Foremen in `campaign_id`, oldest first (`created_at`, then `foreman_id`).
     /// The roster route's read (BP-2b-2).
     async fn list_foremen_for_member(&self, campaign_id: Uuid, player_wallet: &[u8]) -> Result<Vec<ForemanRecord>, RepositoryError>;
+    /// **Demo-only (BP-19a, `breakpoint`; dropped at the port).** Adds what finished digs owe
+    /// the Foreman, computed from the row as it stands under its lock: stress capped at 100
+    /// (Shattered at 100, never cleared here), xp added, rank `max(rank, rank_for_xp(xp))`.
+    /// `Ok(false)` and nothing written for an unknown or KIA Foreman.
+    async fn settle_foreman_dig(&self, foreman_id: Uuid, stress: u32, xp: u32) -> Result<bool, RepositoryError>;
 }
 
 // ── PostgresForemanRepository ────────────────────────────────────────────────
@@ -218,6 +224,40 @@ impl ForemanRepository for PostgresForemanRepository {
             updated_at:      r.updated_at,
         }).collect())
     }
+
+    async fn settle_foreman_dig(&self, foreman_id: Uuid, stress: u32, xp: u32) -> Result<bool, RepositoryError> {
+        // Dropping `tx` without commit rolls back. The row lock is held to commit, so the
+        // effects are computed from what any other writer committed before us (§4c).
+        let mut tx = self.pool.begin().await.map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        let row = sqlx::query!(
+            "SELECT stress, xp, rank, is_kia FROM foreman_records WHERE foreman_id = $1 FOR NO KEY UPDATE",
+            foreman_id,
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        let Some(row) = row.filter(|r| !r.is_kia) else {
+            tx.commit().await.map_err(|e| RepositoryError::Internal(e.to_string()))?;
+            return Ok(false);
+        };
+        let due_stress = i32::try_from(stress).unwrap_or(i32::MAX);
+        let new_stress = i32::from(row.stress).saturating_add(due_stress).min(100);
+        let new_xp = row.xp.saturating_add(i32::try_from(xp).unwrap_or(i32::MAX));
+        let new_rank = row.rank.max(crate::commander_gen::rank_for_xp(new_xp));
+        let new_stress = i16::try_from(new_stress).map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        sqlx::query!(
+            "UPDATE foreman_records SET stress = $2, xp = $3, rank = $4, is_shattered = is_shattered OR $2 >= 100::SMALLINT, updated_at = now() WHERE foreman_id = $1",
+            foreman_id,
+            new_stress,
+            new_xp,
+            new_rank,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        tx.commit().await.map_err(|e| RepositoryError::Internal(e.to_string()))?;
+        Ok(true)
+    }
 }
 
 // ── InMemoryForemanRepository ────────────────────────────────────────────────
@@ -266,6 +306,23 @@ impl ForemanRepository for InMemoryForemanRepository {
             .collect();
         rows.sort_by_key(|r| (r.created_at, r.foreman_id));
         Ok(rows)
+    }
+
+    async fn settle_foreman_dig(&self, foreman_id: Uuid, stress: u32, xp: u32) -> Result<bool, RepositoryError> {
+        let Some(mut r) = self.store.get_mut(&foreman_id) else {
+            return Ok(false);
+        };
+        if r.is_kia {
+            return Ok(false);
+        }
+        let due_stress = i32::try_from(stress).unwrap_or(i32::MAX);
+        r.stress = i32::from(r.stress).saturating_add(due_stress).min(100) as i16;
+        r.xp = r.xp.saturating_add(i32::try_from(xp).unwrap_or(i32::MAX));
+        r.rank = r.rank.max(crate::commander_gen::rank_for_xp(r.xp));
+        // `create_foreman`'s invariant: a record at 100 is Shattered.
+        r.is_shattered = r.is_shattered || r.stress >= 100;
+        r.updated_at = Utc::now();
+        Ok(true)
     }
 }
 

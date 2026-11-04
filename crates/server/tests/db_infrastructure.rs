@@ -3516,6 +3516,39 @@ async fn test_foreman_records_reject_non_canon_roster_values() {
     clean_wallet_4g1(&pool, &wallet).await;
 }
 
+/// BP-19a (demo-only, `breakpoint`) — `settle_foreman_dig` caps stress at 100 and Shatters
+/// there, adds XP and ranks up from it; a KIA Foreman and an unknown id write nothing.
+#[tokio::test]
+async fn pg_settle_foreman_dig_caps_and_ranks() {
+    let pool = match test_pool().await {
+        Some(p) => p,
+        None => { eprintln!("TEST_DATABASE_URL not set — skipping live DB integration test"); return; }
+    };
+    let wallet = [113u8; 32];
+    clean_wallet_4g1(&pool, &wallet).await;
+    let campaign_id = seed_account_and_campaign(&pool, wallet, 0x19A1_i64).await;
+    let repo = PostgresForemanRepository::new(pool.clone());
+
+    let mut worn = hand_built_foreman(wallet, campaign_id);
+    worn.stress = 95;
+    worn.xp = 90;
+    repo.create_foreman(worn.clone()).await.expect("create_foreman failed");
+    assert!(repo.settle_foreman_dig(worn.foreman_id, 10, 25).await.expect("settle_foreman_dig"));
+    let got = repo.get_foreman(worn.foreman_id).await.unwrap().expect("the Foreman");
+    assert_eq!((got.stress, got.is_shattered, got.xp, got.rank), (100, true, 115, 2));
+
+    let mut dead = hand_built_foreman(wallet, campaign_id);
+    dead.is_kia = true;
+    repo.create_foreman(dead.clone()).await.expect("create_foreman failed");
+    assert!(!repo.settle_foreman_dig(dead.foreman_id, 10, 25).await.expect("settle_foreman_dig"));
+    let got = repo.get_foreman(dead.foreman_id).await.unwrap().expect("the Foreman");
+    assert_eq!((got.stress, got.is_shattered, got.xp, got.rank, got.is_kia), (17, false, 0, 1, true), "a KIA Foreman is unchanged");
+
+    assert!(!repo.settle_foreman_dig(uuid::Uuid::new_v4(), 10, 25).await.expect("settle_foreman_dig"));
+
+    clean_wallet_4g1(&pool, &wallet).await;
+}
+
 /// A hand-built Advisor (7a-2) with the given specialization string.
 fn hand_built_advisor(wallet: [u8; 32], campaign_id: uuid::Uuid, specialization: &str) -> AdvisorRecord {
     AdvisorRecord {

@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE foreman_records SET stress = $2, xp = $3, rank = $4, is_shattered = is_shattered OR $2 >= 100::SMALLINT, updated_at = now() WHERE foreman_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int2",
+        "Int4",
+        "Int2"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d73c75d00c06edc6cd15b36056b769b873f7a902445f9f79610d35c2597887ee"
+}
