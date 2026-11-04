@@ -598,7 +598,7 @@ async fn post_mission_resolve(
     };
     // (BP-16, demo-only) Whether the Gunsmith stands, read once here and logged with the rest:
     // the replay reads the log, never the live base, so a later build can't change this fight.
-    roll_inputs.gunsmith = state.demo_ops.store.base_of(rec.campaign_id).gunsmith;
+    roll_inputs.gunsmith = state.demo_ops.store.base_of(rec.campaign_id, now).gunsmith;
     entry.payload["roll_inputs"] = roll_inputs.to_json();
     if let Err(e) = state.input_log_repo.start_session(&config, &entry).await {
         abort_deployment_or_log(&state, deployment_id).await;

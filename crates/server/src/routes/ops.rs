@@ -36,7 +36,7 @@ use crate::api_types::MissionResolveRequest;
 use crate::auth::AuthSession;
 use crate::demo_ops::{
     fight_losses, fight_wounded, foreman_threshold, ForemanDue, ForemanRead, LeaderClaim, DEMO_BENCH_STRESS_PER_MIN, DEMO_HEAT_THRESHOLD, ops_board, ops_time, raid_fight, raid_result, ActiveOpView, BaseBuilding,
-    BuildRefusal, CompanyView, ContractStart, CrewFightView, DigStart, DrillOutcome, DrillRefusal, EscortRefusal, FightPay,
+    BuildRefusal, CompanyView, ConstructionView, ContractStart, CrewFightView, DigStart, DrillOutcome, DrillRefusal, EscortRefusal, FightPay,
     HealRefusal, MoreOp, NextRefusal, OpSquad, OpsBase, OpsBoard, OpsSite, PullRefusal, RaidResult, ReplaceHold, ReplaceRefusal,
     ReturnRefusal, StartRefusal, DEMO_CREW_FIGHT_MORALE_LOSS, DEMO_MELTDOWN_MORALE_LOSS, DEMO_REPLACE_MERC_CREDITS,
     DEMO_REPLACE_MINER_CREDITS,
@@ -102,6 +102,9 @@ pub struct OpsView<'a> {
     /// The latest landed hazard trips (BP-20a-2), newest last, at most 3; absent when there are none.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub trip_reports: Vec<TripReport>,
+    /// The building going up (BP-21): `{"building", "done_at"}`; absent when none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub construction: Option<ConstructionView>,
 }
 
 /// A board site as sent (BP-20a-1): the site's own keys, flattened, then its ways, Fast first.
@@ -340,7 +343,7 @@ async fn load_board(
 }
 
 fn ops_response(state: &AppState, campaign_id: Uuid, gw: (i32, i32), board: &OpsBoard, now: DateTime<Utc>) -> Response {
-    let (s, more_ops, squads, trip_reports) = state.demo_ops.store.ops_body(campaign_id, now);
+    let (s, more_ops, squads, trip_reports, construction) = state.demo_ops.store.ops_body(campaign_id, now);
     // BP-11a-3: the sites as they stand (a fought contract off the board, a returned one moved);
     // the route's own board only when the campaign has no entry (a store full of ops).
     let sites = site_views(s.sites.as_deref().unwrap_or(&board.sites), board);
@@ -357,6 +360,7 @@ fn ops_response(state: &AppState, campaign_id: Uuid, gw: (i32, i32), board: &Ops
         crew_fight: s.crew_fight,
         more_ops,
         trip_reports,
+        construction,
     };
     Json(view).into_response()
 }
@@ -625,7 +629,7 @@ async fn get_ops_board(
     let now = Utc::now();
     let (campaign, gateway, wallet) = ops_member(&state, &token, campaign_id, "get_ops_board").await?;
     let Some(gw) = gateway else {
-        let view = OpsView { campaign_id, gateway: None, sites: Vec::new(), active_op: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), company: CompanyBody::new(CompanyView::default(), 1), now: ops_time(now), crew_fight: None, more_ops: Vec::new(), trip_reports: Vec::new() };
+        let view = OpsView { campaign_id, gateway: None, sites: Vec::new(), active_op: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), company: CompanyBody::new(CompanyView::default(), 1), now: ops_time(now), crew_fight: None, more_ops: Vec::new(), trip_reports: Vec::new(), construction: None };
         return Ok(Json(view).into_response());
     };
     let board = load_board(&state, &campaign, gw, now, false, "get_ops_board").await?;
@@ -1346,10 +1350,13 @@ async fn post_ops_pull(
 /// demo-only). Order: `401` → `429` `ops_ip` → `429` `ops_wallet` → axum's body rejection,
 /// counted (`413` over `OPS_BODY_LIMIT`; `400`, `415`, `422`) → `404` → `403` → `409` not `Active`
 /// (entry dropped) → `409` no gateway → the board → a pending raid latched → `400` unknown building
-/// → `409` the team is out → `409` already built → `409` not enough banked ore → `200`, the whole
-/// state.
+/// → `409` the team is out → `409` already built → `409` already building (BP-21) → `409` not
+/// enough banked ore → `200`, the whole state.
 /// - The cost is debited from `ore_banked` and `base` names what stands. A haul that has come
 ///   home banks first, so its ore can pay on the same call.
+/// - BP-21: the building stands `BaseBuilding::build_secs` later (the body's `construction`
+///   until then), one at a time. An op may start while it goes up; it counts from the first
+///   roll after it stands, and no rolled number is read again (ruling R3).
 /// - Never while an op is out (a contract until its homeward leg lands, a haul still on the
 ///   road), so no base number changes under a live op and a haul's ambush stays as the pull
 ///   rolled it. A pending raid means an op is out, so no `RaidPending` arm is needed.
@@ -1383,6 +1390,7 @@ async fn post_ops_build(
         Ok(()) => {}
         Err(BuildRefusal::OpOut) => return Err(conflict("the team is out: build when they're home")),
         Err(BuildRefusal::AlreadyBuilt) => return Err(conflict("already built")),
+        Err(BuildRefusal::AlreadyBuilding) => return Err(conflict("already building")),
         Err(BuildRefusal::NotEnoughOre) => return Err(conflict("not enough banked ore")),
     }
     settle_leaders(&state, campaign_id, &wallet, now).await;
@@ -3116,7 +3124,10 @@ mod tests {
     }
 
     /// Seed 2's 120-ore haul lands; the build's own call banks it and pays the Radio Shack's 50,
-    /// and `base` shows it. Then already built, then short of ore; a board read shows the same.
+    /// and `construction` names it going up while `base` shows none yet (BP-21). A second build
+    /// is `already building`, whichever building. Once it stands (`rewind_build`), `base` shows it
+    /// and `construction` is absent. Then already built, then short of ore; a board read shows the
+    /// same.
     #[tokio::test]
     async fn ops_build_spends_the_bank_and_shows_the_base() {
         let state = Arc::new(session_state());
@@ -3133,8 +3144,19 @@ mod tests {
         let (status, body, _) = build(&state, c, "radio_shack").await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(body["active_op"].is_null(), "home: {body}");
+        assert_eq!((body["ore_banked"].as_u64(), &body["base"]), (Some(70), &none));
+        assert_eq!(body["construction"]["building"], "radio_shack");
+        assert!(body["construction"]["done_at"].is_string(), "{body}");
+        for other in ["radio_shack", "gunsmith"] {
+            let (status, body, _) = build(&state, c, other).await;
+            assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("already building")), "{other}");
+        }
+        state.demo_ops.store.rewind_build(c, crate::demo_ops::DEMO_BUILD_SECS_RADIO_SHACK);
         let shack = serde_json::json!({"radio_shack": true, "hobbyist_benches": false, "grease_pit": false, "gunsmith": false, "basic_smelter": false});
+        let (status, body) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!((body["ore_banked"].as_u64(), &body["base"]), (Some(70), &shack));
+        assert!(body.get("construction").is_none(), "absent once it stands: {body}");
         let (status, body, _) = build(&state, c, "radio_shack").await;
         assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("already built")));
         let (status, body, _) = build(&state, c, "gunsmith").await;

@@ -299,6 +299,14 @@ pub const DEMO_COST_GREASE_PIT: u32 = 80;
 pub const DEMO_COST_HOBBYIST_BENCHES: u32 = 120;
 /// The Basic Smelter's cost in banked ore.
 pub const DEMO_COST_BASIC_SMELTER: u32 = 80;
+/// Seconds each building takes to go up (BP-21, §4e C2), read through `BaseBuilding::build_secs`.
+/// A demo scale: canon T1 construction takes about 15 minutes (`Economy_Balancing_Stub`), and no
+/// shipped string states these seconds as the game's build times.
+pub const DEMO_BUILD_SECS_RADIO_SHACK: i64 = 15;
+pub const DEMO_BUILD_SECS_GREASE_PIT: i64 = 20;
+pub const DEMO_BUILD_SECS_BASIC_SMELTER: i64 = 20;
+pub const DEMO_BUILD_SECS_GUNSMITH: i64 = 25;
+pub const DEMO_BUILD_SECS_HOBBYIST_BENCHES: i64 = 30;
 
 /// One pin on the board. A dig carries `tier`; a contract carries `mission_id` and `name`.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -1090,6 +1098,28 @@ impl BaseBuilding {
             Self::BasicSmelter => DEMO_COST_BASIC_SMELTER,
         }
     }
+
+    /// Its seconds to go up (BP-21), a `DEMO_BUILD_SECS_*` const.
+    pub fn build_secs(self) -> i64 {
+        match self {
+            Self::RadioShack => DEMO_BUILD_SECS_RADIO_SHACK,
+            Self::HobbyistBenches => DEMO_BUILD_SECS_HOBBYIST_BENCHES,
+            Self::GreasePit => DEMO_BUILD_SECS_GREASE_PIT,
+            Self::Gunsmith => DEMO_BUILD_SECS_GUNSMITH,
+            Self::BasicSmelter => DEMO_BUILD_SECS_BASIC_SMELTER,
+        }
+    }
+
+    /// Its id in a body (BP-21, the body's `construction`): `from_id`'s inverse.
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::RadioShack => "radio_shack",
+            Self::HobbyistBenches => "hobbyist_benches",
+            Self::GreasePit => "grease_pit",
+            Self::Gunsmith => "gunsmith",
+            Self::BasicSmelter => "basic_smelter",
+        }
+    }
 }
 
 /// The campaign's merc base (BP-10a): which buildings stand, serialised as the body's `base`.
@@ -1574,6 +1604,8 @@ pub enum BuildRefusal {
     OpOut,
     /// The building already stands.
     AlreadyBuilt,
+    /// A building is already going up (BP-21): one at a time, the pending one included.
+    AlreadyBuilding,
     /// The banked ore is short of the building's cost (also: the campaign has no entry).
     NotEnoughOre,
 }
@@ -1585,6 +1617,21 @@ pub enum BuildRefusal {
 struct ContractSlot {
     finished_at: Option<DateTime<Utc>>,
     pin: Option<(i32, i32, u32, u32)>,
+}
+
+/// A building going up (BP-21): which, and when it stands (`OpsEntry::settle_build`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingBuild {
+    building: BaseBuilding,
+    done_at: DateTime<Utc>,
+}
+
+/// The body's `construction` (BP-21): the building going up and when it stands,
+/// `{"building": "radio_shack", "done_at": "…Z"}` (RFC 3339 ms, like `now`); absent when none.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ConstructionView {
+    pub building: &'static str,
+    pub done_at: String,
 }
 
 /// One campaign's ops state: the cached board, the ops in flight (one slot each), when the team
@@ -1654,9 +1701,28 @@ struct OpsEntry {
     trip_reports: Vec<TripReport>,
     /// The last report's `seq` (BP-20a-2): 0 until the first.
     trip_seq: u32,
+    /// The building going up (BP-21): set by `build_op` with its ore already debited, stood by
+    /// `settle_build`. On the keep list (the player has paid for it); never at a default with
+    /// nothing else set, since only a completion clears it and a completion sets `base`.
+    pending_build: Option<PendingBuild>,
 }
 
 impl OpsEntry {
+    /// Stands a pending build whose `done_at` has come (BP-21). Run first by `settle_arrival` and
+    /// alone by `DemoOpsStore::base_of`; idempotent under the store lock, so no claim is needed.
+    /// Writes no `moved_at`: the build's own call did.
+    fn settle_build(&mut self, now: DateTime<Utc>) {
+        if let Some(p) = self.pending_build.filter(|p| now >= p.done_at) {
+            self.base.set(p.building);
+            self.pending_build = None;
+        }
+    }
+
+    /// The body's `construction` (BP-21); `None` when nothing is going up.
+    fn construction(&self) -> Option<ConstructionView> {
+        self.pending_build.map(|p| ConstructionView { building: p.building.id(), done_at: ops_time(p.done_at) })
+    }
+
     /// Every op out, in slot order: the dig, then the contract slots by key.
     fn ops(&self) -> impl Iterator<Item = &ActiveOp> {
         self.dig.iter().chain(self.contracts_out.values())
@@ -1837,7 +1903,10 @@ impl OpsEntry {
     /// movement never moves the stamp back (the same as today's write while one op is out).
     /// BP-18a-2: the wages (`settle_wages`) first of all, so pay a latch adds after this settle
     /// is never taken for minutes that passed before it.
+    /// BP-21: a due build stands before anything else (`settle_build`), so the rest of this
+    /// settle and every caller after it read the base it completes.
     fn settle_arrival(&mut self, now: DateTime<Utc>) {
+        self.settle_build(now);
         self.settle_wages(now);
         self.settle_contracts(now);
         self.settle_sickbay(now);
@@ -2175,7 +2244,8 @@ fn new_op(site: &OpsSite, op_seed: u32, dig: Option<DigStart>, contract: Option<
 /// - only `start_op`, `next_op`, `return_op`, `drill_op`, `pull_op`, `latch_raid` and
 ///   `settle_arrival` (the ambush's reveal and the arrival, run first by every op read and
 ///   write) write a slot. The arrival adds to the banked ore and `build_op` debits it; only
-///   `build_op` writes the base, and never while an op is out. Each takes the lock, calls
+///   `build_op` starts a build, never while an op is out, and only `settle_build` stands it
+///   (BP-21). Each takes the lock, calls
 ///   `settle_arrival` first and returns owned data; none is held across an `.await`;
 /// - **the merc base (BP-10a):** the drill's heat, raid chance and ore, the view's `next_ore`,
 ///   melt check and `next_raid_pct`, and the pull's ambush chance all come from `OpsBase`'s
@@ -2207,8 +2277,8 @@ fn new_op(site: &OpsSite, op_seed: u32, dig: Option<DigStart>, contract: Option<
 ///   `travel_secs` after the pull: an accepted overcount;
 /// - the eviction takes only an entry with no op in any slot, no banked ore, no banked credits, no
 ///   building, no sickbay off the default, no trophy, no replace in flight (BP-12a-1,
-///   BP-12a-2), no undrained Foreman tally (BP-19a, `foreman_due` off the default) and no
-///   undrained hazard tally (BP-20a-2, tested by value);
+///   BP-12a-2), no undrained Foreman tally (BP-19a, `foreman_due` off the default), no
+///   undrained hazard tally (BP-20a-2, tested by value) and no building going up (BP-21);
 /// - **the Foreman's tally (BP-19a):** every place a dig leaves its slot (the homeward arrival in
 ///   `settle_arrival`, a Crew wipe in `drill_op` or `latch_crew`, a guard wipe in `latch_raid`,
 ///   a dig left by `next_op_for`) adds `DigState::settlement` into `foreman_due` in the same
@@ -2260,8 +2330,8 @@ impl DemoOpsStore {
     /// Makes room for a new entry: below the cap, nothing; at it, evicts the least recently
     /// touched entry that holds no op in any slot (BP-18a-1a), no banked ore, no banked credits, no building, no sickbay
     /// off the default, no trophy, no replace in flight (BP-12a-1, BP-12a-2), no undrained
-    /// Foreman tally (BP-19a, tested by value) and no undrained hazard tally (BP-20a-2, tested by
-    /// value), and journals
+    /// Foreman tally (BP-19a, tested by value), no undrained hazard tally (BP-20a-2, tested by
+    /// value) and no building going up (BP-21), and journals
     /// (first, then at most hourly). The sickbay is tested by value, never by presence: a latch
     /// can leave a bay at the default until the entry's next settle (Reviewer BP-12a-1 F1).
     /// `false` when every entry holds one of them. An entry whose only state is a finished contract can go
@@ -2273,7 +2343,7 @@ impl DemoOpsStore {
         }
         let victim = inner
             .iter()
-            .filter(|(_, e)| e.dig.is_none() && e.contracts_out.is_empty() && e.ore_banked == 0 && e.credits_banked == 0 && e.base == OpsBase::default() && e.sickbay.values().all(|b| *b == SickBay::default()) && e.trophies.is_empty() && e.credits_in_flight == 0 && e.foreman_due == ForemanDue::default() && e.hazard_due == HazardDue::default())
+            .filter(|(_, e)| e.dig.is_none() && e.contracts_out.is_empty() && e.ore_banked == 0 && e.credits_banked == 0 && e.base == OpsBase::default() && e.sickbay.values().all(|b| *b == SickBay::default()) && e.trophies.is_empty() && e.credits_in_flight == 0 && e.foreman_due == ForemanDue::default() && e.hazard_due == HazardDue::default() && e.pending_build.is_none())
             .min_by_key(|(_, e)| e.touched)
             .map(|(id, _)| *id);
         let Some(id) = victim else {
@@ -2313,7 +2383,7 @@ impl DemoOpsStore {
         if !self.make_room(&mut inner) {
             return false;
         }
-        inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, dig: None, contracts_out: BTreeMap::new(), moved_at: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), contracts: HashMap::new(), sickbay: HashMap::new(), trophies: Vec::new(), credits_in_flight: 0, crew_fight: None, wages_at: now, bench_at: now, squads: 1, hire_in_flight: false, foreman_due: ForemanDue::default(), hazard_due: HazardDue::default(), trip_reports: Vec::new(), trip_seq: 0 });
+        inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, dig: None, contracts_out: BTreeMap::new(), moved_at: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), contracts: HashMap::new(), sickbay: HashMap::new(), trophies: Vec::new(), credits_in_flight: 0, crew_fight: None, wages_at: now, bench_at: now, squads: 1, hire_in_flight: false, foreman_due: ForemanDue::default(), hazard_due: HazardDue::default(), trip_reports: Vec::new(), trip_seq: 0, pending_build: None });
         true
     }
 
@@ -2368,7 +2438,7 @@ impl DemoOpsStore {
             if !self.make_room(&mut inner) {
                 return Err(StartRefusal::Full);
             }
-            inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, dig: None, contracts_out: BTreeMap::new(), moved_at: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), contracts: HashMap::new(), sickbay: HashMap::new(), trophies: Vec::new(), credits_in_flight: 0, crew_fight: None, wages_at: now, bench_at: now, squads: 1, hire_in_flight: false, foreman_due: ForemanDue::default(), hazard_due: HazardDue::default(), trip_reports: Vec::new(), trip_seq: 0 });
+            inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, dig: None, contracts_out: BTreeMap::new(), moved_at: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), contracts: HashMap::new(), sickbay: HashMap::new(), trophies: Vec::new(), credits_in_flight: 0, crew_fight: None, wages_at: now, bench_at: now, squads: 1, hire_in_flight: false, foreman_due: ForemanDue::default(), hazard_due: HazardDue::default(), trip_reports: Vec::new(), trip_seq: 0, pending_build: None });
         }
         let Some(e) = inner.get_mut(&campaign_id) else {
             return Err(StartRefusal::Full);
@@ -2960,7 +3030,7 @@ impl DemoOpsStore {
     /// always the primary (`slot_keys` is dig-first), so it is never here. Empty with one op or
     /// none. A second return, never a field on `OpsSnapshot`, which a test compares whole.
     pub fn ops_state_all(&self, campaign_id: Uuid, now: DateTime<Utc>) -> (OpsSnapshot, Vec<MoreOp>) {
-        let (snapshot, more_ops, _, _) = self.ops_body(campaign_id, now);
+        let (snapshot, more_ops, _, _, _) = self.ops_body(campaign_id, now);
         (snapshot, more_ops)
     }
 
@@ -2968,11 +3038,12 @@ impl DemoOpsStore {
     /// `company.wages`; and the landed hazard trips (BP-20a-2, the body's `trip_reports`), a return
     /// beside the snapshot, never a field on `OpsSnapshot`. A campaign with no entry counts one squad (every demo member joins with
     /// one), and pays nothing until it has an entry.
-    pub fn ops_body(&self, campaign_id: Uuid, now: DateTime<Utc>) -> (OpsSnapshot, Vec<MoreOp>, u8, Vec<TripReport>) {
+    /// BP-21: the fifth element is the body's `construction`, after the settle.
+    pub fn ops_body(&self, campaign_id: Uuid, now: DateTime<Utc>) -> (OpsSnapshot, Vec<MoreOp>, u8, Vec<TripReport>, Option<ConstructionView>) {
         let mut inner = self.lock();
         let Some(e) = inner.get_mut(&campaign_id) else {
             let none = OpsSnapshot { sites: None, op: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), company: CompanyView::default(), crew_fight: None };
-            return (none, Vec::new(), 1, Vec::new());
+            return (none, Vec::new(), 1, Vec::new(), None);
         };
         e.settle_arrival(now);
         let primary = e.primary_key();
@@ -2997,7 +3068,7 @@ impl DemoOpsStore {
             company: e.company(),
             crew_fight: e.crew_fight,
         };
-        (snapshot, more_ops, e.squads, e.trip_reports.clone())
+        (snapshot, more_ops, e.squads, e.trip_reports.clone(), e.construction())
     }
 
     /// Which of `sections` the store holds busy (BP-18a-1b-2, `OpsEntry::section_busy`), after
@@ -3100,12 +3171,15 @@ impl DemoOpsStore {
         sites.into_iter().find(|s| s.site_id == site_id)
     }
 
-    /// Builds `building` at the campaign's merc base (BP-10a): its cost is debited from the banked
-    /// ore. Settles first, so a haul that has just come home banks before the check and can pay on
-    /// the same call. Never while an op is out, so no base number changes under a live op and a
-    /// haul's ambush stays as the pull rolled it. Writes `moved_at` (the keep list). Refusals in
-    /// order: `OpOut` → `AlreadyBuilt` → `NotEnoughOre` (also for a campaign with no entry, which
-    /// has banked nothing).
+    /// Starts `building` at the campaign's merc base (BP-10a; timed since BP-21): its cost is
+    /// debited from the banked ore at once, and it stands `build_secs` later (`settle_build`, at
+    /// the first read at or after `done_at`). Settles first, so a haul that has just come home
+    /// banks before the check and can pay on the same call, and a due build stands before the
+    /// checks. Never while an op is out. An op may start while a build is going up (BP-21 R3):
+    /// the building counts from the first roll after it stands, and no rolled number is read
+    /// again. One at a time. Writes `moved_at` (the keep list). Refusals in order: `OpOut` →
+    /// `AlreadyBuilt` → `AlreadyBuilding` → `NotEnoughOre` (also for a campaign with no entry,
+    /// which has banked nothing).
     pub fn build_op(&self, campaign_id: Uuid, building: BaseBuilding, now: DateTime<Utc>) -> Result<(), BuildRefusal> {
         let mut inner = self.lock();
         let Some(e) = inner.get_mut(&campaign_id) else {
@@ -3118,12 +3192,15 @@ impl DemoOpsStore {
         if e.base.has(building) {
             return Err(BuildRefusal::AlreadyBuilt);
         }
+        if e.pending_build.is_some() {
+            return Err(BuildRefusal::AlreadyBuilding);
+        }
         let cost = building.cost();
         if e.ore_banked < cost {
             return Err(BuildRefusal::NotEnoughOre);
         }
         e.ore_banked -= cost;
-        e.base.set(building);
+        e.pending_build = Some(PendingBuild { building, done_at: now + Duration::seconds(building.build_secs()) });
         e.moved_at = Some(now);
         e.touched = now;
         Ok(())
@@ -3177,10 +3254,13 @@ impl DemoOpsStore {
     }
 
     /// The campaign's base as it stands (BP-16), for the mission route's Gunsmith row: a copy
-    /// taken under the lock, with no settle (settling never changes `base`); no entry reads as
-    /// no building.
-    pub fn base_of(&self, campaign_id: Uuid) -> OpsBase {
-        self.lock().get(&campaign_id).map_or_else(OpsBase::default, |e| e.base)
+    /// taken under the lock after `settle_build` alone (BP-21: a due build stands; no wages, no
+    /// arrival); no entry reads as no building.
+    pub fn base_of(&self, campaign_id: Uuid, now: DateTime<Utc>) -> OpsBase {
+        self.lock().get_mut(&campaign_id).map_or_else(OpsBase::default, |e| {
+            e.settle_build(now);
+            e.base
+        })
     }
 
     /// Heals every wounded soldier of `section_id` at once (BP-12a-1, §4e B3), for
@@ -3371,6 +3451,15 @@ impl DemoOpsStore {
                     *t -= back;
                 }
             }
+        }
+    }
+
+    /// Moves the campaign's pending build `secs` into the past (BP-21), so a route test sees it
+    /// stand without sleeping. `rewind_op` leaves it.
+    #[cfg(test)]
+    pub(crate) fn rewind_build(&self, campaign_id: Uuid, secs: i64) {
+        if let Some(p) = self.lock().get_mut(&campaign_id).and_then(|e| e.pending_build.as_mut()) {
+            p.done_at -= Duration::seconds(secs);
         }
     }
 
@@ -4524,8 +4613,8 @@ mod tests {
         assert_eq!(store.ops_snapshot(a, at(30)).1, 120);
     }
 
-    /// A build debits its cost and stands. Already built comes before short of ore, and a
-    /// refusal moves nothing.
+    /// A build debits its cost at once and stands `build_secs` later (BP-21: the Radio Shack's
+    /// 15 s, from 31 to 46). Already built comes before short of ore, and a refusal moves nothing.
     #[test]
     fn ops_store_build_debits_the_bank_and_stands() {
         let store = DemoOpsStore::new(2);
@@ -4534,10 +4623,10 @@ mod tests {
         banked_120(&store, a);
         assert_eq!(store.build_op(a, BaseBuilding::RadioShack, at(31)), Ok(()));
         let shack = OpsBase { radio_shack: true, ..OpsBase::default() };
-        assert_eq!(store.ops_snapshot(a, at(32)), (None, 70, shack));
-        assert_eq!(store.build_op(a, BaseBuilding::RadioShack, at(33)), Err(BuildRefusal::AlreadyBuilt));
-        assert_eq!(store.build_op(a, BaseBuilding::Gunsmith, at(34)), Err(BuildRefusal::NotEnoughOre));
-        assert_eq!(store.ops_snapshot(a, at(35)), (None, 70, shack));
+        assert_eq!(store.ops_snapshot(a, at(46)), (None, 70, shack));
+        assert_eq!(store.build_op(a, BaseBuilding::RadioShack, at(47)), Err(BuildRefusal::AlreadyBuilt));
+        assert_eq!(store.build_op(a, BaseBuilding::Gunsmith, at(48)), Err(BuildRefusal::NotEnoughOre));
+        assert_eq!(store.ops_snapshot(a, at(49)), (None, 70, shack));
     }
 
     /// Never while an op is out, and "out" comes first: a haul on the road (nothing banked yet),
@@ -4658,6 +4747,80 @@ mod tests {
         assert!(!store.moved_since(a, at(400), at(450)), "home at 30 s, nothing since");
         assert_eq!(store.build_op(a, BaseBuilding::RadioShack, at(500)), Ok(()));
         assert!(store.moved_since(a, at(500), at(501)), "the build");
+    }
+
+    /// BP-21: a build is pending until its `done_at` and stands at it, not a second before; the
+    /// body's `construction` names it until then and is gone after.
+    #[test]
+    fn ops_store_build_stands_at_its_done_at() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        banked_120(&store, a);
+        assert_eq!(store.build_op(a, BaseBuilding::RadioShack, at(31)), Ok(()));
+        assert_eq!(store.ops_snapshot(a, at(45)), (None, 70, OpsBase::default()), "paid, not yet standing");
+        assert_eq!(store.ops_body(a, at(45)).4, Some(ConstructionView { building: "radio_shack", done_at: ops_time(at(46)) }));
+        let shack = OpsBase { radio_shack: true, ..OpsBase::default() };
+        assert_eq!(store.ops_snapshot(a, at(46)), (None, 70, shack));
+        assert_eq!(store.ops_body(a, at(46)).4, None);
+    }
+
+    /// BP-21: one build at a time. While the Radio Shack goes up, the same building and another
+    /// are both `AlreadyBuilding` (before the ore check: 70 is short of the Gunsmith's 100), and
+    /// neither debits; once it stands, the Shack is `AlreadyBuilt`.
+    #[test]
+    fn ops_store_one_build_at_a_time() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        banked_120(&store, a);
+        assert_eq!(store.build_op(a, BaseBuilding::RadioShack, at(31)), Ok(()));
+        assert_eq!(store.build_op(a, BaseBuilding::RadioShack, at(35)), Err(BuildRefusal::AlreadyBuilding));
+        assert_eq!(store.build_op(a, BaseBuilding::Gunsmith, at(35)), Err(BuildRefusal::AlreadyBuilding));
+        assert_eq!(store.ops_snapshot(a, at(36)).1, 70, "no second debit");
+        assert_eq!(store.build_op(a, BaseBuilding::RadioShack, at(46)), Err(BuildRefusal::AlreadyBuilt));
+    }
+
+    /// BP-21: a pending build keeps its entry (its ore is already spent). `a` holds only the
+    /// Benches going up (ore 0, base default, its Foreman tally drained) and is the least recently
+    /// touched; a new campaign evicts the board-only `b`, never `a`, and the Benches stand at 61.
+    #[test]
+    fn make_room_keeps_a_pending_build() {
+        let store = DemoOpsStore::new(2);
+        let (a, b, c) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
+        banked_120(&store, a);
+        assert_eq!(store.build_op(a, BaseBuilding::HobbyistBenches, at(31)), Ok(()));
+        let _ = store.take_foreman_due(a, at(31));
+        assert!(store.put_board(b, (5, 0), board(), at(32)));
+        assert!(store.put_board(c, (5, 0), board(), at(33)));
+        assert_eq!(store.len(), 2);
+        assert!(store.board(b, (5, 0), at(34)).is_none(), "the board-only entry is evicted");
+        let benches = OpsBase { hobbyist_benches: true, ..OpsBase::default() };
+        assert_eq!(store.ops_snapshot(a, at(61)), (None, 0, benches), "kept, and the Benches stand");
+    }
+
+    /// BP-21 R3: a dig started while the Radio Shack goes up offers the plain 5 % raid chance
+    /// until the Shack stands at 46 and its 3 % from then on (`raid_pct`, the drill's own reader).
+    #[test]
+    fn ops_store_a_build_counts_from_the_first_roll_after_it_stands() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        banked_120(&store, a);
+        assert_eq!(store.build_op(a, BaseBuilding::RadioShack, at(31)), Ok(()));
+        let crew = DigStart { crew_id: CREW, commander_id: COMMANDER, threshold: 100, section_id: None, escort: true };
+        store.start_op(a, (5, 0), board(), &dig(1), 7, Some(crew), None, at(32)).expect("start while the Shack goes up");
+        assert_eq!(dig_view(&store, a, at(45)).next_raid_pct, Some(5), "on site from 42, the Shack not yet standing");
+        assert_eq!(dig_view(&store, a, at(46)).next_raid_pct, Some(3), "the Shack stands");
+    }
+
+    /// BP-21: `base_of` (the mission route's Gunsmith row) stands a due build itself, with no ops
+    /// read between: the Gunsmith goes up at 31 and stands at 56.
+    #[test]
+    fn base_of_stands_a_due_build() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        banked_120(&store, a);
+        assert_eq!(store.build_op(a, BaseBuilding::Gunsmith, at(31)), Ok(()));
+        assert!(!store.base_of(a, at(55)).gunsmith, "not yet");
+        assert!(store.base_of(a, at(56)).gunsmith, "stood by base_of itself");
     }
 
     /// BP-11a-2: a contract's fight is pending only once the team is on site, as a `Contract`
