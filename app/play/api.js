@@ -184,8 +184,13 @@ export async function getSession() {
   return r.body;
 }
 
+// demo-only (BP-24b): the demo's name ask hears of a 201 (a new membership), never of a 200.
+let onJoined = null;
+export function setOnJoined(fn) { onJoined = fn; }
+
 export async function postJoin() {
   const r = await request('POST', '/api/campaign/join'); // 201 Joined or 200 AlreadyMember
+  if (r.status === 201 && onJoined && r.body) onJoined(r.body.campaign_id); // demo-only (BP-24b)
   return r.body; // {campaign_id, commander_id, foreman_id, section_id, crew_id}
 }
 

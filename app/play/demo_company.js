@@ -7,7 +7,7 @@
 // says what it really changes in this build, each trait gets a plain line, the hub's Back opens
 // "Your Company" with a stats card for the Section and the Crew, and the combat screen's factor
 // labels say where each number comes from. It reads the roster the client already holds and makes
-// no network call. Every string goes in through textContent.
+// no network call but BP-24b's name ask. Every string goes in through textContent.
 //
 // BP-12b: "Your Company" is the Company screen. Once demo_ops.js has adopted an ops body for the
 // campaign, the Section card shows its bunks, its sickbay, Heal and Replace, the Crew card shows
@@ -15,7 +15,7 @@
 // demo_ops.js's, read through the view it registers; this file renders, keeps the costs and the
 // shelf's lines, and ticks the heal countdown (no network call) while the card is open.
 
-import { store } from './api.js';
+import { store, request, ApiError, setOnJoined } from './api.js';
 import { bandWord } from './demo_dig.js'; // BP-19c
 
 const RANK_XP = [100, 400, 1100, 2600]; // commander_gen.rs:132 RANK_THRESHOLDS (ranks 2..=5); harness k3 holds its own copy
@@ -98,10 +98,21 @@ const SCORE_LABELS = {
 const GUNSMITH_ROW = 'Gunsmith (your base)'; // demo_roll.rs's row label, shown as sent (Reviewer BP-16a CF (d))
 const GEAR_HINT = 'Gear: standard. Gunsmith adds 10.'; // A11 (BP-16b): only when this fight's roll had no Gunsmith row
 const KIT_ROW = 'Armoury kit ('; // BP-23b: demo_roll.rs:351's label, shown as sent; with it the hint steps aside too
+// BP-24b: ops/name's four 400 texts (demo_name.rs:51-54), shown as sent; any other refusal shows askBad.
+const NAME_REFUSALS = new Set(['a company name is 1 to 24 characters', "letters, numbers, spaces and - ' . & only",
+  'a company name needs at least one letter', 'Compliance has rejected that name. Pick another.']);
 
 const COMPANY_COPY = {
   hubButton: 'Your Company',
   heading: 'Your Company',
+  // BP-24b (Wiki copy): the name ask on the reveal after a new run's join (a 201), and its answers.
+  askLine: 'Name your company. Compliance will read it.',
+  askPlaceholder: 'Your Company',
+  askName: 'Name it',
+  askSkip: 'Not now',
+  askDone: 'Registered with Compliance:',
+  askBad: 'That name did not go through. Try another.',
+  askClosed: 'Compliance is closed. The company stays Your Company this run.',
   xpNext: '{xp} / {next} to Rank {r}',
   xpTop: '{xp} · top rank',
   stress: '{n} / 100',
@@ -241,6 +252,15 @@ const CSS = `
 .company-hire .company-card-line { font-size: 3.8cqw; }
 .company-hire .company-card-line.muted { font-size: 3.4cqw; }
 .company-hire .company-act { width: 100%; max-width: none; margin-top: 0; min-height: 11cqw; font-size: 4.4cqw; }
+.reveal-heading.company-heading { overflow-wrap: anywhere; }
+.name-ask { display: flex; flex-direction: column; gap: 2cqw; text-align: left; }
+.name-ask-line { margin: 0; font-size: 4.2cqw; line-height: 1.4; color: var(--accent); }
+.name-ask-input { width: 100%; min-height: 13cqw; padding: 2.5cqw 3cqw; font-family: var(--body); font-size: 5cqw; text-transform: none; color: var(--text); background: var(--panel); border: 0.5cqw solid var(--panel-edge); border-radius: 1.5cqw; }
+.name-ask-input:focus-visible { outline: 0.6cqw solid var(--text); outline-offset: 0.4cqw; }
+.name-ask-note { margin: 0; font-size: 3.8cqw; line-height: 1.35; color: var(--accent); }
+.name-ask-note[hidden] { display: none; }
+.name-ask-row { display: flex; gap: 2cqw; }
+.name-ask-row .btn { flex: 1 1 0; width: auto; min-height: 11cqw; padding: 0 2cqw; font-size: 4.4cqw; }
 `;
 
 const fill = (text, values) => text.replace(/\{(\w+)\}/g, (m, k) => (k in values ? String(values[k]) : m));
@@ -262,6 +282,24 @@ let shown = null;     // the card on screen: { kind, index }, or null
 let tick = null;      // the heal countdown's display timer (no network call)
 let drawnKey = null;  // the open card's drawn state, the countdown left out (Reviewer BP-12b F1)
 let hireBox = null;   // BP-18b-1: the squad hire block on the Company screen
+
+// BP-24b: the name ask. A 201 join marks its campaign, in sessionStorage so a reload mid-ask asks again, with an
+// in-page Set for private mode; Name it's answers, Not now and Continue settle it. Keyed on the join, never on
+// company.name being absent: the name is off the keep list and can vanish mid-run (Reviewer BP-24a F7).
+const askKey = id => `mm.demo.nameAsk.${id}`;
+const asks = new Set();
+function askPending(id) {
+  if (asks.has(id)) return true;
+  try { return sessionStorage.getItem(askKey(id)) === '1'; } catch { return false; }
+}
+function markAsk(id) {
+  asks.add(id);
+  try { sessionStorage.setItem(askKey(id), '1'); } catch { /* the in-page Set holds it */ }
+}
+function settleAsk(id) {
+  asks.delete(id);
+  try { sessionStorage.removeItem(askKey(id)); } catch { /* memory only */ }
+}
 
 // ── the roster the client holds ────────────────────────────────────────────────
 function roster() {
@@ -340,8 +378,17 @@ function dressReveal(container) {
   if (fromHub) {
     fromHub = false;
     const heading = container.querySelector('.reveal-heading');
-    if (heading) heading.textContent = COMPANY_COPY.heading;
+    if (heading) {
+      // BP-24b: the adopted body's company.name, else Your Company (a name lost to an eviction or a deploy falls
+      // back here, with no ask). Text only (Reviewer BP-24a F6); dir auto for a right-to-left name (F5).
+      const company = view && view.adopted() ? view.company() : null;
+      heading.textContent = company && typeof company.name === 'string' ? company.name : COMPANY_COPY.heading;
+      heading.dir = 'auto';
+      heading.classList.add('company-heading');
+    }
   }
+  const askCamp = store.campaign(); // BP-24b: an entry reveal (never the Company screen) carries a pending ask
+  if (!opened && askCamp && askPending(askCamp.campaign_id)) drawAsk(container, askCamp.campaign_id);
   const c = campaignCommander();
   const xpRow = statRow(cardNode, 'XP');
   if (c && xpRow) xpRow.querySelector('.stat-value').textContent = xpLine(c.xp, c.rank);
@@ -392,6 +439,65 @@ function dressReveal(container) {
     list.before(hireBox);
     drawHire();
   }
+}
+
+// BP-24b: the name ask, under the reveal's heading. Name it sends the raw value (the server trims and checks it)
+// to the stored campaign and adopts nothing: the hub's next ops read brings company.name. A 400/422/415 keeps the
+// ask (the server's four texts shown as sent, else askBad); every other answer settles it with askClosed.
+function drawAsk(container, id) {
+  const heading = container.querySelector('.reveal-heading');
+  if (!heading) return;
+  const box = el('div', 'name-ask');
+  const input = el('input', 'name-ask-input');
+  input.type = 'text';
+  input.maxLength = 24;
+  input.autocomplete = 'off';
+  input.setAttribute('autocapitalize', 'words');
+  input.spellcheck = false;
+  input.setAttribute('enterkeyhint', 'done');
+  input.placeholder = COMPANY_COPY.askPlaceholder;
+  input.setAttribute('aria-label', COMPANY_COPY.askLine);
+  const note = el('p', 'name-ask-note');
+  note.hidden = true;
+  note.setAttribute('role', 'status');
+  const nameBtn = el('button', 'btn btn-primary name-ask-name', COMPANY_COPY.askName);
+  const skipBtn = el('button', 'btn name-ask-skip', COMPANY_COPY.askSkip);
+  nameBtn.type = 'button';
+  skipBtn.type = 'button';
+  const row = el('div', 'name-ask-row');
+  row.append(nameBtn, skipBtn);
+  box.append(el('p', 'name-ask-line', COMPANY_COPY.askLine), input, note, row);
+  heading.after(box);
+  let busy = false;
+  const ready = () => { nameBtn.disabled = busy || input.value.trim() === ''; skipBtn.disabled = busy; input.disabled = busy; };
+  const close = text => {
+    settleAsk(id);
+    if (!text) return box.remove();
+    box.replaceChildren(el('p', 'name-ask-line', text));
+  };
+  ready();
+  input.addEventListener('input', () => { note.hidden = true; ready(); });
+  input.addEventListener('keydown', e => { if (e.key === 'Enter' && !nameBtn.disabled) { e.preventDefault(); nameBtn.click(); } });
+  skipBtn.addEventListener('click', () => { if (!skipBtn.disabled) close(null); });
+  nameBtn.addEventListener('click', async () => {
+    if (nameBtn.disabled) return;
+    busy = true;
+    ready();
+    try {
+      const r = await request('POST', `/api/campaign/${encodeURIComponent(id)}/ops/name`, { body: { name: input.value }, retry500: false });
+      const named = r.body && r.body.company && typeof r.body.company.name === 'string' ? r.body.company.name : input.value.trim();
+      close(`${COMPANY_COPY.askDone} ${named}`);
+    } catch (e) {
+      if (e instanceof ApiError && e.kind === 'bad') {
+        busy = false;
+        note.textContent = NAME_REFUSALS.has(e.message) ? e.message : COMPANY_COPY.askBad;
+        note.hidden = false;
+        ready();
+        return;
+      }
+      close(COMPANY_COPY.askClosed);
+    }
+  });
 }
 
 // The hire block: its line, Hire squad, the cap or short line, the hire's refusal, the hired line, the wage
@@ -747,6 +853,12 @@ export function mountCompany(d, v) {
   style.textContent = CSS;
   document.head.append(style);
   deps.$('btn-back').textContent = COMPANY_COPY.hubButton;
+  setOnJoined(id => markAsk(id)); // BP-24b: a 201 join (api.js) marks the new run's ask
+  // BP-24b: Continue settles the ask, as Not now does, so it is asked once per run (a reload while it shows asks again).
+  deps.$('btn-continue').addEventListener('click', () => {
+    const camp = store.campaign();
+    if (camp) settleAsk(camp.campaign_id);
+  }, true);
   // Taken before the keeper's own listener renders the reveal (its observer runs straight after that listener).
   deps.$('screen-hub').addEventListener('click', e => {
     if (e.target instanceof Element && e.target.closest('#btn-back')) fromHub = true;
