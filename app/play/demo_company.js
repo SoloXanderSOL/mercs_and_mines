@@ -210,6 +210,7 @@ const CSS = `
 .briefing-traits { margin: 0; font-size: 3.8cqw; line-height: 1.35; color: var(--muted); }
 .briefing-traits span { display: block; }
 .chip[data-company] { cursor: pointer; border-color: var(--accent); }
+.portrait .company-portrait { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
 .chip[data-company]:focus-visible { outline: 0.5cqw solid var(--accent); outline-offset: 0.5cqw; }
 .company-card[hidden] { display: none; }
 .company-card { position: absolute; left: 5cqw; right: 5cqw; top: 30cqw; z-index: 5; padding: 4cqw; display: flex; flex-direction: column; gap: 2cqw; text-align: left; background: rgba(11, 11, 12, 0.97); border: 0.4cqw solid var(--accent); border-radius: 2cqw; }
@@ -294,10 +295,34 @@ function statRow(info, label) {
   return null;
 }
 
+// BP-22 (art list #28-32): one painted portrait per origin, laid over the keeper card's silhouette. An origin
+// not in the map, or a file that fails to load, leaves the silhouette. Both reveals (the join's and Your
+// Company) dress the same card. The swap re-fires the observer; dressReveal's company flag absorbs it.
+const PORTRAITS = {
+  'Human (Corporate)': 'portrait_human_corporate.jpg',
+  'Human (Underhive)': 'portrait_human_underhive.jpg',
+  Duck: 'portrait_duck.jpg',
+  Bearocrat: 'portrait_bearocrat.jpg',
+  'Science Ape': 'portrait_science_ape.jpg',
+};
+
+function dressPortrait(cardNode) {
+  const box = cardNode.querySelector('.portrait');
+  const row = statRow(cardNode, 'Origin');
+  const origin = row && row.querySelector('.stat-value').textContent;
+  if (!box || !origin || !Object.prototype.hasOwnProperty.call(PORTRAITS, origin)) return;
+  const img = el('img', 'company-portrait');
+  img.alt = '';
+  img.addEventListener('error', () => img.remove());
+  img.src = `assets/art/${PORTRAITS[origin]}`;
+  box.append(img);
+}
+
 function dressReveal(container) {
   const cardNode = container.querySelector('.commander-card');
   if (!cardNode || cardNode.dataset.company === '1') return;
   cardNode.dataset.company = '1';
+  dressPortrait(cardNode);
   hideCard();
   const opened = fromHub;
   companyUp = opened; // BP-20b (F3)

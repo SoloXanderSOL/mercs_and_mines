@@ -54,9 +54,8 @@ export const BASE_COPY = {
   endBaseOnly: 'Banked ore and credits do not transfer. The base stays on the old books.',
 };
 
-// Placeholder art (BP-10b): line drawings in the accent colour, one per building. Real sprites
-// replace one url() each (and join the service worker's SHELL). The Radio Shack follows
-// Building_Art_Style_Guide's T1 Intelligence Hub; the other four have no design yet.
+// List art (BP-10b): line drawings in the accent colour, one per building, kept as the list's thumbnails.
+// The painted sprites (art list #11-15, BP-22) stand on the plot above the list instead; see PLOT.
 const SVG_HEAD = "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64' fill='none' stroke='%23d9a441' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'>";
 const ART = {
   radio_shack: "<path d='M6 58h52'/><rect x='40' y='48' width='14' height='10'/><path d='M22 58l6-40M30 58l2-40'/><path d='M23 51h8M25 39h7M27 27h5'/><path d='M14 20a14 14 0 0 0 22-14'/><path d='M25 13l6 6'/><path d='M32 18l26 40' stroke-width='1'/>",
@@ -66,6 +65,18 @@ const ART = {
   basic_smelter: "<path d='M6 58h52'/><path d='M14 58V32h26v26'/><path d='M21 32V18h12v14'/><path d='M24 18v-6M30 18v-9'/><path d='M21 52a6 6 0 0 1 12 0'/><path d='M40 38l14 9v11'/>",
 };
 const artCss = id => `.base-art-${id} { background-image: url("${SVG_HEAD}${ART[id]}</svg>"); }`;
+
+// The base that grows (BP-22, art list #10-15): the plot is a band of Base_Plot_Empty (1008 x 1050, fence to
+// gate), and each standing building's sprite sits on its pad. Boxes are [left, top, width] in % of that file
+// (Wiki's bp22_encode.ps1). Sprites are never `.base-art-<id>`: the harness finds the list's slots by that class.
+const PLOT = 'assets/art/base_plot_band.jpg';
+const SPRITE = {
+  radio_shack: [13.86, 10.09, 25.79],
+  hobbyist_benches: [57.74, 19.32, 23.58],
+  grease_pit: [36.47, 38.29, 24.01],
+  gunsmith: [16.74, 56.1, 22.91],
+  basic_smelter: [58.92, 55.41, 22.39],
+};
 
 export const BASE_CSS = `
 .ops-base { position: absolute; top: 11.5cqw; left: 3cqw; padding: 1cqw 2.5cqw; font-family: var(--mono); font-size: 3.6cqw; color: var(--accent); background: rgba(11, 11, 12, 0.94); border: 0.3cqw solid var(--accent); border-radius: 1.5cqw; cursor: pointer; }
@@ -92,6 +103,10 @@ export const BASE_CSS = `
 .base-flavour { margin: 0; font-size: 3.1cqw; line-height: 1.25; color: var(--muted); }
 .base-build { width: auto; max-width: none; min-height: 8.5cqw; margin-top: 0.8cqw; padding: 0 2.5cqw; font-size: 3.6cqw; align-self: flex-start; }
 .base-close { width: auto; max-width: none; min-height: 8.5cqw; padding: 0 3cqw; font-size: 3.6cqw; }
+.base-plot { position: relative; flex: none; }
+.base-plot-img { display: block; width: 100%; height: auto; aspect-ratio: 1008 / 1050; border-radius: 1.5cqw; }
+.base-plot-sprite { position: absolute; height: auto; pointer-events: none; }
+.base-plot-sprite[hidden] { display: none; }
 ${BASE.map(b => artCss(b.id)).join('\n')}
 @media (prefers-reduced-motion: reduce) {
   .base-art { transition: none; }
@@ -140,8 +155,29 @@ export function createBase(onBuild, onClose) {
     slot.append(pic, text);
     return { b, slot, stamp, button };
   });
-  node.append(head, bankedEl, pop, note, ...slots.map(s => s.slot));
-  return { node, bankedEl, pop, note, slots };
+  const plot = el('div', 'base-plot');
+  const ground = el('img', 'base-plot-img');
+  ground.alt = '';
+  ground.addEventListener('error', () => plot.remove());
+  ground.src = PLOT;
+  plot.append(ground);
+  const sprites = {};
+  for (const b of BASE) {
+    const img = el('img', 'base-plot-sprite');
+    const [left, top, width] = SPRITE[b.id];
+    img.alt = '';
+    img.hidden = true;
+    img.dataset.building = b.id;
+    img.style.left = `${left}%`;
+    img.style.top = `${top}%`;
+    img.style.width = `${width}%`;
+    img.addEventListener('error', () => img.remove());
+    img.src = `assets/art/building_${b.id}.png`;
+    plot.append(img);
+    sprites[b.id] = img;
+  }
+  node.append(head, bankedEl, pop, note, plot, ...slots.map(s => s.slot));
+  return { node, bankedEl, pop, note, slots, sprites };
 }
 
 // `s`: { base, banked, credits, out, held, rate, going } from demo_ops.js; `going` (BP-21b): the building going up,
@@ -158,6 +194,7 @@ export function renderBase(v, s, built, paid) {
     const up = s.base[b.id] === true;
     const going = !up && lock && s.going.id === b.id;
     slot.classList.toggle('built', up);
+    v.sprites[b.id].hidden = !up; // BP-22: the plot shows what stands
     stamp.textContent = up ? BASE_COPY.operational : going ? BASE_COPY.going : BASE_COPY.planned;
     button.hidden = up;
     const short = b.cost - s.banked;

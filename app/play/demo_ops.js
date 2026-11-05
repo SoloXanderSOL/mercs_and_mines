@@ -226,7 +226,8 @@ const CSS = `
 #screen-briefing .briefing-stance { margin: 0; font-family: var(--display); font-weight: 700; font-size: 4.6cqw; line-height: 1.25; color: var(--accent); }
 #screen-briefing .briefing-rule { margin: 0; font-size: 3.5cqw; line-height: 1.3; color: var(--muted); }
 #screen-briefing .briefing-approaches { display: flex; gap: 2cqw; width: 100%; max-width: 84cqw; }
-#screen-briefing .briefing-approaches .btn { flex: 1; width: auto; max-width: none; min-height: 11cqw; padding: 0 2cqw; font-size: 4.4cqw; }
+#screen-briefing .briefing-approaches .btn { flex: 1; width: auto; max-width: none; min-height: 11cqw; padding: 0 2cqw; font-size: 4.4cqw; display: inline-flex; align-items: center; justify-content: center; gap: 1cqw; }
+#screen-briefing .briefing-approaches .briefing-icon { flex: none; width: 5cqw; height: 5cqw; }
 #screen-battle .still { height: 24cqw; }
 #screen-battle .score-lines { gap: 0.8cqw; }
 #screen-battle .score-row { padding: 0.8cqw 3cqw; }
@@ -260,6 +261,7 @@ const STANCE_LINES = {
 };
 const APPROACH_RULE = 'Flank beats dug in. Dig in beats an attack. Assault beats spread out. Your pick deploys.';
 const APPROACHES = [['Assault', 'Assault'], ['Flank', 'Flank'], ['DigIn', 'Dig in']]; // [wire value, button label]
+const APPROACH_ICON = { Assault: 'icon_approach_assault.png', Flank: 'icon_approach_flank.png', DigIn: 'icon_approach_dig_in.png' }; // BP-22
 const VERDICT = {
   good: 'Good call: {p} on the odds.',
   bad: 'Bad call: {p} on the odds.',
@@ -1149,6 +1151,11 @@ function createApproaches() {
     const b = el('button', 'btn btn-primary briefing-approach', label);
     b.type = 'button';
     b.dataset.approach = wire;
+    const icon = el('img', 'briefing-icon');
+    icon.alt = '';
+    icon.addEventListener('error', () => icon.remove());
+    icon.src = `assets/art/${APPROACH_ICON[wire]}`;
+    b.prepend(icon);
     b.addEventListener('click', () => {
       pendingApproach = wire; deps.$('btn-deploy').click(); pendingApproach = null;
     });

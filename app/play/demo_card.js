@@ -2,7 +2,8 @@
 // deletes this file). Public teaser text (`public: true`, Wiki/Story/DEMO-001_The_Seeker_Hoard.md),
 // shipped verbatim. It opens on the hub after a relic contract win (A12, demo_ops.js), once per
 // campaign: story → choice → outcome → the hub. Flavour only: nothing is sent; the seen flag is stored.
-// Text-only frame (no illustration yet); every string goes in through textContent.
+// The story page carries the card's picture (art list #27) above the title and scrolls when it is taller than
+// the stage (Director, 2026-11-03); every string goes in through textContent.
 
 import { store } from './api.js';
 
@@ -13,8 +14,9 @@ const CARD = {
   body: [
     ['It is a pre-collapse device called a ', { b: 'Seeker' }, '. It still turns on.'],
     ['Inside is a wallet holding an ancient hoard of a digital currency called ', { b: 'SOL' }, '. According to the ledger, you are now its only owner. Of all of it. Anywhere.'],
-    ['There are stories on it too. They tell of a mythical city called ', { b: 'London' }, ', and of a legendary gathering held there called ', { b: 'Breakpoint' }, '. One speaker is recorded in detail: a man with a calamitous blonde haircut, whose name has been lost to time. He spent his slot shuffling through his notes, losing his place, and talking at length about someone called Peppa Pig.'],
-    ['The Ape has gone very quiet. It keeps murmuring "London" in an accent nobody on Gunmetal has ever been able to explain.'],
+    ['There are stories on it too. They tell of a mythical city called ', { b: 'London' }, ', and of a legendary gathering held there called ', { b: 'Breakpoint' }, '. One speaker is recorded in detail: a man with a calamitous blonde haircut, whose name has been lost to time. He spent his slot shuffling through his notes, losing his place, and talking at length about someone called Peppa Pig. Strangest of all, he talks exactly like a Science Ape.'],
+    ['Nobody else on Gunmetal speaks the way the Apes do. Nobody knows where the accent comes from, and the Apes have always refused to say.'],
+    ['The Ape has gone very quiet. It keeps murmuring "London" to itself, and for the first time, it sounds homesick.'],
   ],
   continue: 'Continue',
   options: [
@@ -25,7 +27,8 @@ const CARD = {
 };
 
 const CSS = `
-.screen-card { gap: 3cqw; }
+.screen-card { gap: 3cqw; overflow-y: auto; justify-content: flex-start; justify-content: safe center; }
+.card-pic { display: block; width: 100%; height: auto; aspect-ratio: 960 / 536; border-radius: 1cqw; }
 .card-frame { width: 100%; border: 0.5cqw solid var(--accent); border-radius: 1.5cqw; background: var(--panel); padding: 4cqw; display: flex; flex-direction: column; gap: 2.5cqw; text-align: left; }
 .card-title { margin: 0; font-family: var(--display); font-weight: 800; font-size: 7cqw; line-height: 1.1; text-align: center; }
 .card-body { margin: 0; font-size: 3.9cqw; line-height: 1.4; }
@@ -69,6 +72,7 @@ function button(className, text, onClick) {
 function page(...children) {
   for (const s of document.querySelectorAll('#stage > .screen')) s.hidden = s !== section;
   section.replaceChildren(...children);
+  section.scrollTop = 0;
 }
 
 export function showCard(ctx, next) {
@@ -92,7 +96,11 @@ export function showCard(ctx, next) {
     return b;
   }));
   const frame = el('div', 'card-frame');
-  frame.append(el('h1', 'card-title', CARD.title), paragraph([opening]), ...CARD.body.map(paragraph));
+  const pic = el('img', 'card-pic');
+  pic.alt = '';
+  pic.addEventListener('error', () => pic.remove()); // a failed picture leaves the text whole
+  pic.src = 'assets/art/scene_seeker_hoard.jpg';
+  frame.append(pic, el('h1', 'card-title', CARD.title), paragraph([opening]), ...CARD.body.map(paragraph));
   page(frame, button('btn btn-primary', CARD.continue, choice));
 }
 
