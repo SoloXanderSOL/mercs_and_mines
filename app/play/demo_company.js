@@ -86,7 +86,7 @@ const TRAITS = {
 };
 
 // A11: the keeper's labels (battle.js:45) → where each factor comes from. The server's modifier rows (BP-14a) keep
-// their own labels and pass through untouched. Gear stays its own line (C1, C6 change it).
+// their own labels and pass through untouched. Gear stays its own line; the armoury's kit is the server's own row (BP-23b).
 const SCORE_LABELS = {
   'Squad skill': 'Squad: standard-issue Rookies',
   'Squad size': 'Headcount: {n} Rookies',
@@ -97,6 +97,7 @@ const SCORE_LABELS = {
 };
 const GUNSMITH_ROW = 'Gunsmith (your base)'; // demo_roll.rs's row label, shown as sent (Reviewer BP-16a CF (d))
 const GEAR_HINT = 'Gear: standard. Gunsmith adds 10.'; // A11 (BP-16b): only when this fight's roll had no Gunsmith row
+const KIT_ROW = 'Armoury kit ('; // BP-23b: demo_roll.rs:351's label, shown as sent; with it the hint steps aside too
 
 const COMPANY_COPY = {
   hubButton: 'Your Company',
@@ -135,6 +136,8 @@ const COMPANY_COPY = {
   back: 'Back on the roster.',
   led: 'Led by {name}. XP {xp}. Stress {n} / 100.',
   kit: 'Kit: standard issue.',
+  kitHeld: 'Kit: {item} ({grade}), +{p} on the roll.', // BP-23b: p is company.kit's points, the server's own
+  kitOff: 'Take off',
   bank: 'Banked: {n} credits',
   heal: 'Patch up {n} · {cost} credits',
   healNote: '{each} credits a soldier. On their feet {secs} s after payment.',
@@ -159,8 +162,14 @@ const COMPANY_COPY = {
   shelfKind: 'Loot',
   shelfChip: 'Trophy Shelf',
   shelfTitle: 'Trophy Shelf',
-  shelfSub: 'Recovered in the field. Catalogued, polished, not issued. Logistics is still writing the forms.',
+  shelfSub: 'Recovered in the field. One item per Section; it counts in every fight that Section leads.',
   shelfEmpty: 'Nothing recovered yet. Win a fight and something may come home with the team.',
+  // BP-23b (Wiki copy): the armoury
+  equip: 'Equip',
+  equipTo: 'Equip {name}',
+  kitAtBase: 'Kit is issued at base. A Section that is out keeps what it carries.',
+  kitGone: 'That item has left the shelf. The list is up to date now.',
+  kitShelfFull: 'The Trophy Shelf is full. Swap in another item instead.',
 };
 
 // Replace: offered on the player's own rows below 8; one tap buys what the bank covers (BP-12b).
@@ -169,7 +178,7 @@ const replaceOffer = (h, each, bank) => h >= 8 ? null : { n: Math.max(1, Math.mi
 // The heal countdown, against the server's clock (demo_ops.js's serverNow), never the phone's.
 const healSecs = (b, now) => Math.max(0, Math.ceil((Date.parse(b.healed_at) - now()) / 1000));
 
-// A5: one line per item the loot roll can produce (loot_roller.rs:20-47, byte for byte). Flavour only: no trophy acts in this build.
+// A5: one line per item the loot roll can produce (loot_roller.rs:20-47, byte for byte). The line is flavour: an equipped item's points are the server's (company.kit, BP-23b).
 const TROPHY_LINES = new Map([
   ["Salvaged Ammo Cache", "Half of it fits our rifles. The other half is evidence."],
   ["Dented Flak Vest", "The dent is where it worked. The previous owner was unavailable for comment."],
@@ -226,6 +235,8 @@ const CSS = `
 .company-trophy-name { margin: 0; font-family: var(--display); font-weight: 800; font-size: 4.2cqw; line-height: 1.2; overflow-wrap: anywhere; }
 .company-trophy-grade { margin: 0; font-family: var(--mono); font-size: 3.2cqw; text-transform: uppercase; color: var(--accent); }
 .company-trophy-line { margin: 0; font-size: 3.6cqw; line-height: 1.35; color: var(--muted); }
+.company-equip { display: flex; flex-wrap: wrap; gap: 1.5cqw; }
+.company-card .company-equip .company-act { flex: 1 1 0; width: auto; min-height: 8cqw; padding: 0 2cqw; font-size: 3.6cqw; }
 .company-hire { display: flex; flex-direction: column; gap: 1.5cqw; margin-top: 3cqw; text-align: left; }
 .company-hire .company-card-line { font-size: 3.8cqw; }
 .company-hire .company-card-line.muted { font-size: 3.4cqw; }
@@ -458,6 +469,7 @@ function act(text, disabled, onTap) {
 function noticeLine(target, action, each) {
   const n = view.notice();
   if (!n || n.target !== target || n.action !== action) return null;
+  if (action === 'equip') return n.kind === 'out' ? COMPANY_COPY.kitAtBase : n.kind === 'gone' ? COMPANY_COPY.kitGone : n.kind === 'shelfFull' ? COMPANY_COPY.kitShelfFull : null; // BP-23b
   if (n.kind === 'short') return fill(COMPANY_COPY.short, { each });
   if (n.kind === 'out') return target === 'section' ? COMPANY_COPY.sectionOut : COMPANY_COPY.out;
   if (n.kind === 'full') return target === 'section' ? COMPANY_COPY.sectionFull : COMPANY_COPY.crewFull;
@@ -519,7 +531,16 @@ function sectionRows(s) {
   const c = (leaderId && r && Array.isArray(r.commanders) ? r.commanders.find(x => x.commander_id === leaderId) : null) || (free) || campaignCommander();
   const band = c ? bandWord(c.band) : ''; // BP-19c
   if (c) rows.push(line(fill(band ? COMPANY_COPY.ledBand : COMPANY_COPY.led, { name: c.name, xp: xpLine(c.xp, c.rank), n: c.stress, band }), true));
-  rows.push(line(COMPANY_COPY.kit, true), line(fill(COMPANY_COPY.bank, { n: credits })));
+  const k = view.kit(s.section_id); // BP-23b
+  if (k) {
+    rows.push(line(fill(COMPANY_COPY.kitHeld, { item: k.item_name, grade: k.quality_grade, p: k.points })));
+    rows.push(act(COMPANY_COPY.kitOff, view.held() || view.sectionOut(s.section_id), () => view.equip(s.section_id, null, 'section')));
+    const kn = noticeLine('section', 'equip');
+    if (kn) rows.push(line(kn));
+  } else {
+    rows.push(line(COMPANY_COPY.kit, true));
+  }
+  rows.push(line(fill(COMPANY_COPY.bank, { n: credits })));
   if (b.wounded > 0 && b.healing === 0) {
     const p = healPrice(view.base());
     const cost = b.wounded * p.each;
@@ -563,15 +584,29 @@ function crewRows(w, r) {
   return rows.concat(replaceRows('crew', w.crew_id, h, REPLACE_MINER_CREDITS, COMPANY_COPY.hire, COMPANY_COPY.hireNote));
 }
 
-// A5: newest first (the body lists newest last), each with its grade and its line.
+// A5: last shelved first (the body lists it last; kit taken off goes to the back, BP-23a), each with its grade and its line.
+// BP-23b: an Equip per Section (named when there are two, as the Company list names them), disabled while that
+// Section is out or a call is in flight; the server's 409 stays the authority.
 function shelfRows() {
   const items = Array.isArray(view.trophies()) ? view.trophies().slice().reverse() : [];
   const rows = [line(COMPANY_COPY.shelfSub, true)];
-  if (items.length === 0) return rows.concat(line(COMPANY_COPY.shelfEmpty));
+  const said = noticeLine('shelf', 'equip'); // BP-23b: an equip's refusal, after its re-read
+  if (items.length === 0) return rows.concat(line(COMPANY_COPY.shelfEmpty), said ? [line(said)] : []);
+  const r = roster();
+  const secs = r && Array.isArray(r.sections) ? r.sections : [];
+  const isHeld = view.held();
+  const texts = secs.some(s => view.sectionOut(s.section_id)) ? [COMPANY_COPY.kitAtBase] : [];
+  if (said && !texts.includes(said)) texts.push(said);
+  rows.push(...texts.map(t => line(t)));
   for (const t of items) {
     const row = el('div', 'company-trophy');
     row.append(el('p', 'company-trophy-name', String(t.item_name)), el('p', 'company-trophy-grade', String(t.quality_grade)),
       el('p', 'company-trophy-line', TROPHY_LINES.get(t.item_name) || TROPHY_UNKNOWN));
+    if (secs.length) {
+      const pick = el('div', 'company-equip');
+      for (const s of secs) pick.append(act(secs.length === 1 ? COMPANY_COPY.equip : fill(COMPANY_COPY.equipTo, { name: s.name }), isHeld || view.sectionOut(s.section_id), () => view.equip(s.section_id, t, 'shelf')));
+      row.append(pick);
+    }
     rows.push(row);
   }
   return rows;
@@ -676,9 +711,10 @@ function dressScore(lines) {
   const labels = [...lines.querySelectorAll('li.score-row .score-label')];
   // The roll's own rows say whether the Gunsmith stood (roll_inputs.gunsmith, read once by the server): no base read.
   const gun = labels.some(l => l.textContent === GUNSMITH_ROW);
+  const kit = labels.some(l => l.textContent.startsWith(KIT_ROW)); // BP-23b
   for (const label of labels) {
     const key = label.textContent;
-    if (key === 'Gear' && !gun) label.textContent = GEAR_HINT;
+    if (key === 'Gear' && !gun && !kit) label.textContent = GEAR_HINT;
     else if (Object.prototype.hasOwnProperty.call(SCORE_LABELS, key)) label.textContent = fill(SCORE_LABELS[key], { n });
   }
 }

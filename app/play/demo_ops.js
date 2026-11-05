@@ -146,6 +146,9 @@ const REFUSAL = {
   escortEmpty: 'no soldiers left to send',
   cap: 'you already have two squads',
   taken: 'another squad has that contract', // BP-18b-2a: Next's pick on a site another op holds
+  kitOut: 'the team is out: kit is issued at base', // BP-23b: equip's three 409s (routes/ops.rs:1504-1506)
+  notOnShelf: "that item isn't on the Trophy Shelf",
+  shelfFull: 'the Trophy Shelf is full',
 };
 
 // A12: the relic contract reads as a relic dig (Wiki copy, BP-11b-2). The server's name stays.
@@ -321,7 +324,7 @@ const fitToFight = d => {
   return b.healing > 0 || credits >= healPrice(base).each * b.wounded ? 0 : h;
 };
 let adoptedFor = null;  // the campaign whose ops body has been adopted (the Company screen needs one, BP-12b)
-let companyAsk = null;  // the heal or replace in flight: { action, target }
+let companyAsk = null;  // the heal, replace, hire or equip in flight: { action, target }
 let companyNotice = null; // its refusal's line on the card: { action, target, kind }
 let fightDress = null;  // the demo fight's own briefing dressing, { name, lead, family }, re-applied on every show (Reviewer BP-11b-2 F2)
 let fitNote = null;     // the briefing's 0-fit line
@@ -1629,6 +1632,10 @@ async function send(path, body, built, spentOf, beforeAdopt, afterAdopt) {
       companyNotice = { ...ask, kind: err.message === REFUSAL.short ? 'short' : 'out' };
       return load();
     }
+    if (err.message === REFUSAL.kitOut || err.message === REFUSAL.notOnShelf || err.message === REFUSAL.shelfFull) { // BP-23b
+      companyNotice = { ...ask, kind: err.message === REFUSAL.kitOut ? 'out' : err.message === REFUSAL.notOnShelf ? 'gone' : 'shelfFull' };
+      return load();
+    }
     if (err.message === REFUSAL.cap) { // BP-18b-1: the squad hire's cap
       companyNotice = { ...ask, kind: 'cap' };
       return load();
@@ -1750,6 +1757,14 @@ function sendReplace(target, id, count, each) {
   companyAsk = { action: 'replace', target };
   const body = target === 'section' ? { section_id: id, count } : { crew_id: id, count };
   send(opsPath(campaignId) + '/replace', body, false, () => count * each, () => patchHeads(target, id, count));
+}
+
+// BP-23b: the armoury. `from` is the card that asked ('shelf' or 'section'), where a refusal's line is drawn.
+function sendEquip(sectionId, item, from) {
+  if (held() || !campaignId) return;
+  companyNotice = null;
+  companyAsk = { action: 'equip', target: from };
+  send(opsPath(campaignId) + '/equip', { section_id: sectionId, item: item ? { item_name: item.item_name, quality_grade: item.quality_grade } : null }, false);
 }
 
 // The team leaves the hex it stands on (cached as the next leg's origin when the move lands).
@@ -2007,6 +2022,8 @@ export function mountOps(d) {
     clearNotice: () => { companyNotice = null; },
     heal: sendHeal,
     replace: sendReplace,
+    kit: id => (company.kit || []).find(k => k.section_id === id) || null, // BP-23b
+    equip: sendEquip,
   });
   watch();
   onMapCreated(attach);
