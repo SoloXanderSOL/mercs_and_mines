@@ -17,7 +17,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sim_engine::game_types::{MissionCategory, MissionDefinition, RollModifier};
+use sim_engine::game_types::{MissionCategory, MissionDefinition, QualityGrade, RollModifier};
 use sim_engine::missions::missions;
 use sim_engine::roster::{CommanderFlaw, CommanderSpecialization};
 
@@ -171,6 +171,64 @@ pub const DEMO_STRAINED_ROLL_CUT: i32 = 3;
 /// The stress row from Breaking Point (BP-19b): Command Presence inverted.
 pub const DEMO_BREAKING_ROLL_CUT: i32 = 10;
 
+/// An armoury item's grade as the roll sees it (BP-23a, §4e C6): the canon `QualityGrade`'s five
+/// steps, demo-local so `RollInputs` stays `Copy` and `Eq` (Linux D1). Logged by its canon name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KitGrade {
+    Basic,
+    Standard,
+    Specialized,
+    Superior,
+    Elite,
+}
+
+impl KitGrade {
+    pub fn from_quality(q: &QualityGrade) -> Self {
+        match q {
+            QualityGrade::Basic => Self::Basic,
+            QualityGrade::Standard => Self::Standard,
+            QualityGrade::Specialized => Self::Specialized,
+            QualityGrade::Superior => Self::Superior,
+            QualityGrade::Elite => Self::Elite,
+        }
+    }
+
+    /// The canon name, as `QualityGrade` serialises it and as `roll_inputs` logs it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Basic => "Basic",
+            Self::Standard => "Standard",
+            Self::Specialized => "Specialized",
+            Self::Superior => "Superior",
+            Self::Elite => "Elite",
+        }
+    }
+
+    /// `as_str` back; `None` for anything else.
+    pub fn from_name(s: &str) -> Option<Self> {
+        match s {
+            "Basic" => Some(Self::Basic),
+            "Standard" => Some(Self::Standard),
+            "Specialized" => Some(Self::Specialized),
+            "Superior" => Some(Self::Superior),
+            "Elite" => Some(Self::Elite),
+            _ => None,
+        }
+    }
+
+    /// The kit's points on the roll (BP-23a, Wiki ruling): 4, 6, 8, 10, 12 by grade. About 85 % of
+    /// the booth's drops are Basic or Standard (Linux check 11), so the floor is kept visible.
+    pub fn points(self) -> i32 {
+        match self {
+            Self::Basic => 4,
+            Self::Standard => 6,
+            Self::Specialized => 8,
+            Self::Superior => 10,
+            Self::Elite => 12,
+        }
+    }
+}
+
 /// The record Commander's roll inputs as they were at fight time (BP-14a), logged in
 /// `session_start` as `roll_inputs`. `gunsmith` (BP-16): whether the Gunsmith stood at the
 /// campaign's base when the route read it; logged only when true (`"gunsmith": true`), so an
@@ -178,6 +236,10 @@ pub const DEMO_BREAKING_ROLL_CUT: i32 = 10;
 /// `stress` (BP-19b): the record's stress at fight time, before this fight's +10; logged only
 /// when above 0, so an absent key (every log before BP-19b) reads as 0, Rested, and replays
 /// unchanged.
+/// `armoury` (BP-23a): the grade of the kit the fight's leading Section (`section_ids[0]`, the
+/// one the latch charges) held when the route read it; logged only when set
+/// (`"armoury": "Basic"`), so an absent key, every log before BP-23a, reads as no kit and
+/// replays unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RollInputs {
     pub rank: i16,
@@ -185,11 +247,13 @@ pub struct RollInputs {
     pub fatal_flaw: CommanderFlaw,
     pub gunsmith: bool,
     pub stress: i16,
+    pub armoury: Option<KitGrade>,
 }
 
 impl RollInputs {
     /// `None` for a rank outside 1..=5 or a trait off the roster (the route answers `500`). The
-    /// record knows nothing of the base: `gunsmith` is false, and the route sets it.
+    /// record knows nothing of the base or the armoury: `gunsmith` is false and `armoury` `None`,
+    /// and the route sets both.
     pub fn from_record(rec: &CommanderRecord) -> Option<Self> {
         Self::parse(rec.rank as i64, &rec.specialization, &rec.fatal_flaw).map(|i| Self { stress: rec.stress, ..i })
     }
@@ -206,11 +270,16 @@ impl RollInputs {
         if self.stress > 0 {
             v["stress"] = json!(self.stress);
         }
+        if let Some(k) = self.armoury {
+            v["armoury"] = json!(k.as_str());
+        }
         v
     }
 
-    /// The logged form back. `None` for anything `to_json` can't have written; an absent
-    /// `gunsmith` is false (a log from before BP-16), a present one must be a bool.
+    /// The logged form back. `None` for a malformed log: a rank outside 1..=5, a trait off the
+    /// roster, or a present optional key of the wrong type or range (`gunsmith` a bool,
+    /// `stress` 0..=100, `armoury` a grade name). An absent optional key is its default: no
+    /// Gunsmith (before BP-16), stress 0 (before BP-19b), no kit (before BP-23a).
     pub fn from_json(v: &Value) -> Option<Self> {
         let gunsmith = match v.get("gunsmith") {
             None => false,
@@ -220,8 +289,12 @@ impl RollInputs {
             None => 0,
             Some(s) => i16::try_from(s.as_i64()?).ok().filter(|s| (0..=100).contains(s))?,
         };
+        let armoury = match v.get("armoury") {
+            None => None,
+            Some(a) => Some(KitGrade::from_name(a.as_str()?)?),
+        };
         let inputs = Self::parse(v["rank"].as_i64()?, v["specialization"].as_str()?, v["fatal_flaw"].as_str()?)?;
-        Some(Self { gunsmith, stress, ..inputs })
+        Some(Self { gunsmith, stress, armoury, ..inputs })
     }
 
     fn parse(rank: i64, specialization: &str, fatal_flaw: &str) -> Option<Self> {
@@ -234,12 +307,13 @@ impl RollInputs {
             fatal_flaw: CommanderFlaw::from_db_str(fatal_flaw)?,
             gunsmith: false,
             stress: 0,
+            armoury: None,
         })
     }
 }
 
 /// The fight's rows, in a fixed order (approach, rank, Specialisation, stress (BP-19b), Flaw,
-/// then the Gunsmith, BP-16); a 0-point row is
+/// then the Gunsmith, BP-16, then the armoury kit, BP-23a); a 0-point row is
 /// left out. `inputs` is `None` for a fight logged before BP-14a: it resolved with no rows.
 pub fn roll_modifiers(inputs: Option<&RollInputs>, approach: Option<MissionApproach>, mission: &MissionDefinition) -> Vec<RollModifier> {
     let mut rows = Vec::new();
@@ -273,6 +347,9 @@ pub fn roll_modifiers(inputs: Option<&RollInputs>, approach: Option<MissionAppro
         push("fatal_flaw", format!("{}: {}", i.fatal_flaw.as_str(), flaw_line(i.fatal_flaw, flaw)), flaw);
         let gunsmith = if i.gunsmith { DEMO_GUNSMITH_ROLL_POINTS } else { 0 };
         push("gunsmith", "Gunsmith (your base)".to_string(), gunsmith);
+        if let Some(k) = i.armoury {
+            push("armoury", format!("Armoury kit ({})", k.as_str()), k.points());
+        }
     }
     rows
 }
@@ -401,7 +478,7 @@ mod tests {
     /// its category, no approach, and a fight logged before BP-14a.
     #[test]
     fn roll_modifiers_build_the_rows_in_order() {
-        let i = RollInputs { rank: 3, specialization: CommanderSpecialization::Cannoneer, fatal_flaw: F::Paranoid, gunsmith: false, stress: 0 };
+        let i = RollInputs { rank: 3, specialization: CommanderSpecialization::Cannoneer, fatal_flaw: F::Paranoid, gunsmith: false, stress: 0, armoury: None };
         let got = roll_modifiers(Some(&i), Some(A::Flank), mission("GUARD_DUTY"));
         assert_eq!(rows(&got), [("approach", -15), ("commander_rank", 4), ("specialization", 5), ("fatal_flaw", -10)]);
         let labels: Vec<&str> = got.iter().map(|r| r.label.as_str()).collect();
@@ -415,9 +492,9 @@ mod tests {
         assert_eq!(rows(&g), [("approach", -15), ("commander_rank", 4), ("specialization", 5), ("fatal_flaw", -10), ("gunsmith", 10)]);
         assert_eq!(g[4].label, "Gunsmith (your base)");
 
-        let i = RollInputs { rank: 1, specialization: CommanderSpecialization::Cannoneer, fatal_flaw: F::Embezzler, gunsmith: false, stress: 0 };
+        let i = RollInputs { rank: 1, specialization: CommanderSpecialization::Cannoneer, fatal_flaw: F::Embezzler, gunsmith: false, stress: 0, armoury: None };
         assert_eq!(rows(&roll_modifiers(Some(&i), None, mission("SUPPLY_RAID"))), [("fatal_flaw", -3)]);
-        let i = RollInputs { rank: 2, specialization: CommanderSpecialization::Breacher, fatal_flaw: F::TheGambler, gunsmith: false, stress: 0 };
+        let i = RollInputs { rank: 2, specialization: CommanderSpecialization::Breacher, fatal_flaw: F::TheGambler, gunsmith: false, stress: 0, armoury: None };
         assert_eq!(rows(&roll_modifiers(Some(&i), Some(A::Flank), mission("BLACK_SITE_RAID"))),
                    [("approach", 15), ("commander_rank", 2), ("specialization", 5), ("fatal_flaw", 15)]);
         assert_eq!(rows(&roll_modifiers(None, Some(A::DigIn), mission("GUARD_DUTY"))), [("approach", 15)]);
@@ -428,7 +505,7 @@ mod tests {
     fn roll_inputs_round_trip_and_refuse_what_was_never_written() {
         let rec = crate::commander_gen::generate_commander(vec![7; 32], uuid::Uuid::nil(), 42);
         let i = RollInputs::from_record(&rec).expect("a generated Commander is on the roster");
-        assert_eq!(i, RollInputs { rank: 1, specialization: CommanderSpecialization::Cannoneer, fatal_flaw: F::Paranoid, gunsmith: false, stress: 0 });
+        assert_eq!(i, RollInputs { rank: 1, specialization: CommanderSpecialization::Cannoneer, fatal_flaw: F::Paranoid, gunsmith: false, stress: 0, armoury: None });
         assert_eq!(i.to_json(), json!({ "rank": 1, "specialization": "Cannoneer", "fatal_flaw": "Paranoid" }));
         assert_eq!(RollInputs::from_json(&i.to_json()), Some(i), "a log from before BP-16 has no key");
         let g = RollInputs { gunsmith: true, ..i };
@@ -455,7 +532,7 @@ mod tests {
     /// unsuited mission at 40 shows the stress row alone.
     #[test]
     fn stress_rows_follow_the_band() {
-        let base = RollInputs { rank: 3, specialization: CommanderSpecialization::Cannoneer, fatal_flaw: F::Paranoid, gunsmith: false, stress: 0 };
+        let base = RollInputs { rank: 3, specialization: CommanderSpecialization::Cannoneer, fatal_flaw: F::Paranoid, gunsmith: false, stress: 0, armoury: None };
         let at = |stress: i16| roll_modifiers(Some(&RollInputs { stress, ..base }), Some(A::Flank), mission("GUARD_DUTY"));
         assert_eq!(rows(&at(30)), [("approach", -15), ("commander_rank", 4), ("specialization", 5), ("fatal_flaw", -10)]);
         for s in [31, 70] {
@@ -469,7 +546,7 @@ mod tests {
             assert_eq!(rows(&got), [("approach", -15), ("commander_rank", 4), ("stress", -10), ("fatal_flaw", -10)], "{s}");
             assert_eq!(got[2].label, format!("Commander stress {s}: Breaking Point"));
         }
-        let i = RollInputs { rank: 1, specialization: CommanderSpecialization::Cannoneer, fatal_flaw: F::Embezzler, gunsmith: false, stress: 40 };
+        let i = RollInputs { rank: 1, specialization: CommanderSpecialization::Cannoneer, fatal_flaw: F::Embezzler, gunsmith: false, stress: 40, armoury: None };
         assert_eq!(rows(&roll_modifiers(Some(&i), None, mission("SUPPLY_RAID"))), [("stress", -3), ("fatal_flaw", -3)]);
     }
 
@@ -477,7 +554,7 @@ mod tests {
     /// as an explicit 0; anything `to_json` can't write is refused.
     #[test]
     fn roll_inputs_stress_is_logged_only_above_0() {
-        let i = RollInputs { rank: 1, specialization: CommanderSpecialization::Cannoneer, fatal_flaw: F::Paranoid, gunsmith: false, stress: 0 };
+        let i = RollInputs { rank: 1, specialization: CommanderSpecialization::Cannoneer, fatal_flaw: F::Paranoid, gunsmith: false, stress: 0, armoury: None };
         assert!(i.to_json().get("stress").is_none());
         let s = RollInputs { stress: 40, ..i };
         assert_eq!(s.to_json()["stress"], json!(40));
@@ -488,6 +565,47 @@ mod tests {
         assert_eq!(roll_modifiers(Some(&absent), None, mission("GUARD_DUTY")), roll_modifiers(Some(&zero), None, mission("GUARD_DUTY")));
         for bad in [json!(101), json!(-1), json!("x")] {
             let v = json!({ "rank": 1, "specialization": "Cannoneer", "fatal_flaw": "Paranoid", "stress": bad });
+            assert_eq!(RollInputs::from_json(&v), None, "{v}");
+        }
+    }
+
+    /// BP-23a test 1: the armoury row comes last, after the Gunsmith, at 4/6/8/10/12 by grade
+    /// (Wiki's ruling, pinned as literals), labelled with the canon grade name; no kit, no row.
+    /// The logged name is `QualityGrade`'s own serde name for all five grades.
+    #[test]
+    fn armoury_row_is_last_and_scales_by_grade() {
+        use sim_engine::game_types::QualityGrade as Q;
+        let i = RollInputs { rank: 3, specialization: CommanderSpecialization::Cannoneer, fatal_flaw: F::Paranoid, gunsmith: true, stress: 0, armoury: None };
+        let grades = [
+            (KitGrade::Basic, 4, "Armoury kit (Basic)"),
+            (KitGrade::Standard, 6, "Armoury kit (Standard)"),
+            (KitGrade::Specialized, 8, "Armoury kit (Specialized)"),
+            (KitGrade::Superior, 10, "Armoury kit (Superior)"),
+            (KitGrade::Elite, 12, "Armoury kit (Elite)"),
+        ];
+        for (g, p, label) in grades {
+            let got = roll_modifiers(Some(&RollInputs { armoury: Some(g), ..i }), Some(A::Flank), mission("GUARD_DUTY"));
+            assert_eq!(rows(&got), [("approach", -15), ("commander_rank", 4), ("specialization", 5), ("fatal_flaw", -10), ("gunsmith", 10), ("armoury", p)], "{g:?}");
+            assert_eq!(got[5].label, label);
+        }
+        let none = roll_modifiers(Some(&i), Some(A::Flank), mission("GUARD_DUTY"));
+        assert!(none.iter().all(|r| r.key != "armoury"), "no kit, no row");
+        for q in [Q::Basic, Q::Standard, Q::Specialized, Q::Superior, Q::Elite] {
+            assert_eq!(json!(KitGrade::from_quality(&q).as_str()), serde_json::to_value(&q).expect("serialise"), "{q:?}");
+        }
+    }
+
+    /// BP-23a test 2: `armoury` is logged only when set, by its grade name, and round-trips; an
+    /// absent key reads as no kit; a present key that is not a grade name is a malformed log.
+    #[test]
+    fn roll_inputs_log_the_armoury_only_when_set() {
+        let i = RollInputs { rank: 1, specialization: CommanderSpecialization::Cannoneer, fatal_flaw: F::Paranoid, gunsmith: false, stress: 0, armoury: None };
+        assert!(i.to_json().get("armoury").is_none());
+        let e = RollInputs { armoury: Some(KitGrade::Elite), ..i };
+        assert_eq!(e.to_json(), json!({ "rank": 1, "specialization": "Cannoneer", "fatal_flaw": "Paranoid", "armoury": "Elite" }));
+        assert_eq!(RollInputs::from_json(&e.to_json()), Some(e));
+        for bad in [json!("Shiny"), json!(3)] {
+            let v = json!({ "rank": 1, "specialization": "Cannoneer", "fatal_flaw": "Paranoid", "armoury": bad });
             assert_eq!(RollInputs::from_json(&v), None, "{v}");
         }
     }

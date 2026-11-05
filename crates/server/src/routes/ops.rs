@@ -24,7 +24,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use shared::SessionToken;
-use sim_engine::game_types::{BattleReport, LootDrop, Squad};
+use sim_engine::game_types::{BattleReport, LootDrop, QualityGrade, Squad};
 use sim_engine::missions::missions;
 use sim_engine::resolver::resolve_mission_with_modifiers;
 use sim_engine::rng::generate_seed;
@@ -44,7 +44,7 @@ use crate::demo_ops::{
 use crate::commander_gen::generate_commander;
 use crate::demo_ops::{HireHold, HireRefusal, DEMO_HIRE_CAP, DEMO_HIRE_CREDITS, DEMO_WAGE_CREDITS_PER_MIN};
 use crate::demo_ops::{RouteKind, RoutePath};
-use crate::demo_ops::{hazard_warning, HazardDue, TripReport};
+use crate::demo_ops::{hazard_warning, EquipRefusal, HazardDue, Trophy, TripReport};
 use crate::repository::section::starter_section;
 use crate::repository::{outcome_db_str, CampaignInstance, CampaignLifecycle, DeploymentRecord, RepositoryError, SectionRecord, SectorState};
 use crate::state::AppState;
@@ -55,8 +55,8 @@ use super::{
     unauthorized, AppError,
 };
 
-/// Request body cap for `ops/start`, `ops/next`, `ops/build`, `ops/heal` and `ops/replace`
-/// (the five routes that read a body), layered on each route: the overflow reaches the handler
+/// Request body cap for `ops/start`, `ops/next`, `ops/build`, `ops/heal`, `ops/replace` and
+/// `ops/equip` (the six routes that read a body), layered on each route: the overflow reaches the handler
 /// as a `JsonRejection` after the limiters, so it is counted (`413`).
 pub const OPS_BODY_LIMIT: usize = 1024;
 
@@ -73,6 +73,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/campaign/:campaign_id/ops/replace", post(post_ops_replace).layer(DefaultBodyLimit::max(OPS_BODY_LIMIT)))
         .route("/api/campaign/:campaign_id/ops/escort", post(post_ops_escort))
         .route("/api/campaign/:campaign_id/ops/hire", post(post_ops_hire))
+        .route("/api/campaign/:campaign_id/ops/equip", post(post_ops_equip).layer(DefaultBodyLimit::max(OPS_BODY_LIMIT)))
 }
 
 /// The ops state as the client sees it, from every route. `now` is the server's clock, so the
@@ -215,6 +216,21 @@ pub struct OpsBuildRequest {
 #[derive(Deserialize)]
 pub struct OpsHealRequest {
     pub section_id: String,
+}
+
+/// `ops/equip`'s body (BP-23a): `section_id` a string parsed after the member checks; `item` a
+/// Trophy Shelf entry as the body shows it, `null` or absent to take the Section's kit off.
+#[derive(Deserialize)]
+pub struct OpsEquipRequest {
+    pub section_id: String,
+    pub item: Option<OpsEquipItem>,
+}
+
+/// A Trophy Shelf entry named by `ops/equip` (BP-23a): both fields, as the shelf shows them.
+#[derive(Deserialize)]
+pub struct OpsEquipItem {
+    pub item_name: String,
+    pub quality_grade: QualityGrade,
 }
 
 /// `ops/replace`'s body (BP-12a-2): exactly one of `section_id` / `crew_id`, strings parsed after
@@ -1441,6 +1457,54 @@ async fn post_ops_heal(
         Err(HealRefusal::NotEnoughCredits) => return Err(conflict("not enough banked credits")),
     }
     settle_leaders(&state, campaign_id, &wallet, now).await;
+    Ok(ops_response(&state, campaign_id, gw, &board, now))
+}
+
+/// Equips a Trophy Shelf item onto a Section, or takes its kit off, `POST
+/// /api/campaign/:campaign_id/ops/equip {section_id, item: {item_name, quality_grade} | null}`
+/// (BP-23a, demo-only, §4e C6). Order: `401` → `429` `ops_ip` → `429` `ops_wallet` → axum's body
+/// rejection, counted (`413` over `OPS_BODY_LIMIT`; `400`, `415`, `422`) → `404` → `403` → `409`
+/// not `Active` (entry dropped) → `409` no gateway → the board → a pending battle latched → `400`
+/// unknown section (not one of the member's Sections; a Crew id too) → `409` the team is out →
+/// `409` not on the Trophy Shelf → `409` the shelf is full (take-off only) → `200`, the whole state.
+/// - One item per Section; it counts on the roll of every fight its Section leads
+///   (`KitGrade::points`, logged as `roll_inputs.armoury`).
+/// - Abuse bound: memory only, no DB write, so no launch lock; one roster read (as `ops/start`);
+///   the shared ops limiter (40/min per wallet, 400 per address). Nothing is awaited after the
+///   store's change, so a dropped handler loses nothing.
+async fn post_ops_equip(
+    AuthSession(token): AuthSession,
+    State(state): State<Arc<AppState>>,
+    ci: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    Path(campaign_id): Path<Uuid>,
+    body: Result<Json<OpsEquipRequest>, JsonRejection>,
+) -> Result<Response, AppError> {
+    if let Some(r) = ops_limits(&state, &token, ci, &headers)? {
+        return Ok(r);
+    }
+    let Json(req) = match body {
+        Ok(j) => j,
+        Err(rej) => return Ok(rej.into_response()),
+    };
+    let now = Utc::now();
+    let (campaign, gateway, wallet) = ops_member(&state, &token, campaign_id, "post_ops_equip").await?;
+    let Some(gw) = gateway else {
+        return Err(conflict("no gateway assigned"));
+    };
+    let board = load_board(&state, &campaign, gw, now, false, "post_ops_equip").await?;
+    latch_pending_raid(&state, campaign_id, now, "post_ops_equip").await?;
+    let sections = state.section_repo.list_sections_for_member(campaign_id, &wallet).await.map_err(|e| {
+        internal_error(format!("post_ops_equip: list_sections_for_member failed for campaign {campaign_id}: {e}"))
+    })?;
+    let section_id = named_section(&sections, &req.section_id)?.section_id;
+    let item = req.item.map(|i| Trophy { quality_grade: i.quality_grade, item_name: i.item_name });
+    match state.demo_ops.store.equip_op(campaign_id, section_id, item, now) {
+        Ok(()) => {}
+        Err(EquipRefusal::OpOut) => return Err(conflict("the team is out: kit is issued at base")),
+        Err(EquipRefusal::NotOnShelf) => return Err(conflict("that item isn't on the Trophy Shelf")),
+        Err(EquipRefusal::ShelfFull) => return Err(conflict("the Trophy Shelf is full")),
+    }
     Ok(ops_response(&state, campaign_id, gw, &board, now))
 }
 
@@ -2917,13 +2981,179 @@ mod tests {
         let got: Vec<(i32, i32, String)> = [false, true]
             .into_iter()
             .map(|gunsmith| {
-                let i = crate::demo_roll::RollInputs { rank: 1, specialization: CommanderSpecialization::Cannoneer, fatal_flaw: CommanderFlaw::Paranoid, gunsmith, stress: 0 };
+                let i = crate::demo_roll::RollInputs { rank: 1, specialization: CommanderSpecialization::Cannoneer, fatal_flaw: CommanderFlaw::Paranoid, gunsmith, stress: 0, armoury: None };
                 let rows = crate::demo_roll::roll_modifiers(Some(&i), None, mission);
                 let r = resolve_mission_with_modifiers(&squad, mission, &rows, "2026-11-02T00:00:00Z", Some(13), &config.sim);
                 (r.score_breakdown.raw_roll, r.score_breakdown.total_score, format!("{:?}", r.outcome))
             })
             .collect();
         assert_eq!(got, vec![(57, 56, "Defeat".to_string()), (57, 66, "Success".to_string())]);
+    }
+
+    /// BP-23a test 6, on `gunsmith_alone_flips_seed_13`'s fixture: no kit, 57 / 56, Defeat; Basic
+    /// kit (+4), 57 / 60, Success; Elite kit (+12), 57 / 68, Success. The roll's own draw stays
+    /// 57; `report_id` moves with the outcome, so it is not pinned.
+    #[test]
+    fn armoury_flips_seed_13() {
+        use crate::demo_roll::KitGrade;
+        use sim_engine::roster::{CommanderFlaw, CommanderSpecialization};
+        let mission = missions().get("GUARD_DUTY").expect("GUARD_DUTY");
+        let squad = Squad { units: rookies(4), commander: None };
+        let config = Config::default();
+        let got: Vec<(i32, i32, String)> = [None, Some(KitGrade::Basic), Some(KitGrade::Elite)]
+            .into_iter()
+            .map(|armoury| {
+                let i = crate::demo_roll::RollInputs { rank: 1, specialization: CommanderSpecialization::Cannoneer, fatal_flaw: CommanderFlaw::Paranoid, gunsmith: false, stress: 0, armoury };
+                let rows = crate::demo_roll::roll_modifiers(Some(&i), None, mission);
+                let r = resolve_mission_with_modifiers(&squad, mission, &rows, "2026-11-02T00:00:00Z", Some(13), &config.sim);
+                (r.score_breakdown.raw_roll, r.score_breakdown.total_score, format!("{:?}", r.outcome))
+            })
+            .collect();
+        assert_eq!(got, vec![(57, 56, "Defeat".to_string()), (57, 60, "Success".to_string()), (57, 68, "Success".to_string())]);
+    }
+
+    /// BP-23a: `ops/equip` with `body`.
+    async fn equip(state: &Arc<AppState>, campaign: Uuid, body: serde_json::Value) -> (StatusCode, serde_json::Value, Vec<u8>) {
+        post(state, campaign, "equip", Some(&body.to_string())).await
+    }
+
+    /// BP-23a: a mission fight on `GUARD_DUTY` with 4 Rookies, flanking, sending `sections` in
+    /// order; the `200` body.
+    async fn armoury_fight(state: &Arc<AppState>, commander_id: Uuid, sections: &[Uuid]) -> serde_json::Value {
+        let body = serde_json::json!({
+            "squad": { "units": rookies(4) },
+            "mission_id": "GUARD_DUTY",
+            "commander_id": commander_id,
+            "section_ids": sections,
+            "approach": "Flank",
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/mission/resolve")
+            .header("authorization", "Bearer t")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = with_test_peer(crate::routes::router(Arc::clone(state)), TEST_PEER).oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let response: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON");
+        assert_eq!(status, StatusCode::OK, "{response}");
+        response
+    }
+
+    /// BP-23a: the seed-42 Commander (Cannoneer, Paranoid) at rank 3 in `campaign`; its id.
+    async fn rank3_commander(state: &AppState, campaign: Uuid) -> Uuid {
+        let mut commander = crate::commander_gen::generate_commander(WALLET.to_vec(), campaign, 42);
+        commander.rank = 3;
+        let id = commander.commander_id;
+        state.commander_repo.create_commander(commander).await.expect("create_commander");
+        id
+    }
+
+    fn report_keys(report: &serde_json::Value) -> Vec<(String, i64)> {
+        report["score_breakdown"]["modifiers"]
+            .as_array()
+            .expect("modifiers")
+            .iter()
+            .map(|m| (m["key"].as_str().expect("key").to_string(), m["points"].as_i64().expect("points")))
+            .collect()
+    }
+
+    /// BP-23a test 7, on the Gunsmith route test's pattern: a Superior trophy equipped onto the
+    /// Section leaves the shelf and shows in `company.kit` at 10 points; the Section's fight logs
+    /// `"armoury": "Superior"` and ends its rows with the armoury's 10; with the kit taken off,
+    /// the replay reads the log and equals the live report in its rows and total.
+    #[tokio::test]
+    async fn ops_equip_route_logs_and_replays_the_kit() {
+        let state = Arc::new(session_state());
+        let c = campaign_with(&state, WALLET, true, Some(GATEWAY)).await;
+        seed_sector(&state, &c).await;
+        assert_eq!(get(&state, Some("t"), c.campaign_id).await.0, StatusCode::OK);
+        let commander_id = rank3_commander(&state, c.campaign_id).await;
+        let section = member_section(&state, c.campaign_id).await;
+        let name = "Rogue AI Comms Module";
+        state.demo_ops.store.set_trophies(c.campaign_id, vec![Trophy { quality_grade: QualityGrade::Superior, item_name: name.into() }]);
+        let item = serde_json::json!({ "item_name": name, "quality_grade": "Superior" });
+        let (status, body, _) = equip(&state, c.campaign_id, serde_json::json!({ "section_id": section, "item": item })).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["company"]["kit"], serde_json::json!([{ "section_id": section, "item_name": name, "quality_grade": "Superior", "points": 10 }]));
+        assert_eq!(body["company"]["trophies"], serde_json::json!([]));
+
+        let response = armoury_fight(&state, commander_id, &[section]).await;
+        let deps = state.commander_repo.list_deployments_by_commander(commander_id).await.expect("deployments");
+        assert_eq!(deps.len(), 1);
+        let entries = state.input_log_repo.get_entries_by_session(&deps[0].session_id).await.expect("entries");
+        assert_eq!(entries[0].payload["roll_inputs"]["armoury"], "Superior");
+        assert_eq!(report_keys(&response["report"]).last(), Some(&("armoury".to_string(), 10)));
+
+        let (status, body, _) = equip(&state, c.campaign_id, serde_json::json!({ "section_id": section, "item": null })).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (report, _) = replay_report(&state, &deps[0], "test").await.expect("replay_report");
+        let replayed = serde_json::to_value(&report).unwrap();
+        assert_eq!(report_keys(&replayed), report_keys(&response["report"]));
+        assert_eq!(replayed["score_breakdown"]["total_score"], response["report"]["score_breakdown"]["total_score"]);
+    }
+
+    /// BP-23a test 8: each refusal, with its text. A non-UUID and the member's Crew id are not
+    /// Sections (`400`); an item not on the shelf (`409`); a take-off with the shelf at 20 (`409`);
+    /// and, with the Section out on a contract and the item on the shelf, the team is out (`409`).
+    #[tokio::test]
+    async fn ops_equip_route_refusals() {
+        let state = Arc::new(session_state());
+        let c = contract_campaign(&state).await;
+        assert_eq!(get(&state, Some("t"), c).await.0, StatusCode::OK);
+        let section = member_section(&state, c).await;
+        let crew = seed_crew(&state, c, false).await;
+        let a = Trophy { quality_grade: QualityGrade::Basic, item_name: "Scrap Plating".into() };
+        let a_body = serde_json::json!({ "item_name": "Scrap Plating", "quality_grade": "Basic" });
+        state.demo_ops.store.set_trophies(c, vec![a.clone()]);
+        let error = |r: &(StatusCode, serde_json::Value, Vec<u8>)| (r.0, r.1["error"].as_str().map(str::to_string));
+        let unknown = (StatusCode::BAD_REQUEST, Some("unknown section".to_string()));
+        assert_eq!(error(&equip(&state, c, serde_json::json!({ "section_id": "nope", "item": a_body })).await), unknown);
+        assert_eq!(error(&equip(&state, c, serde_json::json!({ "section_id": crew, "item": a_body })).await), unknown);
+        let other = serde_json::json!({ "item_name": "Scrap Plating", "quality_grade": "Elite" });
+        assert_eq!(
+            error(&equip(&state, c, serde_json::json!({ "section_id": section, "item": other })).await),
+            (StatusCode::CONFLICT, Some("that item isn't on the Trophy Shelf".to_string()))
+        );
+        let (status, body, _) = equip(&state, c, serde_json::json!({ "section_id": section, "item": a_body })).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let full: Vec<Trophy> = (0..20).map(|i| Trophy { quality_grade: QualityGrade::Basic, item_name: format!("t{i}") }).collect();
+        state.demo_ops.store.set_trophies(c, full);
+        assert_eq!(
+            error(&equip(&state, c, serde_json::json!({ "section_id": section, "item": null })).await),
+            (StatusCode::CONFLICT, Some("the Trophy Shelf is full".to_string()))
+        );
+        let (status, body, _) = start(&state, c, SITE).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let t0 = serde_json::json!({ "item_name": "t0", "quality_grade": "Basic" });
+        assert_eq!(
+            error(&equip(&state, c, serde_json::json!({ "section_id": section, "item": t0 })).await),
+            (StatusCode::CONFLICT, Some("the team is out: kit is issued at base".to_string()))
+        );
+    }
+
+    /// BP-23a test 9: only the leading Section's kit counts. Kit on S1 only; a fight sent
+    /// `[S2, S1]` has no armoury row and logs no `armoury` key.
+    #[tokio::test]
+    async fn armoury_counts_the_leading_section_only() {
+        let state = Arc::new(session_state());
+        let c = campaign_with(&state, WALLET, true, Some(GATEWAY)).await;
+        seed_sector(&state, &c).await;
+        assert_eq!(get(&state, Some("t"), c.campaign_id).await.0, StatusCode::OK);
+        let commander_id = rank3_commander(&state, c.campaign_id).await;
+        let (s1, s2) = second_section(&state, c.campaign_id).await;
+        let name = "Rogue AI Comms Module";
+        state.demo_ops.store.set_trophies(c.campaign_id, vec![Trophy { quality_grade: QualityGrade::Superior, item_name: name.into() }]);
+        let item = serde_json::json!({ "item_name": name, "quality_grade": "Superior" });
+        let (status, body, _) = equip(&state, c.campaign_id, serde_json::json!({ "section_id": s1, "item": item })).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let response = armoury_fight(&state, commander_id, &[s2, s1]).await;
+        assert!(report_keys(&response["report"]).iter().all(|(k, _)| k != "armoury"), "{response}");
+        let deps = state.commander_repo.list_deployments_by_commander(commander_id).await.expect("deployments");
+        let entries = state.input_log_repo.get_entries_by_session(&deps[0].session_id).await.expect("entries");
+        assert!(entries[0].payload["roll_inputs"].get("armoury").is_none(), "{}", entries[0].payload);
     }
 
     /// Reviewer BP-14a F3: a Commander whose record is off the roll roster (a Flaw no build

@@ -50,6 +50,7 @@ use uuid::Uuid;
 
 use crate::map_gen::{hex_axial_distance, HexTerrain, MagmaVeinNode, SAFE_ZONE_RADIUS};
 use crate::rate_limit::{ClientKey, FixedWindow, RateWarn, RATE_LIMIT_MAP_CAP, RATE_LIMIT_WINDOW};
+use crate::demo_roll::KitGrade;
 use crate::repository::{DeploymentRecord, PauseHook};
 
 /// Ops requests per client address per minute, every `…/ops*` route together.
@@ -1308,11 +1309,36 @@ pub struct SickBayView {
 }
 
 /// The store's half of the Company (BP-12a-1): the sickbays, sorted by `section_id`, and the
-/// Trophy Shelf. Headcount, morale and XP stay on the roster read.
+/// Trophy Shelf. Headcount, morale and XP stay on the roster read. `kit` (BP-23a): each
+/// Section's armoury kit, sorted by `section_id`; absent from the body when no Section holds
+/// any, so a body without kit is unchanged.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct CompanyView {
     pub sections: Vec<SickBayView>,
     pub trophies: Vec<Trophy>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub kit: Vec<KitView>,
+}
+
+/// A Section's armoury kit as the client sees it (BP-23a): the item, its grade and its points
+/// on the roll (`KitGrade::points`).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct KitView {
+    pub section_id: Uuid,
+    pub item_name: String,
+    pub quality_grade: QualityGrade,
+    pub points: i32,
+}
+
+/// Why `equip_op` refused (BP-23a), in the order it checks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EquipRefusal {
+    /// The Section leads a contract or guards the dig (`section_busy`): kit is issued at base.
+    OpOut,
+    /// The item is not on the Trophy Shelf (also a campaign with no entry).
+    NotOnShelf,
+    /// A take-off with the shelf at `DEMO_TROPHY_CAP`: the kit would push the oldest trophy off.
+    ShelfFull,
 }
 
 /// Why `heal_op` refused (BP-12a-1), in the order it checks.
@@ -1667,6 +1693,10 @@ struct OpsEntry {
     /// The Trophy Shelf (BP-12a-1): an applied latch's loot, newest last, at most
     /// `DEMO_TROPHY_CAP`; leaves only with the entry.
     trophies: Vec<Trophy>,
+    /// The armoury (BP-23a, §4e C6): one Trophy Shelf item per Section, by Section id. Written
+    /// only by `equip_op`; a take-off removes the key, so no entry sits at a default. On the keep
+    /// list (the player's own loot); leaves only with the entry.
+    kit: BTreeMap<Uuid, Trophy>,
     /// Credits a replace has debited and not yet finished (BP-12a-2): set by `begin_replace`,
     /// cleared by `finish_replace`. `make_room` keeps an entry while it is not 0.
     credits_in_flight: u32,
@@ -1888,7 +1918,12 @@ impl OpsEntry {
             .map(|(id, b)| SickBayView { section_id: *id, wounded: b.wounded, healing: b.healing, healed_at: b.healed_at.map(ops_time) })
             .collect();
         sections.sort_by_key(|s| s.section_id);
-        CompanyView { sections, trophies: self.trophies.clone() }
+        let kit = self
+            .kit
+            .iter()
+            .map(|(id, t)| KitView { section_id: *id, item_name: t.item_name.clone(), quality_grade: t.quality_grade.clone(), points: KitGrade::from_quality(&t.quality_grade).points() })
+            .collect();
+        CompanyView { sections, trophies: self.trophies.clone(), kit }
     }
 
     /// First fires a haul's ambush once its time has come (BP-8b-2): the trigger is set at
@@ -2329,7 +2364,7 @@ impl DemoOpsStore {
 
     /// Makes room for a new entry: below the cap, nothing; at it, evicts the least recently
     /// touched entry that holds no op in any slot (BP-18a-1a), no banked ore, no banked credits, no building, no sickbay
-    /// off the default, no trophy, no replace in flight (BP-12a-1, BP-12a-2), no undrained
+    /// off the default, no trophy, no armoury kit (BP-23a), no replace in flight (BP-12a-1, BP-12a-2), no undrained
     /// Foreman tally (BP-19a, tested by value), no undrained hazard tally (BP-20a-2, tested by
     /// value) and no building going up (BP-21), and journals
     /// (first, then at most hourly). The sickbay is tested by value, never by presence: a latch
@@ -2343,7 +2378,7 @@ impl DemoOpsStore {
         }
         let victim = inner
             .iter()
-            .filter(|(_, e)| e.dig.is_none() && e.contracts_out.is_empty() && e.ore_banked == 0 && e.credits_banked == 0 && e.base == OpsBase::default() && e.sickbay.values().all(|b| *b == SickBay::default()) && e.trophies.is_empty() && e.credits_in_flight == 0 && e.foreman_due == ForemanDue::default() && e.hazard_due == HazardDue::default() && e.pending_build.is_none())
+            .filter(|(_, e)| e.dig.is_none() && e.contracts_out.is_empty() && e.ore_banked == 0 && e.credits_banked == 0 && e.base == OpsBase::default() && e.sickbay.values().all(|b| *b == SickBay::default()) && e.trophies.is_empty() && e.kit.is_empty() && e.credits_in_flight == 0 && e.foreman_due == ForemanDue::default() && e.hazard_due == HazardDue::default() && e.pending_build.is_none())
             .min_by_key(|(_, e)| e.touched)
             .map(|(id, _)| *id);
         let Some(id) = victim else {
@@ -2383,7 +2418,7 @@ impl DemoOpsStore {
         if !self.make_room(&mut inner) {
             return false;
         }
-        inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, dig: None, contracts_out: BTreeMap::new(), moved_at: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), contracts: HashMap::new(), sickbay: HashMap::new(), trophies: Vec::new(), credits_in_flight: 0, crew_fight: None, wages_at: now, bench_at: now, squads: 1, hire_in_flight: false, foreman_due: ForemanDue::default(), hazard_due: HazardDue::default(), trip_reports: Vec::new(), trip_seq: 0, pending_build: None });
+        inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, dig: None, contracts_out: BTreeMap::new(), moved_at: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), contracts: HashMap::new(), sickbay: HashMap::new(), trophies: Vec::new(), kit: BTreeMap::new(), credits_in_flight: 0, crew_fight: None, wages_at: now, bench_at: now, squads: 1, hire_in_flight: false, foreman_due: ForemanDue::default(), hazard_due: HazardDue::default(), trip_reports: Vec::new(), trip_seq: 0, pending_build: None });
         true
     }
 
@@ -2438,7 +2473,7 @@ impl DemoOpsStore {
             if !self.make_room(&mut inner) {
                 return Err(StartRefusal::Full);
             }
-            inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, dig: None, contracts_out: BTreeMap::new(), moved_at: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), contracts: HashMap::new(), sickbay: HashMap::new(), trophies: Vec::new(), credits_in_flight: 0, crew_fight: None, wages_at: now, bench_at: now, squads: 1, hire_in_flight: false, foreman_due: ForemanDue::default(), hazard_due: HazardDue::default(), trip_reports: Vec::new(), trip_seq: 0, pending_build: None });
+            inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, dig: None, contracts_out: BTreeMap::new(), moved_at: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), contracts: HashMap::new(), sickbay: HashMap::new(), trophies: Vec::new(), kit: BTreeMap::new(), credits_in_flight: 0, crew_fight: None, wages_at: now, bench_at: now, squads: 1, hire_in_flight: false, foreman_due: ForemanDue::default(), hazard_due: HazardDue::default(), trip_reports: Vec::new(), trip_seq: 0, pending_build: None });
         }
         let Some(e) = inner.get_mut(&campaign_id) else {
             return Err(StartRefusal::Full);
@@ -3263,6 +3298,52 @@ impl DemoOpsStore {
         })
     }
 
+    /// The armoury kit `section_id` holds (BP-23a), for the mission route's roll: read once at
+    /// fight time and logged, so a later equip can't change a fight. `None` with no entry or no
+    /// kit. Settles nothing: kit moves only through `equip_op`.
+    pub fn kit_of(&self, campaign_id: Uuid, section_id: Uuid) -> Option<KitGrade> {
+        self.lock()
+            .get(&campaign_id)
+            .and_then(|e| e.kit.iter().find(|(s, _)| **s == section_id).map(|(_, t)| KitGrade::from_quality(&t.quality_grade)))
+    }
+
+    /// Equips `item` from the Trophy Shelf onto `section_id`, or takes its kit off with `None`
+    /// (BP-23a, §4e C6: one item per Section). The item leaves the shelf (the first equal entry;
+    /// equal entries are interchangeable); kit the Section already held goes back on the shelf
+    /// after the new item has left it, so a swap never drops a trophy. Taking off kit the Section
+    /// doesn't hold is a no-op. Refusals in order: `OpOut` → `NotOnShelf` (also no entry) →
+    /// `ShelfFull` (take-off only). One critical section, no await. Writes no `moved_at`: nothing
+    /// moves on the map.
+    pub fn equip_op(&self, campaign_id: Uuid, section_id: Uuid, item: Option<Trophy>, now: DateTime<Utc>) -> Result<(), EquipRefusal> {
+        let mut inner = self.lock();
+        let Some(e) = inner.get_mut(&campaign_id) else {
+            return if item.is_some() { Err(EquipRefusal::NotOnShelf) } else { Ok(()) };
+        };
+        e.settle_arrival(now);
+        if e.section_busy(section_id) {
+            return Err(EquipRefusal::OpOut);
+        }
+        let pos = item.as_ref().and_then(|t| e.trophies.iter().position(|s| s == t));
+        if item.is_some() && pos.is_none() {
+            return Err(EquipRefusal::NotOnShelf);
+        }
+        if item.is_none() && e.kit.contains_key(&section_id) && e.trophies.len() >= DEMO_TROPHY_CAP {
+            return Err(EquipRefusal::ShelfFull);
+        }
+        if let Some(i) = pos {
+            e.trophies.remove(i);
+        }
+        let old = match item {
+            Some(t) => e.kit.insert(section_id, t),
+            None => e.kit.remove(&section_id),
+        };
+        if let Some(t) = old {
+            e.trophies.push(t);
+        }
+        e.touched = now;
+        Ok(())
+    }
+
     /// Heals every wounded soldier of `section_id` at once (BP-12a-1, §4e B3), for
     /// `OpsBase::heal_credits` each (BP-16: 20 with the Hobbyist Benches, else 40): they move to
     /// `healing` and are back after `OpsBase::heal_secs` (8 s, else 15 s). A batch already
@@ -3496,6 +3577,15 @@ impl DemoOpsStore {
     pub(crate) fn set_credits(&self, campaign_id: Uuid, credits: u32) {
         if let Some(e) = self.lock().get_mut(&campaign_id) {
             e.credits_banked = credits;
+        }
+    }
+
+    /// Puts `trophies` on the campaign's shelf as given (BP-23a), so a test equips without
+    /// latching a fight for each item. Writes nothing else.
+    #[cfg(test)]
+    pub(crate) fn set_trophies(&self, campaign_id: Uuid, trophies: Vec<Trophy>) {
+        if let Some(e) = self.lock().get_mut(&campaign_id) {
+            e.trophies = trophies;
         }
     }
 
@@ -4920,6 +5010,7 @@ mod tests {
         let want = CompanyView {
             sections: vec![bay(1, 0, None)],
             trophies: vec![Trophy { quality_grade: QualityGrade::Standard, item_name: "Signal Jammer Module".into() }],
+            kit: Vec::new(),
         };
         assert_eq!(store.ops_state(a, at(13)).company, want);
         assert!(!store.latch_raid(a, &guard_duty_arrival(), RaidResult::Retreat, pay, at(14)), "already latched");
@@ -4981,6 +5072,101 @@ mod tests {
         assert_eq!(store.heal_op(a, SECTION, at(26)), Err(HealRefusal::AlreadyHealing));
         assert_eq!(store.ops_state(a, at(26)).company.sections, vec![bay(1, 2, Some(at(27)))]);
         assert_eq!(store.ops_state(a, at(27)).company.sections, vec![bay(1, 0, None)]);
+    }
+
+    /// BP-23a: the two shelf items the armoury store tests move.
+    fn kit_a() -> Trophy {
+        Trophy { quality_grade: QualityGrade::Basic, item_name: "Scrap Plating".into() }
+    }
+
+    fn kit_b() -> Trophy {
+        Trophy { quality_grade: QualityGrade::Elite, item_name: "Sunspear Laser Rifle Mk.V".into() }
+    }
+
+    fn kit_view(section_id: Uuid, t: &Trophy, points: i32) -> KitView {
+        KitView { section_id, item_name: t.item_name.clone(), quality_grade: t.quality_grade.clone(), points }
+    }
+
+    /// The shelf and the kit list, as the body shows them.
+    fn shelf_and_kit(store: &DemoOpsStore, a: Uuid, now: DateTime<Utc>) -> (Vec<Trophy>, Vec<KitView>) {
+        let company = store.ops_state(a, now).company;
+        (company.trophies, company.kit)
+    }
+
+    /// BP-23a test 3: equipping moves the item off the shelf onto the Section; a swap puts the
+    /// old item back after the new one has left; a take-off returns it; a second take-off is a
+    /// no-op.
+    #[test]
+    fn equip_moves_kit_on_and_off_the_shelf() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        assert!(store.put_board(a, (5, 0), board(), at(0)));
+        store.set_trophies(a, vec![kit_a(), kit_b()]);
+        assert_eq!(store.equip_op(a, S1, Some(kit_a()), at(1)), Ok(()));
+        assert_eq!(shelf_and_kit(&store, a, at(1)), (vec![kit_b()], vec![kit_view(S1, &kit_a(), 4)]));
+        assert_eq!(store.equip_op(a, S1, Some(kit_b()), at(2)), Ok(()));
+        assert_eq!(shelf_and_kit(&store, a, at(2)), (vec![kit_a()], vec![kit_view(S1, &kit_b(), 12)]));
+        assert_eq!(store.equip_op(a, S1, None, at(3)), Ok(()));
+        assert_eq!(shelf_and_kit(&store, a, at(3)), (vec![kit_a(), kit_b()], vec![]));
+        assert_eq!(store.equip_op(a, S1, None, at(4)), Ok(()));
+        assert_eq!(shelf_and_kit(&store, a, at(4)), (vec![kit_a(), kit_b()], vec![]));
+    }
+
+    /// BP-23a test 4: each refusal in a case only it decides, and each writes nothing. (a) no
+    /// entry: an equip is not on the shelf, a take-off is `Ok`; (b) S1 leads a contract with the
+    /// item on the shelf: the team is out; (c) S1 idle, the item absent: not on the shelf; (d) S1
+    /// idle holding kit, the shelf at 20, a take-off: the shelf is full.
+    #[test]
+    fn equip_refusals_in_order() {
+        let a = Uuid::from_u128(1);
+        let store = DemoOpsStore::new(2);
+        assert_eq!(store.equip_op(a, S1, Some(kit_a()), at(1)), Err(EquipRefusal::NotOnShelf), "(a)");
+        assert_eq!(store.equip_op(a, S1, None, at(1)), Ok(()), "(a)");
+
+        let store = DemoOpsStore::new(2);
+        assert_eq!(named(&store, a, &site(), C1, S1, at(0)), Ok(()));
+        store.set_trophies(a, vec![kit_a()]);
+        assert_eq!(store.equip_op(a, S1, Some(kit_a()), at(1)), Err(EquipRefusal::OpOut), "(b)");
+        assert_eq!(shelf_and_kit(&store, a, at(1)), (vec![kit_a()], vec![]), "(b)");
+
+        let store = DemoOpsStore::new(2);
+        assert!(store.put_board(a, (5, 0), board(), at(0)));
+        store.set_trophies(a, vec![kit_b()]);
+        assert_eq!(store.equip_op(a, S1, Some(kit_a()), at(1)), Err(EquipRefusal::NotOnShelf), "(c)");
+        assert_eq!(shelf_and_kit(&store, a, at(1)), (vec![kit_b()], vec![]), "(c)");
+
+        let store = DemoOpsStore::new(2);
+        assert!(store.put_board(a, (5, 0), board(), at(0)));
+        store.set_trophies(a, vec![kit_a()]);
+        assert_eq!(store.equip_op(a, S1, Some(kit_a()), at(1)), Ok(()));
+        let full: Vec<Trophy> = (0..20).map(|i| Trophy { quality_grade: QualityGrade::Basic, item_name: format!("t{i}") }).collect();
+        store.set_trophies(a, full.clone());
+        assert_eq!(store.equip_op(a, S1, None, at(2)), Err(EquipRefusal::ShelfFull), "(d)");
+        assert_eq!(shelf_and_kit(&store, a, at(2)), (full, vec![kit_view(S1, &kit_a(), 4)]), "(d)");
+    }
+
+    /// BP-23a test 5: at the cap, an entry whose only state is kit (its one trophy equipped, so
+    /// the shelf is empty) is kept by another campaign's first `put_board`, as the trophy case
+    /// of `make_room_keeps_a_sickbay_or_a_shelf` is; the same entry without the equip, holding
+    /// nothing, is evicted.
+    #[test]
+    fn kit_keeps_an_entry_on_the_keep_list() {
+        let (x, y) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let mut wrong = Vec::new();
+        for (name, equipped, kept) in [("kit", true, true), ("nothing", false, false)] {
+            let store = DemoOpsStore::new(1);
+            assert!(store.put_board(x, (5, 0), board(), at(0)));
+            if equipped {
+                store.set_trophies(x, vec![kit_a()]);
+                assert_eq!(store.equip_op(x, S1, Some(kit_a()), at(1)), Ok(()));
+                assert_eq!(shelf_and_kit(&store, x, at(1)), (vec![], vec![kit_view(S1, &kit_a(), 4)]));
+            }
+            store.put_board(y, (5, 0), board(), at(30));
+            if store.board(x, (5, 0), at(31)).is_some() != kept {
+                wrong.push(name);
+            }
+        }
+        assert!(wrong.is_empty(), "wrong cases: {wrong:?}");
     }
 
     /// BP-12a-1: the shelf keeps the newest 20, newest last.
