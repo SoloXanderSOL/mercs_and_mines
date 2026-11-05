@@ -1311,13 +1311,16 @@ pub struct SickBayView {
 /// The store's half of the Company (BP-12a-1): the sickbays, sorted by `section_id`, and the
 /// Trophy Shelf. Headcount, morale and XP stay on the roster read. `kit` (BP-23a): each
 /// Section's armoury kit, sorted by `section_id`; absent from the body when no Section holds
-/// any, so a body without kit is unchanged.
+/// any, so a body without kit is unchanged. `name` (BP-24a): the company's name from `ops/name`;
+/// absent from the body until named, so an unnamed body is unchanged.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct CompanyView {
     pub sections: Vec<SickBayView>,
     pub trophies: Vec<Trophy>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub kit: Vec<KitView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// A Section's armoury kit as the client sees it (BP-23a): the item, its grade and its points
@@ -1735,6 +1738,9 @@ struct OpsEntry {
     /// `settle_build`. On the keep list (the player has paid for it); never at a default with
     /// nothing else set, since only a completion clears it and a completion sets `base`.
     pending_build: Option<PendingBuild>,
+    /// The company's name (BP-24a, `ops/name`): `None` until named, replaced by a later name.
+    /// Off the keep list: a named entry with nothing else live is evicted like any other.
+    company_name: Option<String>,
 }
 
 impl OpsEntry {
@@ -1923,7 +1929,7 @@ impl OpsEntry {
             .iter()
             .map(|(id, t)| KitView { section_id: *id, item_name: t.item_name.clone(), quality_grade: t.quality_grade.clone(), points: KitGrade::from_quality(&t.quality_grade).points() })
             .collect();
-        CompanyView { sections, trophies: self.trophies.clone(), kit }
+        CompanyView { sections, trophies: self.trophies.clone(), kit, name: self.company_name.clone() }
     }
 
     /// First fires a haul's ambush once its time has come (BP-8b-2): the trigger is set at
@@ -2418,7 +2424,7 @@ impl DemoOpsStore {
         if !self.make_room(&mut inner) {
             return false;
         }
-        inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, dig: None, contracts_out: BTreeMap::new(), moved_at: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), contracts: HashMap::new(), sickbay: HashMap::new(), trophies: Vec::new(), kit: BTreeMap::new(), credits_in_flight: 0, crew_fight: None, wages_at: now, bench_at: now, squads: 1, hire_in_flight: false, foreman_due: ForemanDue::default(), hazard_due: HazardDue::default(), trip_reports: Vec::new(), trip_seq: 0, pending_build: None });
+        inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, dig: None, contracts_out: BTreeMap::new(), moved_at: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), contracts: HashMap::new(), sickbay: HashMap::new(), trophies: Vec::new(), kit: BTreeMap::new(), credits_in_flight: 0, crew_fight: None, wages_at: now, bench_at: now, squads: 1, hire_in_flight: false, foreman_due: ForemanDue::default(), hazard_due: HazardDue::default(), trip_reports: Vec::new(), trip_seq: 0, pending_build: None, company_name: None });
         true
     }
 
@@ -2473,7 +2479,7 @@ impl DemoOpsStore {
             if !self.make_room(&mut inner) {
                 return Err(StartRefusal::Full);
             }
-            inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, dig: None, contracts_out: BTreeMap::new(), moved_at: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), contracts: HashMap::new(), sickbay: HashMap::new(), trophies: Vec::new(), kit: BTreeMap::new(), credits_in_flight: 0, crew_fight: None, wages_at: now, bench_at: now, squads: 1, hire_in_flight: false, foreman_due: ForemanDue::default(), hazard_due: HazardDue::default(), trip_reports: Vec::new(), trip_seq: 0, pending_build: None });
+            inner.insert(campaign_id, OpsEntry { gateway, board, touched: now, dig: None, contracts_out: BTreeMap::new(), moved_at: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), contracts: HashMap::new(), sickbay: HashMap::new(), trophies: Vec::new(), kit: BTreeMap::new(), credits_in_flight: 0, crew_fight: None, wages_at: now, bench_at: now, squads: 1, hire_in_flight: false, foreman_due: ForemanDue::default(), hazard_due: HazardDue::default(), trip_reports: Vec::new(), trip_seq: 0, pending_build: None, company_name: None });
         }
         let Some(e) = inner.get_mut(&campaign_id) else {
             return Err(StartRefusal::Full);
@@ -3492,6 +3498,20 @@ impl DemoOpsStore {
     /// after `listed_at` (a campaign launched after the list was read).
     pub fn retain_campaigns(&self, active: &HashSet<Uuid>, listed_at: DateTime<Utc>) {
         self.lock().retain(|id, e| active.contains(id) || e.touched >= listed_at);
+    }
+
+    /// Names the campaign's company (BP-24a): `name` is `demo_name::check_name`'s output and
+    /// replaces any earlier name. `false` when the campaign has no entry (the store at its cap
+    /// served the board uncached). One critical section, no await. Writes no `moved_at`: nothing
+    /// moves on the map.
+    pub fn name_op(&self, campaign_id: Uuid, name: String, now: DateTime<Utc>) -> bool {
+        let mut inner = self.lock();
+        let Some(e) = inner.get_mut(&campaign_id) else {
+            return false;
+        };
+        e.company_name = Some(name);
+        e.touched = now;
+        true
     }
 
     /// Drops the campaign's entry (a read of a campaign that is no longer `Active`, the reaper's
@@ -4998,6 +5018,24 @@ mod tests {
         }
     }
 
+    /// BP-24a T1: `name_op` names an entry (the view shows it) and a later name replaces it; a
+    /// campaign with no entry is refused. A named entry is off the keep list: at cap 1 the next
+    /// campaign's board evicts it.
+    #[test]
+    fn name_op_names_an_entry_and_stays_off_the_keep_list() {
+        let store = DemoOpsStore::new(1);
+        let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        assert!(!store.name_op(a, "Acme".into(), at(0)), "no entry");
+        assert!(store.put_board(a, (5, 0), board(), at(0)));
+        assert!(store.name_op(a, "Acme".into(), at(1)));
+        assert!(store.name_op(a, "Rival Ore".into(), at(2)));
+        assert_eq!(store.ops_state(a, at(3)).company.name.as_deref(), Some("Rival Ore"));
+        assert!(store.put_board(b, (5, 0), board(), at(4)), "the named entry is evicted");
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.ops_state(b, at(5)).company.name, None);
+        assert!(!store.name_op(a, "Acme".into(), at(6)), "a's entry is gone");
+    }
+
     /// BP-12a-1: one applied latch puts its wounded in the Section's bay and its loot on the
     /// shelf; a refused latch with the same pay writes neither.
     #[test]
@@ -5011,6 +5049,7 @@ mod tests {
             sections: vec![bay(1, 0, None)],
             trophies: vec![Trophy { quality_grade: QualityGrade::Standard, item_name: "Signal Jammer Module".into() }],
             kit: Vec::new(),
+            name: None,
         };
         assert_eq!(store.ops_state(a, at(13)).company, want);
         assert!(!store.latch_raid(a, &guard_duty_arrival(), RaidResult::Retreat, pay, at(14)), "already latched");

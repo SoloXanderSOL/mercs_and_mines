@@ -1205,6 +1205,37 @@ mod tests {
         assert_eq!(campaign_of(&state, fresh).await.state, CampaignLifecycle::Active);
     }
 
+    /// An ops call as `WALLET` (session `t`), through the ops router.
+    async fn ops_call(state: Arc<AppState>, method: &str, uri: String, body: Option<&str>) -> (StatusCode, serde_json::Value) {
+        let mut req = Request::builder().method(method).uri(uri).header("authorization", "Bearer t");
+        if body.is_some() {
+            req = req.header("content-type", "application/json");
+        }
+        let req = req.body(body.map(|b| Body::from(b.to_string())).unwrap_or_else(Body::empty)).unwrap();
+        let resp = with_test_peer(crate::routes::ops::router().with_state(state), TEST_PEER).oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+    }
+
+    /// BP-24a T7: a new run starts unnamed. The member names the run's company, abandons it and
+    /// joins again; the new campaign's ops view has no `company.name`.
+    #[tokio::test]
+    async fn a_new_run_after_the_abandon_starts_unnamed() {
+        let (state, c) = abandon_member(false).await;
+        let (status, body) = ops_call(state.clone(), "POST", format!("/api/campaign/{c}/ops/name"), Some(r#"{"name":"Acme"}"#)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["company"]["name"], "Acme");
+        let (status, body) = abandon(state.clone(), Some("t"), &c.to_string()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = join(state.clone(), Some("t")).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let fresh = id(&body, "campaign_id");
+        let (status, body) = ops_call(state, "GET", format!("/api/campaign/{fresh}/ops"), None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["company"].get("name").is_none(), "{body}");
+    }
+
     /// Reviewer BP-1 F1: an `Active` campaign with no sector (a launch that failed before
     /// its sector write and whose retire failed) is recovered by the abandon.
     #[tokio::test]

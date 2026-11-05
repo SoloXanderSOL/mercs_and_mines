@@ -34,6 +34,7 @@ use uuid::Uuid;
 
 use crate::api_types::MissionResolveRequest;
 use crate::auth::AuthSession;
+use crate::demo_name::check_name;
 use crate::demo_ops::{
     fight_losses, fight_wounded, foreman_threshold, ForemanDue, ForemanRead, LeaderClaim, DEMO_BENCH_STRESS_PER_MIN, DEMO_HEAT_THRESHOLD, ops_board, ops_time, raid_fight, raid_result, ActiveOpView, BaseBuilding,
     BuildRefusal, CompanyView, ConstructionView, ContractStart, CrewFightView, DigStart, DrillOutcome, DrillRefusal, EscortRefusal, FightPay,
@@ -55,8 +56,8 @@ use super::{
     unauthorized, AppError,
 };
 
-/// Request body cap for `ops/start`, `ops/next`, `ops/build`, `ops/heal`, `ops/replace` and
-/// `ops/equip` (the six routes that read a body), layered on each route: the overflow reaches the handler
+/// Request body cap for `ops/start`, `ops/next`, `ops/build`, `ops/heal`, `ops/replace`,
+/// `ops/equip` and `ops/name` (the seven routes that read a body), layered on each route: the overflow reaches the handler
 /// as a `JsonRejection` after the limiters, so it is counted (`413`).
 pub const OPS_BODY_LIMIT: usize = 1024;
 
@@ -74,6 +75,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/campaign/:campaign_id/ops/escort", post(post_ops_escort))
         .route("/api/campaign/:campaign_id/ops/hire", post(post_ops_hire))
         .route("/api/campaign/:campaign_id/ops/equip", post(post_ops_equip).layer(DefaultBodyLimit::max(OPS_BODY_LIMIT)))
+        .route("/api/campaign/:campaign_id/ops/name", post(post_ops_name).layer(DefaultBodyLimit::max(OPS_BODY_LIMIT)))
 }
 
 /// The ops state as the client sees it, from every route. `now` is the server's clock, so the
@@ -231,6 +233,12 @@ pub struct OpsEquipRequest {
 pub struct OpsEquipItem {
     pub item_name: String,
     pub quality_grade: QualityGrade,
+}
+
+/// `ops/name`'s body (BP-24a): the name as typed; the server trims and checks it.
+#[derive(Deserialize)]
+pub struct OpsNameRequest {
+    pub name: String,
 }
 
 /// `ops/replace`'s body (BP-12a-2): exactly one of `section_id` / `crew_id`, strings parsed after
@@ -1504,6 +1512,50 @@ async fn post_ops_equip(
         Err(EquipRefusal::OpOut) => return Err(conflict("the team is out: kit is issued at base")),
         Err(EquipRefusal::NotOnShelf) => return Err(conflict("that item isn't on the Trophy Shelf")),
         Err(EquipRefusal::ShelfFull) => return Err(conflict("the Trophy Shelf is full")),
+    }
+    Ok(ops_response(&state, campaign_id, gw, &board, now))
+}
+
+/// Names the player's company for this run, `POST /api/campaign/:campaign_id/ops/name {name}`
+/// (BP-24a, demo-only, §4e rank 14). Order: `401` → `429` `ops_ip` → `429` `ops_wallet` → axum's
+/// body rejection, counted (`413` over `OPS_BODY_LIMIT`; `400`, `415`, `422`) → `404` → `403` →
+/// `409` not `Active` (entry dropped) → `409` no gateway → the board → a pending battle latched →
+/// the name's checks (`demo_name::check_name`, each a `400` with its text, in its order) → `503`
+/// the ops board is full (the store at its cap holds no entry for this campaign) → `200`, the
+/// whole state, `company.name` the stored name.
+/// - The stored name is the checked one (trimmed, spaces collapsed), never the body's text. A
+///   later name replaces it; the client asks at the start of a run.
+/// - Kept on the campaign's ops entry, off the keep list: lost at a deploy or an eviction. A new
+///   run is a new campaign, so it starts unnamed.
+/// - Abuse bound: memory only (one name of at most 24 chars per entry, replaced in place), no DB
+///   write, so no launch lock; the shared ops limiter (40/min per wallet, 400 per address).
+///   Nothing is awaited after the store's change, so a dropped handler loses nothing. The name
+///   is never written to the journal.
+async fn post_ops_name(
+    AuthSession(token): AuthSession,
+    State(state): State<Arc<AppState>>,
+    ci: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    Path(campaign_id): Path<Uuid>,
+    body: Result<Json<OpsNameRequest>, JsonRejection>,
+) -> Result<Response, AppError> {
+    if let Some(r) = ops_limits(&state, &token, ci, &headers)? {
+        return Ok(r);
+    }
+    let Json(req) = match body {
+        Ok(j) => j,
+        Err(rej) => return Ok(rej.into_response()),
+    };
+    let now = Utc::now();
+    let (campaign, gateway, _) = ops_member(&state, &token, campaign_id, "post_ops_name").await?;
+    let Some(gw) = gateway else {
+        return Err(conflict("no gateway assigned"));
+    };
+    let board = load_board(&state, &campaign, gw, now, false, "post_ops_name").await?;
+    latch_pending_raid(&state, campaign_id, now, "post_ops_name").await?;
+    let name = check_name(&req.name).map_err(|r| bad_request(r.text()))?;
+    if !state.demo_ops.store.name_op(campaign_id, name, now) {
+        return Err(service_unavailable("the ops board is full"));
     }
     Ok(ops_response(&state, campaign_id, gw, &board, now))
 }
@@ -3132,6 +3184,94 @@ mod tests {
             error(&equip(&state, c, serde_json::json!({ "section_id": section, "item": t0 })).await),
             (StatusCode::CONFLICT, Some("the team is out: kit is issued at base".to_string()))
         );
+    }
+
+    async fn name(state: &Arc<AppState>, campaign: Uuid, name: &str) -> (StatusCode, serde_json::Value, Vec<u8>) {
+        post(state, campaign, "name", Some(&serde_json::json!({ "name": name }).to_string())).await
+    }
+
+    /// An `Active` campaign of `WALLET`'s with its sector seeded and its board read once.
+    async fn name_campaign(state: &Arc<AppState>) -> Uuid {
+        let c = campaign_with(state, WALLET, true, Some(GATEWAY)).await;
+        seed_sector(state, &c).await;
+        assert_eq!(get(state, Some("t"), c.campaign_id).await.0, StatusCode::OK);
+        c.campaign_id
+    }
+
+    /// BP-24a T2: no `company.name` until named; the stored name is the checked one, in the
+    /// response and the next read.
+    #[tokio::test]
+    async fn ops_name_route_stores_the_checked_name() {
+        let state = Arc::new(session_state());
+        let c = name_campaign(&state).await;
+        let (_, before) = get(&state, Some("t"), c).await;
+        assert!(before["company"].get("name").is_none(), "{before}");
+        let (status, body, _) = name(&state, c, "  Acme   Mining  ").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["company"]["name"], "Acme Mining");
+        assert_eq!(get(&state, Some("t"), c).await.1["company"]["name"], "Acme Mining");
+    }
+
+    /// BP-24a T3: a later name replaces the first.
+    #[tokio::test]
+    async fn ops_name_route_replaces_an_earlier_name() {
+        let state = Arc::new(session_state());
+        let c = name_campaign(&state).await;
+        assert_eq!(name(&state, c, "Acme").await.0, StatusCode::OK);
+        assert_eq!(name(&state, c, "Rival Ore").await.0, StatusCode::OK);
+        assert_eq!(get(&state, Some("t"), c).await.1["company"]["name"], "Rival Ore");
+    }
+
+    /// BP-24a T4: each check's `400` and text, and a refused name stores nothing (the read after
+    /// each still shows `Acme`); a body with no `name` is axum's `422`.
+    #[tokio::test]
+    async fn ops_name_route_refusals_store_nothing() {
+        let state = Arc::new(session_state());
+        let c = name_campaign(&state).await;
+        assert_eq!(name(&state, c, "Acme").await.0, StatusCode::OK);
+        let long = "x".repeat(25);
+        let error = |r: &(StatusCode, serde_json::Value, Vec<u8>)| (r.0, r.1["error"].as_str().map(str::to_string));
+        for (sent, want) in [
+            (long.as_str(), "a company name is 1 to 24 characters"),
+            ("Acme \u{1F525}", "letters, numbers, spaces and - ' . & only"),
+            ("2026", "a company name needs at least one letter"),
+            ("Bigfuckco", "Compliance has rejected that name. Pick another."),
+        ] {
+            assert_eq!(error(&name(&state, c, sent).await), (StatusCode::BAD_REQUEST, Some(want.to_string())), "{sent}");
+            assert_eq!(get(&state, Some("t"), c).await.1["company"]["name"], "Acme", "{sent} stored nothing");
+        }
+        let (status, _, bytes) = post(&state, c, "name", Some("{}")).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{}", String::from_utf8_lossy(&bytes));
+    }
+
+    /// BP-24a T5: OTHER's campaign, seeded, so a broken member check would answer `200`.
+    #[tokio::test]
+    async fn ops_name_by_a_non_member_is_403() {
+        let state = Arc::new(session_state());
+        let c = campaign_with(&state, OTHER, true, Some(GATEWAY)).await;
+        seed_sector(&state, &c).await;
+        let (status, body, _) = name(&state, c.campaign_id, "Acme").await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(state.demo_ops.store.is_empty());
+    }
+
+    /// BP-24a T6: cap 1, held by the first campaign's op: the second campaign's board is served
+    /// uncached, so there is no entry to name (`503`).
+    #[tokio::test]
+    async fn ops_name_with_the_store_full_of_ops_is_503() {
+        let mut state = session_state();
+        state.demo_ops.store = crate::demo_ops::DemoOpsStore::new(1);
+        let state = Arc::new(state);
+        let first = campaign_with(&state, WALLET, true, Some(GATEWAY)).await;
+        seed_sector(&state, &first).await;
+        let second = campaign_with(&state, WALLET, true, Some(GATEWAY)).await;
+        seed_sector(&state, &second).await;
+        seed_commander(&state, first.campaign_id).await;
+        assert_eq!(start(&state, first.campaign_id, SITE).await.0, StatusCode::OK);
+        let (status, body, _) = name(&state, second.campaign_id, "Acme").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["error"], "the ops board is full");
+        assert_eq!(state.demo_ops.store.len(), 1);
     }
 
     /// BP-23a test 9: only the leading Section's kit counts. Kit on S1 only; a fight sent
