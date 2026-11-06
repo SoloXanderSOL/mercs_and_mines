@@ -8816,3 +8816,52 @@ async fn postgres_add_heads_decides_on_each_term() {
         assert_eq!(read.expect("get_crew"), Some((7, morale)), "{why}: stored");
     }
 }
+
+/// BP-7a — `RedisClaims`: the claim is `SET NX`, the rebuild a compare-and-set on the stored
+/// signature (the Lua script), and the wallet link round-trips. Its own keys, deleted before
+/// and after.
+#[tokio::test]
+async fn redis_field_pass_claims_are_nx_and_cas() {
+    use mercs_server::demo_field_pass::{Attempt, Claims, RedisClaims};
+    let url = match std::env::var("TEST_REDIS_URL").ok() {
+        Some(u) => u,
+        None => {
+            eprintln!("TEST_REDIS_URL not set — skipping redis_field_pass_claims_are_nx_and_cas");
+            return;
+        }
+    };
+    let client = redis::Client::open(url).expect("Invalid TEST_REDIS_URL");
+    let mut mgr = redis::aio::ConnectionManager::new(client).await.expect("Failed to connect to Redis");
+    let (mint, wallet) = ("bp7aTestMint", "bp7aTestWallet");
+    let keys = ["demo:fieldpass:mint:bp7aTestMint", "demo:fieldpass:wallet:bp7aTestWallet"];
+    let clean = |mut m: redis::aio::ConnectionManager| async move {
+        redis::cmd("DEL").arg(&keys).query_async::<()>(&mut m).await.expect("DEL failed");
+    };
+    clean(mgr.clone()).await;
+    let claims = RedisClaims::new(mgr.clone());
+    let at = |sig: &str| Attempt {
+        wallet: wallet.into(),
+        asset: "Asset".into(),
+        signature: sig.into(),
+        wire: "V2lyZQ==".into(),
+        last_valid_block_height: 42,
+    };
+    let mut got = Vec::new();
+    got.push(claims.claim(mint, &at("s1")).await.expect("claim"));
+    got.push(claims.claim(mint, &at("s2")).await.expect("claim"));
+    let after_claims = claims.get(mint).await.expect("get");
+    got.push(claims.replace(mint, "s9", &at("s3")).await.expect("replace"));
+    got.push(claims.replace(mint, "s1", &at("s3")).await.expect("replace"));
+    let after_replace = claims.get(mint).await.expect("get");
+    let before_link = claims.mint_of(wallet).await.expect("mint_of");
+    claims.link(wallet, mint).await.expect("link");
+    let after_link = claims.mint_of(wallet).await.expect("mint_of");
+    let raw: Option<String> = redis::cmd("GET").arg(keys[0]).query_async(&mut mgr).await.expect("GET");
+    clean(mgr.clone()).await;
+
+    assert_eq!(got, [true, false, false, true], "NX wins once; CAS needs the stored signature");
+    assert_eq!(after_claims, Some(at("s1")));
+    assert_eq!(after_replace, Some(at("s3")));
+    assert_eq!((before_link, after_link), (None, Some(mint.to_string())));
+    assert_eq!(raw.as_deref(), Some(r#"{"wallet":"bp7aTestWallet","asset":"Asset","signature":"s3","wire":"V2lyZQ==","last_valid_block_height":42}"#));
+}

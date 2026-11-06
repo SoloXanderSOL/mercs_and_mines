@@ -1,0 +1,15 @@
+{
+  "name": "Breakpoint Genesis Field Pass",
+  "symbol": "MMPASS",
+  "description": "Issued at the Mercs & Mines Breakpoint booth to a Seeker carrying a Genesis Token. A free test-network pass: soulbound, devnet only, and not part of the Genesis Collection. The clerk stamped it anyway.",
+  "image": "https://demo.mercsandmines.com/assets/MM_logo_FINAL_small_fade.png",
+  "external_url": "https://demo.mercsandmines.com/",
+  "attributes": [
+    { "trait_type": "Network", "value": "Devnet" },
+    { "trait_type": "Issued at", "value": "Breakpoint" }
+  ],
+  "properties": {
+    "files": [{ "uri": "https://demo.mercsandmines.com/assets/MM_logo_FINAL_small_fade.png", "type": "image/png" }],
+    "category": "image"
+  }
+}

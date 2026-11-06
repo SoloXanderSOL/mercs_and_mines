@@ -130,6 +130,9 @@ pub struct AppState {
     pub crew_loss: Arc<dyn crate::demo_crew_loss::CrewLoss>,
     /// The latch's Section loss (BP-11a-1, demo-only).
     pub section_loss: Arc<dyn crate::demo_section_loss::SectionLoss>,
+    /// The Field Pass mint (BP-7a, demo-only): no minter and in-memory claims until `main`
+    /// sets them; with no minter the pass routes answer `503`.
+    pub field_pass: crate::demo_field_pass::FieldPassState,
 }
 
 impl AppState {
@@ -175,6 +178,7 @@ impl AppState {
             launch_locks:       LaunchLocks::default(),
             address_campaigns:  crate::demo_address_cap::AddressCampaigns::new(crate::demo_address_cap::DEMO_ADDRESS_LIVE_CAP),
             demo_ops:           crate::demo_ops::DemoOps::default(),
+            field_pass:         crate::demo_field_pass::FieldPassState::default(), // (BP-7a, demo-only)
         }
     }
 }

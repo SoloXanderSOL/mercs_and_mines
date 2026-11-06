@@ -86,6 +86,9 @@ async fn main() {
     state.crew_loss       = Arc::new(mercs_server::demo_crew_loss::PostgresCrewLoss::new(pool.clone()));
     // (BP-11a-1, demo-only): the latch's Section loss.
     state.section_loss = Arc::new(mercs_server::demo_section_loss::PostgresSectionLoss::new(pool.clone()));
+    // BP-7a (demo-only): the Field Pass mint (off without FIELD_PASS_SEED_HEX) and its Redis claims.
+    state.field_pass.minter = mercs_server::demo_field_pass::from_env(config.server.solana_devnet_rpc_url.as_ref());
+    state.field_pass.claims = Arc::new(mercs_server::demo_field_pass::RedisClaims::new(redis_mgr.clone()));
     state.pool  = Some(pool);
     state.redis = Some(redis_mgr);
     let state = Arc::new(state);
