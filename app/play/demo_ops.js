@@ -46,6 +46,7 @@ import { onMapCreated } from './hexmap.js';
 import { setAarNote, setBeforeOffer, setSquadSize, setDeployExtra, setStill, setFightSquad } from './battle.js';
 import { mountStory, writeAar } from './demo_story.js';
 import { showCard, cardSeen } from './demo_card.js';
+import { mountShop, openShop } from './demo_shop.js'; // BP-25
 import { mountCompany, dressBriefing, renderCompany, redrawCompany, healPrice, wageLine } from './demo_company.js';
 import { DIG_COPY, DIG_CSS, createDigPanel, renderDig, hideDig, homewardLines, flash, bankedLine, crewFightLine } from './demo_dig.js';
 import { BASE_COPY, BASE_CSS, createBase, renderBase, hideBase } from './demo_base.js';
@@ -1981,11 +1982,13 @@ export function mountOps(d) {
   baseButton.addEventListener('click', () => (baseOpen ? closeBase() : openBase()));
   baseSheet = createBase(sendBuild, closeBase);
   list = createList();
-  // A13: today's checkout from the hub at any time (no ops call). Leaving it returns to the hub.
+  // A13, BP-25: the Demo Shop screen (demo_shop.js) from the hub at any time (no ops call). Its Buy opens
+  // today's checkout as before; leaving either returns to the hub.
   const shopButton = el('button', 'ops-shop', COPY.shop);
   shopButton.type = 'button';
-  shopButton.addEventListener('click', () => deps.offerCheckout(() => deps.enterHub()));
+  shopButton.addEventListener('click', () => openShop());
   deps.$('screen-hub').append(strip, bankChip, baseButton, shopButton, baseSheet.node, list.node);
+  mountShop(deps); // BP-25
   endNote = el('p', 'end-ops');
   endNote.hidden = true;
   deps.$('btn-new-run').before(endNote);
