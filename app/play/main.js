@@ -20,7 +20,7 @@ import { createCheckout } from './checkout.js';
 import { renderReveal } from './reveal.js';
 import { HexMap, PALETTE, TERRAIN_ORDER, OVERLAY } from './hexmap.js';
 import { createBattle } from './battle.js';
-import { mountWaysIn } from './demo_ways_in.js'; // demo-only (ODQ-69)
+import { mountWaysIn, resumeRemembered } from './demo_ways_in.js'; // demo-only (ODQ-69; resumeRemembered BP-26)
 import { mountOps } from './demo_ops.js'; // demo-only (BP-9a)
 
 // Booth copy, verbatim from the BP-3a-1, BP-3a-1b, BP-3a-2 and BP-3b-2 prompts (the battle's own
@@ -456,7 +456,7 @@ function buildLegend() {
 
 // ── boot ────────────────────────────────────────────────────────────────────
 async function boot() {
-  if (!store.session()) return show('screen-title');
+  if (!store.session()) return resumeRemembered() || show('screen-title'); // demo-only (BP-26): a remembered throwaway signs itself back in
   $('working-text').textContent = COPY.bootWorking;
   show('screen-working'); // never a blank stage while the session check is in flight
   try {
@@ -567,7 +567,7 @@ function startFresh() {
 
 fillCopy();
 buildLegend();
-mountWaysIn({ $, onSignIn }); // demo-only (ODQ-69)
+mountWaysIn({ $, onSignIn, show, toSignIn, enterCampaign }); // demo-only (ODQ-69; show/toSignIn/enterCampaign BP-26)
 wire();
 battle = createBattle({
   $, DEBUG, music, show, showError, handleError, note, enterHub, enterCampaign,
