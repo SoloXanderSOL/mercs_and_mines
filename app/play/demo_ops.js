@@ -47,6 +47,7 @@ import { setAarNote, setBeforeOffer, setSquadSize, setDeployExtra, setStill, set
 import { mountStory, writeAar } from './demo_story.js';
 import { showCard, cardSeen } from './demo_card.js';
 import { mountShop, openShop } from './demo_shop.js'; // BP-25
+import { mountReview, countContract } from './demo_review.js'; // BP-27
 import { mountCompany, dressBriefing, renderCompany, redrawCompany, healPrice, wageLine } from './demo_company.js';
 import { DIG_COPY, DIG_CSS, createDigPanel, renderDig, hideDig, homewardLines, flash, bankedLine, crewFightLine } from './demo_dig.js';
 import { BASE_COPY, BASE_CSS, createBase, renderBase, hideBase } from './demo_base.js';
@@ -1207,6 +1208,7 @@ function guardHead() {
 function aarNote({ report, section }) {
   writeAar(report, verdictLine(report)); // B4 + B5 (BP-15b): the write-up, then the verdict on the pick, under the banner
   if (!opFight) return [];
+  if (reopen === fightContract) countContract(); // BP-27: a contract's AAR; a raid's or an ambush's reopens fight
   opFight = false;
   const before = fightHead;
   fightHead = null;
@@ -2029,5 +2031,6 @@ export function mountOps(d) {
     equip: sendEquip,
   });
   watch();
+  mountReview(deps); // BP-27: after watch(), so its hub observer runs after the end-of-run check
   onMapCreated(attach);
 }
