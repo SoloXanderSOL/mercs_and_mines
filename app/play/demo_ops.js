@@ -48,7 +48,7 @@ import { mountStory, writeAar } from './demo_story.js';
 import { showCard, cardSeen } from './demo_card.js';
 import { mountShop, openShop } from './demo_shop.js'; // BP-25
 import { mountReview, countContract } from './demo_review.js'; // BP-27
-import { mountCompany, dressBriefing, renderCompany, redrawCompany, healPrice, wageLine } from './demo_company.js';
+import { mountCompany, dressBriefing, renderCompany, redrawCompany, healPrice, wageLine, SELL_ORE_CREDITS } from './demo_company.js';
 import { DIG_COPY, DIG_CSS, createDigPanel, renderDig, hideDig, homewardLines, flash, bankedLine, crewFightLine } from './demo_dig.js';
 import { BASE_COPY, BASE_CSS, createBase, renderBase, hideBase } from './demo_base.js';
 
@@ -140,6 +140,7 @@ const COPY = {
 // Refusals the client keys on by exact text (routes/ops.rs; a server reword changes this block in the same brick).
 const REFUSAL = {
   short: 'not enough banked credits',
+  oreShort: 'not enough banked ore', // BP-28b: ops/sell's store refusal (routes/ops.rs, BP-28a)
   out: 'the team is out: replacements report at base',
   sectionFull: 'no room: a Section holds 8',
   crewFull: 'no room: a Crew holds 8',
@@ -1631,6 +1632,10 @@ async function send(path, body, built, spentOf, beforeAdopt, afterAdopt) {
   if (stale(err) || rated(err)) return;
   if (err instanceof ApiError && err.kind === 'conflict' && ask) {
     // BP-12b: heal's and replace's refusals by exact text; the bank comes from the re-read, never from here.
+    if (err.message === REFUSAL.oreShort) { // BP-28b: a sale's 409; the bank comes from the re-read
+      companyNotice = { ...ask, kind: 'ore' };
+      return load();
+    }
     if (err.message === REFUSAL.short || err.message === REFUSAL.out) {
       companyNotice = { ...ask, kind: err.message === REFUSAL.short ? 'short' : 'out' };
       return load();
@@ -1795,6 +1800,16 @@ function sendHire() {
       redrawCompany();
     });
   });
+}
+
+// BP-28b: sell `ore` of the banked ore (the card's Sell); allowed with a team out (BP-28a). Its spend is the sale's
+// proceeds, negative (spec check F-B), so a contract its body latches reports its pay, not pay plus the sale. `onSold`
+// runs once the 200's body is adopted. A 409 re-reads through send's ask block; any other 4xx is the error screen.
+function sendSell(ore, onSold) {
+  if (held() || !campaignId) return;
+  companyNotice = null;
+  companyAsk = { action: 'sell', target: 'bank' };
+  send(opsPath(campaignId) + '/sell', { ore }, false, () => -(ore * SELL_ORE_CREDITS), undefined, onSold);
 }
 
 // ── the hub's re-entry and the end screen ─────────────────────────────────────
@@ -2007,6 +2022,7 @@ export function mountOps(d) {
   mountCompany(deps, {
     adopted: () => Boolean(campaignId) && adoptedFor === campaignId && Boolean(store.campaign()) && store.campaign().campaign_id === campaignId,
     credits: () => credits,
+    ore: () => banked, // BP-28b: ore_banked, from the last adopted body
     base: () => base,
     out: () => Boolean(op),
     sectionOut: id => opsOut().some(o => o.section_id && o.section_id === id), // every op (F5); not busy on an unguarded dig (section_busy)
@@ -2026,6 +2042,7 @@ export function mountOps(d) {
     notice: () => companyNotice,
     clearNotice: () => { companyNotice = null; },
     heal: sendHeal,
+    sell: sendSell, // BP-28b
     replace: sendReplace,
     kit: id => (company.kit || []).find(k => k.section_id === id) || null, // BP-23b
     equip: sendEquip,
