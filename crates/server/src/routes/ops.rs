@@ -44,6 +44,7 @@ use crate::demo_ops::{
 };
 use crate::commander_gen::generate_commander;
 use crate::demo_ops::{HireHold, HireRefusal, DEMO_HIRE_CAP, DEMO_HIRE_CREDITS, DEMO_WAGE_CREDITS_PER_MIN};
+use crate::demo_ops::SellRefusal;
 use crate::demo_ops::{RouteKind, RoutePath};
 use crate::demo_ops::{hazard_warning, EquipRefusal, HazardDue, Trophy, TripReport};
 use crate::repository::section::starter_section;
@@ -57,7 +58,7 @@ use super::{
 };
 
 /// Request body cap for `ops/start`, `ops/next`, `ops/build`, `ops/heal`, `ops/replace`,
-/// `ops/equip` and `ops/name` (the seven routes that read a body), layered on each route: the overflow reaches the handler
+/// `ops/equip`, `ops/name` and `ops/sell` (the eight routes that read a body), layered on each route: the overflow reaches the handler
 /// as a `JsonRejection` after the limiters, so it is counted (`413`).
 pub const OPS_BODY_LIMIT: usize = 1024;
 
@@ -76,6 +77,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/campaign/:campaign_id/ops/hire", post(post_ops_hire))
         .route("/api/campaign/:campaign_id/ops/equip", post(post_ops_equip).layer(DefaultBodyLimit::max(OPS_BODY_LIMIT)))
         .route("/api/campaign/:campaign_id/ops/name", post(post_ops_name).layer(DefaultBodyLimit::max(OPS_BODY_LIMIT)))
+        .route("/api/campaign/:campaign_id/ops/sell", post(post_ops_sell).layer(DefaultBodyLimit::max(OPS_BODY_LIMIT)))
 }
 
 /// The ops state as the client sees it, from every route. `now` is the server's clock, so the
@@ -239,6 +241,13 @@ pub struct OpsEquipItem {
 #[derive(Deserialize)]
 pub struct OpsNameRequest {
     pub name: String,
+}
+
+/// `ops/sell`'s body (BP-28a): `ore` a `u32`, so a negative, fractional, string or missing
+/// amount is axum's `422`; zero reaches the handler and is our `400`.
+#[derive(Deserialize)]
+pub struct OpsSellRequest {
+    pub ore: u32,
 }
 
 /// `ops/replace`'s body (BP-12a-2): exactly one of `section_id` / `crew_id`, strings parsed after
@@ -1557,6 +1566,49 @@ async fn post_ops_name(
     if !state.demo_ops.store.name_op(campaign_id, name, now) {
         return Err(service_unavailable("the ops board is full"));
     }
+    Ok(ops_response(&state, campaign_id, gw, &board, now))
+}
+
+/// Sells banked ore for credits, `POST /api/campaign/:campaign_id/ops/sell {ore}` (BP-28a,
+/// demo-only, §4f "the losing streak"), at `DEMO_ORE_SELL_CREDITS` credits per ore. Order:
+/// `401` → `429` `ops_ip` → `429` `ops_wallet` → axum's body rejection, counted (`413` over
+/// `OPS_BODY_LIMIT`; `400`, `415`, `422`) → `404` → `403` → `409` not `Active` (entry dropped)
+/// → `409` no gateway → the board → a pending battle latched → `400` sell at least 1 ore →
+/// `409` not enough banked ore (also no entry) → `200`, the whole state.
+/// - Allowed while the team is out: nothing holds banked ore.
+/// - Abuse bound: memory only, no DB write, so no launch lock; the shared ops limiter (40/min
+///   per wallet, 400 per address). The one await after the store's change is `settle_leaders`,
+///   a spawned task, so a dropped handler loses nothing.
+async fn post_ops_sell(
+    AuthSession(token): AuthSession,
+    State(state): State<Arc<AppState>>,
+    ci: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    Path(campaign_id): Path<Uuid>,
+    body: Result<Json<OpsSellRequest>, JsonRejection>,
+) -> Result<Response, AppError> {
+    if let Some(r) = ops_limits(&state, &token, ci, &headers)? {
+        return Ok(r);
+    }
+    let Json(req) = match body {
+        Ok(j) => j,
+        Err(rej) => return Ok(rej.into_response()),
+    };
+    let now = Utc::now();
+    let (campaign, gateway, wallet) = ops_member(&state, &token, campaign_id, "post_ops_sell").await?;
+    let Some(gw) = gateway else {
+        return Err(conflict("no gateway assigned"));
+    };
+    let board = load_board(&state, &campaign, gw, now, false, "post_ops_sell").await?;
+    latch_pending_raid(&state, campaign_id, now, "post_ops_sell").await?;
+    if req.ore == 0 {
+        return Err(bad_request("sell at least 1 ore"));
+    }
+    match state.demo_ops.store.sell_op(campaign_id, req.ore, now) {
+        Ok(()) => {}
+        Err(SellRefusal::NotEnoughOre) => return Err(conflict("not enough banked ore")),
+    }
+    settle_leaders(&state, campaign_id, &wallet, now).await;
     Ok(ops_response(&state, campaign_id, gw, &board, now))
 }
 
@@ -3272,6 +3324,64 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
         assert_eq!(body["error"], "the ops board is full");
         assert_eq!(state.demo_ops.store.len(), 1);
+    }
+
+    async fn sell(state: &Arc<AppState>, campaign: Uuid, body: &str) -> (StatusCode, serde_json::Value, Vec<u8>) {
+        post(state, campaign, "sell", Some(body)).await
+    }
+
+    /// BP-28a R1: 40 of 100 banked ore sells for 2 each; the answer is the whole state, heal's
+    /// key set.
+    #[tokio::test]
+    async fn ops_sell_route_answers_the_whole_state() {
+        let state = Arc::new(session_state());
+        let c = name_campaign(&state).await;
+        state.demo_ops.store.set_ore(c, 100);
+        let (status, body, _) = sell(&state, c, r#"{"ore":40}"#).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!((body["ore_banked"].as_u64(), body["credits_banked"].as_u64()), (Some(60), Some(80)));
+        let keys: std::collections::BTreeSet<&str> = body.as_object().expect("an object").keys().map(|k| k.as_str()).collect();
+        assert_eq!(keys, ["active_op", "base", "campaign_id", "company", "credits_banked", "gateway", "now", "ore_banked", "sites"].into_iter().collect());
+    }
+
+    /// BP-28a R2: zero is our `400`, more than banked our `409`, a missing amount axum's `422`;
+    /// none moves anything. A non-member's sale (OTHER's seeded campaign) is `403` and adds no
+    /// entry.
+    #[tokio::test]
+    async fn ops_sell_route_refusals_and_a_non_member() {
+        let state = Arc::new(session_state());
+        let c = name_campaign(&state).await;
+        state.demo_ops.store.set_ore(c, 100);
+        let (status, body, _) = sell(&state, c, r#"{"ore":0}"#).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::BAD_REQUEST, Some("sell at least 1 ore")));
+        let (status, body, _) = sell(&state, c, r#"{"ore":101}"#).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("not enough banked ore")));
+        let (status, _, bytes) = sell(&state, c, "{}").await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{}", String::from_utf8_lossy(&bytes));
+        let (status, body) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!((body["ore_banked"].as_u64(), body["credits_banked"].as_u64()), (Some(100), Some(0)));
+        let other = campaign_with(&state, OTHER, true, Some(GATEWAY)).await;
+        seed_sector(&state, &other).await;
+        let (status, body, _) = sell(&state, other.campaign_id, r#"{"ore":1}"#).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(state.demo_ops.store.len(), 1, "no entry for OTHER's campaign");
+    }
+
+    /// BP-28a R3: the 14th latcher. A won contract's fight (SUCCESS_SEED, pay 400) is logged and
+    /// the sale is the first ops call after it. On this path the only credit writers are this
+    /// route's latch (`latch_raid`, the 400) and the sale (10 ore × 2); `set_ore` writes ore only.
+    #[tokio::test]
+    async fn ops_sell_latches_a_pending_battle() {
+        let state = Arc::new(session_state());
+        let cc = campaign_with(&state, WALLET, true, Some(GATEWAY)).await;
+        seed_commander(&state, cc.campaign_id).await;
+        let (c, _, _) = contract_on_site(&state, &cc).await;
+        fight_logged(&state, c, SUCCESS_SEED, None).await;
+        state.demo_ops.store.set_ore(c, 10);
+        let (status, body, _) = sell(&state, c, r#"{"ore":10}"#).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!((body["ore_banked"].as_u64(), body["credits_banked"].as_u64()), (Some(0), Some(420)));
     }
 
     /// BP-23a test 9: only the leading Section's kit counts. Kit on S1 only; a fight sent

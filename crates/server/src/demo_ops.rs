@@ -96,6 +96,10 @@ pub const DEMO_HIRE_CREDITS: u32 = 600;
 pub const DEMO_HIRE_CAP: usize = 2;
 /// Wages (BP-18a-2, §4e B6): credits per squad per whole minute, settled on read, floor 0.
 pub const DEMO_WAGE_CREDITS_PER_MIN: u32 = 5;
+/// Credits per banked ore sold (BP-28a, demo-only, §4f "the losing streak"): the way out for a
+/// player whose fights have stopped paying. Two, so one careful 3-drill dig (120 ore) buys back
+/// a merc with room for wage minutes, and a tier-1 dig never out-earns a won contract.
+pub const DEMO_ORE_SELL_CREDITS: u32 = 2;
 /// Drill *n* adds a seeded heat from `DEMO_HEAT_MIN` to `DEMO_HEAT_TOP_BASE + DEMO_HEAT_TOP_PER_DRILL × n`
 /// inclusive (§4e B1, BP-13: drill 1 10–20, drill 2 10–25, …); the site melts down at the threshold.
 pub const DEMO_HEAT_MIN: u32 = 10;
@@ -1355,6 +1359,13 @@ pub enum HealRefusal {
     NotEnoughCredits,
 }
 
+/// Why `sell_op` refused (BP-28a). Zero is the route's `400`, never the store's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SellRefusal {
+    /// More ore than is banked (also a campaign with no entry, which has banked nothing).
+    NotEnoughOre,
+}
+
 /// Why `begin_replace` refused (BP-12a-2), in the order it checks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReplaceRefusal {
@@ -2312,7 +2323,7 @@ fn new_op(site: &OpsSite, op_seed: u32, dig: Option<DigStart>, contract: Option<
 ///   and never pends; an unguarded ambush pends with its roll (`PendingRaid::crew`) and is
 ///   latched by `latch_crew`. Only `new_op` and `escort_op` write `escort_at`;
 /// - **the keep list** (the reaper's `moved_since`): a departure (start, next, return, pull), a
-///   homeward arrival, a drill, a latch, a build, a heal and a replace each write `moved_at`. Reading the board or the op
+///   homeward arrival, a drill, a latch, a build, a heal, a replace and a sell each write `moved_at`. Reading the board or the op
 ///   does not, nor does the ambush's reveal; a read that latches a battle does. While an
 ///   ambush waits, `moved_since` still counts the leg's passed `arrive_at`, at most
 ///   `travel_secs` after the pull: an accepted overcount;
@@ -3380,6 +3391,29 @@ impl DemoOpsStore {
         Ok(())
     }
 
+    /// Sells `ore` of the banked ore for `DEMO_ORE_SELL_CREDITS` credits each (BP-28a, §4f): the
+    /// demo's one way out of a losing streak. Settles first, so a haul that has just come home
+    /// banks before the check, and wages already due are taken before the sale's credits are
+    /// added. Nothing holds banked ore (a build debits at once; ore on a dig is the op's until
+    /// it lands), so a sale is allowed while the team is out and competes with nothing;
+    /// `credits_in_flight` is untouched. Writes `moved_at` (the keep list). Refusal:
+    /// `NotEnoughOre` (also no entry). Check and move are one critical section, no await.
+    pub fn sell_op(&self, campaign_id: Uuid, ore: u32, now: DateTime<Utc>) -> Result<(), SellRefusal> {
+        let mut inner = self.lock();
+        let Some(e) = inner.get_mut(&campaign_id) else {
+            return Err(SellRefusal::NotEnoughOre);
+        };
+        e.settle_arrival(now);
+        if e.ore_banked < ore {
+            return Err(SellRefusal::NotEnoughOre);
+        }
+        e.ore_banked -= ore;
+        e.credits_banked = e.credits_banked.saturating_add(ore.saturating_mul(DEMO_ORE_SELL_CREDITS));
+        e.moved_at = Some(now);
+        e.touched = now;
+        Ok(())
+    }
+
     /// Debits `cost` for a replace (BP-12a-2) and holds it in flight, so `make_room` keeps the
     /// entry until `finish_replace`. Settles first, so a team that has just come home can replace
     /// on the same call. Writes `moved_at` (the keep list). Refusals in order: `OpOut` →
@@ -3597,6 +3631,15 @@ impl DemoOpsStore {
     pub(crate) fn set_credits(&self, campaign_id: Uuid, credits: u32) {
         if let Some(e) = self.lock().get_mut(&campaign_id) {
             e.credits_banked = credits;
+        }
+    }
+
+    /// Sets the banked ore at the campaign's entry, so a route test can sell without a dig
+    /// first (BP-28a).
+    #[cfg(test)]
+    pub(crate) fn set_ore(&self, campaign_id: Uuid, ore: u32) {
+        if let Some(e) = self.lock().get_mut(&campaign_id) {
+            e.ore_banked = ore;
         }
     }
 
@@ -4857,6 +4900,69 @@ mod tests {
         assert!(!store.moved_since(a, at(400), at(450)), "home at 30 s, nothing since");
         assert_eq!(store.build_op(a, BaseBuilding::RadioShack, at(500)), Ok(()));
         assert!(store.moved_since(a, at(500), at(501)), "the build");
+    }
+
+    /// BP-28a S1: 50 of seed 2's 120 ore sells for 2 each. The 8 wage minutes since the entry's
+    /// creation (0 s) fall on an empty bank and are forgiven before the sale adds its credits.
+    /// A sale counts as movement (the keep list).
+    #[test]
+    fn sell_op_moves_ore_to_credits_and_counts_as_moving() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        banked_120(&store, a);
+        assert!(!store.moved_since(a, at(400), at(450)), "home at 30 s, nothing since");
+        assert_eq!(store.sell_op(a, 50, at(500)), Ok(()));
+        let s = store.ops_state(a, at(500));
+        assert_eq!((s.ore_banked, s.credits_banked), (70, 100));
+        assert!(store.moved_since(a, at(500), at(501)), "the sale");
+    }
+
+    /// BP-28a S2: selling exactly what is banked is allowed and leaves no ore.
+    #[test]
+    fn sell_op_sells_everything_banked() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        banked_120(&store, a);
+        assert_eq!(store.sell_op(a, 120, at(31)), Ok(()));
+        let s = store.ops_state(a, at(31));
+        assert_eq!((s.ore_banked, s.credits_banked), (0, 240));
+    }
+
+    /// BP-28a S3: no entry has banked nothing; one ore more than banked is refused and moves
+    /// nothing.
+    #[test]
+    fn sell_op_refuses_more_than_banked_and_moves_nothing() {
+        let store = DemoOpsStore::new(2);
+        let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        assert_eq!(store.sell_op(b, 1, at(0)), Err(SellRefusal::NotEnoughOre), "no entry");
+        banked_120(&store, a);
+        assert_eq!(store.sell_op(a, 121, at(31)), Err(SellRefusal::NotEnoughOre));
+        let s = store.ops_state(a, at(31));
+        assert_eq!((s.ore_banked, s.credits_banked), (120, 0));
+    }
+
+    /// BP-28a S4: seed 2's haul arrives at 30 s and nothing reads it before the sale, so only the
+    /// sale's own settle can bank the 120 it sells.
+    #[test]
+    fn sell_op_settles_an_arrived_haul_first() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        pulled(&store, a, 2, 3);
+        assert_eq!(store.sell_op(a, 120, at(30)), Ok(()));
+        let s = store.ops_state(a, at(30));
+        assert_eq!((s.ore_banked, s.credits_banked), (0, 240));
+    }
+
+    /// BP-28a S5: wages due are taken before the sale adds. At 150 s two minutes are due on an
+    /// empty bank (forgiven), so the sale's 240 stand; the third minute, due at 180 s, takes 5.
+    #[test]
+    fn sell_op_takes_due_wages_before_it_adds() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        banked_120(&store, a);
+        assert_eq!(store.sell_op(a, 120, at(150)), Ok(()));
+        assert_eq!(store.ops_state(a, at(150)).credits_banked, 240);
+        assert_eq!(store.ops_state(a, at(180)).credits_banked, 235);
     }
 
     /// BP-21: a build is pending until its `done_at` and stands at it, not a second before; the
