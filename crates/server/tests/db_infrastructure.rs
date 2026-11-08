@@ -8333,7 +8333,7 @@ async fn pg_has_convoy_in_transit_reads_sector_wallet_flag_and_arrival() {
 // Wallets 100–105. Literal times, no sleeps: T0 = 2026-01-01T00:00:00Z, cutoff T0 + 15 min.
 // Each test asserts on its own campaign only: a sweep can see other `Active` rows.
 
-use mercs_server::demo_reaper::{reap_once, reap_once_with_seam, PostgresReaperStore, ReaperStore, ReaperWarns};
+use mercs_server::demo_reaper::{reap_once, reap_once_with_seam, PostgresReaperStore, ReapCutoffs, ReaperStore, ReaperWarns};
 
 fn reap_at(rfc3339: &str) -> chrono::DateTime<chrono::Utc> {
     chrono::DateTime::parse_from_rfc3339(rfc3339).unwrap().with_timezone(&chrono::Utc)
@@ -8383,7 +8383,7 @@ async fn reap_state_of(pool: &sqlx::PgPool, c: uuid::Uuid) -> Option<CampaignLif
 }
 
 /// BP-3c-1b-1 D1 — a campaign whose latest mission started before the cutoff is archived and
-/// its sector deleted.
+/// its sector deleted. BP-42: only once its last mission is older than the 48-hour line.
 #[tokio::test]
 async fn reaper_retires_a_campaign_idle_since_its_last_mission() {
     let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
@@ -8393,9 +8393,14 @@ async fn reaper_retires_a_campaign_idle_since_its_last_mission() {
     reap_deployment(&pool, k, reap_t0()).await;
     let store = PostgresReaperStore::new(pool.clone());
 
-    // Collect.
+    // Collect. BP-42: the mission at T0 makes it played. At cutoff T0 + 15 min its played line
+    // is T0 − 171,000 s, so it is kept; at cutoff T0 + 172,801 s the played line is T0 + 901 s,
+    // so it is retired. The single-cutoff list (flat) still lists it at T0 + 15 min.
     let listed = store.list_idle_campaigns(reap_cutoff(), 10_000).await;
-    let reaped = reap_once(&state, &store, reap_cutoff(), &mut ReaperWarns::new()).await;
+    let _ = reap_once(&state, &store, reap_cutoff(), &mut ReaperWarns::new()).await;
+    let kept = reap_state_of(&pool, c).await;
+    let late = reap_t0() + chrono::Duration::seconds(172_801);
+    let reaped = reap_once(&state, &store, late, &mut ReaperWarns::new()).await;
     let after = reap_state_of(&pool, c).await;
     let sector = state.sector_repo.sector_exists(s).await;
 
@@ -8403,7 +8408,8 @@ async fn reaper_retires_a_campaign_idle_since_its_last_mission() {
     clean_wallet_4g1(&pool, &wallet).await;
 
     // Assert.
-    assert!(listed.expect("list_idle_campaigns").contains(&(c, s)), "listed as idle");
+    assert!(listed.expect("list_idle_campaigns").contains(&(c, s)), "listed as idle by the single cutoff");
+    assert_eq!(kept, Some(CampaignLifecycle::Active), "played, inside 48 hours: kept");
     assert!(reaped >= 1, "the sweep retired it");
     assert_eq!(after, Some(CampaignLifecycle::Archived));
     assert!(!sector.expect("sector_exists"), "its sector is deleted");
@@ -8592,6 +8598,117 @@ async fn reaper_keeps_a_campaign_with_a_convoy_in_transit() {
     assert!(!listed.expect("list_idle_campaigns").contains(&(c, s)), "a convoy in transit: not listed");
     assert!(!in_transit.expect("retire_if_idle"), "a convoy in transit: kept");
     assert!(after_landing.expect("retire_if_idle"), "landed: retired");
+}
+
+// ── BP-42: the two idle lines (demo-only, ODQ-67 (b) amended 2026-11-07) ──────────────
+// Wallets 117–121. Store-level calls with literal lines around a deployment at T0, or around
+// an ops move taken from the clock after the seed (the launch is the real clock).
+
+/// BP-42 D1 — a mission at T0 makes the campaign played: with the played line at T0 − 1 s and
+/// the unplayed at T0 + 1 s it is neither listed nor retired; with both at T0 + 1 s it is both.
+#[tokio::test]
+async fn reaper_class_keeps_a_campaign_with_a_mission_inside_48_hours() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    let wallet = [117u8; 32];
+    let state = default_state();
+    let (c, s, k) = reap_seed(&pool, &state, wallet).await;
+    reap_deployment(&pool, k, reap_t0()).await;
+    let store = PostgresReaperStore::new(pool.clone());
+    let secs = chrono::Duration::seconds;
+    let kept = ReapCutoffs { played: reap_t0() - secs(1), unplayed: reap_t0() + secs(1) };
+    let past = ReapCutoffs { played: reap_t0() + secs(1), unplayed: reap_t0() + secs(1) };
+
+    // Collect.
+    let listed_kept = store.list_idle(kept, &[], &[], 10_000).await;
+    let retired_kept = store.retire_idle(c, kept, None).await;
+    let state_kept = reap_state_of(&pool, c).await;
+    let listed_past = store.list_idle(past, &[], &[], 10_000).await;
+    let retired_past = store.retire_idle(c, past, None).await;
+
+    // Clean.
+    clean_wallet_4g1(&pool, &wallet).await;
+
+    // Assert.
+    assert!(!listed_kept.expect("list_idle").contains(&(c, s)), "played, inside its line: not listed");
+    assert!(!retired_kept.expect("retire_idle"), "played, inside its line: not retired");
+    assert_eq!(state_kept, Some(CampaignLifecycle::Active));
+    assert!(listed_past.expect("list_idle").contains(&(c, s)), "past its played line: listed");
+    assert!(retired_past.expect("retire_idle"), "past its played line: retired");
+}
+
+/// BP-42 D2 — no deployment, but the ops arrays name the campaign with a move at T (after its
+/// launch): with the played line at T − 1 s and the unplayed at T + 1 s it is not listed and
+/// not retired; the retire with no move judges it unplayed (launched before T + 1 s): retired.
+#[tokio::test]
+async fn reaper_class_keeps_an_ops_played_campaign() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    let wallet = [118u8; 32];
+    let state = default_state();
+    let (c, s, _) = reap_seed(&pool, &state, wallet).await;
+    let t = chrono::Utc::now();
+    let store = PostgresReaperStore::new(pool.clone());
+    let secs = chrono::Duration::seconds;
+    let cutoffs = ReapCutoffs { played: t - secs(1), unplayed: t + secs(1) };
+
+    // Collect.
+    let listed = store.list_idle(cutoffs, &[c], &[t], 10_000).await;
+    let retired_moved = store.retire_idle(c, cutoffs, Some(t)).await;
+    let retired_unmoved = store.retire_idle(c, cutoffs, None).await;
+
+    // Clean.
+    clean_wallet_4g1(&pool, &wallet).await;
+
+    // Assert.
+    assert!(!listed.expect("list_idle").contains(&(c, s)), "ops-played, inside its line: not listed");
+    assert!(!retired_moved.expect("retire_idle"), "ops-played, inside its line: not retired");
+    assert!(retired_unmoved.expect("retire_idle"), "no move: unplayed, retired");
+}
+
+/// BP-42 D3 — `A` (seeded first) is kept by an ops move at `t`, taken between the two seeds;
+/// `B` (seeded after `t`) is unplayed and idle. With `LIMIT 1` the list returns `B`: a list that
+/// judged `A` as unplayed would return `A` first, since `t` sorts before `B`'s launch.
+#[tokio::test]
+async fn reaper_list_never_lets_kept_campaigns_fill_the_limit() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    let (wallet_a, wallet_b) = ([119u8; 32], [120u8; 32]);
+    let state = default_state();
+    let (a, _, _) = reap_seed(&pool, &state, wallet_a).await;
+    let t = chrono::Utc::now();
+    let (b, sb, _) = reap_seed(&pool, &state, wallet_b).await;
+    let now = chrono::Utc::now();
+    let store = PostgresReaperStore::new(pool.clone());
+    let cutoffs = ReapCutoffs { played: now - chrono::Duration::hours(1), unplayed: now + chrono::Duration::hours(1) };
+
+    // Collect.
+    let listed = store.list_idle(cutoffs, &[a], &[t], 1).await;
+
+    // Clean.
+    clean_wallet_4g1(&pool, &wallet_a).await;
+    clean_wallet_4g1(&pool, &wallet_b).await;
+
+    // Assert.
+    assert_eq!(listed.expect("list_idle"), vec![(b, sb)], "the kept campaign takes no LIMIT place");
+}
+
+/// BP-42 D4 — the live count rises by exactly one when one `Active` campaign is seeded (the
+/// test DB may hold residue, so the difference is asserted).
+#[tokio::test]
+async fn reaper_count_live_counts_live_campaigns() {
+    let Some(pool) = test_pool().await else { eprintln!("TEST_DATABASE_URL not set — skipping"); return; };
+    let wallet = [121u8; 32];
+    let state = default_state();
+    let store = PostgresReaperStore::new(pool.clone());
+
+    // Collect.
+    let before = store.count_live().await;
+    let _ = reap_seed(&pool, &state, wallet).await;
+    let after = store.count_live().await;
+
+    // Clean.
+    clean_wallet_4g1(&pool, &wallet).await;
+
+    // Assert.
+    assert_eq!(after.expect("count_live") - before.expect("count_live"), 1);
 }
 
 // ── BP-3c-1b-2: the per-address live-campaign cap (demo-only, ODQ-68 (c′)) ──────

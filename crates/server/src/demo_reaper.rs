@@ -1,7 +1,7 @@
 //! The demo reaper (BP-3c-1b-1, ODQ-67 (b), **demo-only**). Every 5 minutes it archives each
-//! `Active` demo campaign whose latest mission start (or, with none, its launch) is more than
-//! 15 minutes old, so a slot an attendee walked away from frees itself (the demo holds at most
-//! 1,000 live campaigns, ODQ-55). A campaign with a convoy in transit is kept until the convoy
+//! `Active` demo campaign that has been idle past its line (below), so a slot an attendee
+//! walked away from frees itself (the demo holds at most 1,000 live campaigns, ODQ-55). A
+//! campaign with a convoy in transit is kept until the convoy
 //! lands, as the abandon keeps it. The `dev` port deletes this file, its `lib.rs` line and its
 //! `main.rs` spawn.
 //!
@@ -12,13 +12,25 @@
 //! `Active` check but inserts after the retire resolves on an `Archived` campaign; the player's
 //! next call gets `409` and the client re-joins.
 //!
-//! The ops layer (BP-8a-2): a campaign whose team departed or came home since the cutoff is
-//! kept (`DemoOpsStore::moved_since`, checked under the launch lock), and each sweep first
-//! prunes the ops store to the `Active` campaigns. Accepted residuals: `ops/start` takes no
-//! launch lock, so an op started between the keep check and the retire is retired with the
-//! campaign; and kept campaigns stay in the oldest-first `LIMIT`, so 200 or more of them
-//! would hide idle ones behind them until they stop moving.
+//! The ops layer (BP-8a-2): each sweep first prunes the ops store to the `Active` campaigns.
+//! Accepted residual: `ops/start` takes no launch lock, so an op started between the keep
+//! check and the retire is retired with the campaign.
 //! A drill counts as moving (BP-8b-1a), so a team still digging on site is kept.
+//!
+//! **Two idle lines (BP-42, ODQ-67 (b) amended 2026-11-07).** A played campaign (a mission
+//! start, or a move the ops store has seen, `DemoOpsStore::last_moved`) is retired after 48
+//! hours idle; an unplayed one after 15 minutes, as before. Its idle time is the latest of its
+//! launch, its last mission start and its last ops move. The select chooses the line per
+//! campaign, with the ops moves passed in as arrays, so kept campaigns never fill the `LIMIT`;
+//! the retire re-checks with the move read under the launch lock. **The safety valve:** at
+//! `DEMO_REAP_PRESSURE_AT` live campaigns the sweep lists by the 15-minute line for everyone,
+//! oldest-idle first, and each retire uses it while the live count less this sweep's retires
+//! still reaches the valve (`under_pressure`); after that, played campaigns are judged by the
+//! 48-hour line again. Accepted residuals: a played campaign listed under pressure and kept
+//! once the count drops still takes a `LIMIT` place until the next sweep; a failed count reads
+//! as no pressure (the 1,000 cap still refuses joins); and a campaign played only through ops
+//! loses that reading at a deploy (the store is in memory), so the boot sweep retires it as
+//! unplayed (Linux F2, ruled with BP-42).
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -36,21 +48,84 @@ use crate::state::AppState;
 
 /// How often the reaper sweeps.
 pub const DEMO_REAP_INTERVAL: Duration = Duration::from_secs(300);
-/// A campaign is idle once its latest mission start (or, with none, its launch) is this old.
+/// An unplayed campaign is idle once its launch is this old; under pressure, every campaign is
+/// idle once its latest activity is this old.
 pub const DEMO_REAP_IDLE_AFTER_SECS: i64 = 900;
+/// BP-42: a played campaign is idle once its latest activity is this old (48 hours).
+pub const DEMO_REAP_IDLE_PLAYED_SECS: i64 = 172_800;
+/// BP-42: at this many live campaigns (80% of `DEMO_LIVE_CAMPAIGN_CAP`), the 15-minute line
+/// applies to every campaign until the count is back under it.
+pub const DEMO_REAP_PRESSURE_AT: i64 = 800;
 /// At most this many campaigns per sweep, oldest first, so one sweep's Postgres work stays
 /// bounded (about 0.5 s at 20,000 deployment rows) and 1,000 idle campaigns clear in 25 minutes.
 pub const DEMO_REAP_MAX_PER_SWEEP: i64 = 200;
 /// A failure logs its first occurrence, then about hourly.
 const REAP_WARN_EVERY_SWEEPS: u32 = 12;
 
+/// The two idle lines a retire is judged against (BP-42).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReapCutoffs {
+    /// A played campaign whose latest activity is before this is idle.
+    pub played: DateTime<Utc>,
+    /// An unplayed campaign launched before this is idle.
+    pub unplayed: DateTime<Utc>,
+}
+
+impl ReapCutoffs {
+    /// The normal pass: `unplayed` is the 15-minute line, and the played line sits
+    /// `DEMO_REAP_IDLE_PLAYED_SECS - DEMO_REAP_IDLE_AFTER_SECS` before it, so both measure
+    /// from the same `now`.
+    pub fn normal(unplayed: DateTime<Utc>) -> Self {
+        let gap = chrono::Duration::seconds(DEMO_REAP_IDLE_PLAYED_SECS - DEMO_REAP_IDLE_AFTER_SECS);
+        Self { played: unplayed - gap, unplayed }
+    }
+
+    /// One line for every campaign: the pressure pass, and the single-cutoff form.
+    pub fn flat(cutoff: DateTime<Utc>) -> Self {
+        Self { played: cutoff, unplayed: cutoff }
+    }
+}
+
+/// BP-42's safety valve: the `live` campaigns less this sweep's `retired` still reach
+/// `DEMO_REAP_PRESSURE_AT`.
+pub fn under_pressure(live: i64, retired: usize) -> bool {
+    live - retired as i64 >= DEMO_REAP_PRESSURE_AT
+}
+
 /// What the reaper reads and writes. Pairs are `(campaign_id, sector_id)`.
 #[async_trait]
 pub trait ReaperStore: Send + Sync {
-    /// Up to `limit` `Active` campaigns idle since before `cutoff`, oldest first.
-    async fn list_idle_campaigns(&self, cutoff: DateTime<Utc>, limit: i64) -> Result<Vec<(Uuid, Uuid)>, RepositoryError>;
-    /// Archives the campaign only if it is still `Active` and still idle since before `cutoff`.
-    async fn retire_if_idle(&self, campaign_id: Uuid, cutoff: DateTime<Utc>) -> Result<bool, RepositoryError>;
+    /// Up to `limit` `Active` campaigns idle under `cutoffs`, oldest-idle first (BP-42).
+    /// `ops_ids` and `ops_at` pair each campaign the ops store has seen move with its latest
+    /// move (`DemoOpsStore::moved_list`): such a campaign is played, and the move counts as
+    /// activity. The line is chosen in the select, so kept campaigns never fill the `LIMIT`.
+    async fn list_idle(
+        &self,
+        cutoffs: ReapCutoffs,
+        ops_ids: &[Uuid],
+        ops_at: &[DateTime<Utc>],
+        limit: i64,
+    ) -> Result<Vec<(Uuid, Uuid)>, RepositoryError>;
+    /// Archives the campaign only if it is still `Active` and still idle under `cutoffs`, with
+    /// `ops_at` its latest ops move, read under the launch lock.
+    async fn retire_idle(
+        &self,
+        campaign_id: Uuid,
+        cutoffs: ReapCutoffs,
+        ops_at: Option<DateTime<Utc>>,
+    ) -> Result<bool, RepositoryError>;
+    /// The live demo campaigns (`Pending`, `Active`, `Ending`), as `DEMO_LIVE_CAMPAIGN_CAP`
+    /// counts them.
+    async fn count_live(&self) -> Result<i64, RepositoryError>;
+
+    /// The single-cutoff form that predates BP-42: one line for every campaign, no ops moves.
+    async fn list_idle_campaigns(&self, cutoff: DateTime<Utc>, limit: i64) -> Result<Vec<(Uuid, Uuid)>, RepositoryError> {
+        self.list_idle(ReapCutoffs::flat(cutoff), &[], &[], limit).await
+    }
+    /// The single-cutoff form of `retire_idle`, with no ops move.
+    async fn retire_if_idle(&self, campaign_id: Uuid, cutoff: DateTime<Utc>) -> Result<bool, RepositoryError> {
+        self.retire_idle(campaign_id, ReapCutoffs::flat(cutoff), None).await
+    }
 }
 
 pub struct PostgresReaperStore {
@@ -67,7 +142,13 @@ impl PostgresReaperStore {
 impl ReaperStore for PostgresReaperStore {
     /// One grouped scan of `deployment_records`, which has no index on `commander_id`: a
     /// correlated subquery per campaign measured 13.5 s at 100,000 rows, this form 39 ms.
-    async fn list_idle_campaigns(&self, cutoff: DateTime<Utc>, limit: i64) -> Result<Vec<(Uuid, Uuid)>, RepositoryError> {
+    async fn list_idle(
+        &self,
+        cutoffs: ReapCutoffs,
+        ops_ids: &[Uuid],
+        ops_at: &[DateTime<Utc>],
+        limit: i64,
+    ) -> Result<Vec<(Uuid, Uuid)>, RepositoryError> {
         let rows = sqlx::query!(
             r#"SELECT c.campaign_id AS "campaign_id!", c.sector_id AS "sector_id!"
                FROM campaign_instances c
@@ -75,15 +156,21 @@ impl ReaperStore for PostgresReaperStore {
                           FROM deployment_records d
                           JOIN commander_records cr ON cr.commander_id = d.commander_id
                           GROUP BY cr.campaign_id) m ON m.campaign_id = c.campaign_id
+               LEFT JOIN unnest($2::uuid[], $3::timestamptz[]) AS o(id, at) ON o.id = c.campaign_id
                WHERE c.state = $1
-                 AND (COALESCE(m.last_start, c.started_at) < $2)
+                 AND GREATEST(COALESCE(m.last_start, c.started_at), o.at)
+                     < CASE WHEN m.last_start IS NOT NULL OR o.id IS NOT NULL
+                            THEN $4::timestamptz ELSE $5::timestamptz END
                  AND NOT EXISTS (SELECT 1 FROM convoy_records v
                                  WHERE v.sector_id = c.sector_id AND v.in_transit
                                    AND v.arrival_time > now() - interval '5 minutes')
-               ORDER BY COALESCE(m.last_start, c.started_at)
-               LIMIT $3"#,
+               ORDER BY GREATEST(COALESCE(m.last_start, c.started_at), o.at)
+               LIMIT $6"#,
             CampaignLifecycle::Active as CampaignLifecycle,
-            cutoff,
+            ops_ids,
+            ops_at,
+            cutoffs.played,
+            cutoffs.unplayed,
             limit,
         )
         .fetch_all(&self.pool)
@@ -94,31 +181,55 @@ impl ReaperStore for PostgresReaperStore {
 
     /// The idle and convoy tests are re-evaluated inside the `UPDATE`, so a deployment row
     /// committed after the reaper's select and before this statement keeps the campaign.
-    async fn retire_if_idle(&self, campaign_id: Uuid, cutoff: DateTime<Utc>) -> Result<bool, RepositoryError> {
+    async fn retire_idle(
+        &self,
+        campaign_id: Uuid,
+        cutoffs: ReapCutoffs,
+        ops_at: Option<DateTime<Utc>>,
+    ) -> Result<bool, RepositoryError> {
         let result = sqlx::query!(
             r#"UPDATE campaign_instances c SET state = $1, updated_at = now()
                WHERE c.campaign_id = $2 AND c.state = $3
-                 AND (COALESCE((SELECT max(d.started_at) FROM deployment_records d
-                                JOIN commander_records cr ON cr.commander_id = d.commander_id
-                                WHERE cr.campaign_id = c.campaign_id), c.started_at) < $4)
+                 AND GREATEST(COALESCE((SELECT max(d.started_at) FROM deployment_records d
+                                        JOIN commander_records cr ON cr.commander_id = d.commander_id
+                                        WHERE cr.campaign_id = c.campaign_id), c.started_at), $4::timestamptz)
+                     < CASE WHEN $4::timestamptz IS NOT NULL
+                                 OR EXISTS (SELECT 1 FROM deployment_records d
+                                            JOIN commander_records cr ON cr.commander_id = d.commander_id
+                                            WHERE cr.campaign_id = c.campaign_id)
+                            THEN $5::timestamptz ELSE $6::timestamptz END
                  AND NOT EXISTS (SELECT 1 FROM convoy_records v
                                  WHERE v.sector_id = c.sector_id AND v.in_transit
                                    AND v.arrival_time > now() - interval '5 minutes')"#,
             CampaignLifecycle::Archived as CampaignLifecycle,
             campaign_id,
             CampaignLifecycle::Active as CampaignLifecycle,
-            cutoff,
+            ops_at,
+            cutoffs.played,
+            cutoffs.unplayed,
         )
         .execute(&self.pool)
         .await
         .map_err(|e| RepositoryError::Internal(e.to_string()))?;
         Ok(result.rows_affected() == 1)
     }
+
+    /// The join's own count (`campaign_join.rs`), the same text: one scan, every sweep.
+    async fn count_live(&self) -> Result<i64, RepositoryError> {
+        sqlx::query_scalar!(
+            r#"SELECT count(*) AS "n!" FROM campaign_instances WHERE state IN ('Pending','Active','Ending')"#
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Internal(e.to_string()))
+    }
 }
 
-/// The in-memory mirror. It sees no deployments and no convoys: it lists `Active` campaigns
-/// launched before `cutoff`, and its `retire_if_idle` checks `Active` only (as
-/// `retire_if_active`). The Postgres tests in `db_infrastructure.rs` are the oracle.
+/// The in-memory mirror. It sees no deployments and no convoys: a campaign is played when the
+/// ops arrays name it, and its idle time is the later of its launch and that move. Its
+/// `retire_idle` keeps a campaign whose `ops_at` is at or after the played line, then checks
+/// `Active` only (as `retire_if_active`). The Postgres tests in `db_infrastructure.rs` are the
+/// oracle.
 pub struct InMemoryReaperStore {
     campaigns: Arc<dyn CampaignRepository + Send + Sync>,
 }
@@ -131,20 +242,50 @@ impl InMemoryReaperStore {
 
 #[async_trait]
 impl ReaperStore for InMemoryReaperStore {
-    async fn list_idle_campaigns(&self, cutoff: DateTime<Utc>, limit: i64) -> Result<Vec<(Uuid, Uuid)>, RepositoryError> {
+    async fn list_idle(
+        &self,
+        cutoffs: ReapCutoffs,
+        ops_ids: &[Uuid],
+        ops_at: &[DateTime<Utc>],
+        limit: i64,
+    ) -> Result<Vec<(Uuid, Uuid)>, RepositoryError> {
+        let moved: std::collections::HashMap<Uuid, DateTime<Utc>> =
+            ops_ids.iter().copied().zip(ops_at.iter().copied()).collect();
         let mut idle: Vec<(DateTime<Utc>, Uuid, Uuid)> = self
             .campaigns
             .list_campaigns_by_state(CampaignLifecycle::Active)
             .await?
             .into_iter()
-            .filter_map(|c| c.started_at.filter(|s| *s < cutoff).map(|s| (s, c.campaign_id, c.sector_id)))
+            .filter_map(|c| {
+                let started = c.started_at?;
+                let at = moved.get(&c.campaign_id).copied();
+                let idle_at = at.map_or(started, |t| t.max(started));
+                let line = if at.is_some() { cutoffs.played } else { cutoffs.unplayed };
+                (idle_at < line).then_some((idle_at, c.campaign_id, c.sector_id))
+            })
             .collect();
         idle.sort_by_key(|(s, ..)| *s);
         Ok(idle.into_iter().take(limit.max(0) as usize).map(|(_, c, s)| (c, s)).collect())
     }
 
-    async fn retire_if_idle(&self, campaign_id: Uuid, _cutoff: DateTime<Utc>) -> Result<bool, RepositoryError> {
+    async fn retire_idle(
+        &self,
+        campaign_id: Uuid,
+        cutoffs: ReapCutoffs,
+        ops_at: Option<DateTime<Utc>>,
+    ) -> Result<bool, RepositoryError> {
+        if ops_at.is_some_and(|t| t >= cutoffs.played) {
+            return Ok(false);
+        }
         self.campaigns.retire_if_active(campaign_id).await
+    }
+
+    async fn count_live(&self) -> Result<i64, RepositoryError> {
+        let mut n = 0;
+        for s in [CampaignLifecycle::Pending, CampaignLifecycle::Active, CampaignLifecycle::Ending] {
+            n += self.campaigns.list_campaigns_by_state(s).await?.len() as i64;
+        }
+        Ok(n)
     }
 }
 
@@ -155,6 +296,8 @@ pub struct ReaperWarns {
     pub select: RepeatWarn,
     pub prune: RepeatWarn,
     pub retire: KeyedRepeatWarn,
+    /// BP-42: the live count the valve reads.
+    pub count: RepeatWarn,
 }
 
 impl ReaperWarns {
@@ -163,6 +306,7 @@ impl ReaperWarns {
             select: RepeatWarn::new(REAP_WARN_EVERY_SWEEPS),
             prune: RepeatWarn::new(REAP_WARN_EVERY_SWEEPS),
             retire: KeyedRepeatWarn::new(REAP_WARN_EVERY_SWEEPS),
+            count: RepeatWarn::new(REAP_WARN_EVERY_SWEEPS),
         }
     }
 }
@@ -194,7 +338,9 @@ async fn prune_ops(state: &AppState, warns: &mut ReaperWarns) {
     }
 }
 
-/// One sweep. Returns how many campaigns it archived.
+/// One sweep. Returns how many campaigns it archived. `cutoff` is the 15-minute line (now less
+/// `DEMO_REAP_IDLE_AFTER_SECS` in production); the played line comes from it
+/// (`ReapCutoffs::normal`), and the valve uses it for everyone (`ReapCutoffs::flat`).
 pub async fn reap_once(state: &AppState, store: &dyn ReaperStore, cutoff: DateTime<Utc>, warns: &mut ReaperWarns) -> usize {
     reap_once_with_seam(state, store, cutoff, warns, None).await
 }
@@ -209,7 +355,26 @@ pub async fn reap_once_with_seam(
     seam: Option<&PauseHook>,
 ) -> usize {
     prune_ops(state, warns).await;
-    let idle = match store.list_idle_campaigns(cutoff, DEMO_REAP_MAX_PER_SWEEP).await {
+    let live = match store.count_live().await {
+        Ok(n) => {
+            if let Some(n) = warns.count.ok() {
+                tracing::info!("demo reaper: the live-campaign count recovered after {n} failed sweeps");
+            }
+            n
+        }
+        Err(e) => {
+            match warns.count.fail() {
+                Some(1) => tracing::warn!("demo reaper: the live-campaign count failed (no pressure this sweep): {e}"),
+                Some(n) => tracing::warn!("demo reaper: the live-campaign count still failing ({n} consecutive sweeps): {e}"),
+                None => {}
+            }
+            0
+        }
+    };
+    let (normal, flat) = (ReapCutoffs::normal(cutoff), ReapCutoffs::flat(cutoff));
+    let listing = if under_pressure(live, 0) { flat } else { normal };
+    let (ops_ids, ops_at) = state.demo_ops.store.moved_list(Utc::now());
+    let idle = match store.list_idle(listing, &ops_ids, &ops_at, DEMO_REAP_MAX_PER_SWEEP).await {
         Ok(v) => {
             if let Some(n) = warns.select.ok() {
                 tracing::info!("demo reaper: the idle-campaign select recovered after {n} failed sweeps");
@@ -234,10 +399,9 @@ pub async fn reap_once_with_seam(
     let mut retired = 0;
     for (campaign_id, sector_id) in idle {
         let _launch = state.launch_locks.lock(campaign_id).await;
-        if state.demo_ops.store.moved_since(campaign_id, cutoff, Utc::now()) {
-            continue;
-        }
-        match store.retire_if_idle(campaign_id, cutoff).await {
+        let ops_at = state.demo_ops.store.last_moved(campaign_id, Utc::now());
+        let cutoffs = if under_pressure(live, retired) { flat } else { normal };
+        match store.retire_idle(campaign_id, cutoffs, ops_at).await {
             Ok(r) => {
                 if let Some(n) = warns.retire.ok(campaign_id) {
                     tracing::info!("demo reaper: the retire of campaign {campaign_id} recovered after {n} failed sweeps");
@@ -339,12 +503,15 @@ mod tests {
         state.campaign_repo.get_campaign(c).await.expect("get_campaign").expect("the campaign exists").state
     }
 
-    /// The canon numbers of ODQ-67 (b), as literals.
+    /// The canon numbers of ODQ-67 (b) (amended 2026-11-07, BP-42) and ODQ-84 (a), as literals.
     #[test]
     fn reaper_numbers_are_odq_67s() {
         assert_eq!(DEMO_REAP_INTERVAL, Duration::from_secs(300), "every 5 minutes");
         assert_eq!(DEMO_REAP_IDLE_AFTER_SECS, 900, "idle after 15 minutes");
         assert_eq!(DEMO_REAP_MAX_PER_SWEEP, 200);
+        assert_eq!(DEMO_REAP_IDLE_PLAYED_SECS, 172_800, "a played campaign: idle after 48 hours");
+        assert_eq!(DEMO_REAP_PRESSURE_AT, 800, "the valve at 80% of 1,000");
+        assert_eq!(crate::demo_address_cap::DEMO_ADDRESS_LIVE_CAP, 300, "ODQ-84 (a)");
     }
 
     /// The in-memory mirror retires `Active` campaigns launched before the cutoff, and only those.
@@ -526,9 +693,10 @@ mod tests {
         assert_eq!(lifecycle(&state, c).await, CampaignLifecycle::Active);
     }
 
-    /// The counter-case: the same team parked on site with no drill since is retired.
+    /// BP-42: the same team parked on site with no drill since is kept. Its move, 1,000 s before
+    /// the 15-minute cutoff, makes the campaign played and lies inside the 48-hour line.
     #[tokio::test]
-    async fn reaper_retires_a_team_parked_on_site() {
+    async fn reaper_keeps_a_team_parked_on_site_for_48_hours() {
         let state = state();
         let store = store(&state);
         let (c, _) = campaign(&state, true).await;
@@ -536,9 +704,144 @@ mod tests {
         let secs = chrono::Duration::seconds;
         state.demo_ops.store.start_op(c, (5, 0), ops_board(), &ops_dig(), 7, ops_crew(), None, cutoff - secs(1000)).expect("start");
 
+        assert_eq!(reap_once(&state, &store, cutoff, &mut ReaperWarns::new()).await, 0);
+        assert_eq!(lifecycle(&state, c).await, CampaignLifecycle::Active);
+        assert_eq!(state.demo_ops.store.len(), 1, "the entry is kept");
+    }
+
+    /// BP-42 L2: a team parked past the 48-hour line is retired. The cutoff is now + 49 h, so the
+    /// played line is cutoff − 171,900 s; the move at cutoff − 172,000 s (its arrival 10 s later,
+    /// at cutoff − 171,990 s) lies before it.
+    #[tokio::test]
+    async fn reaper_retires_a_team_parked_past_48_hours() {
+        let state = state();
+        let store = store(&state);
+        let (c, _) = campaign(&state, true).await;
+        let cutoff = Utc::now() + chrono::Duration::hours(49);
+        let secs = chrono::Duration::seconds;
+        state.demo_ops.store.start_op(c, (5, 0), ops_board(), &ops_dig(), 7, ops_crew(), None, cutoff - secs(172_000)).expect("start");
+
         assert_eq!(reap_once(&state, &store, cutoff, &mut ReaperWarns::new()).await, 1);
         assert_eq!(lifecycle(&state, c).await, CampaignLifecycle::Archived);
-        assert!(state.demo_ops.store.is_empty());
+    }
+
+    /// BP-42 L3: the valve reads the live count less this sweep's retires, against 800.
+    #[test]
+    fn under_pressure_reads_the_live_count_less_the_retired() {
+        assert!(under_pressure(800, 0));
+        assert!(!under_pressure(800, 1));
+        assert!(!under_pressure(799, 0));
+        assert!(!under_pressure(1000, 201));
+        assert!(under_pressure(1000, 200));
+    }
+
+    /// BP-42: the in-memory store with a fixed live count, so a test reaches the valve without
+    /// 800 campaigns. Everything else is the inner store's.
+    struct FixedCount {
+        inner: InMemoryReaperStore,
+        live: i64,
+    }
+
+    #[async_trait]
+    impl ReaperStore for FixedCount {
+        async fn list_idle(
+            &self,
+            cutoffs: ReapCutoffs,
+            ops_ids: &[Uuid],
+            ops_at: &[DateTime<Utc>],
+            limit: i64,
+        ) -> Result<Vec<(Uuid, Uuid)>, RepositoryError> {
+            self.inner.list_idle(cutoffs, ops_ids, ops_at, limit).await
+        }
+        async fn retire_idle(&self, campaign_id: Uuid, cutoffs: ReapCutoffs, ops_at: Option<DateTime<Utc>>) -> Result<bool, RepositoryError> {
+            self.inner.retire_idle(campaign_id, cutoffs, ops_at).await
+        }
+        async fn count_live(&self) -> Result<i64, RepositoryError> {
+            Ok(self.live)
+        }
+    }
+
+    fn fixed(state: &AppState, live: i64) -> FixedCount {
+        FixedCount { inner: store(state), live }
+    }
+
+    /// BP-42 L4: a played campaign idle 16 minutes (its move at cutoff − 1,000 s) is retired at
+    /// 800 live campaigns and kept at 799. Decides the listing site.
+    #[tokio::test]
+    async fn pressure_retires_a_played_campaign_idle_16_minutes() {
+        let secs = chrono::Duration::seconds;
+        for (live, retired, after) in [(800, 1, CampaignLifecycle::Archived), (799, 0, CampaignLifecycle::Active)] {
+            let state = state();
+            let (c, _) = campaign(&state, true).await;
+            let cutoff = Utc::now() + chrono::Duration::hours(1);
+            state.demo_ops.store.start_op(c, (5, 0), ops_board(), &ops_dig(), 7, ops_crew(), None, cutoff - secs(1000)).expect("start");
+
+            assert_eq!(reap_once(&state, &fixed(&state, live), cutoff, &mut ReaperWarns::new()).await, retired, "at {live} live");
+            assert_eq!(lifecycle(&state, c).await, after, "at {live} live");
+        }
+    }
+
+    /// BP-42 L5: at 800 live campaigns the first retire brings the count under the valve, so the
+    /// second played campaign is judged by the 48-hour line again and kept. The older goes.
+    /// Decides the per-retire site.
+    #[tokio::test]
+    async fn pressure_stops_once_the_count_is_back_under_800() {
+        let state = state();
+        let (older, _) = campaign(&state, true).await;
+        let (newer, _) = campaign(&state, true).await;
+        let cutoff = Utc::now() + chrono::Duration::hours(1);
+        let secs = chrono::Duration::seconds;
+        state.demo_ops.store.start_op(older, (5, 0), ops_board(), &ops_dig(), 7, ops_crew(), None, cutoff - secs(2000)).expect("start");
+        state.demo_ops.store.start_op(newer, (5, 0), ops_board(), &ops_dig(), 7, ops_crew(), None, cutoff - secs(1000)).expect("start");
+
+        assert_eq!(reap_once(&state, &fixed(&state, 800), cutoff, &mut ReaperWarns::new()).await, 1);
+        assert_eq!(lifecycle(&state, older).await, CampaignLifecycle::Archived, "the older goes");
+        assert_eq!(lifecycle(&state, newer).await, CampaignLifecycle::Active, "back under 800: kept");
+    }
+
+    /// BP-42 L6: the mirror's live count is `Pending` + `Active` + `Ending`.
+    #[tokio::test]
+    async fn in_memory_count_live_counts_pending_active_ending() {
+        let state = state();
+        let store = store(&state);
+        let _pending = campaign(&state, false).await;
+        let _a = campaign(&state, true).await;
+        let _b = campaign(&state, true).await;
+        let (archived, _) = campaign(&state, true).await;
+        assert!(state.campaign_repo.retire_if_active(archived).await.expect("retire_if_active"));
+
+        assert_eq!(store.count_live().await.expect("count_live"), 3);
+    }
+
+    /// BP-42 L9: store level. A campaign whose array move lies between the lines (played =
+    /// now − 1 h, unplayed = now + 1 h, move at now) is not listed; with no array entry it is
+    /// unplayed and listed under the same lines.
+    #[tokio::test]
+    async fn in_memory_list_idle_judges_a_moved_campaign_by_the_played_line() {
+        let state = state();
+        let store = store(&state);
+        let (c, s) = campaign(&state, true).await;
+        let now = Utc::now();
+        let cutoffs = ReapCutoffs { played: now - chrono::Duration::hours(1), unplayed: now + chrono::Duration::hours(1) };
+
+        assert_eq!(store.list_idle(cutoffs, &[c], &[now], 10).await.expect("list_idle"), vec![]);
+        assert_eq!(store.list_idle(cutoffs, &[], &[], 10).await.expect("list_idle"), vec![(c, s)]);
+    }
+
+    /// BP-42 L10: store level. A move at the played line keeps the campaign; with no move it is
+    /// retired.
+    #[tokio::test]
+    async fn in_memory_retire_idle_keeps_a_move_after_the_played_line() {
+        let state = state();
+        let store = store(&state);
+        let (c, _) = campaign(&state, true).await;
+        let now = Utc::now();
+        let cutoffs = ReapCutoffs { played: now, unplayed: now + chrono::Duration::hours(1) };
+
+        assert!(!store.retire_idle(c, cutoffs, Some(now)).await.expect("retire_idle"));
+        assert_eq!(lifecycle(&state, c).await, CampaignLifecycle::Active);
+        assert!(store.retire_idle(c, cutoffs, None).await.expect("retire_idle"));
+        assert_eq!(lifecycle(&state, c).await, CampaignLifecycle::Archived);
     }
 
     /// BP-8a-2: the sweep prunes the entries of campaigns that are no longer `Active`, even

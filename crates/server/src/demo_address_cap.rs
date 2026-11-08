@@ -29,8 +29,9 @@ use uuid::Uuid;
 use crate::rate_limit::{ClientKey, RateWarn};
 use crate::repository::{CampaignLifecycle, CampaignRepository, RepositoryError};
 
-/// Live demo campaigns one client address may hold (ODQ-68 (c′)).
-pub const DEMO_ADDRESS_LIVE_CAP: usize = 100;
+/// Live demo campaigns one client address may hold (ODQ-68 (c′); 300 since ODQ-84 (a), BP-42,
+/// so a venue address outlasts 48-hour campaigns, still under the reaper's valve at 800).
+pub const DEMO_ADDRESS_LIVE_CAP: usize = 300;
 
 /// Which of a set of campaigns are still live.
 #[async_trait]

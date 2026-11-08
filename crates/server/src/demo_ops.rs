@@ -2388,7 +2388,10 @@ impl DemoOpsStore {
     /// can leave a bay at the default until the entry's next settle (Reviewer BP-12a-1 F1).
     /// `false` when every entry holds one of them. An entry whose only state is a finished contract can go
     /// (BP-11a-3, accepted): its next read recomputes the board and the contract is back early. A
-    /// won contract banked its pay, so it is never the victim.
+    /// won contract banked its pay, so it is never the victim. **BP-42: among the candidates, an
+    /// entry that has never moved goes first** (`moved_at` is what keeps a campaign played for the
+    /// reaper's 48-hour line); a moved one goes only when no unmoved candidate is left, least
+    /// recently touched first, so a full store still makes room.
     fn make_room(&self, inner: &mut HashMap<Uuid, OpsEntry>) -> bool {
         if inner.len() < self.cap {
             return true;
@@ -2396,7 +2399,7 @@ impl DemoOpsStore {
         let victim = inner
             .iter()
             .filter(|(_, e)| e.dig.is_none() && e.contracts_out.is_empty() && e.ore_banked == 0 && e.credits_banked == 0 && e.base == OpsBase::default() && e.sickbay.values().all(|b| *b == SickBay::default()) && e.trophies.is_empty() && e.kit.is_empty() && e.credits_in_flight == 0 && e.foreman_due == ForemanDue::default() && e.hazard_due == HazardDue::default() && e.pending_build.is_none())
-            .min_by_key(|(_, e)| e.touched)
+            .min_by_key(|(_, e)| (e.moved_at.is_some(), e.touched))
             .map(|(id, _)| *id);
         let Some(id) = victim else {
             return false;
@@ -3519,13 +3522,27 @@ impl DemoOpsStore {
     /// that has arrived by `now` counts at its arrival, also while a haul's ambush waits: an
     /// accepted overcount of at most `travel_secs`). Reading the board is not moving.
     pub fn moved_since(&self, campaign_id: Uuid, cutoff: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+        self.last_moved(campaign_id, now).is_some_and(|t| t >= cutoff)
+    }
+
+    /// BP-42: the campaign's latest move, as `moved_since` counts them, or `None` when the store
+    /// has never seen it move. A move makes the campaign played for the reaper.
+    pub fn last_moved(&self, campaign_id: Uuid, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
         let inner = self.lock();
-        let Some(e) = inner.get(&campaign_id) else {
-            return false;
-        };
+        inner.get(&campaign_id).and_then(|e| Self::latest_move(e, now))
+    }
+
+    /// BP-42: every campaign the store has seen move, paired with its latest move, for the
+    /// reaper's select.
+    pub fn moved_list(&self, now: DateTime<Utc>) -> (Vec<Uuid>, Vec<DateTime<Utc>>) {
+        let inner = self.lock();
+        inner.iter().filter_map(|(id, e)| Self::latest_move(e, now).map(|t| (*id, t))).unzip()
+    }
+
+    fn latest_move(e: &OpsEntry, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
         // BP-18a-1a: the latest passed arrival over every slot.
         let arrived = e.ops().map(|op| op.arrive_at).filter(|t| *t <= now).max();
-        e.moved_at.max(arrived).is_some_and(|t| t >= cutoff)
+        e.moved_at.max(arrived)
     }
 
     /// The reaper's prune: keeps the entries of `active` campaigns, and any entry touched at or
@@ -3933,6 +3950,43 @@ mod tests {
         assert_eq!(store.len(), 2);
         assert!(store.op_view(a, at(3)).is_some(), "the op entry is kept");
         assert!(store.board(b, (5, 0), at(3)).is_none(), "the board-only entry is evicted");
+    }
+
+    /// BP-42 L7: a board is not a move. After a start at 10 s, both reads give the start; once
+    /// the leg has arrived (20 s, the site is 10 s out), both give the arrival.
+    #[test]
+    fn last_moved_and_moved_list_read_moves_not_boards() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        store.put_board(a, (5, 0), board(), at(0));
+        assert_eq!(store.last_moved(a, at(1)), None);
+        assert_eq!(store.moved_list(at(1)), (vec![], vec![]));
+
+        store.start_op(a, (5, 0), board(), &site(), 7, None, None, at(10)).expect("start");
+        assert_eq!(store.last_moved(a, at(11)), Some(at(10)));
+        assert_eq!(store.moved_list(at(11)), (vec![a], vec![at(10)]));
+
+        assert_eq!(store.last_moved(a, at(30)), Some(at(20)), "the passed arrival is the later move");
+        assert_eq!(store.moved_list(at(30)), (vec![a], vec![at(20)]));
+    }
+
+    /// BP-42 L8: cap 2. `a` started a contract at 0 s and turned home on arriving at 10 s (no
+    /// dig, so no Foreman tally); by 30 s it is home and holds nothing a keep term reads, and it
+    /// was last touched at 10 s. `b` holds a board only, touched at 20 s. A new `c` evicts `b`, the
+    /// unmoved entry, and keeps the less recently touched but moved `a`.
+    #[test]
+    fn make_room_evicts_an_unmoved_entry_before_a_moved_one() {
+        let store = DemoOpsStore::new(2);
+        let (a, b, c) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
+        store.start_op(a, (5, 0), board(), &site(), 7, None, None, at(0)).expect("start");
+        assert_eq!(store.return_op(a, at(10)), Ok(()));
+        assert!(store.put_board(b, (5, 0), board(), at(20)));
+        assert_eq!(store.ops_snapshot(a, at(30)), (None, 0, OpsBase::default()), "home, nothing banked");
+
+        assert!(store.put_board(c, (5, 0), board(), at(40)));
+        assert_eq!(store.len(), 2);
+        assert!(store.board(b, (5, 0), at(41)).is_none(), "the unmoved entry is evicted");
+        assert!(store.last_moved(a, at(41)).is_some(), "the moved entry is kept");
     }
 
     /// Cap 1, held by an op: another campaign's start is refused and its board is not cached.
@@ -6319,8 +6373,9 @@ mod tests {
     }
 
     /// Cap 2. `a` walks away from a one-drill dig (seed 2) and is home at 22 s, banking nothing:
-    /// only its tally keeps it, so the new `c` evicts the board-only `b`. Drained, `a` is the
-    /// least recently touched and goes for `d`; then `c`, a fresh insert, goes for `e`.
+    /// only its tally keeps it, so the new `c` evicts the board-only `b`. Drained, `a` is a
+    /// candidate again, but it has moved (BP-42): the unmoved `c` goes for `d`, then the unmoved
+    /// `d` goes for `e`, and `a` stays.
     #[test]
     fn make_room_keeps_an_undrained_foreman_due() {
         let store = DemoOpsStore::new(2);
@@ -6335,10 +6390,10 @@ mod tests {
         assert!(store.board(b, (5, 0), at(41)).is_none(), "the board-only entry is evicted");
         assert_eq!(store.take_foreman_due(a, at(42)), due(13, 8), "the tally kept `a`");
         assert!(store.put_board(d, (5, 0), board(), at(50)));
-        assert!(store.board(a, (5, 0), at(51)).is_none(), "drained, `a` is evicted");
+        assert!(store.board(c, (5, 0), at(51)).is_none(), "the unmoved `c` goes before the moved `a`");
         assert!(store.put_board(e, (5, 0), board(), at(60)));
-        assert!(store.board(c, (5, 0), at(61)).is_none(), "a fresh entry is evicted");
-        assert!(store.board(d, (5, 0), at(61)).is_some() && store.board(e, (5, 0), at(61)).is_some());
+        assert!(store.board(d, (5, 0), at(61)).is_none(), "the unmoved `d` goes before the moved `a`");
+        assert!(store.board(a, (5, 0), at(61)).is_some() && store.board(e, (5, 0), at(61)).is_some());
     }
 
     /// A put-back tally is drained once.
