@@ -51,6 +51,7 @@ import { mountReview, countContract } from './demo_review.js'; // BP-27
 import { mountCompany, dressBriefing, renderCompany, redrawCompany, healPrice, wageLine, SELL_ORE_CREDITS } from './demo_company.js';
 import { DIG_COPY, DIG_CSS, createDigPanel, renderDig, hideDig, homewardLines, flash, bankedLine, crewFightLine } from './demo_dig.js';
 import { BASE_COPY, BASE_CSS, createBase, renderBase, hideBase } from './demo_base.js';
+import { mountMore } from './demo_more.js'; // BP-29b
 
 // Booth copy, verbatim from the BP-9a and BP-11b-1 prompts.
 const COPY = {
@@ -1875,7 +1876,9 @@ function watch() {
   // Reviewer BP-11b-2 F2: every show of the briefing during a demo fight gets its dressing again
   // (the keeper re-renders it on a deploy 429's Back and on openMission's static-GET retry).
   const briefing = deps.$('screen-briefing');
-  new MutationObserver(() => { if (briefing.hidden) clearFitTimer(); else if (opFight) dressFight(); else dressApproach(); }).observe(briefing, { attributes: true, attributeFilter: ['hidden'] });
+  // Reviewer BP-29a F1: a briefing shown off a demo fight keeps no contract's difficulty line. Not in dressApproach,
+  // which dressFight calls last.
+  new MutationObserver(() => { if (briefing.hidden) clearFitTimer(); else if (opFight) dressFight(); else { if (tagNote) tagNote.hidden = true; dressApproach(); } }).observe(briefing, { attributes: true, attributeFilter: ['hidden'] });
 }
 
 // New run starts a new campaign, and ore, credits and buildings belong to the campaign: the end
@@ -2070,4 +2073,5 @@ export function mountOps(d) {
   watch();
   mountReview(deps); // BP-27: after watch(), so its hub observer runs after the end-of-run check
   onMapCreated(attach);
+  mountMore(); // BP-29b: last, when every box it watches exists
 }
