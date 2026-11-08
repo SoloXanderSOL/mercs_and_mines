@@ -90,6 +90,8 @@ const COPY = {
   listSub: 'Pick a contract. The squad walks there first.',
   listOut: 'A squad is out.',
   listMeta: '{n} hexes · {s} s',
+  listTag: ' · {word}',              // BP-29a: the difficulty word after a contract row's distance
+  briefingTag: 'Difficulty: {word}', // BP-29a: on a contract's briefing (never the raid's or the ambush's)
   aarLost: 'Lost: {names}.',
   aarDead: '{name} ({status})',
   aarNone: 'No losses. Command notes the anomaly.',
@@ -161,6 +163,11 @@ const RELIC = {
   lead: 'A pre-collapse frigate went into the dirt in Sector 6 before anyone now alive was born. The hold is under three metres of soil and a great deal of competitive interest. Dig it out, see off whoever else turns up, and bring back anything that still hums.',
 };
 const RELIC_SITE = 'contract:CRASHED_SHIP_RAID';
+// BP-29a (Wiki, feedback item 9): each contract's difficulty word, by mission type, set from the spec check's 7,200-fight
+// runs on the starter roster (wins and casualties both). Crashed Ship wins 95% (GhostWire's Extraction bonus) but wounds
+// like a raid: Risky, not Brutal. Never the server's difficulty number, which misleads here; a table, so no fetch and no
+// field the store can lose.
+const DIFFICULTY = { GUARD_DUTY: 'Easy', SUPPLY_RAID: 'Risky', CRASHED_SHIP_RAID: 'Risky', BLACK_SITE_RAID: 'Brutal' };
 const relicWon = o => Boolean(o && o.site_id === RELIC_SITE && o.fought === 'won');
 // B4 briefings (BP-15a, Wiki copy): a contract's own briefing over the server's flavour text. The relic keeps
 // RELIC.lead; the raid and the ambush keep DIG_COPY's leads, which carry the site and the ore at stake.
@@ -220,6 +227,9 @@ const CSS = `
 .ops-list-meta { font-family: var(--mono); font-size: 3.4cqw; color: var(--muted); }
 .briefing-fit[hidden] { display: none; }
 .briefing-fit { margin: 0; font-size: 3.8cqw; line-height: 1.35; color: var(--accent); }
+.ops-list-tag { color: var(--accent); } /* BP-29a */
+.briefing-tag { color: var(--accent); } /* BP-29a */
+.briefing-tag[hidden] { display: none; }
 .ops-shop { position: absolute; top: 1.5cqw; left: 3cqw; padding: 1cqw 2.5cqw; font-family: var(--mono); font-size: 3.6cqw; color: var(--accent); background: rgba(11, 11, 12, 0.94); border: 0.3cqw solid var(--accent); border-radius: 1.5cqw; cursor: pointer; }
 #screen-briefing .briefing-stance[hidden], #screen-briefing #btn-deploy[hidden] { display: none; }
 #screen-briefing { gap: 2cqw; }
@@ -329,8 +339,9 @@ const fitToFight = d => {
 let adoptedFor = null;  // the campaign whose ops body has been adopted (the Company screen needs one, BP-12b)
 let companyAsk = null;  // the heal, replace, hire or equip in flight: { action, target }
 let companyNotice = null; // its refusal's line on the card: { action, target, kind }
-let fightDress = null;  // the demo fight's own briefing dressing, { name, lead, family }, re-applied on every show (Reviewer BP-11b-2 F2)
+let fightDress = null;  // the demo fight's own briefing dressing, { name, lead, family, tag }, re-applied on every show (Reviewer BP-11b-2 F2)
 let fitNote = null;     // the briefing's 0-fit line
+let tagNote = null;     // BP-29a: the briefing's difficulty line (a contract's only)
 let bankNote = null;    // the one-off "ore banked" line after a laden leg lands
 let crewNote = null;    // BP-17b: the one-off wiped line after a Crew wipeout clears the op
 let crewFight = null;   // BP-17b: the last adopted body's crew_fight, sticky until the next start
@@ -1024,8 +1035,10 @@ function renderList() {
     const row = el('button', 'btn ops-list-row');
     row.type = 'button';
     row.disabled = out;
-    row.append(el('span', 'ops-list-name', titleOf(site)),
-      el('span', 'ops-list-meta', fill(COPY.listMeta, { n: Math.round(site.distance), s: Math.round(site.travel_secs) })));
+    const meta = el('span', 'ops-list-meta', fill(COPY.listMeta, { n: Math.round(site.distance), s: Math.round(site.travel_secs) }));
+    const word = DIFFICULTY[site.mission_id]; // BP-29a
+    if (word) meta.append(el('span', 'ops-list-tag', fill(COPY.listTag, { word })));
+    row.append(el('span', 'ops-list-name', titleOf(site)), meta);
     row.addEventListener('click', () => listPick(site));
     const item = el('li', null);
     item.append(row);
@@ -1090,8 +1103,8 @@ async function fightContract() {
   fightPick = squadOfOp(so);
   fightHead = sectionHead();
   fightDress = t.mission_id === RELIC.mission_id
-    ? { name: RELIC.name, lead: RELIC.lead, family: FAMILY[t.mission_id] }
-    : { name: null, lead: BRIEFING[t.mission_id] || null, family: FAMILY[t.mission_id] || null };
+    ? { name: RELIC.name, lead: RELIC.lead, family: FAMILY[t.mission_id], tag: DIFFICULTY[t.mission_id] || null }
+    : { name: null, lead: BRIEFING[t.mission_id] || null, family: FAMILY[t.mission_id] || null, tag: DIFFICULTY[t.mission_id] || null };
   await deps.openMission(t.mission_id, () => deps.enterHub());
   if (!deps.$('screen-briefing').hidden) dressFight();
 }
@@ -1113,6 +1126,13 @@ function dressFight() {
   dressBriefing();
   if (fightDress && fightDress.name) deps.$('briefing-name').textContent = fightDress.name;
   if (fightDress && fightDress.lead) deps.$('briefing-text').textContent = fightDress.lead;
+  if (!tagNote) {
+    tagNote = el('p', 'briefing-line briefing-tag');
+    deps.$('briefing-name').after(tagNote);
+  }
+  const tag = fightDress && fightDress.tag ? fightDress.tag : null; // BP-29a: a raid's or an ambush's dressing has none
+  tagNote.textContent = tag ? fill(COPY.briefingTag, { word: tag }) : '';
+  tagNote.hidden = !tag;
   const section = fightSection();
   let text = '';
   if (section) {

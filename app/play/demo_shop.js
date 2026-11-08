@@ -1,7 +1,7 @@
 // The Demo Shop for the Breakpoint demo (BP-25; demo-only (ODQ-74 (d)): never merged to dev; the port
 // deletes this file). The hub's Demo Shop button opens it. Buy enters today's checkout with the same call and
 // the same `then` as before BP-25 (Not now and Continue land on the hub), so checkout.js and its exits are
-// unchanged. GAP-90's line sits under Buy. The Breakpoint Genesis Field Pass (ODQ-70) has no mint button until
+// unchanged. BP-29a's small print, then GAP-90's line, sit under Buy. The Breakpoint Genesis Field Pass (ODQ-70) has no mint button until
 // BP-7. Nothing here reads the server: the Field Pass line reads the per-wallet Genesis answer that BP-3c-2
 // cached (a 200 only), and no answer draws no line. The screen is outside main.js's SCREENS, so it closes
 // itself whenever another stage screen shows (a late read's show(), an error). Every string goes in through
@@ -12,7 +12,8 @@ import { store } from './api.js';
 // Wiki copy (BP-25). Canon: Wiki/GDD/Soulbound_NFT_Policy.md §1, §2a; the Business Plan's money model.
 const COPY = {
   title: 'Demo Shop',
-  buy: 'Buy a campaign · $3.99 test USDC',
+  buy: 'Try a test payment', // BP-29a (Wiki copy, feedback item 38): nothing is sold here
+  buyNote: 'No real money. This uses test-network USDC so we can check the payment system works before launch.',
   wallet: "Your wallet will warn that it doesn't recognise this site. It's right: this demo runs on the test network and isn't in the dApp Store yet.",
   back: 'Back to the hub',
   passLabel: 'Breakpoint Genesis Field Pass',
@@ -29,7 +30,8 @@ const CSS = `
 .screen-shop { gap: 3cqw; overflow-y: auto; justify-content: flex-start; justify-content: safe center; }
 .shop-pic { display: block; width: 100%; height: auto; aspect-ratio: 1080 / 392; border-radius: 1cqw; }
 .shop-title { margin: 0; font-family: var(--display); font-weight: 800; font-size: 7cqw; line-height: 1.1; text-align: center; }
-.shop-wallet { margin: 0; font-size: 3.6cqw; line-height: 1.4; color: var(--muted); text-align: center; }
+.shop-wallet, .shop-note { margin: 0; font-size: 3.6cqw; line-height: 1.4; color: var(--muted); text-align: center; }
+.shop-buy { flex-shrink: 0; } /* BP-29a: the column overflows the stage, so flex shrink squeezed Buy to its min-height and a wrapped label spilled */
 .shop-frame { width: 100%; border: 0.5cqw solid var(--accent); border-radius: 1.5cqw; background: var(--panel); padding: 4cqw; display: flex; flex-direction: column; gap: 2.5cqw; text-align: left; }
 .shop-label { margin: 0; font-family: var(--display); font-weight: 700; font-size: 5cqw; color: var(--accent); }
 .shop-h { margin: 0; width: 100%; font-family: var(--display); font-weight: 700; font-size: 5cqw; text-align: left; }
@@ -78,7 +80,7 @@ export function openShop() {
   const buy = button('btn btn-primary shop-buy', COPY.buy, () => { close(); deps.offerCheckout(() => deps.enterHub()); });
   const back = button('btn shop-back', COPY.back, () => { close(); deps.enterHub(); });
   for (const s of document.querySelectorAll('#stage > .screen')) s.hidden = s !== section;
-  section.replaceChildren(pic, el('h1', 'shop-title', COPY.title), buy, el('p', 'shop-wallet', COPY.wallet), back, frame,
+  section.replaceChildren(pic, el('h1', 'shop-title', COPY.title), buy, el('p', 'shop-note', COPY.buyNote), el('p', 'shop-wallet', COPY.wallet), back, frame,
     el('h2', 'shop-h', COPY.portraitsTitle), el('p', 'shop-body', COPY.portraits),
     el('h2', 'shop-h', COPY.patronageTitle), el('p', 'shop-body', COPY.patronage));
   section.scrollTop = 0;

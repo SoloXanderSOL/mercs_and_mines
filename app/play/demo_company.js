@@ -266,6 +266,12 @@ const CSS = `
 .name-ask-line { margin: 0; font-size: 4.2cqw; line-height: 1.4; color: var(--accent); }
 .name-ask-input { width: 100%; min-height: 13cqw; padding: 2.5cqw 3cqw; font-family: var(--body); font-size: 5cqw; text-transform: none; color: var(--text); background: var(--panel); border: 0.5cqw solid var(--panel-edge); border-radius: 1.5cqw; }
 .name-ask-input:focus-visible { outline: 0.6cqw solid var(--text); outline-offset: 0.4cqw; }
+/* BP-29a: a yellow caret, and a yellow pulse while the box is empty (focused or not: the ask focuses it), so the box is found */
+/* whether or not the phone opens its keyboard. box-shadow, so the :focus-visible outline above is left alone; steady when reduced. */
+.name-ask-input { caret-color: var(--accent); }
+.name-ask-input:placeholder-shown { animation: name-ask-pulse 1.6s ease-in-out infinite; }
+@keyframes name-ask-pulse { 0%, 100% { box-shadow: 0 0 0 0 transparent; } 50% { box-shadow: 0 0 0 0.8cqw var(--accent); } }
+@media (prefers-reduced-motion: reduce) { .name-ask-input:placeholder-shown { animation: none; box-shadow: 0 0 0 0.5cqw var(--accent); } }
 .name-ask-note { margin: 0; font-size: 3.8cqw; line-height: 1.35; color: var(--accent); }
 .name-ask-note[hidden] { display: none; }
 .name-ask-row { display: flex; gap: 2cqw; }
@@ -487,6 +493,7 @@ function drawAsk(container, id) {
     box.replaceChildren(el('p', 'name-ask-line', text));
   };
   ready();
+  input.focus({ preventScroll: true }); // BP-29a (feedback item 8): the caret shows where to type; the phone may open its keyboard
   input.addEventListener('input', () => { note.hidden = true; ready(); });
   input.addEventListener('keydown', e => { if (e.key === 'Enter' && !nameBtn.disabled) { e.preventDefault(); nameBtn.click(); } });
   skipBtn.addEventListener('click', () => { if (!skipBtn.disabled) close(null); });
@@ -504,6 +511,7 @@ function drawAsk(container, id) {
         note.textContent = NAME_REFUSALS.has(e.message) ? e.message : COMPANY_COPY.askBad;
         note.hidden = false;
         ready();
+        input.focus({ preventScroll: true }); // BP-29a (Reviewer BP-24b F5): back in the box after a refusal
         return;
       }
       close(COMPANY_COPY.askClosed);
