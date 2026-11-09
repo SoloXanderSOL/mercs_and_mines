@@ -11,6 +11,9 @@ ignore = [
   # anyhow, unsound Error::downcast_mut. In Cargo.lock via wit-bindgen (wasm component
   # tooling), never compiled. Re-check 2027-01-22.
   "RUSTSEC-2026-0190",
+  # libsqlite3-sys, C SQLite CVE-2026-119375. In Cargo.lock via sqlx-sqlite, never
+  # compiled (we build sqlx with "postgres" only). Re-check 2027-01-22.
+  "RUSTSEC-2026-0459",
 ]
 
 [output]
