@@ -2,10 +2,11 @@
 // a presentation of the response → the after-action report → the hub, or the end of the run.
 //
 // It presents the mission route's report; nothing is replayed and nothing is recomputed: the
-// outcome is `report.outcome`, the chance is `raw_roll + margin`. The squad is one Section of
+// outcome is `report.outcome`, the chance is `total_score` (BP-32). The squad is one Section of
 // eight identical Rookies (ODQ-63); the archetype standing in for them is never put on screen,
 // so the AAR rows are built here from `final_status` and `hp_lost` only. Every server string
-// goes in through textContent. Pacing is CSS transitions plus requestAnimationFrame: no timers.
+// goes in through textContent. Pacing is CSS transitions plus requestAnimationFrame; the demo's fight
+// log (demo_story.js) adds its own timer. A tap on the screen (not Skip) shows everything at once (BP-32).
 
 import { ApiError, store, counters, getMissions, getUnits, postMission, postAbandon } from './api.js';
 
@@ -43,12 +44,12 @@ const COPY = {
   debugOneRookie: 'Send 1 Rookie (debug)',
   battleWorking: 'Deploying the 1st Section...',
   battleScore: { base: 'Squad skill', squad: 'Squad size', ability: 'Training', gear: 'Gear', mission: 'Mission fit', difficulty: 'Difficulty' },
-  battleChance: 'Chance of success: {n}%',
+  battleRollMade: 'Needed {n} or less. Rolled {r}. Made it.', // BP-32: one line for the roll (draft copy)
   battleCapped: 'Odds capped at {n}%. Command does not believe in sure things.',
   battleFloored: 'Odds never drop below {n}%. Command calls this optimism.',
-  battleRoll: 'Rolled {n}',
+  battleRollMissed: 'Needed {n} or less. Rolled {r}. Missed.', // BP-32 (draft copy)
   battleSkip: 'Skip',
-  battleContinue: 'Continue',
+  battleContinue: 'See result', // BP-32: the AAR opens only from this tap
   outcome: { Success: 'Mission accomplished', Defeat: 'Mission failed', Wipeout: 'No survivors' },
   aarTitle: 'After-action report',
   aarUnits: '1st Section',
@@ -140,6 +141,7 @@ export function createBattle(deps) {
   let result = null;         // the last 200 body this tab holds
   let resultFor = null;      // the Commander that response belongs to
   let run = 0;               // the presentation in progress; Skip and a new run bump it
+  let finishNow = null;      // BP-32: shows the running presentation at once; null when none runs
   let oneRookie = null;      // the debug checkbox, created only under DEBUG
   let onBriefingBack = null; // set by openMission; a briefing from the mission list goes back to the list
 
@@ -194,6 +196,10 @@ export function createBattle(deps) {
     $('btn-briefing-back').addEventListener('click', () => (onBriefingBack || showMissionList)());
     $('btn-deploy').addEventListener('click', deploy);
     $('btn-skip').addEventListener('click', () => { if (result) showAar(); });
+    // BP-32: a tap anywhere else on the battle screen finishes the presentation (Skip still skips).
+    $('screen-battle').addEventListener('click', ev => {
+      if (finishNow && !ev.target.closest('#btn-skip') && !$('screen-battle').hidden) finishNow();
+    });
     $('btn-aar-continue').addEventListener('click', afterAar);
     $('btn-new-run').addEventListener('click', newRun);
     for (const id of ['briefing-still', 'battle-still', 'aar-still']) $(id).addEventListener('error', e => stillFailed(e.currentTarget));
@@ -407,7 +413,7 @@ export function createBattle(deps) {
   }
 
   function countUp(valueNode, target, next, id, format = String) {
-    const ms = 450;
+    const ms = 600; // BP-32: slow enough to read (was 450)
     let start = null;
     const step = now => {
       if (id !== run) return;
@@ -459,27 +465,51 @@ export function createBattle(deps) {
     $('btn-skip').textContent = COPY.battleSkip;
     deps.show('screen-battle');
 
+    // BP-32: one roll line. {n} is total_score, the clamp note's number. On every fight the demo client
+    // sends, the chance is a whole number (identical Rookies, integer rows), so raw_roll <= total_score is
+    // exactly the server's is_success, Wipeouts included. A brick that varies Rookie skill reopens this
+    // (Reviewer BP-14b F2). The line speaks to the roll only; the banner still names the outcome.
+    const rollText = fill(sb.raw_roll <= total ? COPY.battleRollMade : COPY.battleRollMissed, { n: total, r: sb.raw_roll });
+    const showBanner = () => {
+      const outcome = result.report.outcome;
+      banner.textContent = COPY.outcome[outcome] || outcome;
+      banner.classList.add(`outcome-${outcome}`);
+    };
     const steps = [];
     rows.forEach(r => steps.push(next => revealThen(r.row, () => countUp(r.value, r.target, next, id, r.format), id)));
     if (note) steps.push(next => revealThen(note, next, id));
     steps.push(next => {
-      chance.textContent = fill(COPY.battleChance, { n: sb.raw_roll + sb.margin });
-      revealThen(chance, next, id);
-    });
-    steps.push(next => {
-      roll.textContent = fill(COPY.battleRoll, { n: sb.raw_roll });
+      roll.textContent = rollText;
       revealThen(roll, next, id);
     });
     steps.push(next => beforeOutcome({ report: result.report, live: () => id === run }, next));
     steps.push(next => {
-      const outcome = result.report.outcome;
-      banner.textContent = COPY.outcome[outcome] || outcome;
-      banner.classList.add(`outcome-${outcome}`);
+      showBanner();
       revealThen(banner, next, id);
     });
+    const done = () => {
+      finishNow = null;
+      $('btn-skip').textContent = COPY.battleContinue;
+    };
     const go = i => {
       if (id === run && i < steps.length) steps[i](() => go(i + 1));
-      else if (id === run) $('btn-skip').textContent = COPY.battleContinue; // the last step has run
+      else if (id === run) done(); // the last step has run
+    };
+    // BP-32: the finish. The run bump stops every pending reveal, count-up and go; then every row,
+    // the note, the roll line, the log (told at once: the hook's instant flag) and the banner show.
+    finishNow = () => {
+      run += 1;
+      for (const r of rows) {
+        r.value.textContent = (r.format || String)(Math.round(r.target));
+        r.row.classList.add('shown');
+      }
+      if (note) note.classList.add('shown');
+      roll.textContent = rollText;
+      roll.classList.add('shown');
+      beforeOutcome({ report: result.report, live: () => true, instant: true }, () => {});
+      showBanner();
+      banner.classList.add('shown');
+      done();
     };
     // The first reveal waits one frame so the screen is laid out before the transition starts.
     requestAnimationFrame(() => go(0));
@@ -495,6 +525,7 @@ export function createBattle(deps) {
 
   function showAar() {
     run += 1; // stops the presentation, whichever step it is on
+    finishNow = null; // BP-32: nothing left to finish
     const { report, commander: c } = result;
     const outcome = report.outcome;
     still($('aar-still'), ART[outcome] || ART.Defeat, outcome === 'Wipeout', 'aar', report);

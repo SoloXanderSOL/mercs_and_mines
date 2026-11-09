@@ -10,7 +10,8 @@
 
 import { setBeforeOutcome } from './battle.js';
 
-const TICK_MS = 400; // one line every 0.4 s; Skip is live throughout
+const TICK_MS = 1100; // BP-32: one line every 1.1 s, a first-time player's pace (was 0.4 s); Skip is live throughout
+const HOLD_MS = 600;  // BP-32: a pause after the roll line before the first line, and after the last before the banner
 const MAX_LINES = 8; // the opener, the grouped Ready line and the hurt units, the last ones paired to fit
 
 // Every pool says the same fact several ways; the hash picks the wording, never the fact.
@@ -72,7 +73,11 @@ const WRITEUP = {
 const STORY_CSS = `
 #screen-battle #battle-lines[hidden], #screen-battle .fight-log[hidden], #screen-aar .aar-writeup[hidden] { display: none; }
 #screen-battle .fight-log { list-style: none; margin: 0; padding: 0; width: 100%; display: flex; flex-direction: column; gap: 0.8cqw; text-align: left; }
-#screen-battle .fight-log li { padding: 0.6cqw 3cqw; font-size: 3.9cqw; line-height: 1.3; background: var(--panel); border-radius: 1.2cqw; }
+#screen-battle .fight-log li { padding: 0.6cqw 3cqw; font-size: 4.68cqw; line-height: 1.3; background: var(--panel); border-radius: 1.2cqw; }
+#screen-battle .score-row:not(.score-note) { font-size: 4.84cqw; } /* BP-32: rows +10%, the most g1's 12 rows allow */
+#screen-battle .score-value { font-size: 5.06cqw; }
+#screen-battle .battle-chance { display: none; }
+#screen-battle .battle-roll { font-size: 5cqw; }
 #screen-battle .fight-log .log-opener { font-family: var(--display); font-weight: 700; color: var(--accent); background: none; }
 #screen-battle .fight-log .log-kia { color: var(--danger); }
 #screen-aar .aar-writeup { margin: 0; width: 100%; font-size: 3.8cqw; line-height: 1.35; text-align: left; }
@@ -121,16 +126,16 @@ let family = () => null;
 let battle = null, rows = null, log = null, writeup = null, timer = null;
 
 // The setBeforeOutcome step: the log takes the score rows' slot and ticks in; next() reveals the banner.
-function tell({ report }, next) {
+// BP-32: `instant` (battle.js's finish) tells every line at once and returns at once. It clears a log
+// already running first, so the old tick never adds a line under a finished screen.
+function tell({ report, instant }, next) {
+  clearTimeout(timer);
+  timer = null;
   const lines = fightLog(report, family());
   rows.hidden = true;
   log.replaceChildren();
   log.hidden = false;
-  let i = 0;
-  const tick = () => {
-    timer = null;
-    if (i >= lines.length) return next();
-    const l = lines[i++];
+  const add = l => {
     const li = document.createElement('li');
     li.className = `log-${l.kind}`;
     li.textContent = l.text;
@@ -139,9 +144,19 @@ function tell({ report }, next) {
       li.dataset.hp = l.hp.join(' ');
     }
     log.append(li);
-    timer = setTimeout(tick, TICK_MS);
   };
-  tick();
+  if (instant) {
+    lines.forEach(add);
+    return next();
+  }
+  let i = 0;
+  const tick = () => {
+    timer = null;
+    if (i >= lines.length) return next();
+    add(lines[i++]);
+    timer = setTimeout(tick, i < lines.length ? TICK_MS : HOLD_MS);
+  };
+  timer = setTimeout(tick, HOLD_MS);
 }
 
 // Every way off the battle screen hides it (Skip, an error screen, the end of the run): the timer dies
