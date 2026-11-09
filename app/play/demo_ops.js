@@ -49,7 +49,7 @@ import { showCard, cardSeen } from './demo_card.js';
 import { mountShop, openShop } from './demo_shop.js'; // BP-25
 import { mountReview, countContract } from './demo_review.js'; // BP-27
 import { mountCompany, dressBriefing, renderCompany, redrawCompany, healPrice, wageLine, SELL_ORE_CREDITS, openSickbay } from './demo_company.js';
-import { DIG_COPY, DIG_CSS, createDigPanel, renderDig, hideDig, homewardLines, flash, bankedLine, crewFightLine } from './demo_dig.js';
+import { DIG_COPY, DIG_CSS, createDigPanel, renderDig, hideDig, homewardLines, flash, bankedLine, crewFightLine, crewCard } from './demo_dig.js';
 import { BASE_COPY, BASE_CSS, createBase, renderBase, hideBase } from './demo_base.js';
 import { mountMore } from './demo_more.js'; // BP-29b
 
@@ -213,7 +213,7 @@ const REFRESH_READ_MS = 46000; // the server's DEMO_SITE_REFRESH_SECS 45 + 1
 const BUILD_READ_SLACK_MS = 250; // BP-21b: the completion read goes out this long after done_at (the server stands it at or after)
 const BUILD_REREAD_MS = 1000;    // BP-21b (Reviewer BP-21a F5): the one re-read's least delay, for a body after done_at that still names it
 
-const COLOUR = { dig: '#ff8c2a', ring: '#ffd27a', contract: '#6fd3ff', edge: '#0b0b0c', marker: '#ffffff', route: 'rgba(255, 255, 255, 0.7)', preview: 'rgba(255, 210, 122, 0.8)' };
+const COLOUR = { dig: '#ff8c2a', ring: '#ffd27a', contract: '#6fd3ff', edge: '#0b0b0c', marker: '#ffffff', route: 'rgba(255, 255, 255, 0.7)', preview: 'rgba(255, 210, 122, 0.8)', guard: '#8fe36b' }; // BP-34: + the walking guard
 
 const CSS = `
 .ops-strip { position: absolute; left: 3cqw; right: 3cqw; bottom: 17cqw; padding: 3cqw; display: flex; flex-direction: column; gap: 1.5cqw; text-align: left; background: rgba(11, 11, 12, 0.94); border: 0.4cqw solid var(--panel-edge); border-radius: 2cqw; }
@@ -383,6 +383,8 @@ let bankNote = null;    // the one-off "ore banked" line after a laden leg lands
 let crewNote = null;    // BP-17b: the one-off wiped line after a Crew wipeout clears the op
 let crewFight = null;   // BP-17b: the last adopted body's crew_fight, sticky until the next start
 let crewKept = null;    // its JSON, so a new Crew loss re-reads the roster once (spec check F1)
+let crewCardKey;        // BP-34: the crew_fight JSON the card last saw; undefined until the first body after attach (seeded unseen)
+let crewCardNode = null, crewCardTitle = null, crewCardLines = []; // BP-34: the Crew-fight card on the hub
 let digKept = null;    // BP-19c: whether the last adopted body held a dig, from its raw ops (null before the first)
 let rosterDue = false; // BP-19c: a roster reread owed at the next adopt (campaign entry; the hub after an AAR, op out)
 let aarSeen = false;   // BP-19c: an AAR has shown since the hub was last shown
@@ -392,6 +394,7 @@ let seenBattle = null;  // the raid or ambush whose briefing has opened once ('r
 let legKey = null;      // the site and leg the two reads below belong to
 let midAsked = false;   // the pulled haul's midpoint read has been sent
 let landAsked = false;  // the laden leg's arrival read has been sent
+let rearms = 0;         // BP-34 (BP-30 P7): landing/midpoint reads re-armed on this leg (at most 3)
 let throttleUntil = 0;  // a 429's Retry-After, in browser ms: no call and no button until then
 let throttleSecs = 0;
 let hubWasShown = false;
@@ -459,6 +462,9 @@ const canNext = o => Boolean(o && o.leg === 'outbound' && progress(o) >= 1 && !b
 const guardStands = o => Boolean(o && o.dig && (o.dig.escort_at === undefined || (o.dig.escort_at !== null && serverNow() >= Date.parse(o.dig.escort_at))));
 // "Go guard the dig": outbound and unguarded, and never with the Section a bare escort sends at 0 (spec check F6).
 const canGuard = o => Boolean(o && o.leg === 'outbound' && o.dig && o.dig.escort_at === null && guardHead() !== 0);
+// BP-34 (item 18): a guard sent after the Crew is walking out until escort_at. Outbound only: a haul heading home
+// with its guard still walking draws no guard (the server still counts it for the ambush).
+const guardWalking = o => Boolean(o && o.leg === 'outbound' && o.dig && o.dig.escort_at && serverNow() < Date.parse(o.dig.escort_at));
 // BP-18b-1: the squad an op fights with, from its own keys (H1); an op with neither (an old body) has none.
 const squadOfOp = o => (o && (o.section_id || o.commander_id) ? { commander_id: o.commander_id || null, section_id: o.section_id || null } : null);
 // BP-18b-2a: a homeward leg home with nothing to bank (the server clears it on its next read).
@@ -563,6 +569,17 @@ function wayPoints(o) {
   if (!w || !gateway || (o.leg === 'outbound' && ends[0] !== gateway)) return ends;
   const pts = [gateway, ...w.path.map(([q, r]) => ({ q, r }))];
   return o.leg === 'outbound' ? pts : pts.reverse();
+}
+
+// BP-34 (item 18): the walking guard's hex: the Crew's way out from the gateway, timed on that way's seconds (the
+// server's escort_at is the press plus the chosen way's secs); else the straight line on the site's travel_secs.
+function guardSpot(o) {
+  const w = wayOf(o);
+  const secs = w ? w.secs : (siteOf(o.site_id) || {}).travel_secs;
+  if (!gateway || !(secs > 0)) return null;
+  const p = 1 - (Date.parse(o.dig.escort_at) - serverNow()) / (secs * 1000);
+  const pts = w ? [gateway, ...w.path.map(([q, r]) => ({ q, r }))] : [gateway, o.at];
+  return alongPath(pts, Math.min(1, Math.max(0, p)));
 }
 
 // BP-20b (F-C1): the point a share p of the way along pts, an equal share per hex (display only: the server's
@@ -1507,13 +1524,26 @@ function draw(ctx, m) {
     ctx.strokeStyle = COLOUR.edge;
     ctx.stroke();
   }
+  // BP-34 (item 18): the guard on its way, a smaller mark in its own colour (never the Crew's white).
+  const guards = gateway ? all.filter(guardWalking).map(guardSpot).filter(Boolean) : [];
+  for (const h of guards) {
+    const [x, y] = m.hexToScreen(h.q, h.r);
+    ctx.beginPath();
+    ctx.arc(x, y, mr * 0.8, 0, Math.PI * 2);
+    ctx.fillStyle = COLOUR.guard;
+    ctx.fill();
+    ctx.lineWidth = line;
+    ctx.strokeStyle = COLOUR.edge;
+    ctx.stroke();
+  }
+  if (DEBUG) m.canvas.dataset.opsGuard = String(guards.length);
   if (DEBUG) m.canvas.dataset.opsMarkers = String(spots.length);
   const so = shownOp();
   if (so) {
     const p = at(so);
     if (phaseOf(so, p) !== shownPhase || (p < 1 && !isAmbush(so) && secsLeft(so) !== shownSecs)) refresh();
   } else if (homeKey() !== null && homePhase() !== shownPhase) refresh(); // BP-18b-2b (R4)
-  if (opsOut().some(o => !isAmbush(o) && progress(o) < 1) && hubShown()) m.requestFrame();
+  if (opsOut().some(o => (!isAmbush(o) && progress(o) < 1) || guardWalking(o)) && hubShown()) m.requestFrame(); // BP-34: + a walking guard
   ctx.restore();
 }
 
@@ -1558,6 +1588,16 @@ function tap(x, y) {
 // `built`: the building id when this body answers that building's POST, else undefined.
 // `spent`: what this body's own request cost from the bank (a heal or a replace), so a contract it
 // latches still reports the full pay (BP-12b, H4).
+// BP-34 (items 17, 18): the Crew's own fight as a card on the hub. `was`: the dig as the body before this one had it
+// (a wipe's body has none); its escort_at ahead of `now` means the guard was sent and still on its way.
+function showCrewCard(f, was, now) {
+  const late = was && was.dig && was.dig.escort_at ? Date.parse(was.dig.escort_at) - Date.parse(now) : 0;
+  const c = crewCard(f, late > 0 ? Math.ceil(late / 1000) : 0);
+  crewCardTitle.textContent = c.title;
+  crewCardLines.forEach((n, i) => { n.textContent = c.lines[i] || ''; n.hidden = !c.lines[i]; });
+  crewCardNode.hidden = false;
+}
+
 function adopt(body, built, spent = 0) {
   if (!body || body.campaign_id !== campaignId) return;
   company = body.company || { sections: [], trophies: [] };
@@ -1568,6 +1608,7 @@ function adopt(body, built, spent = 0) {
   for (const s of sites) if (Array.isArray(s.routes) && s.routes.length > 0) ways.set(`${s.q},${s.r}`, s.routes); // BP-20b
   gateway = body.gateway || null;
   const before = op;
+  const digBefore = opsOut().find(o => o.kind === 'dig') || null; // BP-34: the dig the last body showed (its escort_at)
   const was = banked;
   const wasCredits = credits;
   op = body.active_op || null;
@@ -1609,6 +1650,11 @@ function adopt(body, built, spent = 0) {
   const crewNow = JSON.stringify(crewFight);
   const crewLoss = crewNow !== crewKept && Boolean(crewFight) && crewFight.heads_lost > 0; // a new Crew loss (spec check F1)
   crewKept = crewNow;
+  // BP-34 (item 17): a Crew fight the player hasn't seen: the triple changed since the card last looked. The first body
+  // after attach only seeds it (a reload's sticky fight is an old one). Two held raids in a row are one triple, so the
+  // second shows no card (named residual: the body carries no fight id, Reviewer BP-17a F3).
+  const crewCardNew = crewCardKey !== undefined && Boolean(crewFight) && crewNow !== crewCardKey;
+  crewCardKey = crewNow;
   const digNow = digIn(body);
   const digLeft = digKept === true && !digNow; // BP-19c: the server cleared a dig, after settle_leaders paid its Foreman
   digKept = digNow;
@@ -1617,7 +1663,14 @@ function adopt(body, built, spent = 0) {
   if (!canNext(shownOp())) { picking = false; pickSite = null; confirming = false; }
   else if (pickSite) pickSite = siteOf(pickSite.site_id);
   const key = op ? `${op.site_id}:${op.leg}:${op.depart_at}` : null;
-  if (key !== legKey) { legKey = key; midAsked = false; landAsked = false; }
+  if (key !== legKey) { legKey = key; midAsked = false; landAsked = false; rearms = 0; }
+  // BP-34 (BP-30 P7): a landing or midpoint read the server answered before its moment (this body's own now short of
+  // arrive_at, or of the midpoint, the server's ambush_at) is re-armed: draw sends it again when the clock gets there.
+  if (op && op.dig && op.leg === 'homeward' && !op.dig.ambush && rearms < 3) {
+    const early = t => Date.parse(body.now) < t;
+    if (landAsked && op.dig.carried > 0 && early(Date.parse(op.arrive_at))) { landAsked = false; rearms += 1; }
+    if (midAsked && op.dig.ended_by === 'pulled' && early((Date.parse(op.depart_at) + Date.parse(op.arrive_at)) / 2)) { midAsked = false; rearms += 1; }
+  }
   if (op) bankNote = null;
   else if (banked > was && before && before.leg === 'homeward' && before.dig && before.dig.carried > 0) {
     bankNote = fill(DIG_COPY.banked, { gained: banked - was });
@@ -1660,6 +1713,7 @@ function adopt(body, built, spent = 0) {
   seenBattle = battle;
   if (map) map.requestFrame();
   refresh();
+  if (crewCardNew) showCrewCard(crewFight, digBefore, body.now); // BP-34
   if (melted) { flash(strip); rereadRoster(); }
   if (raidLatched || latched.length > 0 || crewLoss) rereadRoster();
   const owed = digLeft || rosterDue || tripNew; // BP-19c: once per held → empty, per campaign entry, per hub return after an AAR; BP-20b: per new trip report
@@ -2101,6 +2155,8 @@ function attach(m) {
   listOpen = false;
   crewFight = null;
   crewKept = null;
+  crewCardKey = undefined; // BP-34
+  if (crewCardNode) crewCardNode.hidden = true;
   digKept = null;
   rosterDue = true; // BP-19c (spec check F2): the boot roster was read before any settle_leaders; the first adopt rereads
   aarSeen = false;
@@ -2169,7 +2225,15 @@ export function mountOps(d) {
   const shopButton = el('button', 'ops-shop', COPY.shop);
   shopButton.type = 'button';
   shopButton.addEventListener('click', () => openShop());
-  deps.$('screen-hub').append(strip, bankChip, baseButton, shopButton, baseSheet.node, list.node);
+  crewCardNode = el('section', 'crew-card'); // BP-34 (item 17): the Crew's own fight, on the hub
+  crewCardNode.hidden = true;
+  crewCardTitle = el('h2', 'crew-card-title');
+  crewCardLines = [el('p', 'crew-card-line'), el('p', 'crew-card-line'), el('p', 'crew-card-line')];
+  const crewOk = el('button', 'btn btn-primary', DIG_COPY.cardOk);
+  crewOk.type = 'button';
+  crewOk.addEventListener('click', () => { crewCardNode.hidden = true; });
+  crewCardNode.append(crewCardTitle, ...crewCardLines, crewOk);
+  deps.$('screen-hub').append(strip, bankChip, baseButton, shopButton, baseSheet.node, list.node, crewCardNode);
   mountShop(deps); // BP-25
   endNote = el('p', 'end-ops');
   endNote.hidden = true;

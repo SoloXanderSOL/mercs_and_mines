@@ -27,9 +27,22 @@ export const DIG_COPY = {
   guardWalking: 'The Section is on its way. On guard in {n} s.',
   crewHeld: 'The Crew saw the raiders off. Nobody lost.',
   crewHeldAmbush: 'The Crew beat off the ambush. Nobody lost.',
-  crewRetreat: 'The Crew fought the raiders alone and lost miners.',
+  crewRetreat: 'The Crew fought the raiders and lost miners.', // BP-34: no 'alone' (a sent guard may be on its way)
   crewRetreatAmbush: 'The Crew was ambushed on the road and lost miners.',
   crewWiped: 'The Crew was overrun. Nobody came back, and neither did the ore.',
+  // BP-34 (Wiki copy, draft for the script pass): the Crew-fight card on the hub.
+  cardRaid: 'Raid at the dig',
+  cardAmbush: 'Ambush on the road home',
+  cardRaidHeld: 'Raccoons on dirt bikes hit the dig. The miners grabbed their picks and saw them off.',
+  cardRaidRetreat: 'Raccoons on dirt bikes hit the dig. The miners fought, then fell back with what they could carry.',
+  cardRaidWiped: 'Raccoons on dirt bikes overran the dig. Nobody came back, and neither did the ore.',
+  cardAmbushHeld: 'Raccoons jumped the haul halfway home. The miners held on to the truck.',
+  cardAmbushRetreat: 'Raccoons jumped the haul halfway home. The miners broke and ran for the gateway.',
+  cardAmbushWiped: 'Raccoons jumped the haul halfway home. Nobody came back, and neither did the ore.',
+  cardLostNone: 'Lost: nobody.',
+  cardLost: 'Lost: {n} of the Crew.',
+  cardGuardLate: 'The guard was still {n} s away.',
+  cardOk: 'Carry on',
   pop: '+{n} ore',
   raidWait: 'Raiders at {title}. Fight to resume drilling.',
   ambushWait: 'Ambushed on the road. Fight to bring the haul home.',
@@ -77,6 +90,11 @@ export const DIG_CSS = `
 /* Off site, an open legend covers the chip and the Base button; on site the legend is hidden (Reviewer BP-9b F4). */
 .screen-hub:has(.ops-strip[hidden]):has(.legend:not([hidden])) :is(.ops-banked, .ops-base) { display: none; }
 .end-ops { margin: 0; max-width: 84cqw; font-size: 4.2cqw; line-height: 1.4; color: var(--accent); }
+.crew-card { position: absolute; left: 6cqw; right: 6cqw; top: 30cqw; z-index: 5; padding: 4cqw; display: flex; flex-direction: column; gap: 2.5cqw; text-align: left; background: rgba(11, 11, 12, 0.97); border: 0.5cqw solid var(--danger); border-radius: 2cqw; } /* BP-34 */
+.crew-card[hidden], .crew-card-line[hidden] { display: none; }
+.crew-card-title { margin: 0; font-family: var(--display); font-weight: 800; font-size: 5.5cqw; line-height: 1.15; color: var(--danger); }
+.crew-card-line { margin: 0; font-size: 3.9cqw; line-height: 1.4; }
+.crew-card .btn { width: 100%; max-width: none; min-height: 11cqw; margin-top: 1cqw; font-size: 4.4cqw; }
 @media (prefers-reduced-motion: reduce) {
   .dig-heat-fill { transition: none; }
   .dig-pop.shown, .ops-strip.flash { animation: none; }
@@ -143,6 +161,15 @@ export function crewFightLine(f) {
   if (f.result === 'held') return f.kind === 'ambush' ? DIG_COPY.crewHeldAmbush : DIG_COPY.crewHeld;
   if (f.result === 'retreat') return f.kind === 'ambush' ? DIG_COPY.crewRetreatAmbush : DIG_COPY.crewRetreat;
   return f.result === 'wiped' ? DIG_COPY.crewWiped : '';
+}
+
+// BP-34 (item 17): the Crew-fight card from the body's crew_fight {kind, result, heads_lost}. `lateSecs` > 0: a guard
+// was sent and still that many seconds out when it hit (0 = none on the way). Pure: demo_ops.js shows it.
+export function crewCard(f, lateSecs) {
+  const raid = f.kind === 'raid';
+  const said = { held: raid ? DIG_COPY.cardRaidHeld : DIG_COPY.cardAmbushHeld, retreat: raid ? DIG_COPY.cardRaidRetreat : DIG_COPY.cardAmbushRetreat, wiped: raid ? DIG_COPY.cardRaidWiped : DIG_COPY.cardAmbushWiped }[f.result] || '';
+  const lost = f.heads_lost > 0 ? fill(DIG_COPY.cardLost, { n: f.heads_lost }) : DIG_COPY.cardLostNone;
+  return { title: raid ? DIG_COPY.cardRaid : DIG_COPY.cardAmbush, lines: [said, lost, lateSecs > 0 ? fill(DIG_COPY.cardGuardLate, { n: lateSecs }) : ''] };
 }
 
 // `dig`: the server's view at an arrived dig; `roster`: the stored roster body, or null;
