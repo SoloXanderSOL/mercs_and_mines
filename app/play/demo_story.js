@@ -69,6 +69,44 @@ const WRITEUP = {
   Defeat: 'It did not go to plan. The enemy will be telling this one for years.',
   Wipeout: 'The paperwork for this one will be very short.',
 };
+// BP-36 (§4f P2; Wiki copy): the leading Commander's own line, in place of the write-up, keyed on the outcome
+// and the sign of the server's approach row (good / bad / even; the verdict reads the same row). Two lines per
+// cell, picked by the report hash; a Flaw's own line wins its cell. No line names an approach or a posture (the
+// cell doesn't know them) or a number (the verdict says it). Every line fits beside its cell's verdict in the
+// write-up's two lines at 400 px (cv8 renders all 30). Exported for cv8 only.
+export const VOICE = {
+  Success: {
+    good: ['I\'ll take full credit for that one, sir.', 'Textbook, sir. Somebody should frame it.'],
+    bad: ['We won anyway. Let\'s not do it like that again.', 'Wrong way in, right result. I\'ll fix the log.'],
+    even: ['A fair fight, sir. We won it.', 'No edge either way. Ours, though.'],
+  },
+  Defeat: {
+    good: ['The dice didn\'t read the plan, sir.', 'The plan was sound. The enemy was louder.'],
+    bad: ['I said so, sir. Quietly. To myself.', 'We picked the wrong fight, sir, and it noticed.'],
+    even: ['Even odds, sir. They wanted it more.', 'No edge either way. Theirs, today.'],
+  },
+  Wipeout: {
+    good: ['The plan was fine, sir. I\'m all that\'s left of it.', 'We did it right, sir. I\'ll tell the families.'],
+    bad: ['I\'ll be writing the letters myself, sir.', 'I\'d like it noted that I said nothing at the time.'],
+    even: ['Even odds, sir. The odds lied.', 'Nobody else made it back, sir.'],
+  },
+};
+// One line per Flaw, keyed `<outcome>.<match>`; true to the briefing's TRAITS (demo_company.js) and the canon Flaw.
+export const FLAW_VOICE = {
+  'Embezzler': { 'Success.good': 'Clean win, sir. The receipts will be less so.' },
+  'Bloodthirsty': { 'Defeat.even': 'Retreat, sir? I don\'t know the word.' },
+  'Cowardly': { 'Wipeout.bad': 'I fell back to report, sir. That\'s my story.' },
+  'Paranoid': { 'Defeat.good': 'They knew we were coming, sir. Someone told them.' },
+  'Cult of Bob': { 'Success.good': 'The blessed rifles held, sir. Praise Bob.' },
+  'The Informant': { 'Defeat.bad': 'I\'ve already sold the story, sir. Good price.' },
+  'Glory Hound': { 'Success.even': 'The Commander was magnificent, again.' },
+  'The Gambler': { 'Success.bad': 'Bad odds, sir. Best kind. Let it ride.' },
+  'Chrome-Chaser': { 'Wipeout.good': 'Sound plan, sir. May I have their implants?' },
+  'Martinet': { 'Success.bad': 'We won, sir. Disgracefully. Boots at dawn.' },
+  'Squeak-Touched': { 'Defeat.bad': 'The hamsters warned me, sir. I didn\'t listen.' },
+  'Doomsayer': { 'Success.even': 'We won. Nothing changes. We\'re doomed.' },
+};
+const VOICE_SLOT = 100; // fightLog's say() uses slots 0-7: the line's pick is independent of the log's
 
 const STORY_CSS = `
 #screen-battle #battle-lines[hidden], #screen-battle .fight-log[hidden], #screen-aar .aar-writeup[hidden] { display: none; }
@@ -82,6 +120,7 @@ const STORY_CSS = `
 #screen-battle .fight-log .log-kia { color: var(--danger); }
 #screen-aar .aar-writeup { margin: 0; width: 100%; font-size: 3.8cqw; line-height: 1.35; text-align: left; }
 #screen-aar .aar-verdict { color: var(--accent); }
+#screen-aar .aar-cmdline { font-style: italic; }
 `;
 
 // FNV-1a over the report id, then one mix per line slot: the same report always picks the same wording.
@@ -170,12 +209,26 @@ function leave() {
   rows.hidden = false;
 }
 
+// BP-36: the line for one report and voice ({ flaw, match }), or null when the cell has none (an outcome
+// outside the three, a match outside good / bad / even). Pure: the same report and voice give the same line.
+export function commanderLine(report, voice) {
+  const outcome = report && report.outcome;
+  const cell = voice && VOICE[outcome] && VOICE[outcome][voice.match];
+  if (!cell) return null;
+  const own = (FLAW_VOICE[voice.flaw] || {})[`${outcome}.${voice.match}`];
+  return own || pick(cell, hash(String(report.report_id || '')), VOICE_SLOT);
+}
+
 // The AAR's write-up (keyed on the outcome alone), then the verdict on the pick, in one node under the banner.
-export function writeAar(report, verdict) {
-  const text = WRITEUP[report && report.outcome] || null;
+// BP-36: with a voice (a living Commander who led the pick), the Commander's line, in quotes, takes the
+// write-up's place; without one (KIA, or no pick) the write-up stays.
+export function writeAar(report, verdict, voice) {
+  const said = voice ? commanderLine(report, voice) : null;
+  const text = said ? null : WRITEUP[report && report.outcome] || null;
   writeup.replaceChildren();
+  if (said) writeup.append(span('aar-cmdline', `\u201c${said}\u201d`));
   if (text) writeup.append(span('aar-writeup-text', text));
-  if (text && verdict) writeup.append(' ');
+  if ((said || text) && verdict) writeup.append(' ');
   if (verdict) writeup.append(span('aar-verdict', verdict));
   writeup.hidden = !writeup.childNodes.length;
 }

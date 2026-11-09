@@ -1309,10 +1309,25 @@ function guardHead() {
   return free ? free.headcount : 0;
 }
 
+// BP-36: who speaks the AAR's line. The Commander who led this fight (aarNote's own pick: fightPick, else the
+// campaign's), only after a pick through Confirm, and only alive: deploy() patches KIA into the roster before
+// the AAR. A Shattered Commander still talks. The match is the approach row's sign, as verdictLine reads it.
+function voiceOf(report) {
+  if (!sentApproach) return null; // BP-36: no pick through Confirm, no line
+  const roster = deps.getRoster();
+  const commanders = roster && Array.isArray(roster.commanders) ? roster.commanders : [];
+  const camp = store.campaign();
+  const ledId = (fightPick && fightPick.commander_id) || (camp && camp.commander_id);
+  const led = commanders.find(c => c.commander_id === ledId);
+  if (!led || led.is_kia) return null;
+  const row = ((report && report.score_breakdown) || {}).modifiers?.find(m => m.key === 'approach');
+  return { flaw: led.fatal_flaw, match: !row ? 'even' : row.points > 0 ? 'good' : 'bad' };
+}
+
 // The AAR's loss lines for a fight opened from here: who died, and the Section's count after it
 // (the server takes one soldier per KIA or MIA when the fight latches).
 function aarNote({ report, section }) {
-  writeAar(report, verdictLine(report)); // B4 + B5 (BP-15b): the write-up, then the verdict on the pick, under the banner
+  writeAar(report, verdictLine(report), voiceOf(report)); // B4 + B5 (BP-15b), BP-36: the write-up or the Commander's line, then the verdict
   if (!opFight) return [];
   if (reopen === fightContract) countContract(); // BP-27: a contract's AAR; a raid's or an ambush's reopens fight
   opFight = false;
