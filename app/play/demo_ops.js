@@ -243,12 +243,16 @@ const CSS = `
 #screen-briefing .briefing-line { font-size: 3.9cqw; }
 #screen-briefing .briefing-traits { font-size: 3.4cqw; line-height: 1.3; }
 #screen-briefing .briefing-actions { gap: 1.5cqw; }
-#screen-briefing #btn-briefing-back { min-height: 11cqw; padding: 2cqw 6cqw; font-size: 4.8cqw; }
+#screen-briefing #btn-briefing-back, #screen-briefing #btn-approach-confirm { min-height: 11cqw; padding: 2cqw 6cqw; font-size: 4.8cqw; } /* BP-31: Confirm sized as Back */
 #screen-briefing .briefing-stance { margin: 0; font-family: var(--display); font-weight: 700; font-size: 4.6cqw; line-height: 1.25; color: var(--accent); }
 #screen-briefing .briefing-rule { margin: 0; font-size: 3.5cqw; line-height: 1.3; color: var(--muted); }
+#screen-briefing .briefing-rule[data-picked] { color: var(--text); } /* BP-31: the pick's line */
 #screen-briefing .briefing-approaches { display: flex; gap: 2cqw; width: 100%; max-width: 84cqw; }
-#screen-briefing .briefing-approaches .btn { flex: 1; width: auto; max-width: none; min-height: 11cqw; padding: 0 2cqw; font-size: 4.4cqw; display: inline-flex; align-items: center; justify-content: center; gap: 1cqw; }
-#screen-briefing .briefing-approaches .briefing-icon { flex: none; width: 5cqw; height: 5cqw; }
+#screen-briefing .briefing-approaches .btn { flex: 1; width: auto; max-width: none; min-height: 13cqw; padding: 0 2cqw; font-size: 4.8cqw; display: inline-flex; align-items: center; justify-content: center; gap: 1cqw; } /* BP-31: was 11cqw / 4.4cqw */
+#screen-briefing .briefing-approaches .briefing-icon { flex: none; width: 6.5cqw; height: 6.5cqw; } /* BP-31: was 5cqw */
+#screen-briefing .briefing-approaches .briefing-approach[aria-pressed="true"] { box-shadow: 0 0 0 0.8cqw var(--text), 0 0 4cqw var(--accent); } /* BP-31: the pick glows */
+#screen-briefing .briefing-pair { display: flex; gap: 2cqw; width: 100%; max-width: 84cqw; } /* BP-31: Back | Confirm */
+#screen-briefing .briefing-pair .btn { flex: 1; width: auto; max-width: none; }
 #screen-battle .still { height: 24cqw; }
 #screen-battle .score-lines { gap: 0.8cqw; }
 #screen-battle .score-row { padding: 0.8cqw 3cqw; }
@@ -280,21 +284,45 @@ const STANCE_LINES = {
   Aggressive: 'Intel: the enemy is on the attack.',
   SpreadOut: 'Intel: the enemy is spread out.',
 };
-const APPROACH_RULE = 'Flank beats dug in. Dig in beats an attack. Assault beats spread out. Your pick deploys.';
+const APPROACH_RULE = 'Pick the approach that beats their posture.'; // BP-31 (item 10): was the rock-paper-scissors line
 const APPROACHES = [['Assault', 'Assault'], ['Flank', 'Flank'], ['DigIn', 'Dig in']]; // [wire value, button label]
 const APPROACH_ICON = { Assault: 'icon_approach_assault.png', Flank: 'icon_approach_flank.png', DigIn: 'icon_approach_dig_in.png' }; // BP-22
+// BP-31: the signs of demo_roll.rs approach_points (approach x stance), never its points. A retune of the
+// square changes this table in the same commit.
+const MATCH = {
+  Assault: { DugIn: 'bad', Aggressive: 'even', SpreadOut: 'good' },
+  Flank: { DugIn: 'good', Aggressive: 'bad', SpreadOut: 'even' },
+  DigIn: { DugIn: 'even', Aggressive: 'good', SpreadOut: 'bad' },
+};
+const APPROACH_DESC = { // BP-31: what each approach is good and bad against, in words
+  Assault: 'Assault: good vs spread out, bad vs dug in.',
+  Flank: 'Flank: good vs dug in, bad vs an attack.',
+  DigIn: 'Dig in: good vs an attack, bad vs spread out.',
+};
+const STANCE_WORD = { DugIn: 'dug in', Aggressive: 'attacking', SpreadOut: 'spread out' }; // BP-31
+const MATCH_TAIL = { good: "They're {s}. Good match.", bad: "They're {s}. Bad match.", even: "They're {s}. No edge." }; // BP-31
+const APPROACH_CONFIRM = 'Confirm'; // BP-31: the button that starts the fight
 const VERDICT = {
   good: 'Good call: {p} on the odds.',
   bad: 'Bad call: {p} on the odds.',
   even: 'The enemy hardly noticed your approach.',
 };
-let pendingApproach = null; // set only inside one approach button's click dispatch (deploy() builds its body synchronously)
+let pendingApproach = null; // set only inside Confirm's click dispatch (deploy() builds its body synchronously) // BP-31
 let sentApproach = null;    // what the last mission POST carried, recorded where the body is built
 let approachButtons = [];   // the three approach buttons, created once at the mount
 let stanceNode = null;      // the briefing's stance hint (hidden when the cached body has none)
 let fightMission = null;    // the mission id of the demo fight on the briefing, for its stance
+let pickedApproach = null;  // BP-31: the approach tapped on this briefing; cleared on every show, sent by Confirm
+let ruleNode = null;        // BP-31: the rule line, which shows the pick's line once one is tapped
+let confirmButton = null;   // BP-31: Confirm, beside the keeper Back
 // The cached /api/missions body's stance for a mission, or null (a body cached before BP-14a has none: no hint).
 const stanceLine = id => { const m = (store.missions() || {})[id]; return m && STANCE_LINES[m.stance] ? STANCE_LINES[m.stance] : null; };
+const stanceKey = id => { const m = (store.missions() || {})[id]; return m && STANCE_LINES[m.stance] ? m.stance : null; }; // BP-31
+// BP-31: the description, plus the match against the hinted posture when the briefing has one.
+const pickLine = wire => {
+  const k = opFight && fightMission ? stanceKey(fightMission) : null;
+  return k ? `${APPROACH_DESC[wire]} ${fill(MATCH_TAIL[MATCH[wire][k]], { s: STANCE_WORD[k] })}` : APPROACH_DESC[wire];
+};
 // The AAR's verdict on the pick, keyed only on the server's approach row (absent: the pick was a draw).
 const verdictLine = report => {
   if (!sentApproach) return null;
@@ -303,7 +331,11 @@ const verdictLine = report => {
   return fill(row.points > 0 ? VERDICT.good : VERDICT.bad, { p: row.points > 0 ? `+${row.points}` : String(row.points) });
 };
 // The three buttons follow #btn-deploy's disabled state (every keeper and demo rule, present and future).
-const mirrorDeploy = () => { const off = deps.$('btn-deploy').disabled; for (const b of approachButtons) b.disabled = off; };
+const mirrorDeploy = () => {
+  const off = deps.$('btn-deploy').disabled;
+  for (const b of approachButtons) b.disabled = off;
+  if (confirmButton) confirmButton.disabled = off || !pickedApproach; // BP-31: Confirm also waits for a pick
+};
 
 let deps = null;
 let map = null;         // the map the pins are drawn on
@@ -1161,10 +1193,27 @@ function dressFight() {
   dressApproach();
 }
 
+// BP-31 (item 11): a tap on an approach selects it (aria-pressed is the glow) and shows its line in the rule's
+// place; only Confirm starts the fight.
+function selectApproach(wire) {
+  pickedApproach = wire;
+  for (const o of approachButtons) o.setAttribute('aria-pressed', String(o.dataset.approach === wire));
+  ruleNode.textContent = pickLine(wire);
+  ruleNode.dataset.picked = '';
+  mirrorDeploy();
+}
+function clearApproach() {
+  pickedApproach = null;
+  for (const o of approachButtons) o.setAttribute('aria-pressed', 'false');
+  ruleNode.textContent = APPROACH_RULE;
+  delete ruleNode.dataset.picked;
+}
+
 // B5: on every briefing show, after the keeper's disabled = false (and dressFight's 0-fit rule), the keeper
-// Deploy is hidden behind the three approach buttons, the stance hint is set and the buttons follow its state.
+// Deploy is hidden (Confirm deploys the pick), the pick is cleared, the stance hint is set and the buttons follow its state.
 function dressApproach() {
   deps.$('btn-deploy').hidden = true;
+  clearApproach(); // BP-31: no pick carries over to another show
   const line = opFight && fightMission ? stanceLine(fightMission) : null;
   stanceNode.textContent = line || '';
   stanceNode.hidden = !line;
@@ -1176,24 +1225,38 @@ function createApproaches() {
   const deploy = deps.$('btn-deploy');
   stanceNode = el('p', 'briefing-stance');
   stanceNode.hidden = true;
-  const rule = el('p', 'briefing-rule', APPROACH_RULE);
+  ruleNode = el('p', 'briefing-rule', APPROACH_RULE); // BP-31: held, it shows the pick's line
   const row = el('div', 'briefing-approaches');
   approachButtons = APPROACHES.map(([wire, label]) => {
     const b = el('button', 'btn btn-primary briefing-approach', label);
     b.type = 'button';
     b.dataset.approach = wire;
+    b.setAttribute('aria-pressed', 'false'); // BP-31
     const icon = el('img', 'briefing-icon');
     icon.alt = '';
     icon.addEventListener('error', () => icon.remove());
     icon.src = `assets/art/${APPROACH_ICON[wire]}`;
     b.prepend(icon);
     b.addEventListener('click', () => {
-      pendingApproach = wire; deps.$('btn-deploy').click(); pendingApproach = null;
+      selectApproach(wire); // BP-31: select, not fight
     });
     return b;
   });
   row.append(...approachButtons);
-  deploy.before(stanceNode, rule, row);
+  deploy.before(stanceNode, ruleNode, row);
+  // BP-31: Confirm deploys the pick. It sits beside the keeper Back in one row (Back | Confirm), the measured fit.
+  confirmButton = el('button', 'btn btn-primary', APPROACH_CONFIRM);
+  confirmButton.type = 'button';
+  confirmButton.id = 'btn-approach-confirm';
+  confirmButton.disabled = true;
+  confirmButton.addEventListener('click', () => {
+    if (!pickedApproach) return;
+    pendingApproach = pickedApproach; deps.$('btn-deploy').click(); pendingApproach = null;
+  });
+  const back = deps.$('btn-briefing-back');
+  const pair = el('div', 'briefing-pair');
+  back.before(pair);
+  pair.append(back, confirmButton);
   new MutationObserver(mirrorDeploy).observe(deploy, { attributes: true, attributeFilter: ['disabled'] });
 }
 
