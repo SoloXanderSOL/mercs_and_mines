@@ -304,14 +304,15 @@ pub const DEMO_COST_GREASE_PIT: u32 = 80;
 pub const DEMO_COST_HOBBYIST_BENCHES: u32 = 120;
 /// The Basic Smelter's cost in banked ore.
 pub const DEMO_COST_BASIC_SMELTER: u32 = 80;
-/// Seconds each building takes to go up (BP-21, §4e C2), read through `BaseBuilding::build_secs`.
-/// A demo scale: canon T1 construction takes about 15 minutes (`Economy_Balancing_Stub`), and no
-/// shipped string states these seconds as the game's build times.
-pub const DEMO_BUILD_SECS_RADIO_SHACK: i64 = 15;
-pub const DEMO_BUILD_SECS_GREASE_PIT: i64 = 20;
-pub const DEMO_BUILD_SECS_BASIC_SMELTER: i64 = 20;
-pub const DEMO_BUILD_SECS_GUNSMITH: i64 = 25;
-pub const DEMO_BUILD_SECS_HOBBYIST_BENCHES: i64 = 30;
+/// Seconds each building takes to go up (BP-21), read through `BaseBuilding::build_secs`. BP-35: 0 in
+/// the demo, so a build stands in its own call (Demo_Feedback 2026-11-06 item 2); canon keeps build
+/// times for the full game (T1 about 15 minutes, `Economy_Balancing_Stub`). The pending path stays,
+/// reached in tests through `DemoOpsStore::build_op_lasting`.
+pub const DEMO_BUILD_SECS_RADIO_SHACK: i64 = 0;
+pub const DEMO_BUILD_SECS_GREASE_PIT: i64 = 0;
+pub const DEMO_BUILD_SECS_BASIC_SMELTER: i64 = 0;
+pub const DEMO_BUILD_SECS_GUNSMITH: i64 = 0;
+pub const DEMO_BUILD_SECS_HOBBYIST_BENCHES: i64 = 0;
 
 /// One pin on the board. A dig carries `tier`; a contract carries `mission_id` and `name`.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -3228,14 +3229,22 @@ impl DemoOpsStore {
 
     /// Starts `building` at the campaign's merc base (BP-10a; timed since BP-21): its cost is
     /// debited from the banked ore at once, and it stands `build_secs` later (`settle_build`, at
-    /// the first read at or after `done_at`). Settles first, so a haul that has just come home
+    /// the first read at or after `done_at`); 0 in the demo since BP-35, so in the same call.
+    /// Settles first, so a haul that has just come home
     /// banks before the check and can pay on the same call, and a due build stands before the
     /// checks. Never while an op is out. An op may start while a build is going up (BP-21 R3):
     /// the building counts from the first roll after it stands, and no rolled number is read
-    /// again. One at a time. Writes `moved_at` (the keep list). Refusals in order: `OpOut` →
+    /// again. One at a time, which still holds through `build_op_lasting`. Writes `moved_at`
+    /// (the keep list). Refusals in order: `OpOut` →
     /// `AlreadyBuilt` → `AlreadyBuilding` → `NotEnoughOre` (also for a campaign with no entry,
     /// which has banked nothing).
     pub fn build_op(&self, campaign_id: Uuid, building: BaseBuilding, now: DateTime<Utc>) -> Result<(), BuildRefusal> {
+        self.build_op_lasting(campaign_id, building, now, building.build_secs())
+    }
+
+    /// `build_op` with the building's seconds given (BP-35): production passes `build_secs()` (0);
+    /// the tests of the pending path pass BP-21's seconds.
+    pub(crate) fn build_op_lasting(&self, campaign_id: Uuid, building: BaseBuilding, now: DateTime<Utc>, secs: i64) -> Result<(), BuildRefusal> {
         let mut inner = self.lock();
         let Some(e) = inner.get_mut(&campaign_id) else {
             return Err(BuildRefusal::NotEnoughOre);
@@ -3255,7 +3264,7 @@ impl DemoOpsStore {
             return Err(BuildRefusal::NotEnoughOre);
         }
         e.ore_banked -= cost;
-        e.pending_build = Some(PendingBuild { building, done_at: now + Duration::seconds(building.build_secs()) });
+        e.pending_build = Some(PendingBuild { building, done_at: now + Duration::seconds(secs) });
         e.moved_at = Some(now);
         e.touched = now;
         Ok(())
@@ -3603,15 +3612,6 @@ impl DemoOpsStore {
                     *t -= back;
                 }
             }
-        }
-    }
-
-    /// Moves the campaign's pending build `secs` into the past (BP-21), so a route test sees it
-    /// stand without sleeping. `rewind_op` leaves it.
-    #[cfg(test)]
-    pub(crate) fn rewind_build(&self, campaign_id: Uuid, secs: i64) {
-        if let Some(p) = self.lock().get_mut(&campaign_id).and_then(|e| e.pending_build.as_mut()) {
-            p.done_at -= Duration::seconds(secs);
         }
     }
 
@@ -4820,8 +4820,8 @@ mod tests {
         assert_eq!(store.ops_snapshot(a, at(30)).1, 120);
     }
 
-    /// A build debits its cost at once and stands `build_secs` later (BP-21: the Radio Shack's
-    /// 15 s, from 31 to 46). Already built comes before short of ore, and a refusal moves nothing.
+    /// A build debits its cost at once and stands `build_secs` later (BP-35: 0 s, so it stands at
+    /// 31 and still at 46). Already built comes before short of ore, and a refusal moves nothing.
     #[test]
     fn ops_store_build_debits_the_bank_and_stands() {
         let store = DemoOpsStore::new(2);
@@ -5020,18 +5020,35 @@ mod tests {
     }
 
     /// BP-21: a build is pending until its `done_at` and stands at it, not a second before; the
-    /// body's `construction` names it until then and is gone after.
+    /// body's `construction` names it until then and is gone after. Through `build_op_lasting` with
+    /// BP-21's 15 s for the Radio Shack (BP-35: the demo's own build time is 0).
     #[test]
     fn ops_store_build_stands_at_its_done_at() {
         let store = DemoOpsStore::new(2);
         let a = Uuid::from_u128(1);
         banked_120(&store, a);
-        assert_eq!(store.build_op(a, BaseBuilding::RadioShack, at(31)), Ok(()));
+        assert_eq!(store.build_op_lasting(a, BaseBuilding::RadioShack, at(31), 15), Ok(()));
         assert_eq!(store.ops_snapshot(a, at(45)), (None, 70, OpsBase::default()), "paid, not yet standing");
         assert_eq!(store.ops_body(a, at(45)).4, Some(ConstructionView { building: "radio_shack", done_at: ops_time(at(46)) }));
         let shack = OpsBase { radio_shack: true, ..OpsBase::default() };
         assert_eq!(store.ops_snapshot(a, at(46)), (None, 70, shack));
         assert_eq!(store.ops_body(a, at(46)).4, None);
+    }
+
+    /// BP-35: the demo's build time is 0 (Demo_Feedback 2026-11-06 item 2), so a build stands in
+    /// its own call: the snapshot at the same instant shows it and the body carries no `construction`.
+    #[test]
+    fn ops_store_build_stands_in_its_own_call() {
+        for b in [BaseBuilding::RadioShack, BaseBuilding::HobbyistBenches, BaseBuilding::GreasePit, BaseBuilding::Gunsmith, BaseBuilding::BasicSmelter] {
+            assert_eq!(b.build_secs(), 0, "{b:?}");
+        }
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        banked_120(&store, a);
+        assert_eq!(store.build_op(a, BaseBuilding::RadioShack, at(31)), Ok(()));
+        let shack = OpsBase { radio_shack: true, ..OpsBase::default() };
+        assert_eq!(store.ops_snapshot(a, at(31)), (None, 70, shack));
+        assert_eq!(store.ops_body(a, at(31)).4, None);
     }
 
     /// BP-21: one build at a time. While the Radio Shack goes up, the same building and another
@@ -5042,7 +5059,7 @@ mod tests {
         let store = DemoOpsStore::new(2);
         let a = Uuid::from_u128(1);
         banked_120(&store, a);
-        assert_eq!(store.build_op(a, BaseBuilding::RadioShack, at(31)), Ok(()));
+        assert_eq!(store.build_op_lasting(a, BaseBuilding::RadioShack, at(31), 15), Ok(()));
         assert_eq!(store.build_op(a, BaseBuilding::RadioShack, at(35)), Err(BuildRefusal::AlreadyBuilding));
         assert_eq!(store.build_op(a, BaseBuilding::Gunsmith, at(35)), Err(BuildRefusal::AlreadyBuilding));
         assert_eq!(store.ops_snapshot(a, at(36)).1, 70, "no second debit");
@@ -5057,12 +5074,29 @@ mod tests {
         let store = DemoOpsStore::new(2);
         let (a, b, c) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
         banked_120(&store, a);
-        assert_eq!(store.build_op(a, BaseBuilding::HobbyistBenches, at(31)), Ok(()));
+        assert_eq!(store.build_op_lasting(a, BaseBuilding::HobbyistBenches, at(31), 30), Ok(()));
         let _ = store.take_foreman_due(a, at(31));
         assert!(store.put_board(b, (5, 0), board(), at(32)));
         assert!(store.put_board(c, (5, 0), board(), at(33)));
         assert_eq!(store.len(), 2);
         assert!(store.board(b, (5, 0), at(34)).is_none(), "the board-only entry is evicted");
+        let benches = OpsBase { hobbyist_benches: true, ..OpsBase::default() };
+        assert_eq!(store.ops_snapshot(a, at(61)), (None, 0, benches), "kept, and the Benches stand");
+    }
+
+    /// BP-35 (RULE-032): the pending-build keep term decides alone. `a` holds only the Benches going
+    /// up (BP-21's 30 s; ore 0, base default, its Foreman tally drained) and `b` holds banked ore, so
+    /// with the store full a new campaign finds no victim and is not cached; `a` keeps its build.
+    #[test]
+    fn make_room_refuses_rather_than_evict_a_pending_build() {
+        let store = DemoOpsStore::new(2);
+        let (a, b, c) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
+        banked_120(&store, b);
+        banked_120(&store, a);
+        assert_eq!(store.build_op_lasting(a, BaseBuilding::HobbyistBenches, at(31), 30), Ok(()));
+        let _ = store.take_foreman_due(a, at(31));
+        assert!(!store.put_board(c, (5, 0), board(), at(33)), "no victim: c is not cached");
+        assert_eq!(store.len(), 2);
         let benches = OpsBase { hobbyist_benches: true, ..OpsBase::default() };
         assert_eq!(store.ops_snapshot(a, at(61)), (None, 0, benches), "kept, and the Benches stand");
     }
@@ -5074,7 +5108,7 @@ mod tests {
         let store = DemoOpsStore::new(2);
         let a = Uuid::from_u128(1);
         banked_120(&store, a);
-        assert_eq!(store.build_op(a, BaseBuilding::RadioShack, at(31)), Ok(()));
+        assert_eq!(store.build_op_lasting(a, BaseBuilding::RadioShack, at(31), 15), Ok(()));
         let crew = DigStart { crew_id: CREW, commander_id: COMMANDER, threshold: 100, section_id: None, escort: true };
         store.start_op(a, (5, 0), board(), &dig(1), 7, Some(crew), None, at(32)).expect("start while the Shack goes up");
         assert_eq!(dig_view(&store, a, at(45)).next_raid_pct, Some(5), "on site from 42, the Shack not yet standing");
@@ -5088,7 +5122,7 @@ mod tests {
         let store = DemoOpsStore::new(2);
         let a = Uuid::from_u128(1);
         banked_120(&store, a);
-        assert_eq!(store.build_op(a, BaseBuilding::Gunsmith, at(31)), Ok(()));
+        assert_eq!(store.build_op_lasting(a, BaseBuilding::Gunsmith, at(31), 25), Ok(()));
         assert!(!store.base_of(a, at(55)).gunsmith, "not yet");
         assert!(store.base_of(a, at(56)).gunsmith, "stood by base_of itself");
     }

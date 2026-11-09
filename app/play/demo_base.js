@@ -49,6 +49,7 @@ export const BASE_COPY = {
   oneAtATime: 'One building goes up at a time.',
   pop: '−{n} ore',
   close: 'Close',
+  pick: '{name} · {cost} ore', // BP-35: the plot card's title
   medbay: 'Open the Medbay', // BP-33: a built Medbay's button
   endBase: 'Banked ore and credits do not transfer. The base stays on the old books.',
   endBaseOut: 'Banked ore and credits do not transfer. The base stays on the old books; ore on site and in transit is written off.',
@@ -112,10 +113,20 @@ export const BASE_CSS = `
 .base-plot-img { display: block; width: 100%; height: auto; aspect-ratio: 1008 / 1050; border-radius: 1.5cqw; }
 .base-plot-sprite { position: absolute; height: auto; pointer-events: none; }
 .base-plot-sprite[hidden] { display: none; }
+.base-plot-sprite.dim { filter: grayscale(1); opacity: 0.35; pointer-events: auto; cursor: pointer; } /* BP-35: an empty pad shows its building, dimmed; tap it to build */
+.base-plot-sprite.just { animation: base-rise 0.4s ease-out; }
+@keyframes base-rise { from { transform: scale(0.8); opacity: 0.35; } to { transform: none; opacity: 1; } }
+.base-pick { position: absolute; left: 2cqw; right: 2cqw; bottom: 2cqw; display: flex; flex-direction: column; gap: 1cqw; padding: 2cqw; text-align: left; background: rgba(11, 11, 12, 0.94); border: 0.3cqw solid var(--accent); border-radius: 1.5cqw; }
+.base-pick.top { top: 2cqw; bottom: auto; }
+.base-pick[hidden] { display: none; }
+.base-pick-name { margin: 0; font-family: var(--display); font-weight: 800; font-size: 4.2cqw; line-height: 1.1; }
+.base-pick-effect { margin: 0; font-size: 3.4cqw; line-height: 1.3; color: var(--accent); }
+.base-pick-row { display: flex; gap: 2cqw; align-items: center; }
+.base-pick-build, .base-pick-close { width: auto; max-width: none; min-height: 8.5cqw; padding: 0 2.5cqw; font-size: 3.6cqw; }
 ${BASE.map(b => artCss(b.id)).join('\n')}
 @media (prefers-reduced-motion: reduce) {
   .base-art { transition: none; }
-  .base-pop.shown, .base-slot.just .base-stamp { animation: none; }
+  .base-pop.shown, .base-slot.just .base-stamp, .base-plot-sprite.just { animation: none; }
 }
 `;
 
@@ -133,6 +144,22 @@ function replay(node, className) {
   node.classList.remove(className);
   void node.offsetWidth;
   node.classList.add(className);
+}
+
+// BP-35: draws the plot card for v.pick from that building's list slot (its Build label and disabled state, which
+// renderBase has just set), or hides it when nothing is picked or the picked building stands. The texts are
+// emptied while hidden, so no text search finds a second Build.
+function drawPick(v) {
+  const s = v.pick ? v.slots.find(x => x.b.id === v.pick) : null;
+  const open = Boolean(s) && !s.slot.classList.contains('built');
+  const c = v.card;
+  c.node.hidden = !open;
+  c.node.classList.toggle('top', open && SPRITE[s.b.id][1] > 45);
+  c.name.textContent = open ? fill(BASE_COPY.pick, { name: s.b.name, cost: s.b.cost }) : '';
+  c.effect.textContent = open ? s.b.effect : '';
+  c.build.textContent = open ? s.button.textContent : '';
+  c.build.disabled = !open || s.button.disabled;
+  if (!open) v.pick = null;
 }
 
 // `onBuild(id)`, `onClose()` and `onMedbay()` (BP-33) are demo_ops.js's; the sheet only calls them.
@@ -184,18 +211,41 @@ export function createBase(onBuild, onClose, onMedbay) {
     img.style.top = `${top}%`;
     img.style.width = `${width}%`;
     img.addEventListener('error', () => img.remove());
+    img.addEventListener('click', () => { // BP-35: only an empty (dimmed) pad takes a tap
+      if (!img.classList.contains('dim')) return;
+      v.pick = b.id;
+      drawPick(v);
+    });
     img.src = b.id === MEDBAY ? 'assets/art/building_medbay_t1.png' : `assets/art/building_${b.id}.png`; // BP-33b
     plot.append(img);
     sprites[b.id] = img;
   }
+  // BP-35: the plot card. Its Build sends the same onBuild as the list's; its close only drops the pick.
+  const card = el('div', 'base-pick');
+  card.hidden = true;
+  const cardName = el('p', 'base-pick-name');
+  const cardEffect = el('p', 'base-pick-effect');
+  const cardBuild = el('button', 'btn btn-primary base-pick-build');
+  cardBuild.type = 'button';
+  cardBuild.addEventListener('click', () => { if (v.pick) onBuild(v.pick); });
+  const cardClose = el('button', 'btn base-pick-close', '✕');
+  cardClose.type = 'button';
+  cardClose.setAttribute('aria-label', BASE_COPY.close);
+  cardClose.addEventListener('click', () => { v.pick = null; drawPick(v); });
+  const cardRow = el('div', 'base-pick-row');
+  cardRow.append(cardBuild, cardClose);
+  card.append(cardName, cardEffect, cardRow);
+  plot.append(card);
   node.append(head, bankedEl, pop, note, plot, ...slots.map(s => s.slot));
-  return { node, bankedEl, pop, note, slots, sprites };
+  const v = { node, bankedEl, pop, note, slots, sprites, pick: null, card: { node: card, name: cardName, effect: cardEffect, build: cardBuild } };
+  return v;
 }
 
 // `s`: { base, banked, credits, out, held, rate, going } from demo_ops.js; `going` (BP-21b): the building going up,
 // { id, left } with whole seconds left on the server's clock, or null. `built`: the building this render shows
 // standing for the first time (its moment), or null; `paid`: the building whose ore this render's build POST took
-// (its pop), or null. A building is bought once and goes up over time, one at a time; while a squad is out
+// (its pop), or null. A building is bought once; since BP-35 the demo's build time is 0, so it stands in its own
+// call, and `going` is set only by a body that still carries `construction` (the fake's opt-in buildsecs); while a squad is out
 // nothing can be built.
 export function renderBase(v, s, built, paid) {
   v.bankedEl.textContent = bankedLine(s.banked, s.credits);
@@ -206,7 +256,8 @@ export function renderBase(v, s, built, paid) {
     const up = s.base[b.id] === true;
     const going = !up && lock && s.going.id === b.id;
     slot.classList.toggle('built', up);
-    v.sprites[b.id].hidden = !up; // BP-22: the plot shows what stands
+    v.sprites[b.id].hidden = false; // BP-35: every pad shows its building (BP-22: what stands, in colour)
+    v.sprites[b.id].classList.toggle('dim', !up);
     stamp.textContent = up ? BASE_COPY.operational : going ? BASE_COPY.going : BASE_COPY.planned;
     button.hidden = up;
     if (open) open.hidden = !up; // BP-33: only a standing Medbay opens
@@ -220,12 +271,14 @@ export function renderBase(v, s, built, paid) {
     }
     if (up && b.id === built) {
       replay(slot, 'just');
+      replay(v.sprites[b.id], 'just'); // BP-35: the sprite rises once
       done = b.done;
     }
   }
   if (!s.rate) note = done || note || (lock ? BASE_COPY.oneAtATime : '');
   v.note.textContent = note;
   v.note.hidden = !note;
+  drawPick(v); // BP-35
   v.node.hidden = false;
 }
 
@@ -235,4 +288,7 @@ export function hideBase(v) {
   // class left on would replay the last pop and every slam on each reopen. replay() removes before it adds.
   v.pop.classList.remove('shown');
   for (const { slot } of v.slots) slot.classList.remove('just');
+  for (const img of Object.values(v.sprites)) img.classList.remove('just'); // BP-35: as BP-21b F1
+  v.pick = null; // BP-35: a reopen starts with no card
+  drawPick(v);
 }

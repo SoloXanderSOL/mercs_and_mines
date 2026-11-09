@@ -1387,9 +1387,9 @@ async fn post_ops_pull(
 /// enough banked ore → `200`, the whole state.
 /// - The cost is debited from `ore_banked` and `base` names what stands. A haul that has come
 ///   home banks first, so its ore can pay on the same call.
-/// - BP-21: the building stands `BaseBuilding::build_secs` later (the body's `construction`
-///   until then), one at a time. An op may start while it goes up; it counts from the first
-///   roll after it stands, and no rolled number is read again (ruling R3).
+/// - BP-21: the building stands `BaseBuilding::build_secs` later; BP-35: 0 in the demo, so the
+///   `200` shows it standing and carries no `construction`. An op may start while it goes up; it
+///   counts from the first roll after it stands, and no rolled number is read again (ruling R3).
 /// - Never while an op is out (a contract until its homeward leg lands, a haul still on the
 ///   road), so no base number changes under a live op and a haul's ambush stays as the pull
 ///   rolled it. A pending raid means an op is out, so no `RaidPending` arm is needed.
@@ -3604,9 +3604,8 @@ mod tests {
     }
 
     /// Seed 2's 120-ore haul lands; the build's own call banks it and pays the Radio Shack's 50,
-    /// and `construction` names it going up while `base` shows none yet (BP-21). A second build
-    /// is `already building`, whichever building. Once it stands (`rewind_build`), `base` shows it
-    /// and `construction` is absent. Then already built, then short of ore; a board read shows the
+    /// and (BP-35: the demo's build time is 0) its `200` shows the Shack standing in `base` and
+    /// carries no `construction`. Then already built, then short of ore; a board read shows the
     /// same.
     #[tokio::test]
     async fn ops_build_spends_the_bank_and_shows_the_base() {
@@ -3621,22 +3620,12 @@ mod tests {
         let none = serde_json::json!({"radio_shack": false, "hobbyist_benches": false, "grease_pit": false, "gunsmith": false, "basic_smelter": false});
         assert_eq!(body["base"], none);
         state.demo_ops.store.rewind_op(c, site_secs(&body, DIG));
+        let shack = serde_json::json!({"radio_shack": true, "hobbyist_benches": false, "grease_pit": false, "gunsmith": false, "basic_smelter": false});
         let (status, body, _) = build(&state, c, "radio_shack").await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(body["active_op"].is_null(), "home: {body}");
-        assert_eq!((body["ore_banked"].as_u64(), &body["base"]), (Some(70), &none));
-        assert_eq!(body["construction"]["building"], "radio_shack");
-        assert!(body["construction"]["done_at"].is_string(), "{body}");
-        for other in ["radio_shack", "gunsmith"] {
-            let (status, body, _) = build(&state, c, other).await;
-            assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("already building")), "{other}");
-        }
-        state.demo_ops.store.rewind_build(c, crate::demo_ops::DEMO_BUILD_SECS_RADIO_SHACK);
-        let shack = serde_json::json!({"radio_shack": true, "hobbyist_benches": false, "grease_pit": false, "gunsmith": false, "basic_smelter": false});
-        let (status, body) = get(&state, Some("t"), c).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!((body["ore_banked"].as_u64(), &body["base"]), (Some(70), &shack));
-        assert!(body.get("construction").is_none(), "absent once it stands: {body}");
+        assert!(body.get("construction").is_none(), "stands in its own call: {body}");
         let (status, body, _) = build(&state, c, "radio_shack").await;
         assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("already built")));
         let (status, body, _) = build(&state, c, "gunsmith").await;
