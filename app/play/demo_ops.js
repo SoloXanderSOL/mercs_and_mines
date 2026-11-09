@@ -323,10 +323,13 @@ const pickLine = wire => {
   const k = opFight && fightMission ? stanceKey(fightMission) : null;
   return k ? `${APPROACH_DESC[wire]} ${fill(MATCH_TAIL[MATCH[wire][k]], { s: STANCE_WORD[k] })}` : APPROACH_DESC[wire];
 };
+// BP-36b (Reviewer BP-36 F2): the server's approach row, the one read verdictLine and voiceOf share, so the
+// Commander's line and the verdict can never disagree.
+const approachRow = report => ((report && report.score_breakdown) || {}).modifiers?.find(m => m.key === 'approach');
 // The AAR's verdict on the pick, keyed only on the server's approach row (absent: the pick was a draw).
 const verdictLine = report => {
   if (!sentApproach) return null;
-  const row = ((report && report.score_breakdown) || {}).modifiers?.find(m => m.key === 'approach');
+  const row = approachRow(report);
   if (!row) return VERDICT.even;
   return fill(row.points > 0 ? VERDICT.good : VERDICT.bad, { p: row.points > 0 ? `+${row.points}` : String(row.points) });
 };
@@ -1309,6 +1312,14 @@ function guardHead() {
   return free ? free.headcount : 0;
 }
 
+// BP-36b (Reviewer BP-36 F2): the Commander who led this fight, fightPick's, else the campaign's, from a roster's
+// commanders. voiceOf and aarNote's takes-command line share it.
+function ledCommander(commanders) {
+  const camp = store.campaign();
+  const ledId = (fightPick && fightPick.commander_id) || (camp && camp.commander_id);
+  return commanders.find(c => c.commander_id === ledId);
+}
+
 // BP-36: who speaks the AAR's line. The Commander who led this fight (aarNote's own pick: fightPick, else the
 // campaign's), only after a pick through Confirm, and only alive: deploy() patches KIA into the roster before
 // the AAR. A Shattered Commander still talks. The match is the approach row's sign, as verdictLine reads it.
@@ -1316,11 +1327,9 @@ function voiceOf(report) {
   if (!sentApproach) return null; // BP-36: no pick through Confirm, no line
   const roster = deps.getRoster();
   const commanders = roster && Array.isArray(roster.commanders) ? roster.commanders : [];
-  const camp = store.campaign();
-  const ledId = (fightPick && fightPick.commander_id) || (camp && camp.commander_id);
-  const led = commanders.find(c => c.commander_id === ledId);
+  const led = ledCommander(commanders);
   if (!led || led.is_kia) return null;
-  const row = ((report && report.score_breakdown) || {}).modifiers?.find(m => m.key === 'approach');
+  const row = approachRow(report);
   return { flaw: led.fatal_flaw, match: !row ? 'even' : row.points > 0 ? 'good' : 'bad' };
 }
 
@@ -1348,9 +1357,7 @@ function aarNote({ report, section }) {
   // lead: the next is battle.js's nextUsable pick, the first usable in roster order.
   const roster = deps.getRoster();
   const commanders = roster && Array.isArray(roster.commanders) ? roster.commanders : [];
-  const camp = store.campaign();
-  const ledId = (fightPick && fightPick.commander_id) || (camp && camp.commander_id);
-  const led = commanders.find(c => c.commander_id === ledId);
+  const led = ledCommander(commanders);
   const next = commanders.find(c => !c.is_kia && !c.is_shattered);
   if (led && (led.is_kia || led.is_shattered) && next) lines.push(fill(COPY.takesCommand, { name: led.name, next: next.name }));
   return lines;

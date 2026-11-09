@@ -73,7 +73,8 @@ const WRITEUP = {
 // and the sign of the server's approach row (good / bad / even; the verdict reads the same row). Two lines per
 // cell, picked by the report hash; a Flaw's own line wins its cell. No line names an approach or a posture (the
 // cell doesn't know them) or a number (the verdict says it). Every line fits beside its cell's verdict in the
-// write-up's two lines at 400 px (cv8 renders all 30). Exported for cv8 only.
+// write-up's two lines at 400 px (cv5 renders all 24). Exported for cv5 only. ODQ-86 (a): no Wipeout row, since a
+// Wipeout always kills the leading Commander (commander.rs death_effects), so no line could ever show there.
 export const VOICE = {
   Success: {
     good: ['I\'ll take full credit for that one, sir.', 'Textbook, sir. Somebody should frame it.'],
@@ -85,23 +86,18 @@ export const VOICE = {
     bad: ['I said so, sir. Quietly. To myself.', 'We picked the wrong fight, sir, and it noticed.'],
     even: ['Even odds, sir. They wanted it more.', 'No edge either way. Theirs, today.'],
   },
-  Wipeout: {
-    good: ['The plan was fine, sir. I\'m all that\'s left of it.', 'We did it right, sir. I\'ll tell the families.'],
-    bad: ['I\'ll be writing the letters myself, sir.', 'I\'d like it noted that I said nothing at the time.'],
-    even: ['Even odds, sir. The odds lied.', 'Nobody else made it back, sir.'],
-  },
 };
 // One line per Flaw, keyed `<outcome>.<match>`; true to the briefing's TRAITS (demo_company.js) and the canon Flaw.
 export const FLAW_VOICE = {
   'Embezzler': { 'Success.good': 'Clean win, sir. The receipts will be less so.' },
   'Bloodthirsty': { 'Defeat.even': 'Retreat, sir? I don\'t know the word.' },
-  'Cowardly': { 'Wipeout.bad': 'I fell back to report, sir. That\'s my story.' },
+  'Cowardly': { 'Defeat.bad': 'I fell back to report, sir. That\'s my story.' },
   'Paranoid': { 'Defeat.good': 'They knew we were coming, sir. Someone told them.' },
   'Cult of Bob': { 'Success.good': 'The blessed rifles held, sir. Praise Bob.' },
   'The Informant': { 'Defeat.bad': 'I\'ve already sold the story, sir. Good price.' },
   'Glory Hound': { 'Success.even': 'The Commander was magnificent, again.' },
   'The Gambler': { 'Success.bad': 'Bad odds, sir. Best kind. Let it ride.' },
-  'Chrome-Chaser': { 'Wipeout.good': 'Sound plan, sir. May I have their implants?' },
+  'Chrome-Chaser': { 'Defeat.good': 'Sound plan, sir. May I have their implants?' },
   'Martinet': { 'Success.bad': 'We won, sir. Disgracefully. Boots at dawn.' },
   'Squeak-Touched': { 'Defeat.bad': 'The hamsters warned me, sir. I didn\'t listen.' },
   'Doomsayer': { 'Success.even': 'We won. Nothing changes. We\'re doomed.' },
