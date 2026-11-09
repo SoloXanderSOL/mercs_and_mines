@@ -87,10 +87,14 @@ const COPY = {
   leaveOre: 'Leave {ore} ore in the ground?',
   leaveIt: 'Leave it',
   stay: 'Stay',
-  listTitle: 'Contracts on offer',
-  listSub: 'Pick a contract. The squad walks there first.',
+  listTitle: 'Jobs on offer', // BP-30: digs and contracts
+  listSub: 'Pick a dig or a contract. The team walks there first.', // BP-30
   listOut: 'A squad is out.',
   listMeta: '{n} hexes · {s} s',
+  outOfReach: 'Out of reach: your crews work veins near the gateway.', // BP-30: a tap on a vein that is not on the board
+  labelDig: 'Dig',     // BP-30: over a dig pin
+  labelFight: 'Fight', // BP-30: over a contract pin
+  legendVein: 'Magma vein (bigger is richer; bright ones are workable)', // BP-30: the keeper legend's vein row, rewritten at mount
   listTag: ' · {word}',              // BP-29a: the difficulty word after a contract row's distance
   briefingTag: 'Difficulty: {word}', // BP-29a: on a contract's briefing (never the raid's or the ambush's)
   aarLost: 'Lost: {names}.',
@@ -1032,7 +1036,7 @@ function renderList() {
   const out = Boolean(shownOp()) && !picking;
   list.sub.textContent = out ? COPY.listOut : COPY.listSub;
   list.rows.replaceChildren();
-  for (const site of sites.filter(s => s.kind === 'contract')) {
+  for (const site of sites.filter(s => s.kind === 'contract' || s.kind === 'dig')) { // BP-30: dig sites too
     const row = el('button', 'btn ops-list-row');
     row.type = 'button';
     row.disabled = out;
@@ -1298,6 +1302,78 @@ function pin(ctx, site, x, y, r, line) {
   }
 }
 
+// BP-30 (item 39): every vein is painted over with a dark disc, so the bright marks left on the map are the
+// board's pins (a dig site's pin covers its own vein at every zoom). The radii copy hexmap.js's vein loop
+// (render(), a keeper file): a change to that loop's dot or ring sizes must change these too.
+const DIM = 'rgba(11, 11, 12, 0.6)';
+function dimVeins(ctx, m) {
+  const s = m.view.s;
+  ctx.fillStyle = DIM;
+  ctx.strokeStyle = DIM;
+  for (const vein of m.veins) {
+    const [x, y] = m.hexToScreen(vein.q, vein.r);
+    if (x < -s * 2 || y < -s * 2 || x > m.w + s * 2 || y > m.h + s * 2) continue;
+    const rad = Math.max(1.5, s * (0.25 + 0.07 * vein.tier));
+    ctx.beginPath();
+    ctx.arc(x, y, rad + 0.5, 0, Math.PI * 2);
+    ctx.fill();
+    if (vein.is_tectonic_anchor) {
+      ctx.beginPath();
+      ctx.arc(x, y, rad + Math.max(1.5, s * 0.2), 0, Math.PI * 2);
+      ctx.lineWidth = Math.max(1, s * 0.08) + 1;
+      ctx.stroke();
+    }
+  }
+}
+
+// BP-30 (item 21): Dig or Fight over each pin on screen, in board order. A label whose box (its text + 4 px
+// wide, 13 px tall, its bottom 2 px above the pin) would cover an earlier label or any other pin is skipped.
+const LABEL_FONT = '800 12px "Barlow Condensed", sans-serif';
+const LABEL_H = 13;
+const pinHalf = (st, r) => (st.kind === 'dig' && st.tier === 3 ? r * 4 / 3 : r);
+function drawLabels(ctx, m, r, onScreen) {
+  ctx.font = LABEL_FONT;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'bottom';
+  ctx.lineJoin = 'round';
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = COLOUR.edge;
+  ctx.fillStyle = COLOUR.marker;
+  const pins = sites.map(st => {
+    const [x, y] = m.hexToScreen(st.q, st.r);
+    const h = pinHalf(st, r);
+    return { st, x, y, box: [x - h, y - h, x + h, y + h] };
+  });
+  const hit = (a, b) => a[0] < b[2] && b[0] < a[2] && a[1] < b[3] && b[1] < a[3];
+  const drawn = [];
+  for (const p of pins) {
+    if (!onScreen(p.x, p.y)) continue;
+    const text = p.st.kind === 'dig' ? COPY.labelDig : COPY.labelFight;
+    const w = ctx.measureText(text).width + 4;
+    const bottom = p.box[1] - 2;
+    const box = [p.x - w / 2, bottom - LABEL_H, p.x + w / 2, bottom];
+    if (drawn.some(d => hit(d, box)) || pins.some(o => o !== p && hit(o.box, box))) continue;
+    ctx.strokeText(text, p.x, bottom - 1);
+    ctx.fillText(text, p.x, bottom - 1);
+    drawn.push(box);
+  }
+  if (DEBUG) m.canvas.dataset.opsLabels = String(drawn.length);
+}
+
+// BP-30: is the tapped hex a vein (any vein: a site's own is picked before this is asked)?
+function veinAt(x, y) {
+  const hex = map ? map.hexAt(x, y) : null;
+  return Boolean(hex && map.veins.some(v => v.q === hex.q && v.r === hex.r));
+}
+
+// BP-30 (item 4): the keeper legend's vein row, found by the keeper's own text (main.js COPY.legendVein); a
+// keeper reword leaves it alone rather than rewrite the wrong row.
+const KEEPER_LEGEND_VEIN = 'Magma vein (bigger is richer)';
+function relabelLegend() {
+  const row = [...document.querySelectorAll('#legend-list li')].find(li => li.textContent === KEEPER_LEGEND_VEIN);
+  if (row && row.lastElementChild) row.lastElementChild.textContent = COPY.legendVein;
+}
+
 function draw(ctx, m) {
   if (m !== map) return;
   const s = m.view.s;
@@ -1306,6 +1382,7 @@ function draw(ctx, m) {
   const pad = r * 2;
   const onScreen = (x, y) => x > -pad && y > -pad && x < m.w + pad && y < m.h + pad;
   ctx.save();
+  dimVeins(ctx, m); // BP-30
   // BP-18b-2a: a route and a marker per op out, the shown op last.
   const shown = shownOp();
   const all = opsOut();
@@ -1322,6 +1399,7 @@ function draw(ctx, m) {
     const [x, y] = m.hexToScreen(st.q, st.r);
     if (onScreen(x, y)) pin(ctx, st, x, y, r, line);
   }
+  drawLabels(ctx, m, r, onScreen); // BP-30
   // An ambushed team waits at the midpoint until its fight is latched; the leg's times run on
   // meanwhile, so the marker is pinned rather than read from them (Reviewer BP-8b-2 F2).
   const isAmbush = o => Boolean(o.dig && o.dig.ambush);
@@ -1408,6 +1486,7 @@ function tap(x, y) {
   noDigOpen = false;
   bankNote = null; crewNote = null; tripNote = null;
   notice = '';
+  if (!selected && homeKey() === null && veinAt(x, y)) notice = COPY.outOfReach; // BP-30
   if (selected) showSheet(selected);
   else refresh();
 }
@@ -2072,6 +2151,8 @@ export function mountOps(d) {
   });
   watch();
   mountReview(deps); // BP-27: after watch(), so its hub observer runs after the end-of-run check
+  relabelLegend(); // BP-30
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => { if (map) map.requestFrame(); }); // BP-30: the labels' font
   onMapCreated(attach);
   mountMore(); // BP-29b: last, when every box it watches exists
 }
