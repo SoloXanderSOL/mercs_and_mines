@@ -14,10 +14,10 @@ export const BASE = [
     effect: 'Raid risk 3% a drill, down from 5%.',
     flavour: 'A scrap dish on a leaning pipe mast. It hears raiders coming.',
     done: "Radio Shack operational. Raiders get heard before they're seen." },
-  { id: 'hobbyist_benches', name: 'Hobbyist Benches', cost: 120,
+  { id: 'hobbyist_benches', name: 'Medbay', cost: 120, // BP-33: the Benches renamed; the key stays
     effect: 'Patch up 20 credits a head, done in 8 s.',
-    flavour: 'Scout drones and utility medkits, mostly assembled. Stitches by the numbers.',
-    done: 'Benches operational. Patch-ups at half price.' },
+    flavour: 'A field clinic with a strong stomach. Heals the wounded faster and cheaper.',
+    done: 'Medbay open. Patch-ups cheaper and quicker.' },
   { id: 'grease_pit', name: 'The Grease-Pit', cost: 80,
     effect: 'A lost ambush costs a quarter of the haul.',
     flavour: 'Light vehicles, slow manual repairs. Armoured enough to argue with an ambush.',
@@ -49,6 +49,7 @@ export const BASE_COPY = {
   oneAtATime: 'One building goes up at a time.',
   pop: '−{n} ore',
   close: 'Close',
+  medbay: 'Open the Medbay', // BP-33: a built Medbay's button
   endBase: 'Banked ore and credits do not transfer. The base stays on the old books.',
   endBaseOut: 'Banked ore and credits do not transfer. The base stays on the old books; ore on site and in transit is written off.',
   endBaseOnly: 'Banked ore and credits do not transfer. The base stays on the old books.',
@@ -59,7 +60,7 @@ export const BASE_COPY = {
 const SVG_HEAD = "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64' fill='none' stroke='%23d9a441' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'>";
 const ART = {
   radio_shack: "<path d='M6 58h52'/><rect x='40' y='48' width='14' height='10'/><path d='M22 58l6-40M30 58l2-40'/><path d='M23 51h8M25 39h7M27 27h5'/><path d='M14 20a14 14 0 0 0 22-14'/><path d='M25 13l6 6'/><path d='M32 18l26 40' stroke-width='1'/>",
-  hobbyist_benches: "<path d='M6 58h52'/><path d='M8 46h48M14 46v12M49 46v12'/><path d='M18 46v-6M40 46v-4'/><rect x='26' y='20' width='12' height='6'/><path d='M20 16l6 6M44 16l-6 6M20 30l6-4M44 30l-6-4'/><circle cx='20' cy='16' r='4'/><circle cx='44' cy='16' r='4'/><circle cx='20' cy='30' r='4'/><circle cx='44' cy='30' r='4'/>",
+  hobbyist_benches: "<path d='M6 58h52'/><path d='M10 58V30l22-14 22 14v28'/><path d='M32 30v18M23 39h18'/>", // BP-33: the Medbay (placeholder)
   grease_pit: "<path d='M6 58h52'/><path d='M6 26l26-14 26 14'/><path d='M10 24v34M54 24v34'/><path d='M18 48h28l-4-8H24z'/><circle cx='22' cy='52' r='4'/><circle cx='42' cy='52' r='4'/>",
   gunsmith: "<path d='M6 58h52'/><path d='M10 40h44M14 40v18M49 40v18'/><path d='M16 12v28M48 12v28'/><path d='M10 22h44M36 22l-4 6M20 22v-3'/><path d='M22 40v-5h8v5'/>",
   basic_smelter: "<path d='M6 58h52'/><path d='M14 58V32h26v26'/><path d='M21 32V18h12v14'/><path d='M24 18v-6M30 18v-9'/><path d='M21 52a6 6 0 0 1 12 0'/><path d='M40 38l14 9v11'/>",
@@ -69,10 +70,14 @@ const artCss = id => `.base-art-${id} { background-image: url("${SVG_HEAD}${ART[
 // The base that grows (BP-22, art list #10-15): the plot is a band of Base_Plot_Empty (1008 x 1050, fence to
 // gate), and each standing building's sprite sits on its pad. Boxes are [left, top, width] in % of that file
 // (Wiki's bp22_encode.ps1). Sprites are never `.base-art-<id>`: the harness finds the list's slots by that class.
+// BP-33: the Medbay keeps the Benches' key (the wire, the server, healPrice). Until the Director's Medbay picture
+// exists its plot sprite is the list glyph, not the Benches' PNG; the picture is a one-file
+// follow-up under a new name (RULE-136), with this line and its box going back to the PNG form.
+const MEDBAY = 'hobbyist_benches';
 const PLOT = 'assets/art/base_plot_band.jpg';
 const SPRITE = {
   radio_shack: [13.86, 10.09, 25.79],
-  hobbyist_benches: [57.74, 19.32, 23.58],
+  hobbyist_benches: [59.42, 19.32, 20.21], // BP-33: the square glyph (was the PNG's [57.74, 19.32, 23.58])
   grease_pit: [36.47, 38.29, 24.01],
   gunsmith: [16.74, 56.1, 22.91],
   basic_smelter: [58.92, 55.41, 22.39],
@@ -80,7 +85,7 @@ const SPRITE = {
 
 export const BASE_CSS = `
 .ops-base { position: absolute; top: 11.5cqw; left: 3cqw; padding: 1cqw 2.5cqw; font-family: var(--mono); font-size: 3.6cqw; color: var(--accent); background: rgba(11, 11, 12, 0.94); border: 0.3cqw solid var(--accent); border-radius: 1.5cqw; cursor: pointer; }
-.ops-base[hidden], .base-sheet[hidden], .base-note[hidden], .base-build[hidden] { display: none; }
+.ops-base[hidden], .base-sheet[hidden], .base-note[hidden], .base-build[hidden], .base-open[hidden] { display: none; }
 .base-sheet { position: absolute; left: 3cqw; right: 3cqw; top: 20cqw; bottom: 17cqw; padding: 3cqw; display: flex; flex-direction: column; gap: 1.5cqw; text-align: left; overflow-y: auto; background: rgba(11, 11, 12, 0.96); border: 0.4cqw solid var(--panel-edge); border-radius: 2cqw; }
 .base-head { position: sticky; top: calc(-3cqw - 1px); z-index: 1; display: flex; align-items: baseline; justify-content: space-between; gap: 2cqw; background: rgb(11, 11, 12); }
 .base-line { margin: 0; font-family: var(--mono); font-size: 3.8cqw; color: var(--accent); }
@@ -101,7 +106,7 @@ export const BASE_CSS = `
 .base-name { margin: 0; font-family: var(--display); font-weight: 800; font-size: 4.4cqw; line-height: 1.1; }
 .base-effect { margin: 0; font-size: 3.4cqw; line-height: 1.3; color: var(--accent); }
 .base-flavour { margin: 0; font-size: 3.1cqw; line-height: 1.25; color: var(--muted); }
-.base-build { width: auto; max-width: none; min-height: 8.5cqw; margin-top: 0.8cqw; padding: 0 2.5cqw; font-size: 3.6cqw; align-self: flex-start; }
+.base-build, .base-open { width: auto; max-width: none; min-height: 8.5cqw; margin-top: 0.8cqw; padding: 0 2.5cqw; font-size: 3.6cqw; align-self: flex-start; }
 .base-close { width: auto; max-width: none; min-height: 8.5cqw; padding: 0 3cqw; font-size: 3.6cqw; }
 .base-plot { position: relative; flex: none; }
 .base-plot-img { display: block; width: 100%; height: auto; aspect-ratio: 1008 / 1050; border-radius: 1.5cqw; }
@@ -130,8 +135,8 @@ function replay(node, className) {
   node.classList.add(className);
 }
 
-// `onBuild(id)` and `onClose()` are demo_ops.js's; the sheet only calls them.
-export function createBase(onBuild, onClose) {
+// `onBuild(id)`, `onClose()` and `onMedbay()` (BP-33) are demo_ops.js's; the sheet only calls them.
+export function createBase(onBuild, onClose, onMedbay) {
   const node = el('section', 'base-sheet');
   node.hidden = true;
   const head = el('div', 'base-head');
@@ -151,9 +156,16 @@ export function createBase(onBuild, onClose) {
     const button = el('button', 'btn btn-primary base-build');
     button.type = 'button';
     button.addEventListener('click', () => onBuild(b.id));
+    const open = b.id === MEDBAY ? el('button', 'btn btn-primary base-open', BASE_COPY.medbay) : null; // BP-33
+    if (open) {
+      open.type = 'button';
+      open.hidden = true;
+      open.addEventListener('click', () => onMedbay());
+    }
     text.append(el('p', 'base-name', b.name), el('p', 'base-effect', b.effect), el('p', 'base-flavour', b.flavour), button);
+    if (open) text.append(open);
     slot.append(pic, text);
-    return { b, slot, stamp, button };
+    return { b, slot, stamp, button, open };
   });
   const plot = el('div', 'base-plot');
   const ground = el('img', 'base-plot-img');
@@ -172,7 +184,7 @@ export function createBase(onBuild, onClose) {
     img.style.top = `${top}%`;
     img.style.width = `${width}%`;
     img.addEventListener('error', () => img.remove());
-    img.src = `assets/art/building_${b.id}.png`;
+    img.src = b.id === MEDBAY ? `${SVG_HEAD}${ART[b.id]}</svg>` : `assets/art/building_${b.id}.png`; // BP-33
     plot.append(img);
     sprites[b.id] = img;
   }
@@ -190,13 +202,14 @@ export function renderBase(v, s, built, paid) {
   let note = s.rate || (s.out ? BASE_COPY.out : '');
   let done = '';
   const lock = Boolean(s.going); // one at a time: the server answers `already building` (BP-21a)
-  for (const { b, slot, stamp, button } of v.slots) {
+  for (const { b, slot, stamp, button, open } of v.slots) {
     const up = s.base[b.id] === true;
     const going = !up && lock && s.going.id === b.id;
     slot.classList.toggle('built', up);
     v.sprites[b.id].hidden = !up; // BP-22: the plot shows what stands
     stamp.textContent = up ? BASE_COPY.operational : going ? BASE_COPY.going : BASE_COPY.planned;
     button.hidden = up;
+    if (open) open.hidden = !up; // BP-33: only a standing Medbay opens
     const short = b.cost - s.banked;
     if (going) button.textContent = s.going.left > 0 ? fill(BASE_COPY.left, { n: s.going.left }) : BASE_COPY.due;
     else button.textContent = !s.out && short > 0 ? fill(BASE_COPY.short, { n: short }) : fill(BASE_COPY.build, { cost: b.cost });

@@ -48,7 +48,7 @@ import { mountStory, writeAar } from './demo_story.js';
 import { showCard, cardSeen } from './demo_card.js';
 import { mountShop, openShop } from './demo_shop.js'; // BP-25
 import { mountReview, countContract } from './demo_review.js'; // BP-27
-import { mountCompany, dressBriefing, renderCompany, redrawCompany, healPrice, wageLine, SELL_ORE_CREDITS } from './demo_company.js';
+import { mountCompany, dressBriefing, renderCompany, redrawCompany, healPrice, wageLine, SELL_ORE_CREDITS, openSickbay } from './demo_company.js';
 import { DIG_COPY, DIG_CSS, createDigPanel, renderDig, hideDig, homewardLines, flash, bankedLine, crewFightLine } from './demo_dig.js';
 import { BASE_COPY, BASE_CSS, createBase, renderBase, hideBase } from './demo_base.js';
 import { mountMore } from './demo_more.js'; // BP-29b
@@ -2162,7 +2162,7 @@ export function mountOps(d) {
   baseButton.type = 'button';
   baseButton.hidden = true;
   baseButton.addEventListener('click', () => (baseOpen ? closeBase() : openBase()));
-  baseSheet = createBase(sendBuild, closeBase);
+  baseSheet = createBase(sendBuild, closeBase, openSickbay); // BP-33: + the Medbay's button
   list = createList();
   // A13, BP-25: the Demo Shop screen (demo_shop.js) from the hub at any time (no ops call). Its Buy opens
   // today's checkout as before; leaving either returns to the hub.

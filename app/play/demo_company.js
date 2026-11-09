@@ -299,6 +299,7 @@ let drawnKey = null;  // the open card's drawn state, the countdown left out (Re
 let selling = null;   // BP-28b: the open Sell row: { key, ore }, the amount Sell will post
 let sold = null;      // BP-28b: the last sale's line, on the card that made it: { key, ore }
 let hireBox = null;   // BP-18b-1: the squad hire block on the Company screen
+let sickbayNext = false; // BP-33: the reveal about to render was asked for by the base's Medbay button
 
 // BP-24b: the name ask. A 201 join marks its campaign, in sessionStorage so a reload mid-ask asks again, with an
 // in-page Set for private mode; Name it's answers, Not now and Continue settle it. Keyed on the join, never on
@@ -448,6 +449,10 @@ function dressReveal(container) {
     shelf.setAttribute('tabindex', '0');
     list.append(shelf);
   }
+  // BP-33: the Medbay's open: the Section card that needs healing goes on top (after the hideCard() above).
+  const sick = sickbayNext;
+  sickbayNext = false;
+  if (sick && opened) openCard('section', sickbayIndex());
   // BP-18b-1: the squad hire, once, above the chips (from the hub, with an adopted body that carries company.hire):
   // #reveal-content scrolls with it below them (measured: scrollHeight 949 to 1024 against clientHeight 600).
   hireBox = null;
@@ -542,6 +547,25 @@ function drawHire() {
   if (wages) texts.push(wages);
   rows.push(...texts.map(t => line(t)), line(COMPANY_COPY.wagesNote, true));
   hireBox.replaceChildren(...rows);
+}
+
+// BP-33: the base's Medbay button. The Company screen opens through the hub's own Your Company path (as
+// redrawCompany does), and dressReveal opens the first Section with wounded or healing soldiers, else the first
+// Section. The flag lives one task: the content observer's microtask runs before the clearing one, so a Back that
+// rendered no reveal leaves nothing pending.
+export function openSickbay() {
+  if (!deps) return;
+  sickbayNext = true;
+  deps.$('btn-back').click();
+  queueMicrotask(() => { sickbayNext = false; });
+}
+
+function sickbayIndex() {
+  const r = roster();
+  const list = r && Array.isArray(r.sections) ? r.sections : [];
+  if (!view || !view.adopted()) return 0;
+  const i = list.findIndex(s => { const b = view.bayOf(s.section_id); return b.wounded > 0 || b.healing > 0; });
+  return i < 0 ? 0 : i;
 }
 
 // After a squad hire's roster re-read (demo_ops.js): the open Company screen is drawn again from the new
