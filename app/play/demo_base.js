@@ -60,7 +60,7 @@ export const BASE_COPY = {
 const SVG_HEAD = "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64' fill='none' stroke='%23d9a441' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'>";
 const ART = {
   radio_shack: "<path d='M6 58h52'/><rect x='40' y='48' width='14' height='10'/><path d='M22 58l6-40M30 58l2-40'/><path d='M23 51h8M25 39h7M27 27h5'/><path d='M14 20a14 14 0 0 0 22-14'/><path d='M25 13l6 6'/><path d='M32 18l26 40' stroke-width='1'/>",
-  hobbyist_benches: "<path d='M6 58h52'/><path d='M10 58V30l22-14 22 14v28'/><path d='M32 30v18M23 39h18'/>", // BP-33: the Medbay (placeholder)
+  hobbyist_benches: "<path d='M6 58h52'/><path d='M10 58V30l22-14 22 14v28'/><path d='M32 30v18M23 39h18'/>", // BP-33: the Medbay's list icon
   grease_pit: "<path d='M6 58h52'/><path d='M6 26l26-14 26 14'/><path d='M10 24v34M54 24v34'/><path d='M18 48h28l-4-8H24z'/><circle cx='22' cy='52' r='4'/><circle cx='42' cy='52' r='4'/>",
   gunsmith: "<path d='M6 58h52'/><path d='M10 40h44M14 40v18M49 40v18'/><path d='M16 12v28M48 12v28'/><path d='M10 22h44M36 22l-4 6M20 22v-3'/><path d='M22 40v-5h8v5'/>",
   basic_smelter: "<path d='M6 58h52'/><path d='M14 58V32h26v26'/><path d='M21 32V18h12v14'/><path d='M24 18v-6M30 18v-9'/><path d='M21 52a6 6 0 0 1 12 0'/><path d='M40 38l14 9v11'/>",
@@ -70,14 +70,14 @@ const artCss = id => `.base-art-${id} { background-image: url("${SVG_HEAD}${ART[
 // The base that grows (BP-22, art list #10-15): the plot is a band of Base_Plot_Empty (1008 x 1050, fence to
 // gate), and each standing building's sprite sits on its pad. Boxes are [left, top, width] in % of that file
 // (Wiki's bp22_encode.ps1). Sprites are never `.base-art-<id>`: the harness finds the list's slots by that class.
-// BP-33: the Medbay keeps the Benches' key (the wire, the server, healPrice). Until the Director's Medbay picture
-// exists its plot sprite is the list glyph, not the Benches' PNG; the picture is a one-file
-// follow-up under a new name (RULE-136), with this line and its box going back to the PNG form.
+// BP-33: the Medbay keeps the Benches' key (the wire, the server, healPrice). BP-33b: its plot sprite is the
+// Director's picture under its own name, building_medbay_t1.png (Wiki-encoded, RULE-136), not the Benches' PNG;
+// its box below is BP-22's formula on the same top-right pad (Wiki's bp33b_encode.ps1).
 const MEDBAY = 'hobbyist_benches';
 const PLOT = 'assets/art/base_plot_band.jpg';
 const SPRITE = {
   radio_shack: [13.86, 10.09, 25.79],
-  hobbyist_benches: [59.42, 19.32, 20.21], // BP-33: the square glyph (was the PNG's [57.74, 19.32, 23.58])
+  hobbyist_benches: [58.41, 18.51, 22.91], // BP-33b: building_medbay_t1.png on the top-right pad
   grease_pit: [36.47, 38.29, 24.01],
   gunsmith: [16.74, 56.1, 22.91],
   basic_smelter: [58.92, 55.41, 22.39],
@@ -184,7 +184,7 @@ export function createBase(onBuild, onClose, onMedbay) {
     img.style.top = `${top}%`;
     img.style.width = `${width}%`;
     img.addEventListener('error', () => img.remove());
-    img.src = b.id === MEDBAY ? `${SVG_HEAD}${ART[b.id]}</svg>` : `assets/art/building_${b.id}.png`; // BP-33
+    img.src = b.id === MEDBAY ? 'assets/art/building_medbay_t1.png' : `assets/art/building_${b.id}.png`; // BP-33b
     plot.append(img);
     sprites[b.id] = img;
   }
