@@ -104,7 +104,7 @@ const COPY = {
   aarSection: '{name}: {a} → {b}',
   shop: 'Shop', // BP-40a-2a: the bottom bar's label
   // BP-12b (Wiki copy)
-  aarWounded: 'Wounded: {n}, in the sickbay. Patch them up on the Company screen.',
+  aarWounded: 'Wounded: {n}, in the sickbay. Patch them up at Your Company.',
   zeroFit: 'Everyone fit to fight is in the sickbay. Patch them up first.',
   zeroFitHealing: 'Nobody is fit to fight yet. Deploy opens when the sickbay lets them go.',
   walkingWounded: 'Nobody is fit to fight. The walking wounded are going anyway.',
@@ -428,7 +428,7 @@ let throttleSecs = 0;
 let hubWasShown = false;
 let base = {};          // the server's base: which buildings stand
 let baseOpen = false;   // the base sheet is showing
-let landBase = false;   // BP-40a-2a (R1, R2): this hub visit owes a landing decision (an entry reveal's Continue, an AAR's return)
+let landBase = false;   // BP-40a-2a (R1, R2): this hub visit owes a landing decision (an entry reveal's Continue)
 let justBuilt = null;   // BP-21b: the building the last adopted body showed standing for the first time, for its moment on the sheet
 let justPaid = null;    // BP-21b: the building the last adopted build POST paid for, for the sheet's pop
 let construction = null; // BP-21b: the last adopted body's construction ({ building, done_at }), null when none
@@ -1081,10 +1081,11 @@ function openBase() {
 }
 
 // BP-40a-2a (R1, R2): a landing opens the base when nothing is out. With a team out the map stays, so its strip
-// (Keep drilling, Pull out, Fight) shows. Decided once per owed landing, on the body held at that moment.
+// (Keep drilling, Pull out, Fight) shows. Decided once per owed landing, on the body held at that moment. Unlike the
+// Base button it keeps the notes the same body wrote (a trip report, the no-dig line): they show when the sheet closes.
 function landOnBase() {
   landBase = false;
-  if (opsOut().length === 0 && gateway) openBase();
+  if (opsOut().length === 0 && gateway) { baseOpen = true; listOpen = false; selected = null; picker = false; refresh(); }
 }
 
 function closeBase() {
@@ -2153,7 +2154,6 @@ function watch() {
     if (shown !== hubWasShown) strip.classList.remove('flash'); // BP-37a-2 (RULE-114): the meltdown's flash, the same way
     if (shown !== hubWasShown) quietBase(baseSheet); // BP-40a-2a (BP-37a-2 check 15, RULE-114): the sheet's pop and rises, the same way
     if (!shown && hubWasShown) landBase = false; // BP-40a-2a: an owed landing is this visit's only
-    if (shown && !hubWasShown && aarSeen) landBase = true; // BP-40a-2a (R2): back from an AAR
     if (shown && !hubWasShown && endOnHub) { // a Section lost while away ends the run now, before any read
       const kind = endOnHub;
       endOnHub = null;
