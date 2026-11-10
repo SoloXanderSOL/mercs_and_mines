@@ -424,6 +424,7 @@ body { display: flex; align-items: center; justify-content: center; }
 .battle-roll.roll-missed { color: var(--danger); } /* BP-37a: and red on a failure */
 .battle-outcome { font-family: var(--display); font-weight: 800; font-size: 8cqw; text-transform: uppercase; letter-spacing: 0.04em; min-height: 9cqw; }
 #btn-skip { margin-top: auto; }
+#btn-skip:disabled { pointer-events: none; } /* BP-37a-2 (Reviewer BP-37a F2): a tap on the greyed button reaches the screen, which hurries the log */
 
 .outcome-Success { color: var(--accent); }
 .outcome-Defeat { color: var(--text); }

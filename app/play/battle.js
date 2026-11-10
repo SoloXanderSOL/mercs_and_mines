@@ -18,6 +18,7 @@ const GLYPH = '🪖';            // the same for every Rookie
 const ROW_MS = 750;      // BP-37a: a row's hold after its 0.25 s fade, so rows land about a second apart
 const SPIN_MS = 1500;    // BP-37a: how long the roll's number spins before it lands
 const SPIN_STEP_MS = 75; // BP-37a: one face of the spin
+const GRACE_MS = 400;    // BP-37a-2: a screen tap this soon after ROLL is ROLL's own double tap, so it never skips the spin
 const SPIN_FACES = [47, 12, 88, 63, 5, 71, 29, 94, 38, 56, 17, 82, 3, 65, 41, 99, 24, 77, 9, 52]; // fixed: presentation, never a roll
 const calm = () => typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches;
 
@@ -152,6 +153,7 @@ export function createBattle(deps) {
   let finishNow = null;      // BP-32: shows the rest at once, after the roll only (BP-37a); null when none runs
   let fillNow = null;        // BP-37a: fills the breakdown at once; null once it is all up
   let rollNow = null;        // BP-37a: the ROLL tap; null once the roll has started
+  let rolledAt = 0;          // BP-37a-2: performance.now() at the ROLL tap; GRACE_MS counts from it
   let oneRookie = null;      // the debug checkbox, created only under DEBUG
   let onBriefingBack = null; // set by openMission; a briefing from the mission list goes back to the list
 
@@ -216,7 +218,7 @@ export function createBattle(deps) {
     $('screen-battle').addEventListener('click', ev => {
       if (ev.target.closest('#btn-skip') || $('screen-battle').hidden) return;
       if (fillNow) fillNow();
-      else if (finishNow) finishNow();
+      else if (finishNow && performance.now() - rolledAt >= GRACE_MS) finishNow(); // BP-37a-2: never inside ROLL's own double tap
     });
     $('btn-aar-continue').addEventListener('click', afterAar);
     $('btn-new-run').addEventListener('click', newRun);
@@ -440,9 +442,10 @@ export function createBattle(deps) {
   function spin(node, face, next, id) {
     if (calm()) return next();
     let k = 0;
+    const t0 = performance.now(); // BP-37a-2 (Reviewer BP-37a F1, RULE-156): the spin ends on the clock, not on a count of ticks
     const tick = () => {
       if (id !== run) return;
-      if (k * SPIN_STEP_MS >= SPIN_MS) return next();
+      if (performance.now() - t0 >= SPIN_MS) return next();
       node.textContent = face(SPIN_FACES[k % SPIN_FACES.length]);
       k += 1;
       setTimeout(tick, SPIN_STEP_MS);
@@ -543,6 +546,7 @@ export function createBattle(deps) {
       if (fillNow) fillNow();
       rollNow = null;
       button.disabled = true;
+      rolledAt = performance.now();
       const rid = ++run;
       const face = r => fill(COPY.battleRollSpin, { n: total, r });
       const steps = [
