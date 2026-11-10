@@ -94,7 +94,8 @@ const COPY = {
   outOfReach: 'Out of reach: your crews work veins near the gateway.', // BP-30: a tap on a vein that is not on the board
   labelDig: 'Dig',     // BP-30: over a dig pin
   labelFight: 'Fight', // BP-30: over a contract pin
-  legendVein: 'Magma vein (bigger is richer; bright ones are workable)', // BP-30: the keeper legend's vein row, rewritten at mount
+  labelBase: 'Base',               // BP-37b (item 3): over the home hex, in the Dig/Fight labels' style
+  recentre: 'Recentre the map',    // BP-37b (item 2): the corner icon's accessible name
   listTag: ' · {word}',              // BP-29a: the difficulty word after a contract row's distance
   briefingTag: 'Difficulty: {word}', // BP-29a: on a contract's briefing (never the raid's or the ambush's)
   aarLost: 'Lost: {names}.',
@@ -215,6 +216,25 @@ const BUILD_REREAD_MS = 1000;    // BP-21b (Reviewer BP-21a F5): the one re-read
 
 const COLOUR = { dig: '#ff8c2a', ring: '#ffd27a', contract: '#6fd3ff', edge: '#0b0b0c', marker: '#ffffff', route: 'rgba(255, 255, 255, 0.7)', preview: 'rgba(255, 210, 122, 0.8)', guard: '#8fe36b' }; // BP-34: + the walking guard
 
+// BP-37b (item 1, ruling 4): a tapped hex with no site says what it is, keyed by the sector's HexTerrain string. Each
+// line claims only what the demo does (demo_ops.rs travel_secs, passable, hazard_of / hazard_cost); a canon effect
+// the demo doesn't simulate is left out. No line makes a richness-by-distance claim (ODQ-72 is open).
+const TERRAIN = {
+  AshenPlains: 'Ashen Plains: open ground. Teams cross it at the usual pace.',
+  ScorchedDesert: 'Scorched Desert: flat and dry. Teams cross it at the usual pace.',
+  RuinedCity: 'Ruined City: slow going. Falling ruins can wound a squad, or shake a Crew and its Foreman.',
+  CityState: 'City-State: a living city with good roads. Teams cross it twice as fast.',
+  GunOutpost: 'G.U.N. Outpost: G.U.N. keeps these roads clear. Teams cross it twice as fast.',
+  MagmaFlow: 'Magma Flow: molten rock. No route crosses it.',
+  CooledMagma: 'Cooled Magma: very slow going. The soft crust can wound a squad, or swallow a quarter of a haul on the way home.',
+  VolcanicCaldera: 'Volcanic Caldera: an open crater. No route crosses it.',
+  Mountain: 'Mountain: too steep to cross. No route goes over it.',
+  Ravine: 'Ravine: too deep to cross. No route goes over it.',
+  ToxicZone: 'Toxic Zone: gas. It can wound a squad and stress its Commander, or stress a Crew and its Foreman.',
+};
+const GLOW_MS = 2000;     // BP-37b (item 4): one rise and fade of a diggable pin's glow
+const GLOW_STEP_MS = 66;  // about 15 paints a second (RULE-156: the phase is read from the clock, never a frame count)
+
 const CSS = `
 .ops-strip { position: absolute; left: 3cqw; right: 3cqw; bottom: 17cqw; padding: 3cqw; display: flex; flex-direction: column; gap: 1.5cqw; text-align: left; background: rgba(11, 11, 12, 0.94); border: 0.4cqw solid var(--panel-edge); border-radius: 2cqw; }
 .ops-strip[hidden], .ops-title[hidden], .ops-line[hidden], .ops-actions[hidden], .ops-actions .btn[hidden] { display: none; }
@@ -271,6 +291,11 @@ const CSS = `
 .still[src$="scene_defeat.jpg"] { object-position: 50% 62%; }
 .still[src$="scene_wipeout.jpg"] { object-position: 50% 28%; }
 .ops-banked { white-space: pre-line; }
+#btn-recentre, #btn-legend, #legend { display: none; } /* BP-37b: the keeper bar's Recentre and Legend leave the demo */
+.ops-glow { position: absolute; top: 10cqw; left: 0; width: 100%; height: calc(100% - 26cqw); display: block; pointer-events: none; } /* BP-37b: .hub-map's box (play.css, keeper): a change there must change this too */
+.ops-recentre { position: absolute; top: 11.5cqw; left: 18cqw; width: 8.5cqw; height: 8.5cqw; padding: 0; background: rgba(11, 11, 12, 0.94); border: 0.3cqw solid var(--accent); border-radius: 1.5cqw; cursor: pointer; } /* BP-37b: right of Base (BP-40a-2 moves it to the corner) */
+.ops-recentre::before { content: ''; position: absolute; inset: 1.8cqw; border: 0.5cqw solid var(--accent); border-radius: 50%; }
+.ops-recentre::after { content: ''; position: absolute; left: 50%; top: 50%; width: 1.2cqw; height: 1.2cqw; margin: -0.6cqw 0 0 -0.6cqw; background: var(--accent); border-radius: 50%; }
 `;
 
 const opsPath = id => '/api/campaign/' + encodeURIComponent(id) + '/ops';
@@ -433,6 +458,12 @@ let fightPick = null; // BP-18b-1: the fought op's squad, { commander_id, sectio
 let hiredNote = false; // BP-18b-1: a squad hire landed; the Company screen says so until it closes
 let endOnHub = null;   // a Section-at-0 end of run waiting for the hub, so it never cuts an AAR (Reviewer BP-11b-1 F1)
 let listOpen = false;   // the contracts list is showing
+let glowNode = null;    // BP-37b: the glow's own canvas over the map
+let glowRaf = 0;        // BP-37b: the pending glow frame (rAF only: a timer would count into timers_started)
+let glowLast = 0;       // BP-37b: performance.now() at the last loop paint
+let glowPaints = 0;     // BP-37b: paints so far (?debug=1 reads it)
+let terrainFor = null;  // BP-37b: the campaign the cached terrain belongs to
+let terrainOf = null;   // BP-37b: the sector's terrain keyed "q,r", read at the first tap
 
 let strip = null, titleNode = null, lineNodes = [], outNode = null, actions = null, buttons = [];
 let waysRow = null, wayButtons = []; // BP-20b: the ways row and its two buttons
@@ -742,6 +773,7 @@ function hideStrip() {
 function refresh() {
   if (!strip) return;
   renderCompany(); // the Company card's buttons follow held() and the last body (BP-12b, H3)
+  glow(); // BP-37b: the glow follows a sheet, a dig going out or coming home, and a new board
   // While a raid or an ambush waits, the hub's own GUARD_DUTY would count as its fight
   // (Reviewer BP-8b-2 F1), so the mission list is shut until the dig's fight is fought.
   deps.$('btn-missions').disabled = Boolean(battleOf(op));
@@ -1038,7 +1070,6 @@ function close() {
 
 // The Base button toggles the sheet; the bank note's Base opens it.
 function openBase() {
-  closeLegend();
   baseOpen = true;
   listOpen = false;
   selected = null;
@@ -1053,17 +1084,10 @@ function closeBase() {
   refresh();
 }
 
-// A sheet and the legend share the box over the bar, so only one is open at a time (Reviewer BP-10b F2).
-function closeLegend() {
-  deps.$('legend').hidden = true;
-  deps.$('btn-legend').setAttribute('aria-expanded', 'false');
-}
-
 // ── the contracts list (A2) ──────────────────────────────────────────────────
 // Missions opens the board's contracts, not the keeper list: a row hands off to its pin, so every
 // contract is walked to and fought on site.
 function openList() {
-  closeLegend();
   listOpen = true;
   baseOpen = false;
   picker = false;
@@ -1404,30 +1428,6 @@ function pin(ctx, site, x, y, r, line) {
   }
 }
 
-// BP-30 (item 39): every vein is painted over with a dark disc, so the bright marks left on the map are the
-// board's pins (a dig site's pin covers its own vein at every zoom). The radii copy hexmap.js's vein loop
-// (render(), a keeper file): a change to that loop's dot or ring sizes must change these too.
-const DIM = 'rgba(11, 11, 12, 0.6)';
-function dimVeins(ctx, m) {
-  const s = m.view.s;
-  ctx.fillStyle = DIM;
-  ctx.strokeStyle = DIM;
-  for (const vein of m.veins) {
-    const [x, y] = m.hexToScreen(vein.q, vein.r);
-    if (x < -s * 2 || y < -s * 2 || x > m.w + s * 2 || y > m.h + s * 2) continue;
-    const rad = Math.max(1.5, s * (0.25 + 0.07 * vein.tier));
-    ctx.beginPath();
-    ctx.arc(x, y, rad + 0.5, 0, Math.PI * 2);
-    ctx.fill();
-    if (vein.is_tectonic_anchor) {
-      ctx.beginPath();
-      ctx.arc(x, y, rad + Math.max(1.5, s * 0.2), 0, Math.PI * 2);
-      ctx.lineWidth = Math.max(1, s * 0.08) + 1;
-      ctx.stroke();
-    }
-  }
-}
-
 // BP-30 (item 21): Dig or Fight over each pin on screen, in board order. A label whose box (its text + 4 px
 // wide, 13 px tall, its bottom 2 px above the pin) would cover an earlier label or any other pin is skipped.
 const LABEL_FONT = '800 12px "Barlow Condensed", sans-serif';
@@ -1448,6 +1448,18 @@ function drawLabels(ctx, m, r, onScreen) {
   });
   const hit = (a, b) => a[0] < b[2] && b[0] < a[2] && a[1] < b[3] && b[1] < a[3];
   const drawn = [];
+  let based = 0; // BP-37b (item 3, F3): Base first, so a site label that would cover it is the one skipped
+  if (gateway) {
+    const [x, y] = m.hexToScreen(gateway.q, gateway.r);
+    if (onScreen(x, y)) {
+      const w = ctx.measureText(COPY.labelBase).width + 4;
+      const bottom = y - m.view.s * Math.sqrt(3) / 2 - 2; // 2 px above the flat-top hex's top edge
+      ctx.strokeText(COPY.labelBase, x, bottom - 1);
+      ctx.fillText(COPY.labelBase, x, bottom - 1);
+      drawn.push([x - w / 2, bottom - LABEL_H, x + w / 2, bottom]);
+      based = 1;
+    }
+  }
   for (const p of pins) {
     if (!onScreen(p.x, p.y)) continue;
     const text = p.st.kind === 'dig' ? COPY.labelDig : COPY.labelFight;
@@ -1459,7 +1471,8 @@ function drawLabels(ctx, m, r, onScreen) {
     ctx.fillText(text, p.x, bottom - 1);
     drawn.push(box);
   }
-  if (DEBUG) m.canvas.dataset.opsLabels = String(drawn.length);
+  if (DEBUG) m.canvas.dataset.opsLabels = String(drawn.length - based); // site labels only, as before BP-37b
+  if (DEBUG) m.canvas.dataset.opsBase = String(based); // BP-37b
 }
 
 // BP-30: is the tapped hex a vein (any vein: a site's own is picked before this is asked)?
@@ -1468,12 +1481,74 @@ function veinAt(x, y) {
   return Boolean(hex && map.veins.some(v => v.q === hex.q && v.r === hex.r));
 }
 
-// BP-30 (item 4): the keeper legend's vein row, found by the keeper's own text (main.js COPY.legendVein); a
-// keeper reword leaves it alone rather than rewrite the wrong row.
-const KEEPER_LEGEND_VEIN = 'Magma vein (bigger is richer)';
-function relabelLegend() {
-  const row = [...document.querySelectorAll('#legend-list li')].find(li => li.textContent === KEEPER_LEGEND_VEIN);
-  if (row && row.lastElementChild) row.lastElementChild.textContent = COPY.legendVein;
+// BP-37b (item 1, F1): the tapped hex's line. HexMap keeps no terrain table, so it is read from the sector body
+// main.js stored (read at the first tap, never at attach: main.js stores it after the map is made). An unknown hex
+// or terrain gets no line, as off the map.
+function terrainLine(hex) {
+  if (terrainFor !== campaignId) {
+    const sector = campaignId ? store.sector(campaignId) : null;
+    terrainOf = sector && sector.terrain ? sector.terrain : null;
+    terrainFor = terrainOf ? campaignId : null;
+  }
+  if (!hex || !terrainOf) return '';
+  return TERRAIN[terrainOf[`${hex.q},${hex.r}`]] || '';
+}
+
+// BP-37b (item 4): a diggable pin's light rises and fades. It is painted on its own canvas (pointer-events: none)
+// over the map, so a glow frame never redraws the map and sends no read. It shows only on the hub with no sheet up
+// and no dig out (one dig at a time: no pin is diggable while one is out), on the dig pins on screen.
+const calmMap = () => Boolean(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+function glowPins() {
+  if (!map || !map.w || !glowNode || !hubShown() || baseOpen || listOpen) return [];
+  if (opsOut().some(o => o.kind === 'dig')) return [];
+  const r = Math.max(6, map.view.s * 0.55); // draw()'s pin radius
+  const pad = r * 2;
+  return sites.filter(st => st.kind === 'dig').map(st => {
+    const [x, y] = map.hexToScreen(st.q, st.r);
+    return { x, y, rad: st.tier === 3 ? r * 4 / 3 : r };
+  }).filter(p => p.x > -pad && p.y > -pad && p.x < map.w + pad && p.y < map.h + pad);
+}
+
+// One paint at `now`; true while there is a pin to glow. Under reduced motion the glow holds steady at its brightest.
+function paintGlow(now) {
+  const pins = glowPins();
+  if (!glowNode || !map || !map.w) return false;
+  const w = Math.round(map.w * map.dpr), h = Math.round(map.h * map.dpr);
+  if (glowNode.width !== w || glowNode.height !== h) { glowNode.width = w; glowNode.height = h; }
+  const ctx = glowNode.getContext('2d');
+  ctx.setTransform(map.dpr, 0, 0, map.dpr, 0, 0);
+  ctx.clearRect(0, 0, map.w, map.h);
+  const level = calmMap() ? 1 : 0.5 - 0.5 * Math.cos(((now % GLOW_MS) / GLOW_MS) * Math.PI * 2);
+  for (const p of pins) {
+    const out = p.rad * 2.4;
+    const g = ctx.createRadialGradient(p.x, p.y, p.rad, p.x, p.y, out);
+    g.addColorStop(0, `rgba(255, 140, 42, ${(0.15 + 0.45 * level).toFixed(3)})`);
+    g.addColorStop(1, 'rgba(255, 140, 42, 0)');
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, out, 0, Math.PI * 2);
+    ctx.arc(p.x, p.y, p.rad, 0, Math.PI * 2, true); // a ring outside the pin: the pin itself is never tinted
+    ctx.fill();
+  }
+  glowPaints += 1;
+  if (DEBUG) { glowNode.dataset.opsGlow = String(glowPaints); glowNode.dataset.opsGlowPins = String(pins.length); }
+  return pins.length > 0;
+}
+
+function glowTick(now) {
+  glowRaf = 0;
+  if (now - glowLast >= GLOW_STEP_MS) {
+    glowLast = now;
+    if (!paintGlow(now)) return; // the gate failed: the canvas is clear and the loop stops (a refresh or a map frame restarts it)
+  }
+  glowRaf = requestAnimationFrame(glowTick);
+}
+
+// From every map frame and every refresh: paint now (so the glow follows a pan), then keep the pulse going.
+function glow() {
+  if (!glowNode) return;
+  const any = paintGlow(performance.now());
+  if (any && !calmMap() && !glowRaf) glowRaf = requestAnimationFrame(glowTick);
 }
 
 function draw(ctx, m) {
@@ -1484,7 +1559,6 @@ function draw(ctx, m) {
   const pad = r * 2;
   const onScreen = (x, y) => x > -pad && y > -pad && x < m.w + pad && y < m.h + pad;
   ctx.save();
-  dimVeins(ctx, m); // BP-30
   // BP-18b-2a: a route and a marker per op out, the shown op last.
   const shown = shownOp();
   const all = opsOut();
@@ -1566,6 +1640,7 @@ function draw(ctx, m) {
     if (phaseOf(so, p) !== shownPhase || (p < 1 && !isAmbush(so) && secsLeft(so) !== shownSecs)) refresh();
   } else if (homeKey() !== null && homePhase() !== shownPhase) refresh(); // BP-18b-2b (R4)
   if (opsOut().some(o => (!isAmbush(o) && progress(o) < 1) || guardWalking(o)) && hubShown()) m.requestFrame(); // BP-34: + a walking guard
+  glow(); // BP-37b: the glow follows this frame's view
   ctx.restore();
 }
 
@@ -1591,17 +1666,24 @@ function pick(x, y) {
 
 function tap(x, y) {
   if (baseOpen || listOpen) return; // a sheet covers the map
+  // BP-37b (item 3, F2): the home hex opens the base, before the nearest-pin search (a 2-hex dig is in its reach).
+  // A site on the exact hex keeps the tap; so does Next mission's pick.
+  const hex = map ? map.hexAt(x, y) : null;
+  const exact = hex ? sites.find(st => st.q === hex.q && st.r === hex.r) : null;
+  const home = Boolean(hex && gateway && !exact && hex.q === gateway.q && hex.r === gateway.r);
   if (shownOp()) { // the strip stays while the team is out; Next mission's pick takes a pin
     if (picking && !confirming) choose(pick(x, y));
+    else if (home) openBase();
     return;
   }
+  if (home) return openBase();
   selected = pick(x, y);
   if (map) map.requestFrame(); // BP-20b: the sheet's way on the map
   picker = false;
   noDigOpen = false;
   bankNote = null; crewNote = null; tripNote = null;
   notice = '';
-  if (!selected && homeKey() === null && veinAt(x, y)) notice = COPY.outOfReach; // BP-30
+  if (!selected && homeKey() === null) notice = veinAt(x, y) ? COPY.outOfReach : terrainLine(hex); // BP-30; BP-37b (item 1): any other hex says what it is
   if (selected) showSheet(selected);
   else refresh();
 }
@@ -2086,11 +2168,6 @@ function watch() {
     e.preventDefault();
     openList();
   }, true);
-  // The legend shuts any open sheet first; the keeper toggle then opens it (Reviewer BP-10b F2).
-  hub.addEventListener('click', e => {
-    if (!(e.target instanceof Element) || !e.target.closest('#btn-legend') || !(baseOpen || listOpen)) return;
-    closeSheets();
-  }, true);
   // Reviewer BP-11b-2 F2: every show of the briefing during a demo fight gets its dressing again
   // (the keeper re-renders it on a deploy 429's Back and on openMission's static-GET retry).
   const briefing = deps.$('screen-briefing');
@@ -2255,7 +2332,13 @@ export function mountOps(d) {
   crewOk.type = 'button';
   crewOk.addEventListener('click', () => { crewCardNode.hidden = true; });
   crewCardNode.append(crewCardTitle, ...crewCardLines, crewOk);
-  deps.$('screen-hub').append(strip, bankChip, baseButton, shopButton, baseSheet.node, list.node, crewCardNode);
+  const recentre = el('button', 'ops-recentre'); // BP-37b (item 2): Recentre as a small icon on the map
+  recentre.type = 'button';
+  recentre.setAttribute('aria-label', COPY.recentre);
+  recentre.addEventListener('click', () => { if (map) map.home(); });
+  glowNode = el('canvas', 'ops-glow'); // BP-37b (item 4): over the map, under every demo node
+  deps.$('hub-map').after(glowNode);
+  deps.$('screen-hub').append(strip, bankChip, baseButton, recentre, shopButton, baseSheet.node, list.node, crewCardNode);
   mountShop(deps); // BP-25
   endNote = el('p', 'end-ops');
   endNote.hidden = true;
@@ -2300,7 +2383,6 @@ export function mountOps(d) {
   });
   watch();
   mountReview(deps); // BP-27: after watch(), so its hub observer runs after the end-of-run check
-  relabelLegend(); // BP-30
   if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => { if (map) map.requestFrame(); }); // BP-30: the labels' font
   onMapCreated(attach);
   mountMore(); // BP-29b: last, when every box it watches exists

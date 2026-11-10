@@ -86,9 +86,6 @@ export const DIG_CSS = `
 @keyframes dig-flash { from { background: rgba(200, 68, 58, 0.9); } to { background: rgba(11, 11, 12, 0.94); } }
 .ops-title.danger { color: var(--danger); }
 .ops-banked { position: absolute; top: 11.5cqw; right: 3cqw; padding: 1cqw 2.5cqw; font-family: var(--mono); font-size: 3.6cqw; color: var(--accent); background: rgba(11, 11, 12, 0.94); border: 0.3cqw solid var(--panel-edge); border-radius: 1.5cqw; }
-.screen-hub:has(.ops-strip:not([hidden])) .legend { display: none; }
-/* Off site, an open legend covers the chip and the Base button; on site the legend is hidden (Reviewer BP-9b F4). */
-.screen-hub:has(.ops-strip[hidden]):has(.legend:not([hidden])) :is(.ops-banked, .ops-base) { display: none; }
 .end-ops { margin: 0; max-width: 84cqw; font-size: 4.2cqw; line-height: 1.4; color: var(--accent); }
 .crew-card { position: absolute; left: 6cqw; right: 6cqw; top: 30cqw; z-index: 5; padding: 4cqw; display: flex; flex-direction: column; gap: 2.5cqw; text-align: left; background: rgba(11, 11, 12, 0.97); border: 0.5cqw solid var(--danger); border-radius: 2cqw; } /* BP-34 */
 .crew-card[hidden], .crew-card-line[hidden] { display: none; }
