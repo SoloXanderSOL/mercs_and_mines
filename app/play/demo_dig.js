@@ -152,6 +152,7 @@ export function createDigPanel() {
   const shake = el('span', 'dig-shake');   // the shake rides an inner span, so it never fights the beat's transform
   heatPop.append(shake);
   pops.append(pop, heatPop);
+  for (const n of [pop, heatPop]) n.addEventListener('animationend', e => { if (e.target === n) n.classList.remove('shown'); }); // BP-37c F1: a finished beat leaves no class to replay
   node.append(heat, status, range, risk, crew, guard, crewFight, pops);
   node.hidden = true;
   return { node, bar, ghost, over, status, range, risk, crew, guard, crewFight, pop, heatPop, shake, lastOre: null, lastHeat: null };
@@ -249,6 +250,7 @@ export function hideDig(p) {
   p.node.hidden = true;
   p.lastOre = null;
   p.lastHeat = null;
+  for (const n of [p.pop, p.heatPop]) n.classList.remove('shown'); // BP-37c F1 (BP-21b F1's rule): what hides the panel clears its beat
 }
 
 // The strip on a dig's homeward leg, by how the dig ended; null on a contract's leg.
