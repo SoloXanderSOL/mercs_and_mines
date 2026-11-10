@@ -1,8 +1,8 @@
 // demo-only (BP-9b, BP-10b, BP-11b-1): the dig site's panel, the Hold-or-Fold screen (Breakpoint §4d). Never ported to dev.
 //
 // Pure rendering for demo_ops.js: the heat bar with its threshold tick, the status, risk and Crew
-// lines, and the copy for the dig's beats. It holds no state beyond the last ore figure it drew
-// (for the "+n ore" pop) and makes no calls. Every number comes from the server's `dig` view and
+// lines, and the copy for the dig's beats. It holds no state beyond the last ore and heat figures
+// it drew (for BP-37c's "+N ORE" / "+N HEAT" pop) and makes no calls. Every number comes from the server's `dig` view and
 // the roster the client already holds, so the client keeps no heat or ore constant. Every string
 // goes in through textContent.
 
@@ -43,7 +43,8 @@ export const DIG_COPY = {
   cardLost: 'Lost: {n} of the Crew.',
   cardGuardLate: 'The guard was still {n} s away.',
   cardOk: 'Carry on',
-  pop: '+{n} ore',
+  pop: '+{n} ORE',
+  popHeat: '+{n} HEAT', // BP-37c (item 6): the heat that drill added, never the total
   raidWait: 'Raiders at {title}. Fight to resume drilling.',
   ambushWait: 'Ambushed on the road. Fight to bring the haul home.',
   raidLead: 'Claim jumpers at {title}: raccoons on dirt bikes, very interested in your drill. Drilling halts until the site is secured. They cannot read the Keep Out sign. Explain it to them.',
@@ -64,6 +65,7 @@ export const DIG_COPY = {
 // The bar runs from 0 to 1.2 × threshold, so the threshold tick sits at 1 / 1.2 of its width.
 const SCALE = 1.2;
 const HOT = 0.7; // the fill turns from amber to red at this share of the threshold
+const TREMBLE = 0.5; // BP-37c (item 7): the heat number trembles from this share of the threshold
 
 export const DIG_CSS = `
 .dig-panel { position: relative; display: flex; flex-direction: column; gap: 1.2cqw; }
@@ -79,9 +81,17 @@ export const DIG_CSS = `
 .dig-line { margin: 0; font-size: 3.9cqw; line-height: 1.35; }
 .dig-line.alert { color: var(--accent); font-weight: 700; }
 .dig-line.danger { color: var(--danger); font-weight: 700; }
-.dig-pop { position: absolute; right: 0; top: 5cqw; font-family: var(--display); font-weight: 800; font-size: 4.6cqw; color: var(--accent); opacity: 0; pointer-events: none; }
-.dig-pop.shown { animation: dig-pop 0.9s ease-out; }
-@keyframes dig-pop { from { opacity: 1; transform: none; } to { opacity: 0; transform: translateY(-3cqw); } }
+.dig-pops { position: absolute; left: 0; right: 0; bottom: calc(100% + 12.8cqw); display: flex; justify-content: center; align-items: baseline; gap: 6cqw; font-family: var(--display); font-weight: 800; font-size: 7cqw; line-height: 1.1; text-shadow: 0 0 1.5cqw #000; pointer-events: none; } /* BP-37c */
+.dig-pop { color: var(--accent); opacity: 0; }
+.dig-pop-heat { color: var(--danger); opacity: 0; }
+.dig-shake { display: inline-block; }
+.dig-pop.shown, .dig-pop-heat.shown { animation: dig-pop 2s linear; }
+@keyframes dig-pop { 0%, 75% { opacity: 1; transform: none; } 100% { opacity: 0; transform: translateY(-3cqw); } }
+@keyframes dig-hold { from, to { opacity: 1; } }
+.dig-pop-heat.shown.tremble .dig-shake { animation: dig-tremble 0.125s linear 16; }
+.dig-pop-heat.shown.rattle .dig-shake { animation: dig-rattle 0.08s linear 25; }
+@keyframes dig-tremble { 0%, 100% { transform: none; } 25% { transform: translate(-0.4cqw, 0.2cqw); } 75% { transform: translate(0.4cqw, -0.2cqw); } }
+@keyframes dig-rattle { 0%, 100% { transform: none; } 25% { transform: translate(-1cqw, 0.5cqw); } 75% { transform: translate(1cqw, -0.5cqw); } }
 .ops-strip.flash { animation: dig-flash 0.4s ease-out; }
 @keyframes dig-flash { from { background: rgba(200, 68, 58, 0.9); } to { background: rgba(11, 11, 12, 0.94); } }
 .ops-title.danger { color: var(--danger); }
@@ -94,7 +104,9 @@ export const DIG_CSS = `
 .crew-card .btn { width: 100%; max-width: none; min-height: 11cqw; margin-top: 1cqw; font-size: 4.4cqw; }
 @media (prefers-reduced-motion: reduce) {
   .dig-heat-fill { transition: none; }
-  .dig-pop.shown, .ops-strip.flash { animation: none; }
+  .ops-strip.flash { animation: none; }
+  .dig-pop.shown, .dig-pop-heat.shown { animation: dig-hold 2s steps(1, end); }
+  .dig-pop-heat.shown.tremble .dig-shake, .dig-pop-heat.shown.rattle .dig-shake { animation: none; }
 }
 `;
 
@@ -134,10 +146,15 @@ export function createDigPanel() {
   const crew = el('p', 'dig-line dig-crew');
   const guard = el('p', 'dig-line dig-guard');           // BP-17b: who guards the dig
   const crewFight = el('p', 'dig-line dig-crew-fight');  // BP-17b: the Crew's own fight
+  const pops = el('div', 'dig-pops');      // BP-37c: "+N ORE" and "+N HEAT", one line above the strip
   const pop = el('span', 'dig-pop');
-  node.append(heat, status, range, risk, crew, guard, crewFight, pop);
+  const heatPop = el('span', 'dig-pop-heat');
+  const shake = el('span', 'dig-shake');   // the shake rides an inner span, so it never fights the beat's transform
+  heatPop.append(shake);
+  pops.append(pop, heatPop);
+  node.append(heat, status, range, risk, crew, guard, crewFight, pops);
   node.hidden = true;
-  return { node, bar, ghost, over, status, range, risk, crew, guard, crewFight, pop, lastOre: null };
+  return { node, bar, ghost, over, status, range, risk, crew, guard, crewFight, pop, heatPop, shake, lastOre: null, lastHeat: null };
 }
 
 // The Crew and Foreman the dig start picked: the roster's first of each (same listers, same order).
@@ -180,6 +197,9 @@ export function renderDig(p, dig, roster, extra = {}) {
   // BP-13: the next drill's range from the body (absent on an older server: no range, no ghost).
   const live = Number.isFinite(dig.next_heat_max) && dig.next_heat_max > 0 && !dig.raid;
   const hot = live && dig.might_overheat === true;
+  // BP-37c (item 7): rattle on `hot` (live only, so a raid's or a finished dig's stale flag never rattles),
+  // else a tremble from TREMBLE x threshold, else none.
+  const band = hot ? 'rattle' : dig.heat >= dig.threshold * TREMBLE ? 'tremble' : '';
   const at = v => (scale > 0 ? Math.max(0, Math.min(1, v / scale)) : 0);
   const pc = v => (v * 100).toFixed(2) + '%';
   const top = live ? dig.heat + dig.next_heat_max : dig.heat;
@@ -215,12 +235,20 @@ export function renderDig(p, dig, roster, extra = {}) {
     replay(p.pop, 'shown');
   }
   p.lastOre = dig.ore_on_site;
+  if (p.lastHeat !== null && dig.heat > p.lastHeat) {
+    p.shake.textContent = fill(DIG_COPY.popHeat, { n: dig.heat - p.lastHeat });
+    p.heatPop.classList.toggle('tremble', band === 'tremble');
+    p.heatPop.classList.toggle('rattle', band === 'rattle');
+    replay(p.heatPop, 'shown');
+  }
+  p.lastHeat = dig.heat;
   p.node.hidden = false;
 }
 
 export function hideDig(p) {
   p.node.hidden = true;
   p.lastOre = null;
+  p.lastHeat = null;
 }
 
 // The strip on a dig's homeward leg, by how the dig ended; null on a contract's leg.
