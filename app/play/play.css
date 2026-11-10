@@ -14,6 +14,7 @@
   --accent-ink: #1a1408;
   --danger: #c8443a;
   --warn: #8f6cc9;
+  --good: #7fd17f; /* BP-37a: a roll that made it */
   --display: 'Barlow Condensed', 'Arial Narrow', sans-serif;
   --body: 'Barlow', system-ui, sans-serif;
   --mono: 'Share Tech Mono', ui-monospace, monospace;
@@ -419,6 +420,8 @@ body { display: flex; align-items: center; justify-content: center; }
 .score-value { font-family: var(--mono); font-size: 4.6cqw; }
 .battle-reveal { margin: 0; }
 .battle-chance, .battle-roll { font-family: var(--display); font-weight: 700; font-size: 6cqw; }
+.battle-roll.roll-made { color: var(--good); }     /* BP-37a: the roll lands green on a success */
+.battle-roll.roll-missed { color: var(--danger); } /* BP-37a: and red on a failure */
 .battle-outcome { font-family: var(--display); font-weight: 800; font-size: 8cqw; text-transform: uppercase; letter-spacing: 0.04em; min-height: 9cqw; }
 #btn-skip { margin-top: auto; }
 

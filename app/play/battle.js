@@ -5,8 +5,9 @@
 // outcome is `report.outcome`, the chance is `total_score` (BP-32). The squad is one Section of
 // eight identical Rookies (ODQ-63); the archetype standing in for them is never put on screen,
 // so the AAR rows are built here from `final_status` and `hp_lost` only. Every server string
-// goes in through textContent. Pacing is CSS transitions plus requestAnimationFrame; the demo's fight
-// log (demo_story.js) adds its own timer. A tap on the screen (not Skip) shows everything at once (BP-32).
+// goes in through textContent. Pacing is CSS transitions plus timers; the demo's fight log (demo_story.js)
+// adds its own. BP-37a: the rows land whole about a second apart and end on the chance, and ROLL rolls. A
+// tap on the screen fills the rows before the roll and shows the rest at once after it; it never rolls.
 
 import { ApiError, store, counters, getMissions, getUnits, postMission, postAbandon } from './api.js';
 
@@ -14,6 +15,11 @@ const STAND_IN = 'GHOST_WIRE'; // ODQ-63 stand-in, never shown
 const SQUAD_SIZE = 8;          // one Section: at most 8 units (MAX_UNITS_PER_SECTION)
 const ORDER = ['GUARD_DUTY', 'ORE_EXTRACTION', 'SUPPLY_RAID', 'BLACK_SITE_RAID'];
 const GLYPH = '🪖';            // the same for every Rookie
+const ROW_MS = 750;      // BP-37a: a row's hold after its 0.25 s fade, so rows land about a second apart
+const SPIN_MS = 1500;    // BP-37a: how long the roll's number spins before it lands
+const SPIN_STEP_MS = 75; // BP-37a: one face of the spin
+const SPIN_FACES = [47, 12, 88, 63, 5, 71, 29, 94, 38, 56, 17, 82, 3, 65, 41, 99, 24, 77, 9, 52]; // fixed: presentation, never a roll
+const calm = () => typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches;
 
 const ART = {
   briefing: 'assets/art/pre_battle.png',
@@ -48,7 +54,9 @@ const COPY = {
   battleCapped: 'Odds capped at {n}%. Command does not believe in sure things.',
   battleFloored: 'Odds never drop below {n}%. Command calls this optimism.',
   battleRollMissed: 'Needed {n} or less. Rolled {r}. Missed.', // BP-32 (draft copy)
-  battleSkip: 'Skip',
+  battleChance: 'Chance of success: {n}%', // BP-37a: the total line that ends the breakdown (draft copy)
+  battleRollSpin: 'Needed {n} or less. Rolled {r}.', // BP-37a: the spin's faces (draft copy)
+  battleRoll: 'ROLL', // BP-37a: replaces Skip; the player rolls (draft copy)
   battleContinue: 'See result', // BP-32: the AAR opens only from this tap
   outcome: { Success: 'Mission accomplished', Defeat: 'Mission failed', Wipeout: 'No survivors' },
   aarTitle: 'After-action report',
@@ -140,8 +148,10 @@ export function createBattle(deps) {
   let mission = null;        // the contract on the briefing
   let result = null;         // the last 200 body this tab holds
   let resultFor = null;      // the Commander that response belongs to
-  let run = 0;               // the presentation in progress; Skip and a new run bump it
-  let finishNow = null;      // BP-32: shows the running presentation at once; null when none runs
+  let run = 0;               // the presentation in progress; ROLL, a tap, the AAR and a new run bump it
+  let finishNow = null;      // BP-32: shows the rest at once, after the roll only (BP-37a); null when none runs
+  let fillNow = null;        // BP-37a: fills the breakdown at once; null once it is all up
+  let rollNow = null;        // BP-37a: the ROLL tap; null once the roll has started
   let oneRookie = null;      // the debug checkbox, created only under DEBUG
   let onBriefingBack = null; // set by openMission; a briefing from the mission list goes back to the list
 
@@ -175,7 +185,7 @@ export function createBattle(deps) {
     $('briefing-squad').textContent = fill(COPY.briefingSquad, { n: SQUAD_SIZE });
     $('btn-deploy').textContent = COPY.briefingDeploy;
     $('btn-briefing-back').textContent = COPY.briefingBack;
-    $('btn-skip').textContent = COPY.battleSkip;
+    $('btn-skip').textContent = COPY.battleRoll;
     $('aar-title').textContent = COPY.aarTitle;
     $('aar-units-heading').textContent = COPY.aarUnits;
     $('aar-pay-heading').textContent = COPY.aarRewards;
@@ -195,10 +205,18 @@ export function createBattle(deps) {
     $('btn-missions-back').addEventListener('click', deps.enterHub);
     $('btn-briefing-back').addEventListener('click', () => (onBriefingBack || showMissionList)());
     $('btn-deploy').addEventListener('click', deploy);
-    $('btn-skip').addEventListener('click', () => { if (result) showAar(); });
-    // BP-32: a tap anywhere else on the battle screen finishes the presentation (Skip still skips).
+    // BP-37a: the battle's one button. ROLL rolls, filling any rows still to come first; it is disabled from
+    // the roll until the log ends, and then 'See result' opens the AAR, the only way there.
+    $('btn-skip').addEventListener('click', () => {
+      if (rollNow) rollNow();
+      else if (result && !finishNow) showAar();
+    });
+    // A tap anywhere else: before the roll it fills the rows and never rolls (BP-37a); after the roll it
+    // shows the rest at once (BP-32).
     $('screen-battle').addEventListener('click', ev => {
-      if (finishNow && !ev.target.closest('#btn-skip') && !$('screen-battle').hidden) finishNow();
+      if (ev.target.closest('#btn-skip') || $('screen-battle').hidden) return;
+      if (fillNow) fillNow();
+      else if (finishNow) finishNow();
     });
     $('btn-aar-continue').addEventListener('click', afterAar);
     $('btn-new-run').addEventListener('click', newRun);
@@ -412,43 +430,51 @@ export function createBattle(deps) {
     node.classList.add('shown');
   }
 
-  function countUp(valueNode, target, next, id, format = String) {
-    const ms = 600; // BP-32: slow enough to read (was 450)
-    let start = null;
-    const step = now => {
+  // BP-37a: a row's hold once its fade is done, so the rows land about a second apart.
+  function hold(next, id) {
+    setTimeout(() => { if (id === run) next(); }, ROW_MS);
+  }
+
+  // BP-37a: the roll's number spins through fixed faces for SPIN_MS, then `next` lands it. Under reduced
+  // motion it lands at once.
+  function spin(node, face, next, id) {
+    if (calm()) return next();
+    let k = 0;
+    const tick = () => {
       if (id !== run) return;
-      if (start === null) start = now;
-      const t = Math.min(1, (now - start) / ms);
-      valueNode.textContent = format(Math.round(target * t));
-      if (t < 1) requestAnimationFrame(step);
-      else next();
+      if (k * SPIN_STEP_MS >= SPIN_MS) return next();
+      node.textContent = face(SPIN_FACES[k % SPIN_FACES.length]);
+      k += 1;
+      setTimeout(tick, SPIN_STEP_MS);
     };
-    requestAnimationFrame(step);
+    tick();
   }
 
   function present() {
     const id = ++run;
+    finishNow = null; // BP-37a: set again at the roll, so a battle left mid-log can't finish this one
     const sb = result.report.score_breakdown;
     still($('battle-still'), ART.battle, false, 'battle', result.report);
     music(MUSIC.battle);
     const lines = $('battle-lines');
     lines.replaceChildren();
-    const rows = SCORE_LINES.map(([key, field]) => {
+    // BP-37a: a row that adds 0 is left out, and every row shows its value whole (no count-up).
+    const rows = SCORE_LINES.filter(([, field]) => (Number(sb[field]) || 0) !== 0).map(([key, field]) => {
+      const target = Number(sb[field]) || 0;
       const row = el('li', 'score-row');
-      const value = el('span', 'score-value', '0');
-      row.append(el('span', 'score-label', COPY.battleScore[key]), value);
+      row.append(el('span', 'score-label', COPY.battleScore[key]), el('span', 'score-value', String(target)));
       lines.append(row);
-      return { row, value, target: Number(sb[field]) || 0 };
+      return { row, target };
     });
     // The server's modifier rows (BP-14a: the approach and the Commander), after the six, with the
     // server's own labels and a sign. On dev the list is always empty.
     const signed = n => (n > 0 ? `+${n}` : String(n));
-    (Array.isArray(sb.modifiers) ? sb.modifiers : []).forEach((m, i) => {
+    (Array.isArray(sb.modifiers) ? sb.modifiers : []).filter(m => (Number(m.points) || 0) !== 0).forEach((m, i) => {
+      const target = Number(m.points) || 0;
       const row = el('li', i === 0 ? 'score-row score-modifier score-rule' : 'score-row score-modifier');
-      const value = el('span', 'score-value', '0');
-      row.append(el('span', 'score-label', m.label), value);
+      row.append(el('span', 'score-label', m.label), el('span', 'score-value', signed(target)));
       lines.append(row);
-      rows.push({ row, value, target: Number(m.points) || 0, format: signed });
+      rows.push({ row, target });
     });
     // The rows add up to the chance unless the 5 to 95 clamp cut it. Then one line says so, keyed on
     // the server's total_score (the clamped chance) against the sum of what the rows show.
@@ -461,58 +487,86 @@ export function createBattle(deps) {
     const roll = $('battle-roll');
     const banner = $('battle-outcome');
     for (const n of [chance, roll, banner]) { n.classList.remove('shown'); n.textContent = ''; }
+    roll.classList.remove('roll-made', 'roll-missed');
     banner.classList.remove(...[...banner.classList].filter(c => c.startsWith('outcome-')));
-    $('btn-skip').textContent = COPY.battleSkip;
+    const button = $('btn-skip');
+    button.textContent = COPY.battleRoll;
+    button.disabled = false;
     deps.show('screen-battle');
 
     // BP-32: one roll line. {n} is total_score, the clamp note's number. On every fight the demo client
     // sends, the chance is a whole number (identical Rookies, integer rows), so raw_roll <= total_score is
     // exactly the server's is_success, Wipeouts included. A brick that varies Rookie skill reopens this
     // (Reviewer BP-14b F2). The line speaks to the roll only; the banner still names the outcome.
-    const rollText = fill(sb.raw_roll <= total ? COPY.battleRollMade : COPY.battleRollMissed, { n: total, r: sb.raw_roll });
+    const made = sb.raw_roll <= total;
+    const rollText = fill(made ? COPY.battleRollMade : COPY.battleRollMissed, { n: total, r: sb.raw_roll });
+    const chanceText = fill(COPY.battleChance, { n: total });
+    const land = () => { // BP-37a: the roll lands, green for a success and red for a failure
+      roll.textContent = rollText;
+      roll.classList.add(made ? 'roll-made' : 'roll-missed');
+    };
     const showBanner = () => {
       const outcome = result.report.outcome;
       banner.textContent = COPY.outcome[outcome] || outcome;
       banner.classList.add(`outcome-${outcome}`);
     };
-    const steps = [];
-    rows.forEach(r => steps.push(next => revealThen(r.row, () => countUp(r.value, r.target, next, id, r.format), id)));
-    if (note) steps.push(next => revealThen(note, next, id));
-    steps.push(next => {
-      roll.textContent = rollText;
-      revealThen(roll, next, id);
-    });
-    steps.push(next => beforeOutcome({ report: result.report, live: () => id === run }, next));
-    steps.push(next => {
-      showBanner();
-      revealThen(banner, next, id);
-    });
     const done = () => {
       finishNow = null;
-      $('btn-skip').textContent = COPY.battleContinue;
+      button.disabled = false;
+      button.textContent = COPY.battleContinue;
     };
-    const go = i => {
-      if (id === run && i < steps.length) steps[i](() => go(i + 1));
-      else if (id === run) done(); // the last step has run
+    const go = (steps, i, runId, end) => {
+      if (runId !== run) return;
+      if (i < steps.length) steps[i](() => go(steps, i + 1, runId, end));
+      else end();
     };
-    // BP-32: the finish. The run bump stops every pending reveal, count-up and go; then every row,
-    // the note, the roll line, the log (told at once: the hook's instant flag) and the banner show.
-    finishNow = () => {
+
+    // BP-37a: the breakdown is the rows, the clamp note and the chance; then ROLL waits for the player.
+    const breakdown = rows.map(r => next => revealThen(r.row, () => hold(next, id), id));
+    if (note) breakdown.push(next => revealThen(note, () => hold(next, id), id));
+    breakdown.push(next => {
+      chance.textContent = chanceText;
+      revealThen(chance, next, id);
+    });
+    // A tap before the roll: the run bump stops every pending reveal and hold, and the breakdown shows whole.
+    fillNow = () => {
       run += 1;
-      for (const r of rows) {
-        r.value.textContent = (r.format || String)(Math.round(r.target));
-        r.row.classList.add('shown');
-      }
+      for (const r of rows) r.row.classList.add('shown');
       if (note) note.classList.add('shown');
-      roll.textContent = rollText;
-      roll.classList.add('shown');
-      beforeOutcome({ report: result.report, live: () => true, instant: true }, () => {});
-      showBanner();
-      banner.classList.add('shown');
-      done();
+      chance.textContent = chanceText;
+      chance.classList.add('shown');
+      fillNow = null;
+    };
+    // ROLL: fills whatever is left of the breakdown, then the spin, the landing, the hook (the demo's log)
+    // and the banner. The button stays disabled until the end, when it reads 'See result'.
+    rollNow = () => {
+      if (fillNow) fillNow();
+      rollNow = null;
+      button.disabled = true;
+      const rid = ++run;
+      const face = r => fill(COPY.battleRollSpin, { n: total, r });
+      const steps = [
+        next => { roll.textContent = face(SPIN_FACES[0]); revealThen(roll, next, rid); },
+        next => spin(roll, face, next, rid),
+        next => { land(); next(); },
+        next => beforeOutcome({ report: result.report, live: () => rid === run }, next),
+        next => { showBanner(); revealThen(banner, next, rid); },
+      ];
+      // BP-32's finish, after the roll only: the run bump stops the spin and every pending reveal; the roll
+      // lands, the log is told at once (the hook's instant flag) and the banner shows.
+      finishNow = () => {
+        run += 1;
+        land();
+        roll.classList.add('shown');
+        beforeOutcome({ report: result.report, live: () => true, instant: true }, () => {});
+        showBanner();
+        banner.classList.add('shown');
+        done();
+      };
+      go(steps, 0, rid, done);
     };
     // The first reveal waits one frame so the screen is laid out before the transition starts.
-    requestAnimationFrame(() => go(0));
+    requestAnimationFrame(() => go(breakdown, 0, id, () => { fillNow = null; }));
   }
 
   // ── After-action report ──────────────────────────────────────────────────
@@ -526,6 +580,7 @@ export function createBattle(deps) {
   function showAar() {
     run += 1; // stops the presentation, whichever step it is on
     finishNow = null; // BP-32: nothing left to finish
+    fillNow = null; rollNow = null; // BP-37a
     const { report, commander: c } = result;
     const outcome = report.outcome;
     still($('aar-still'), ART[outcome] || ART.Defeat, outcome === 'Wipeout', 'aar', report);
