@@ -15,9 +15,9 @@ export const BASE = [
     flavour: 'A scrap dish on a leaning pipe mast. It hears raiders coming.',
     done: "Radio Shack operational. Raiders get heard before they're seen." },
   { id: 'hobbyist_benches', name: 'Medbay', cost: 120, // BP-33: the Benches renamed; the key stays
-    effect: 'Patch up 20 credits a head, done in 8 s.',
-    flavour: 'A field clinic with a strong stomach. Heals the wounded faster and cheaper.',
-    done: 'Medbay open. Patch-ups cheaper and quicker.' },
+    effect: 'Patch up 20 credits a head, half the usual 40.',
+    flavour: 'A field clinic with a strong stomach. Heals the wounded at half the price.',
+    done: 'Medbay open. Patch-ups at half price.' },
   { id: 'grease_pit', name: 'The Grease-Pit', cost: 80,
     effect: 'A lost ambush costs a quarter of the haul.',
     flavour: 'Light vehicles, slow manual repairs. Armoured enough to argue with an ambush.',

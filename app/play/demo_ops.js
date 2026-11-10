@@ -2049,19 +2049,12 @@ function sendBuild(id) {
   send(opsPath(campaignId) + '/build', { building: id }, id);
 }
 
-// That Section's healing in a body's company, absent = 0: what a heal spent, since the server heals
-// everyone wounded after its own latch (H4).
-const healingIn = (res, id) => {
-  const s = res && res.company && Array.isArray(res.company.sections) ? res.company.sections.find(x => x.section_id === id) : null;
-  return s ? Number(s.healing) || 0 : 0;
-};
-
 // Heal a Section's wounded (BP-12b): the card's Patch up.
 function sendHeal(sectionId) {
   if (held() || !campaignId) return;
   companyNotice = null;
   companyAsk = { action: 'heal', target: 'section' };
-  send(opsPath(campaignId) + '/heal', { section_id: sectionId }, false, res => healPrice(res.base).each * healingIn(res, sectionId)); // the price of the base the charge came with
+  send(opsPath(campaignId) + '/heal', { section_id: sectionId }, false, res => Number(res.charged) || 0); // BP-40a-1: the server's own debit (the healed Section has left the body, H4)
 }
 
 // The kept roster after a replace's 200: the row the server added to gains `count` (never past

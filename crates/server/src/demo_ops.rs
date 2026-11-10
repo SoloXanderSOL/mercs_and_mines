@@ -82,8 +82,9 @@ pub const DEMO_SITE_REFRESH_SECS: i64 = 45;
 /// Hobbyist Benches (BP-16). Read through `OpsBase::heal_credits`.
 pub const DEMO_HEAL_CREDITS: u32 = 40;
 /// Seconds until a healed batch is back on its feet (BP-12a-1); `DEMO_BENCHES_HEAL_SECS` with
-/// the Hobbyist Benches (BP-16). Read through `OpsBase::heal_secs`.
-pub const DEMO_HEAL_SECS: i64 = 15;
+/// the Hobbyist Benches (BP-16). Read through `OpsBase::heal_secs`. 0 since BP-40a-1: the demo
+/// heals in the call (canon keeps heal times); tests of a pending batch use `heal_op_lasting`.
+pub const DEMO_HEAL_SECS: i64 = 0;
 /// The Trophy Shelf keeps the newest this many items (BP-12a-1); the oldest is dropped.
 pub const DEMO_TROPHY_CAP: usize = 20;
 /// Credits per soldier replaced (BP-12a-2, §4e): a fresh merc for a Section, up to 8.
@@ -292,8 +293,9 @@ pub const DEMO_SMELTER_ORE_DEN: u32 = 4;
 pub const DEMO_GREASE_PIT_LOSS_DIV: u32 = 4;
 /// The Hobbyist Benches' price per wounded soldier healed, in place of `DEMO_HEAL_CREDITS`.
 pub const DEMO_BENCHES_HEAL_CREDITS: u32 = 20;
-/// The Hobbyist Benches' seconds until a healed batch is back, in place of `DEMO_HEAL_SECS`.
-pub const DEMO_BENCHES_HEAL_SECS: i64 = 8;
+/// The Hobbyist Benches' seconds until a healed batch is back, in place of `DEMO_HEAL_SECS`; 0
+/// since BP-40a-1.
+pub const DEMO_BENCHES_HEAL_SECS: i64 = 0;
 /// The Radio Shack's cost in banked ore.
 pub const DEMO_COST_RADIO_SHACK: u32 = 50;
 /// The Gunsmith's cost in banked ore (its +10: `demo_roll::DEMO_GUNSMITH_ROLL_POINTS`).
@@ -1192,7 +1194,8 @@ impl OpsBase {
         }
     }
 
-    /// Seconds until a healed batch is back: 8 with the Hobbyist Benches, else 15 (BP-16).
+    /// Seconds until a healed batch is back: 0 with or without the Hobbyist Benches (BP-40a-1;
+    /// 8 and 15 from BP-16 until then).
     fn heal_secs(&self) -> i64 {
         if self.hobbyist_benches {
             DEMO_BENCHES_HEAL_SECS
@@ -3375,12 +3378,19 @@ impl DemoOpsStore {
 
     /// Heals every wounded soldier of `section_id` at once (BP-12a-1, §4e B3), for
     /// `OpsBase::heal_credits` each (BP-16: 20 with the Hobbyist Benches, else 40): they move to
-    /// `healing` and are back after `OpsBase::heal_secs` (8 s, else 15 s). A batch already
-    /// healing keeps the price and time it was healed at.
+    /// `healing` and are back after `OpsBase::heal_secs` (0 since BP-40a-1, so the next settle,
+    /// the response's own, has them fit). Returns the credits debited (BP-40a-1: the heal body's
+    /// `charged`). A batch already healing keeps the price and time it was healed at.
     /// Allowed while the team is out (Linux C3): the sickbay feeds nothing the server rolls.
     /// Writes `moved_at` (the keep list). Refusals in order: `NobodyToHeal` (also no entry) →
     /// `AlreadyHealing` → `NotEnoughCredits`. Check and debit are one critical section, no await.
-    pub fn heal_op(&self, campaign_id: Uuid, section_id: Uuid, now: DateTime<Utc>) -> Result<(), HealRefusal> {
+    pub fn heal_op(&self, campaign_id: Uuid, section_id: Uuid, now: DateTime<Utc>) -> Result<u32, HealRefusal> {
+        self.heal_op_lasting(campaign_id, section_id, now, None)
+    }
+
+    /// `heal_op` with the batch's seconds given (BP-40a-1, BP-35's `build_op_lasting` pattern):
+    /// `None` is the base's `heal_secs` (production); tests of a pending batch pass `Some(secs)`.
+    pub(crate) fn heal_op_lasting(&self, campaign_id: Uuid, section_id: Uuid, now: DateTime<Utc>, secs: Option<i64>) -> Result<u32, HealRefusal> {
         let mut inner = self.lock();
         let Some(e) = inner.get_mut(&campaign_id) else {
             return Err(HealRefusal::NobodyToHeal);
@@ -3394,13 +3404,14 @@ impl DemoOpsStore {
         if bay.healing > 0 {
             return Err(HealRefusal::AlreadyHealing);
         }
-        if !e.debit_credits(base.heal_credits() * u32::from(bay.wounded)) {
+        let charged = base.heal_credits() * u32::from(bay.wounded);
+        if !e.debit_credits(charged) {
             return Err(HealRefusal::NotEnoughCredits);
         }
-        e.sickbay.insert(section_id, SickBay { wounded: 0, healing: bay.wounded, healed_at: Some(now + Duration::seconds(base.heal_secs())) });
+        e.sickbay.insert(section_id, SickBay { wounded: 0, healing: bay.wounded, healed_at: Some(now + Duration::seconds(secs.unwrap_or(base.heal_secs()))) });
         e.moved_at = Some(now);
         e.touched = now;
-        Ok(())
+        Ok(charged)
     }
 
     /// Sells `ore` of the banked ore for `DEMO_ORE_SELL_CREDITS` credits each (BP-28a, §4f): the
@@ -4808,7 +4819,7 @@ mod tests {
         assert_eq!(ambush, vec![(10, 10), (15, 15), (15, 15), (20, 20), (50, 50)]);
         let kept: Vec<(u32, u32)> = [30, 50, 60, 120].into_iter().map(|c| (plain.ambush_kept(c), all.ambush_kept(c))).collect();
         assert_eq!(kept, vec![(15, 23), (25, 38), (30, 45), (60, 90)]);
-        assert_eq!((plain.heal_credits(), plain.heal_secs(), all.heal_credits(), all.heal_secs()), (40, 15, 20, 8));
+        assert_eq!((plain.heal_credits(), plain.heal_secs(), all.heal_credits(), all.heal_secs()), (40, 0, 20, 0));
         let ids = ["radio_shack", "hobbyist_benches", "grease_pit", "gunsmith", "basic_smelter", "barracks", ""];
         let costs: Vec<Option<u32>> = ids.into_iter().map(|id| BaseBuilding::from_id(id).map(BaseBuilding::cost)).collect();
         assert_eq!(costs, vec![Some(50), Some(120), Some(80), Some(100), Some(80), None, None]);
@@ -5251,13 +5262,14 @@ mod tests {
     }
 
     /// BP-12a-1: a heal takes 40 a head from the bank and moves the wounded to healing until 15 s
-    /// after the heal; with nobody left wounded, a second heal is refused.
+    /// after the heal (BP-40a-1: `heal_op_lasting` with the old 15 s); with nobody left wounded,
+    /// a second heal is refused.
     #[test]
     fn heal_debits_40_a_head() {
         let store = DemoOpsStore::new(2);
         let a = Uuid::from_u128(1);
         contract_latched(&store, a, RaidResult::Held, wounded_pay(400, 3));
-        assert_eq!(store.heal_op(a, SECTION, at(12)), Ok(()));
+        assert_eq!(store.heal_op_lasting(a, SECTION, at(12), Some(15)), Ok(120));
         let s = store.ops_state(a, at(12));
         assert_eq!(s.credits_banked, 280);
         assert_eq!(s.company.sections, vec![bay(0, 3, Some(at(27)))]);
@@ -5265,17 +5277,32 @@ mod tests {
     }
 
     /// BP-16: with the Hobbyist Benches a heal takes 20 a head and the batch is back after 8 s
-    /// (healed at 12, back at 20).
+    /// (healed at 12, back at 20; BP-40a-1: `heal_op_lasting` with the old 8 s).
     #[test]
     fn heal_with_the_benches_debits_20_a_head_for_8_s() {
         let store = DemoOpsStore::new(2);
         let a = Uuid::from_u128(1);
         contract_latched(&store, a, RaidResult::Held, wounded_pay(400, 3));
         store.set_base(a, OpsBase { hobbyist_benches: true, ..OpsBase::default() });
-        assert_eq!(store.heal_op(a, SECTION, at(12)), Ok(()));
+        assert_eq!(store.heal_op_lasting(a, SECTION, at(12), Some(8)), Ok(60));
         let s = store.ops_state(a, at(12));
         assert_eq!(s.credits_banked, 340);
         assert_eq!(s.company.sections, vec![bay(0, 3, Some(at(20)))]);
+    }
+
+    /// BP-40a-1: the Medbay site of "a heal is done in one tap" (RULE-033): with the Hobbyist
+    /// Benches, production `heal_op` charges 20 a head and the batch is fit at the heal's own
+    /// instant, so the bay is gone from the same `now`'s state.
+    #[test]
+    fn heal_at_the_medbay_is_done_in_its_own_call() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        contract_latched(&store, a, RaidResult::Held, wounded_pay(400, 3));
+        store.set_base(a, OpsBase { hobbyist_benches: true, ..OpsBase::default() });
+        assert_eq!(store.heal_op(a, SECTION, at(12)), Ok(60));
+        let s = store.ops_state(a, at(12));
+        assert_eq!(s.credits_banked, 340);
+        assert!(s.company.sections.is_empty(), "healed in the call: {:?}", s.company.sections);
     }
 
     /// BP-12a-1: short of 40 a head, the heal is refused and writes nothing.
@@ -5298,7 +5325,7 @@ mod tests {
         let store = DemoOpsStore::new(2);
         let a = Uuid::from_u128(1);
         contract_latched(&store, a, RaidResult::Held, wounded_pay(400, 2));
-        assert_eq!(store.heal_op(a, SECTION, at(12)), Ok(()));
+        assert_eq!(store.heal_op_lasting(a, SECTION, at(12), Some(15)), Ok(80)); // BP-40a-1: the old 15 s
         assert_eq!(store.next_op(a, &supply_raid(), 9, None, Some(LEAD), at(20)), Ok(()));
         let second = RaidTrigger { trigger_at: at(26), mission_id: "SUPPLY_RAID", kind: BattleKind::Contract };
         assert!(store.latch_raid(a, &second, RaidResult::Held, wounded_pay(0, 1), at(26)));
@@ -5434,7 +5461,7 @@ mod tests {
         let c = |store: &DemoOpsStore| contract_latched(store, x, RaidResult::Wiped, wounded_pay(0, 0));
         let d = |store: &DemoOpsStore| {
             contract_latched(store, x, RaidResult::Held, wounded_pay(80, 2));
-            assert_eq!(store.heal_op(x, SECTION, at(12)), Ok(()));
+            assert_eq!(store.heal_op_lasting(x, SECTION, at(12), Some(15)), Ok(80)); // BP-40a-1: D needs the bay alive at 20
             assert_eq!(store.next_op(x, &supply_raid(), 9, None, Some(LEAD), at(20)), Ok(()));
             let second = RaidTrigger { trigger_at: at(26), mission_id: "SUPPLY_RAID", kind: BattleKind::Contract };
             let cap0 = FightPay { section_id: SECTION, cap: Some(0), ..FightPay::default() };

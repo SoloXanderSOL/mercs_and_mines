@@ -110,6 +110,10 @@ pub struct OpsView<'a> {
     /// The building going up (BP-21): `{"building", "done_at"}`; absent when none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub construction: Option<ConstructionView>,
+    /// What this request debited from the bank (BP-40a-1): on the heal's `200` only; absent
+    /// on every other body.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub charged: Option<u32>,
 }
 
 /// A board site as sent (BP-20a-1): the site's own keys, flattened, then its ways, Fast first.
@@ -376,6 +380,11 @@ async fn load_board(
 }
 
 fn ops_response(state: &AppState, campaign_id: Uuid, gw: (i32, i32), board: &OpsBoard, now: DateTime<Utc>) -> Response {
+    ops_response_charged(state, campaign_id, gw, board, now, None)
+}
+
+/// `ops_response` with the request's own debit (BP-40a-1: the heal's `charged`).
+fn ops_response_charged(state: &AppState, campaign_id: Uuid, gw: (i32, i32), board: &OpsBoard, now: DateTime<Utc>, charged: Option<u32>) -> Response {
     let (s, more_ops, squads, trip_reports, construction) = state.demo_ops.store.ops_body(campaign_id, now);
     // BP-11a-3: the sites as they stand (a fought contract off the board, a returned one moved);
     // the route's own board only when the campaign has no entry (a store full of ops).
@@ -394,6 +403,7 @@ fn ops_response(state: &AppState, campaign_id: Uuid, gw: (i32, i32), board: &Ops
         more_ops,
         trip_reports,
         construction,
+        charged,
     };
     Json(view).into_response()
 }
@@ -662,7 +672,7 @@ async fn get_ops_board(
     let now = Utc::now();
     let (campaign, gateway, wallet) = ops_member(&state, &token, campaign_id, "get_ops_board").await?;
     let Some(gw) = gateway else {
-        let view = OpsView { campaign_id, gateway: None, sites: Vec::new(), active_op: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), company: CompanyBody::new(CompanyView::default(), 1), now: ops_time(now), crew_fight: None, more_ops: Vec::new(), trip_reports: Vec::new(), construction: None };
+        let view = OpsView { campaign_id, gateway: None, sites: Vec::new(), active_op: None, ore_banked: 0, credits_banked: 0, base: OpsBase::default(), company: CompanyBody::new(CompanyView::default(), 1), now: ops_time(now), crew_fight: None, more_ops: Vec::new(), trip_reports: Vec::new(), construction: None, charged: None };
         return Ok(Json(view).into_response());
     };
     let board = load_board(&state, &campaign, gw, now, false, "get_ops_board").await?;
@@ -1435,10 +1445,11 @@ async fn post_ops_build(
 /// rejection, counted (`413` over `OPS_BODY_LIMIT`; `400`, `415`, `422`) → `404` → `403` → `409`
 /// not `Active` (entry dropped) → `409` no gateway → the board → a pending battle latched →
 /// `400` unknown section → `409` nobody to heal → `409` already healing → `409` not enough
-/// banked credits → `200`, the whole state.
+/// banked credits → `200`, the whole state plus `charged`, the credits debited (BP-40a-1).
 /// - Every wounded soldier of the Section at once, `OpsBase::heal_credits` each from
 ///   `credits_banked` (40, or 20 with the Hobbyist Benches, BP-16), back after
-///   `OpsBase::heal_secs` (15 s, or 8 s). Allowed while the team is out (the sickbay feeds
+///   `OpsBase::heal_secs` (0 since BP-40a-1: fit in this call's own body, so `409 already
+///   healing` has no route path left). Allowed while the team is out (the sickbay feeds
 ///   nothing the server rolls).
 /// - Abuse bound: memory only, no DB write, so no launch lock; the shared ops limiter (40/min per
 ///   wallet, 400 per address); at most one bay per Section a latch wrote.
@@ -1467,14 +1478,14 @@ async fn post_ops_heal(
     let Ok(section_id) = Uuid::parse_str(&req.section_id) else {
         return Err(bad_request("unknown section"));
     };
-    match state.demo_ops.store.heal_op(campaign_id, section_id, now) {
-        Ok(()) => {}
+    let charged = match state.demo_ops.store.heal_op(campaign_id, section_id, now) {
+        Ok(charged) => charged,
         Err(HealRefusal::NobodyToHeal) => return Err(conflict("nobody to heal")),
         Err(HealRefusal::AlreadyHealing) => return Err(conflict("already healing")),
         Err(HealRefusal::NotEnoughCredits) => return Err(conflict("not enough banked credits")),
-    }
+    };
     settle_leaders(&state, campaign_id, &wallet, now).await;
-    Ok(ops_response(&state, campaign_id, gw, &board, now))
+    Ok(ops_response_charged(&state, campaign_id, gw, &board, now, Some(charged)))
 }
 
 /// Equips a Trophy Shelf item onto a Section, or takes its kit off, `POST
@@ -3847,7 +3858,8 @@ mod tests {
     }
 
     /// BP-12a-1: a won contract with wounded (`HEAL_WIN_SEED`: 3 wounded, 600 credits) heals all
-    /// three at once for 40 each; they are healing until 15 s after the heal's own `now`.
+    /// three at once for 40 each. BP-40a-1 (the base site's 0 pin): they are fit in the heal's
+    /// own body, which carries `charged`, the debit; a read after it carries none.
     #[tokio::test]
     async fn ops_heal_spends_credits() {
         let state = Arc::new(session_state());
@@ -3864,11 +3876,11 @@ mod tests {
         let (status, body, _) = heal(&state, c, &section.to_string()).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["credits_banked"].as_u64(), Some(banked - 40 * wounded));
-        let now = chrono::DateTime::parse_from_rfc3339(body["now"].as_str().expect("now")).expect("rfc3339").with_timezone(&chrono::Utc);
-        assert_eq!(
-            body["company"]["sections"][0],
-            serde_json::json!({ "section_id": section, "wounded": 0, "healing": wounded, "healed_at": ops_time(now + chrono::Duration::seconds(15)) })
-        );
+        assert_eq!(body["charged"].as_u64(), Some(40 * wounded), "the heal's own debit: {body}");
+        assert_eq!(body["company"]["sections"], serde_json::json!([]), "healed in the call: {body}");
+        let (status, after) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{after}");
+        assert_eq!((after.get("charged"), &after["company"]["sections"]), (None, &serde_json::json!([])), "a read carries no charge: {after}");
     }
 
     /// BP-12a-1: a `section_id` that is not a UUID is `400`; a UUID with no wounded is `409`.

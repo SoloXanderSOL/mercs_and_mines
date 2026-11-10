@@ -20,9 +20,9 @@ import { bandWord, bankedLine } from './demo_dig.js'; // BP-19c; BP-28b: the ban
 
 const RANK_XP = [100, 400, 1100, 2600]; // commander_gen.rs:132 RANK_THRESHOLDS (ranks 2..=5); harness k3 holds its own copy
 export const HEAL_CREDITS = 40;           // demo_ops.rs DEMO_HEAL_CREDITS; harness y14 holds its own copy
-export const HEAL_SECS = 15;              // demo_ops.rs DEMO_HEAL_SECS (copy only: the body's healed_at decides)
+export const HEAL_SECS = 0;               // demo_ops.rs DEMO_HEAL_SECS, 0 since BP-40a-1 (the body's healed_at decides)
 export const BENCHES_HEAL_CREDITS = 20;   // demo_ops.rs DEMO_BENCHES_HEAL_CREDITS (BP-16a)
-export const BENCHES_HEAL_SECS = 8;       // demo_ops.rs DEMO_BENCHES_HEAL_SECS (copy only: the body's healed_at decides)
+export const BENCHES_HEAL_SECS = 0;       // demo_ops.rs DEMO_BENCHES_HEAL_SECS, 0 since BP-40a-1
 // The Patch-up price for a base, by the server's rule (OpsBase::heal_credits / heal_secs, BP-16a): the Benches halve it.
 export function healPrice(base) {
   return base && base.hobbyist_benches ? { each: BENCHES_HEAL_CREDITS, secs: BENCHES_HEAL_SECS } : { each: HEAL_CREDITS, secs: HEAL_SECS };
@@ -159,7 +159,7 @@ const COMPANY_COPY = {
   sold: 'Sold {o} ore for {c} credits. Command thanks you for your liquidity.',
   oreShort: 'There is less ore in the bank than that. The figures are up to date now.',
   heal: 'Patch up {n} · {cost} credits',
-  healNote: '{each} credits a soldier. On their feet {secs} s after payment.',
+  healNote: '{each} credits a soldier. Back on their feet at once.',
   short: 'Not enough banked credits. {each} each.',
   requisition: 'Requisition {n} · {cost} credits',
   requisitionNote: '{each} credits a Rookie. They arrive with no history and no complaints yet.',
