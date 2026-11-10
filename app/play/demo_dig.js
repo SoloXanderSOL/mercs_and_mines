@@ -246,11 +246,16 @@ export function renderDig(p, dig, roster, extra = {}) {
   p.node.hidden = false;
 }
 
+// BP-37a-2 (Reviewer BP-37c rework F1, RULE-114): clears the dig's beat, so nothing replays when the panel or the hub shows again.
+export function quietDig(p) {
+  for (const n of [p.pop, p.heatPop]) n.classList.remove('shown');
+}
+
 export function hideDig(p) {
   p.node.hidden = true;
   p.lastOre = null;
   p.lastHeat = null;
-  for (const n of [p.pop, p.heatPop]) n.classList.remove('shown'); // BP-37c F1 (BP-21b F1's rule): what hides the panel clears its beat
+  quietDig(p); // BP-37c F1 (BP-21b F1's rule): what hides the panel clears its beat
 }
 
 // The strip on a dig's homeward leg, by how the dig ended; null on a contract's leg.
@@ -264,7 +269,12 @@ export function homewardLines(dig, title, n) {
   }
 }
 
-// The meltdown's beat: a red flash across the strip.
+// The meltdown's beat: a red flash across the strip. A finished flash clears its class (BP-37a-2, RULE-114), so
+// showing the strip again never replays it. One listener per strip; the dig pops' own animationend bubbles here too.
 export function flash(strip) {
+  if (!strip.flashEnd) {
+    strip.flashEnd = e => { if (e.target === strip && e.animationName === 'dig-flash') strip.classList.remove('flash'); };
+    strip.addEventListener('animationend', strip.flashEnd);
+  }
   replay(strip, 'flash');
 }

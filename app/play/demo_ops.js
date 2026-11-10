@@ -49,7 +49,7 @@ import { showCard, cardSeen } from './demo_card.js';
 import { mountShop, openShop } from './demo_shop.js'; // BP-25
 import { mountReview, countContract } from './demo_review.js'; // BP-27
 import { mountCompany, dressBriefing, renderCompany, redrawCompany, healPrice, wageLine, SELL_ORE_CREDITS, openSickbay } from './demo_company.js';
-import { DIG_COPY, DIG_CSS, createDigPanel, renderDig, hideDig, homewardLines, flash, bankedLine, crewFightLine, crewCard } from './demo_dig.js';
+import { DIG_COPY, DIG_CSS, createDigPanel, renderDig, hideDig, quietDig, homewardLines, flash, bankedLine, crewFightLine, crewCard } from './demo_dig.js';
 import { BASE_COPY, BASE_CSS, createBase, renderBase, hideBase } from './demo_base.js';
 import { mountMore } from './demo_more.js'; // BP-29b
 
@@ -2144,6 +2144,8 @@ function watch() {
     const shown = !hub.hidden;
     if (shown && !hubWasShown) fightPick = null; // BP-18b-2a (F1, R4): afterAar has read it; the next fight's opener sets it
     if (shown !== hubWasShown) picker = false; // BP-18b-2b (R6): the picker never outlives the hub
+    if (shown !== hubWasShown) quietDig(dig); // BP-37a-2 (Reviewer BP-37c rework F1, RULE-114): on the hide (a raid's fight opens in the replay's task) and on the return (a drill's 200 landed while away)
+    if (shown !== hubWasShown) strip.classList.remove('flash'); // BP-37a-2 (RULE-114): the meltdown's flash, the same way
     if (shown && !hubWasShown && endOnHub) { // a Section lost while away ends the run now, before any read
       const kind = endOnHub;
       endOnHub = null;

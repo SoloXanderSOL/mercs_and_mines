@@ -87,14 +87,16 @@ const TRAITS = {
 };
 
 // A11: the keeper's labels (battle.js:45) → where each factor comes from. The server's modifier rows (BP-14a) keep
-// their own labels and pass through untouched; the Gunsmith and the armoury's kit are the server's own rows. Gear is
-// 0 on every demo fight, so the keeper leaves its row out (BP-37a) and it has no label here.
+// their own labels and pass through untouched; the Gunsmith and the armoury's kit are the server's own rows. Gear
+// (calc_gear_bonus: the units' equipment success_bonus) is 0 on every demo fight, since the client sends no equipment,
+// so the keeper leaves its row out (BP-37a); its label stays as a fallback (BP-37a-2, Reviewer BP-37a F3).
 const SCORE_LABELS = {
   'Squad skill': 'Squad: standard-issue Rookies',
   'Squad size': 'Headcount: {n} Rookies',
   'Training': 'Training: 8 per Rookie',
   'Mission fit': 'Mission type: drills pay off on digs only',
   'Difficulty': 'Difficulty: set by the contract',
+  'Gear': 'Gear: standard issue',
 };
 // BP-24b: ops/name's four 400 texts (demo_name.rs:51-54), shown as sent; any other refusal shows askBad.
 const NAME_REFUSALS = new Set(['a company name is 1 to 24 characters', "letters, numbers, spaces and - ' . & only",
