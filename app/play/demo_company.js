@@ -87,18 +87,15 @@ const TRAITS = {
 };
 
 // A11: the keeper's labels (battle.js:45) → where each factor comes from. The server's modifier rows (BP-14a) keep
-// their own labels and pass through untouched. Gear stays its own line; the armoury's kit is the server's own row (BP-23b).
+// their own labels and pass through untouched; the Gunsmith and the armoury's kit are the server's own rows. Gear is
+// 0 on every demo fight, so the keeper leaves its row out (BP-37a) and it has no label here.
 const SCORE_LABELS = {
   'Squad skill': 'Squad: standard-issue Rookies',
   'Squad size': 'Headcount: {n} Rookies',
   'Training': 'Training: 8 per Rookie',
-  'Gear': 'Gear: standard issue',
   'Mission fit': 'Mission type: drills pay off on digs only',
   'Difficulty': 'Difficulty: set by the contract',
 };
-const GUNSMITH_ROW = 'Gunsmith (your base)'; // demo_roll.rs's row label, shown as sent (Reviewer BP-16a CF (d))
-const GEAR_HINT = 'Gear: standard. Gunsmith adds 10.'; // A11 (BP-16b): only when this fight's roll had no Gunsmith row
-const KIT_ROW = 'Armoury kit ('; // BP-23b: demo_roll.rs:351's label, shown as sent; with it the hint steps aside too
 // BP-24b: ops/name's four 400 texts (demo_name.rs:51-54), shown as sent; any other refusal shows askBad.
 const NAME_REFUSALS = new Set(['a company name is 1 to 24 characters', "letters, numbers, spaces and - ' . & only",
   'a company name needs at least one letter', 'Compliance has rejected that name. Pick another.']);
@@ -890,13 +887,9 @@ function dressScore(lines) {
   const s = view.fightSection(); // BP-18b-1: the fought op's Section
   const n = s ? view.squadOf(s) : 0; // the squad sent (BP-12b: the headcount less the sickbay)
   const labels = [...lines.querySelectorAll('li.score-row .score-label')];
-  // The roll's own rows say whether the Gunsmith stood (roll_inputs.gunsmith, read once by the server): no base read.
-  const gun = labels.some(l => l.textContent === GUNSMITH_ROW);
-  const kit = labels.some(l => l.textContent.startsWith(KIT_ROW)); // BP-23b
   for (const label of labels) {
     const key = label.textContent;
-    if (key === 'Gear' && !gun && !kit) label.textContent = GEAR_HINT;
-    else if (Object.prototype.hasOwnProperty.call(SCORE_LABELS, key)) label.textContent = fill(SCORE_LABELS[key], { n });
+    if (Object.prototype.hasOwnProperty.call(SCORE_LABELS, key)) label.textContent = fill(SCORE_LABELS[key], { n });
   }
 }
 

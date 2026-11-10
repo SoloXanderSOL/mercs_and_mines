@@ -10,7 +10,7 @@
 
 import { setBeforeOutcome } from './battle.js';
 
-const TICK_MS = 1100; // BP-32: one line every 1.1 s, a first-time player's pace (was 0.4 s); Skip is live throughout
+const TICK_MS = 1100; // BP-32: one line every 1.1 s, a first-time player's pace (was 0.4 s); a tap tells the rest at once
 const HOLD_MS = 600;  // BP-32: a pause after the roll line before the first line, and after the last before the banner
 const MAX_LINES = 8; // the opener, the grouped Ready line and the hurt units, the last ones paired to fit
 
@@ -110,7 +110,7 @@ const STORY_CSS = `
 #screen-battle .fight-log li { padding: 0.6cqw 3cqw; font-size: 4.68cqw; line-height: 1.3; background: var(--panel); border-radius: 1.2cqw; }
 #screen-battle .score-row:not(.score-note) { font-size: 4.84cqw; } /* BP-32: rows +10%, the most g1's 12 rows allow */
 #screen-battle .score-value { font-size: 5.06cqw; }
-#screen-battle .battle-chance { display: none; }
+#screen-battle .battle-chance { font-size: 5cqw; } /* BP-37a: the total, sized like the roll line */
 #screen-battle .battle-roll { font-size: 5cqw; }
 #screen-battle .fight-log .log-opener { font-family: var(--display); font-weight: 700; color: var(--accent); background: none; }
 #screen-battle .fight-log .log-kia { color: var(--danger); }
@@ -194,7 +194,7 @@ function tell({ report, instant }, next) {
   timer = setTimeout(tick, HOLD_MS);
 }
 
-// Every way off the battle screen hides it (Skip, an error screen, the end of the run): the timer dies
+// Every way off the battle screen hides it ('See result', an error screen, the end of the run): the timer dies
 // here, and the score rows come back for the next fight (present() resets their children, not `hidden`).
 function leave() {
   if (!battle.hidden) return;
