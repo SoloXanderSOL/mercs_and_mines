@@ -103,7 +103,7 @@ const NAME_REFUSALS = new Set(['a company name is 1 to 24 characters', "letters,
   'a company name needs at least one letter', 'Compliance has rejected that name. Pick another.']);
 
 const COMPANY_COPY = {
-  hubButton: 'Your Company',
+  hubButton: 'Company', // BP-40a-2a: four bar buttons at 88 px; 'Your Company' wrapped
   heading: 'Your Company',
   // BP-24b (Wiki copy): the name ask on the reveal after a new run's join (a 201), and its answers.
   askLine: 'Name your company. Compliance will read it.',
@@ -139,7 +139,7 @@ const COMPANY_COPY = {
   crewForeman: 'Foreman: {name}, {spec}',
   close: 'Close',
   // BP-12b (Wiki copy)
-  atBase: 'The sickbay and the Trophy Shelf are kept at base. Open the map to see them.',
+  atBase: 'The sickbay and the Trophy Shelf are kept at base. Head back to the base to see them.',
   bunks: '{f} fit, {w} wounded, {n} healing, {e} empty bunks',
   fit: 'Fit to fight: {f}',
   bay: 'In the sickbay: {w} wounded.',
@@ -290,6 +290,7 @@ let deps = null;
 let view = null;      // demo_ops.js's state and requests (BP-12b), registered at the mount
 let fromHub = false;  // the reveal about to render was opened by the hub's Your Company
 let companyUp = false; // BP-20b (Reviewer BP-19c F3): the reveal on screen is Your Company, not an entry reveal
+export const companyShown = () => companyUp; // BP-40a-2a (R1): demo_ops's Continue hook tells an entry reveal from Your Company
 let card = null;      // the stats card: { node, title, lines }
 let traitsLine = null; // the briefing's trait lines, created on the first briefing
 let shown = null;     // the card on screen: { kind, index }, or null

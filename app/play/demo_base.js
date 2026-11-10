@@ -15,7 +15,7 @@ export const BASE = [
     flavour: 'A scrap dish on a leaning pipe mast. It hears raiders coming.',
     done: "Radio Shack operational. Raiders get heard before they're seen." },
   { id: 'hobbyist_benches', name: 'Medbay', cost: 120, // BP-33: the Benches renamed; the key stays
-    effect: 'Patch up 20 credits a head, half the usual 40.',
+    effect: 'Patch up 20 credits a head, not 40.',
     flavour: 'A field clinic with a strong stomach. Heals the wounded at half the price.',
     done: 'Medbay open. Patch-ups at half price.' },
   { id: 'grease_pit', name: 'The Grease-Pit', cost: 80,
@@ -85,7 +85,7 @@ const SPRITE = {
 };
 
 export const BASE_CSS = `
-.ops-base { position: absolute; top: 11.5cqw; left: 3cqw; padding: 1cqw 2.5cqw; font-family: var(--mono); font-size: 3.6cqw; color: var(--accent); background: rgba(11, 11, 12, 0.94); border: 0.3cqw solid var(--accent); border-radius: 1.5cqw; cursor: pointer; }
+/* BP-40a-2a (item 4): .ops-base is a .btn-bar button in the hub's bottom bar (play.css), no longer on the map's top edge */
 .ops-base[hidden], .base-sheet[hidden], .base-note[hidden], .base-build[hidden], .base-open[hidden] { display: none; }
 .base-sheet { position: absolute; left: 3cqw; right: 3cqw; top: 20cqw; bottom: 17cqw; padding: 3cqw; display: flex; flex-direction: column; gap: 1.5cqw; text-align: left; overflow-y: auto; background: rgba(11, 11, 12, 0.96); border: 0.4cqw solid var(--panel-edge); border-radius: 2cqw; }
 .base-head { position: sticky; top: calc(-3cqw - 1px); z-index: 1; display: flex; align-items: baseline; justify-content: space-between; gap: 2cqw; background: rgb(11, 11, 12); }
@@ -280,6 +280,15 @@ export function renderBase(v, s, built, paid) {
   v.note.hidden = !note;
   drawPick(v); // BP-35
   v.node.hidden = false;
+}
+
+// BP-40a-2a (BP-37a-2 check 15, RULE-114): a hub hide or return drops the sheet's one-shots and leaves the sheet as it
+// was, so a pop or a rise never replays when the hub shows again (both orders: a beat running at the hide, a replay
+// adopted while the hub was hidden).
+export function quietBase(v) {
+  v.pop.classList.remove('shown');
+  for (const { slot } of v.slots) slot.classList.remove('just');
+  for (const img of Object.values(v.sprites)) img.classList.remove('just');
 }
 
 export function hideBase(v) {

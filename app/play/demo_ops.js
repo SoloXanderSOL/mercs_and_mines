@@ -48,9 +48,9 @@ import { mountStory, writeAar } from './demo_story.js';
 import { showCard, cardSeen } from './demo_card.js';
 import { mountShop, openShop } from './demo_shop.js'; // BP-25
 import { mountReview, countContract } from './demo_review.js'; // BP-27
-import { mountCompany, dressBriefing, renderCompany, redrawCompany, healPrice, wageLine, SELL_ORE_CREDITS, openSickbay } from './demo_company.js';
+import { mountCompany, dressBriefing, renderCompany, redrawCompany, healPrice, wageLine, SELL_ORE_CREDITS, openSickbay, companyShown } from './demo_company.js';
 import { DIG_COPY, DIG_CSS, createDigPanel, renderDig, hideDig, quietDig, homewardLines, flash, bankedLine, crewFightLine, crewCard } from './demo_dig.js';
-import { BASE_COPY, BASE_CSS, createBase, renderBase, hideBase } from './demo_base.js';
+import { BASE_COPY, BASE_CSS, createBase, renderBase, hideBase, quietBase } from './demo_base.js';
 import { mountMore } from './demo_more.js'; // BP-29b
 
 // Booth copy, verbatim from the BP-9a and BP-11b-1 prompts.
@@ -102,9 +102,9 @@ const COPY = {
   aarDead: '{name} ({status})',
   aarNone: 'No losses. Command notes the anomaly.',
   aarSection: '{name}: {a} → {b}',
-  shop: 'Demo Shop',
+  shop: 'Shop', // BP-40a-2a: the bottom bar's label
   // BP-12b (Wiki copy)
-  aarWounded: 'Wounded: {n}, in the sickbay. Patch them up at Your Company.',
+  aarWounded: 'Wounded: {n}, in the sickbay. Patch them up on the Company screen.',
   zeroFit: 'Everyone fit to fight is in the sickbay. Patch them up first.',
   zeroFitHealing: 'Nobody is fit to fight yet. Deploy opens when the sickbay lets them go.',
   walkingWounded: 'Nobody is fit to fight. The walking wounded are going anyway.',
@@ -255,7 +255,7 @@ const CSS = `
 .ops-list-tag { color: var(--accent); } /* BP-29a */
 .briefing-tag { color: var(--accent); } /* BP-29a */
 .briefing-tag[hidden] { display: none; }
-.ops-shop { position: absolute; top: 1.5cqw; left: 3cqw; padding: 1cqw 2.5cqw; font-family: var(--mono); font-size: 3.6cqw; color: var(--accent); background: rgba(11, 11, 12, 0.94); border: 0.3cqw solid var(--accent); border-radius: 1.5cqw; cursor: pointer; }
+/* BP-40a-2a (item 4): .ops-shop is a .btn-bar button in the hub's bottom bar (play.css), no longer in the title bar */
 #screen-briefing .briefing-stance[hidden], #screen-briefing #btn-deploy[hidden] { display: none; }
 #screen-briefing { gap: 2cqw; }
 #screen-briefing .still { height: 24cqw; }
@@ -293,7 +293,7 @@ const CSS = `
 .ops-banked { white-space: pre-line; }
 #btn-recentre, #btn-legend, #legend { display: none; } /* BP-37b: the keeper bar's Recentre and Legend leave the demo */
 .ops-glow { position: absolute; top: 10cqw; left: 0; width: 100%; height: calc(100% - 26cqw); display: block; pointer-events: none; } /* BP-37b: .hub-map's box (play.css, keeper): a change there must change this too */
-.ops-recentre { position: absolute; top: 11.5cqw; left: 18cqw; width: 8.5cqw; height: 8.5cqw; padding: 0; background: rgba(11, 11, 12, 0.94); border: 0.3cqw solid var(--accent); border-radius: 1.5cqw; cursor: pointer; } /* BP-37b: right of Base (BP-40a-2 moves it to the corner) */
+.ops-recentre { position: absolute; top: 11.5cqw; left: 3cqw; width: 8.5cqw; height: 8.5cqw; padding: 0; background: rgba(11, 11, 12, 0.94); border: 0.3cqw solid var(--accent); border-radius: 1.5cqw; cursor: pointer; } /* BP-37b; BP-40a-2a: the top-left corner, where Base stood before it moved to the bar */
 .ops-recentre::before { content: ''; position: absolute; inset: 1.8cqw; border: 0.5cqw solid var(--accent); border-radius: 50%; }
 .ops-recentre::after { content: ''; position: absolute; left: 50%; top: 50%; width: 1.2cqw; height: 1.2cqw; margin: -0.6cqw 0 0 -0.6cqw; background: var(--accent); border-radius: 50%; }
 `;
@@ -428,6 +428,7 @@ let throttleSecs = 0;
 let hubWasShown = false;
 let base = {};          // the server's base: which buildings stand
 let baseOpen = false;   // the base sheet is showing
+let landBase = false;   // BP-40a-2a (R1, R2): this hub visit owes a landing decision (an entry reveal's Continue, an AAR's return)
 let justBuilt = null;   // BP-21b: the building the last adopted body showed standing for the first time, for its moment on the sheet
 let justPaid = null;    // BP-21b: the building the last adopted build POST paid for, for the sheet's pop
 let construction = null; // BP-21b: the last adopted body's construction ({ building, done_at }), null when none
@@ -1079,6 +1080,13 @@ function openBase() {
   refresh();
 }
 
+// BP-40a-2a (R1, R2): a landing opens the base when nothing is out. With a team out the map stays, so its strip
+// (Keep drilling, Pull out, Fight) shows. Decided once per owed landing, on the body held at that moment.
+function landOnBase() {
+  landBase = false;
+  if (opsOut().length === 0 && gateway) openBase();
+}
+
 function closeBase() {
   baseOpen = false;
   refresh();
@@ -1454,10 +1462,13 @@ function drawLabels(ctx, m, r, onScreen) {
     if (onScreen(x, y)) {
       const w = ctx.measureText(COPY.labelBase).width + 4;
       const bottom = y - m.view.s * Math.sqrt(3) / 2 - 2; // 2 px above the flat-top hex's top edge
-      ctx.strokeText(COPY.labelBase, x, bottom - 1);
-      ctx.fillText(COPY.labelBase, x, bottom - 1);
-      drawn.push([x - w / 2, bottom - LABEL_H, x + w / 2, bottom]);
-      based = 1;
+      const box = [x - w / 2, bottom - LABEL_H, x + w / 2, bottom];
+      if (!pins.some(p => hit(p.box, box))) { // BP-40a-2a (Reviewer BP-37b F3, RULE-157): a pin under Base keeps its own label
+        ctx.strokeText(COPY.labelBase, x, bottom - 1);
+        ctx.fillText(COPY.labelBase, x, bottom - 1);
+        drawn.push(box);
+        based = 1;
+      }
     }
   }
   for (const p of pins) {
@@ -1815,6 +1826,7 @@ function adopt(body, built, spent = 0) {
   const battle = battleKey(op);
   const opening = Boolean(battle && battle !== seenBattle && hubShown());
   seenBattle = battle;
+  if (landBase && hubShown()) landOnBase(); // BP-40a-2a: a new map has no body at the hub's show; its first adopt decides
   if (map) map.requestFrame();
   refresh();
   if (crewCardNew) showCrewCard(crewFight, digBefore, body.now); // BP-34
@@ -2139,6 +2151,9 @@ function watch() {
     if (shown !== hubWasShown) picker = false; // BP-18b-2b (R6): the picker never outlives the hub
     if (shown !== hubWasShown) quietDig(dig); // BP-37a-2 (Reviewer BP-37c rework F1, RULE-114): on the hide (a raid's fight opens in the replay's task) and on the return (a drill's 200 landed while away)
     if (shown !== hubWasShown) strip.classList.remove('flash'); // BP-37a-2 (RULE-114): the meltdown's flash, the same way
+    if (shown !== hubWasShown) quietBase(baseSheet); // BP-40a-2a (BP-37a-2 check 15, RULE-114): the sheet's pop and rises, the same way
+    if (!shown && hubWasShown) landBase = false; // BP-40a-2a: an owed landing is this visit's only
+    if (shown && !hubWasShown && aarSeen) landBase = true; // BP-40a-2a (R2): back from an AAR
     if (shown && !hubWasShown && endOnHub) { // a Section lost while away ends the run now, before any read
       const kind = endOnHub;
       endOnHub = null;
@@ -2150,6 +2165,7 @@ function watch() {
       if (op) rosterDue = true;
       else freshRoster();
     }
+    if (shown && !hubWasShown && landBase && lastBody) landOnBase(); // BP-40a-2a (R1, R2): the cached map's held body decides now
     if (shown && !hubWasShown && op) load(); // a contract latches on this read (Reviewer BP-11a-2 CF1); a laden haul still reads (BP-10b F3)
     hubWasShown = shown;
   }).observe(hub, { attributes: true, attributeFilter: ['hidden'] });
@@ -2308,15 +2324,18 @@ export function mountOps(d) {
   strip.append(titleNode, dig.node, ...lineNodes, outNode, waysRow, actions);
   bankChip = el('div', 'ops-banked');
   bankChip.hidden = true;
-  baseButton = el('button', 'ops-base', BASE_COPY.button);
+  baseButton = el('button', 'btn btn-bar ops-base', BASE_COPY.button); // BP-40a-2a (item 4): in the bottom bar
   baseButton.type = 'button';
   baseButton.hidden = true;
   baseButton.addEventListener('click', () => (baseOpen ? closeBase() : openBase()));
+  // BP-40a-2a (R1): Continue on an entry reveal (sign-in, a 401's re-sign-in, a new run, a resume, a lost mission) owes
+  // a landing; Continue on Your Company does not. Taken before the keeper's listener, so demo_company's flag still holds.
+  deps.$('btn-continue').addEventListener('click', () => { if (!companyShown()) landBase = true; }, true);
   baseSheet = createBase(sendBuild, closeBase, openSickbay); // BP-33: + the Medbay's button
   list = createList();
   // A13, BP-25: the Demo Shop screen (demo_shop.js) from the hub at any time (no ops call). Its Buy opens
   // today's checkout as before; leaving either returns to the hub.
-  const shopButton = el('button', 'ops-shop', COPY.shop);
+  const shopButton = el('button', 'btn btn-bar ops-shop', COPY.shop); // BP-40a-2a (item 4): in the bottom bar
   shopButton.type = 'button';
   shopButton.addEventListener('click', () => openShop());
   crewCardNode = el('section', 'crew-card'); // BP-34 (item 17): the Crew's own fight, on the hub
@@ -2333,7 +2352,8 @@ export function mountOps(d) {
   recentre.addEventListener('click', () => { if (map) map.home(); });
   glowNode = el('canvas', 'ops-glow'); // BP-37b (item 4): over the map, under every demo node
   deps.$('hub-map').after(glowNode);
-  deps.$('screen-hub').append(strip, bankChip, baseButton, recentre, shopButton, baseSheet.node, list.node, crewCardNode);
+  deps.$('screen-hub').append(strip, bankChip, recentre, baseSheet.node, list.node, crewCardNode);
+  deps.$('screen-hub').querySelector('.hub-bottom').append(baseButton, shopButton); // BP-40a-2a (item 4): after Company and Missions
   mountShop(deps); // BP-25
   endNote = el('p', 'end-ops');
   endNote.hidden = true;
