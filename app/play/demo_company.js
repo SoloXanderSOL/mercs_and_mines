@@ -299,7 +299,7 @@ let drawnKey = null;  // the open card's drawn state, the countdown left out (Re
 let selling = null;   // BP-28b: the open Sell row: { key, ore }, the amount Sell will post
 let sold = null;      // BP-28b: the last sale's line, on the card that made it: { key, ore }
 let hireBox = null;   // BP-18b-1: the squad hire block on the Company screen
-let sickbayNext = false; // BP-33: the reveal about to render was asked for by the base's Medbay button
+let companyNext = null; // BP-33, BP-40a-2b: the reveal about to render was asked for by the base: 'company', 'section', 'crew' or 'heal'
 
 // BP-24b: the name ask. A 201 join marks its campaign, in sessionStorage so a reload mid-ask asks again, with an
 // in-page Set for private mode; Name it's answers, Not now and Continue settle it. Keyed on the join, never on
@@ -449,10 +449,12 @@ function dressReveal(container) {
     shelf.setAttribute('tabindex', '0');
     list.append(shelf);
   }
-  // BP-33: the Medbay's open: the Section card that needs healing goes on top (after the hideCard() above).
-  const sick = sickbayNext;
-  sickbayNext = false;
-  if (sick && opened) openCard('section', sickbayIndex());
+  // BP-33, BP-40a-2b (R4): the base's ask: Heal puts the Section card that needs healing on top, Sections the first
+  // Section's card, Crew the first Crew's (its Foreman rows included); Your Company no card (after the hideCard() above).
+  const next = companyNext;
+  companyNext = null;
+  if (next === 'heal' && opened) openCard('section', sickbayIndex());
+  else if ((next === 'section' || next === 'crew') && opened) openCard(next, 0);
   // BP-18b-1: the squad hire, once, above the chips (from the hub, with an adopted body that carries company.hire):
   // #reveal-content scrolls with it below them (measured: scrollHeight 949 to 1024 against clientHeight 600).
   hireBox = null;
@@ -553,12 +555,15 @@ function drawHire() {
 // redrawCompany does), and dressReveal opens the first Section with wounded or healing soldiers, else the first
 // Section. The flag lives one task: the content observer's microtask runs before the clearing one, so a Back that
 // rendered no reveal leaves nothing pending.
-export function openSickbay() {
+// BP-40a-2b: any building box's way into the Company screen, with the card `kind` asks for ('company' asks for none).
+export function openCompanyAt(kind) {
   if (!deps) return;
-  sickbayNext = true;
+  companyNext = kind;
   deps.$('btn-back').click();
-  queueMicrotask(() => { sickbayNext = false; });
+  queueMicrotask(() => { companyNext = null; });
 }
+
+export function openSickbay() { openCompanyAt('heal'); }
 
 function sickbayIndex() {
   const r = roster();

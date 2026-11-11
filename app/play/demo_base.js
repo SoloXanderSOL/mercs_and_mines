@@ -49,7 +49,6 @@ export const BASE_COPY = {
   oneAtATime: 'One building goes up at a time.',
   pop: '−{n} ore',
   close: 'Close',
-  pick: '{name} · {cost} ore', // BP-35: the plot card's title
   medbay: 'Open the Medbay', // BP-33: a built Medbay's button
   endBase: 'Banked ore and credits do not transfer. The base stays on the old books.',
   endBaseOut: 'Banked ore and credits do not transfer. The base stays on the old books; ore on site and in transit is written off.',
@@ -83,6 +82,20 @@ const SPRITE = {
   gunsmith: [16.74, 56.1, 22.91],
   basic_smelter: [58.92, 55.41, 22.39],
 };
+// BP-40a-2b (BP-40 items 2-3): the Tent is painted into the band, with no id, pad or Build, so it is a clear button over
+// the painting: [left, top, width, height] in % of the band (Wiki-measured on base_plot_band.jpg: canvas and sandbags).
+const TENT = 'tent';
+const TENT_BOX = [38.2, 3.3, 23.8, 20.5];
+// Each building's tag over its pad, its box's line and the box's one button (demo_ops.js's onTarget sends it on).
+// Lines: Wiki's, from the tech tree's click-text where it fits (the Director's script pass may reword).
+const BOX = {
+  tent: { name: 'Operations Tent', tag: 'COMPANY', button: 'Your Company', line: 'Every permit on this base was signed here. The stamp is broken.' },
+  radio_shack: { tag: 'INTEL', button: 'World Map', line: 'Range: three hexes. The operator hears Sector 7 anyway.' },
+  hobbyist_benches: { tag: 'MEDBAY', button: 'Heal', line: 'The surgeon was a vet before the war. He is confident.' },
+  grease_pit: { tag: 'MISSIONS', button: 'Missions', line: 'Where vehicles go to be patched, parked and quietly blamed for the last convoy.' },
+  gunsmith: { tag: 'MERCS', button: 'Sections', line: 'Turns steel into arguments that end quickly.' },
+  basic_smelter: { tag: 'CREW', button: 'Crew', line: 'Rock goes in, money comes out. The Trust is unimpressed.' },
+};
 
 export const BASE_CSS = `
 /* BP-40a-2a (item 4): .ops-base is a .btn-bar button in the hub's bottom bar (play.css), no longer on the map's top edge */
@@ -111,7 +124,7 @@ export const BASE_CSS = `
 .base-close { width: auto; max-width: none; min-height: 8.5cqw; padding: 0 3cqw; font-size: 3.6cqw; }
 .base-plot { position: relative; flex: none; }
 .base-plot-img { display: block; width: 100%; height: auto; aspect-ratio: 1008 / 1050; border-radius: 1.5cqw; }
-.base-plot-sprite { position: absolute; height: auto; pointer-events: none; }
+.base-plot-sprite { position: absolute; height: auto; cursor: pointer; } /* BP-40a-2b: built or not, a tap opens its box */
 .base-plot-sprite[hidden] { display: none; }
 .base-plot-sprite.dim { filter: grayscale(1); opacity: 0.35; pointer-events: auto; cursor: pointer; } /* BP-35: an empty pad shows its building, dimmed; tap it to build */
 .base-plot-sprite.just { animation: base-rise 0.4s ease-out; }
@@ -122,7 +135,13 @@ export const BASE_CSS = `
 .base-pick-name { margin: 0; font-family: var(--display); font-weight: 800; font-size: 4.2cqw; line-height: 1.1; }
 .base-pick-effect { margin: 0; font-size: 3.4cqw; line-height: 1.3; color: var(--accent); }
 .base-pick-row { display: flex; gap: 2cqw; align-items: center; }
-.base-pick-build, .base-pick-close { width: auto; max-width: none; min-height: 8.5cqw; padding: 0 2.5cqw; font-size: 3.6cqw; }
+.base-pick-build, .base-pick-go, .base-pick-close { width: auto; max-width: none; min-height: 8.5cqw; padding: 0 2.5cqw; font-size: 3.6cqw; }
+/* BP-40a-2b: the box's line, the Tent's clear button, and the tags in the map labels' style (canvas there: 800 12px, 3 px stroke) */
+.base-pick-flavour { margin: 0; font-size: 3.1cqw; line-height: 1.25; color: var(--muted); }
+.base-pick-build[hidden], .base-pick-effect[hidden] { display: none; }
+.base-plot-tent { position: absolute; margin: 0; padding: 0; border: 0; background: none; cursor: pointer; }
+.base-tag { position: absolute; transform: translate(-50%, calc(-100% - 0.5cqw)); padding: 0 0.5cqw; font-family: var(--display); font-weight: 800; font-size: 3cqw; line-height: 3.25cqw; color: #ffffff; -webkit-text-stroke: 0.75cqw #0b0b0c; paint-order: stroke fill; white-space: nowrap; pointer-events: none; }
+.base-tag.in { transform: translate(-50%, 0.5cqw); } /* the Tent's sits on its roof, inside the plot */
 ${BASE.map(b => artCss(b.id)).join('\n')}
 @media (prefers-reduced-motion: reduce) {
   .base-art { transition: none; }
@@ -146,24 +165,33 @@ function replay(node, className) {
   node.classList.add(className);
 }
 
-// BP-35: draws the plot card for v.pick from that building's list slot (its Build label and disabled state, which
-// renderBase has just set), or hides it when nothing is picked or the picked building stands. The texts are
-// emptied while hidden, so no text search finds a second Build.
+// BP-35, BP-40a-2b: draws the box for v.pick: the name, its line, its effect, Build while the building isn't standing
+// (the list slot's label and disabled state, which renderBase has just set) and its one button; or hides it when
+// nothing is picked. The Tent always stands and has no slot or effect. A box stays open when its building goes up
+// (R9). The texts are emptied while hidden, so no text search finds a second Build.
 function drawPick(v) {
-  const s = v.pick ? v.slots.find(x => x.b.id === v.pick) : null;
-  const open = Boolean(s) && !s.slot.classList.contains('built');
+  const box = v.pick ? BOX[v.pick] : null;
+  const s = box && v.pick !== TENT ? v.slots.find(x => x.b.id === v.pick) : null;
+  const open = Boolean(box) && (v.pick === TENT || Boolean(s));
+  const up = open && (!s || s.slot.classList.contains('built'));
   const c = v.card;
   c.node.hidden = !open;
-  c.node.classList.toggle('top', open && SPRITE[s.b.id][1] > 45);
-  c.name.textContent = open ? fill(BASE_COPY.pick, { name: s.b.name, cost: s.b.cost }) : '';
-  c.effect.textContent = open ? s.b.effect : '';
-  c.build.textContent = open ? s.button.textContent : '';
-  c.build.disabled = !open || s.button.disabled;
+  c.node.classList.toggle('top', Boolean(s) && SPRITE[v.pick][1] > 45);
+  c.name.textContent = open ? (s ? s.b.name : box.name) : '';
+  c.flavour.textContent = open ? box.line : '';
+  c.effect.textContent = s ? s.b.effect : '';
+  c.effect.hidden = !s;
+  c.build.textContent = open && !up ? s.button.textContent : '';
+  c.build.hidden = up;
+  c.build.disabled = !open || up || s.button.disabled;
+  c.go.textContent = open ? box.button : '';
+  c.go.disabled = !open || (v.pick === 'grease_pit' && v.fight); // R8: as the bar's Missions
   if (!open) v.pick = null;
 }
 
-// `onBuild(id)`, `onClose()` and `onMedbay()` (BP-33) are demo_ops.js's; the sheet only calls them.
-export function createBase(onBuild, onClose, onMedbay) {
+// `onBuild(id)`, `onClose()`, `onMedbay()` (BP-33) and `onTarget(id)` (BP-40a-2b: a box's one button, the Tent's id
+// 'tent') are demo_ops.js's; the sheet only calls them.
+export function createBase(onBuild, onClose, onMedbay, onTarget) {
   const node = el('section', 'base-sheet');
   node.hidden = true;
   const head = el('div', 'base-head');
@@ -200,6 +228,17 @@ export function createBase(onBuild, onClose, onMedbay) {
   ground.addEventListener('error', () => plot.remove());
   ground.src = PLOT;
   plot.append(ground);
+  // BP-40a-2b (R1): the Tent's clear button goes in before the sprites, so a building keeps its own tap where their
+  // boxes overlap (the Radio Shack's and the Medbay's; spec check §5).
+  const tent = el('button', 'base-plot-tent');
+  tent.type = 'button';
+  tent.setAttribute('aria-label', BOX[TENT].name);
+  tent.style.left = `${TENT_BOX[0]}%`;
+  tent.style.top = `${TENT_BOX[1]}%`;
+  tent.style.width = `${TENT_BOX[2]}%`;
+  tent.style.height = `${TENT_BOX[3]}%`;
+  tent.addEventListener('click', () => { v.pick = TENT; drawPick(v); });
+  plot.append(tent);
   const sprites = {};
   for (const b of BASE) {
     const img = el('img', 'base-plot-sprite');
@@ -211,8 +250,7 @@ export function createBase(onBuild, onClose, onMedbay) {
     img.style.top = `${top}%`;
     img.style.width = `${width}%`;
     img.addEventListener('error', () => img.remove());
-    img.addEventListener('click', () => { // BP-35: only an empty (dimmed) pad takes a tap
-      if (!img.classList.contains('dim')) return;
+    img.addEventListener('click', () => { // BP-35, BP-40a-2b: every pad takes a tap and opens its box, built or not
       v.pick = b.id;
       drawPick(v);
     });
@@ -220,24 +258,44 @@ export function createBase(onBuild, onClose, onMedbay) {
     plot.append(img);
     sprites[b.id] = img;
   }
-  // BP-35: the plot card. Its Build sends the same onBuild as the list's; its close only drops the pick.
+  // BP-40a-2b (item 2): a one-word tag over every building, the Tent's on its roof; under the box, never taking a tap.
+  for (const id of [TENT, ...BASE.map(b => b.id)]) {
+    const tag = el('span', id === TENT ? 'base-tag in' : 'base-tag', BOX[id].tag);
+    tag.dataset.building = id;
+    const [left, top, width] = id === TENT ? TENT_BOX : SPRITE[id];
+    tag.style.left = `${left + width / 2}%`;
+    tag.style.top = `${top}%`;
+    plot.append(tag);
+  }
+  // BP-35, BP-40a-2b (item 3): the building's box. Its Build sends the same onBuild as the list's; its one button drops
+  // the box first, so a return to the base never finds it open (R7), then goes; its close only drops the pick.
   const card = el('div', 'base-pick');
   card.hidden = true;
   const cardName = el('p', 'base-pick-name');
+  const cardFlavour = el('p', 'base-pick-flavour');
   const cardEffect = el('p', 'base-pick-effect');
   const cardBuild = el('button', 'btn btn-primary base-pick-build');
   cardBuild.type = 'button';
   cardBuild.addEventListener('click', () => { if (v.pick) onBuild(v.pick); });
+  const cardGo = el('button', 'btn btn-primary base-pick-go');
+  cardGo.type = 'button';
+  cardGo.addEventListener('click', () => {
+    const id = v.pick;
+    if (!id) return;
+    v.pick = null;
+    drawPick(v);
+    onTarget(id);
+  });
   const cardClose = el('button', 'btn base-pick-close', '✕');
   cardClose.type = 'button';
   cardClose.setAttribute('aria-label', BASE_COPY.close);
   cardClose.addEventListener('click', () => { v.pick = null; drawPick(v); });
   const cardRow = el('div', 'base-pick-row');
-  cardRow.append(cardBuild, cardClose);
-  card.append(cardName, cardEffect, cardRow);
+  cardRow.append(cardBuild, cardGo, cardClose);
+  card.append(cardName, cardFlavour, cardEffect, cardRow);
   plot.append(card);
   node.append(head, bankedEl, pop, note, plot, ...slots.map(s => s.slot));
-  const v = { node, bankedEl, pop, note, slots, sprites, pick: null, card: { node: card, name: cardName, effect: cardEffect, build: cardBuild } };
+  const v = { node, bankedEl, pop, note, slots, sprites, pick: null, fight: false, card: { node: card, name: cardName, flavour: cardFlavour, effect: cardEffect, build: cardBuild, go: cardGo } };
   return v;
 }
 
@@ -278,6 +336,7 @@ export function renderBase(v, s, built, paid) {
   if (!s.rate) note = done || note || (lock ? BASE_COPY.oneAtATime : '');
   v.note.textContent = note;
   v.note.hidden = !note;
+  v.fight = Boolean(s.fight); // BP-40a-2b (R8): the Grease Pit's Missions is shut while a raid or an ambush waits
   drawPick(v); // BP-35
   v.node.hidden = false;
 }

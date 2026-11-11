@@ -48,7 +48,7 @@ import { mountStory, writeAar } from './demo_story.js';
 import { showCard, cardSeen } from './demo_card.js';
 import { mountShop, openShop } from './demo_shop.js'; // BP-25
 import { mountReview, countContract } from './demo_review.js'; // BP-27
-import { mountCompany, dressBriefing, renderCompany, redrawCompany, healPrice, wageLine, SELL_ORE_CREDITS, openSickbay, companyShown } from './demo_company.js';
+import { mountCompany, dressBriefing, renderCompany, redrawCompany, healPrice, wageLine, SELL_ORE_CREDITS, openSickbay, openCompanyAt, companyShown } from './demo_company.js';
 import { DIG_COPY, DIG_CSS, createDigPanel, renderDig, hideDig, quietDig, homewardLines, flash, bankedLine, crewFightLine, crewCard } from './demo_dig.js';
 import { BASE_COPY, BASE_CSS, createBase, renderBase, hideBase, quietBase } from './demo_base.js';
 import { mountMore } from './demo_more.js'; // BP-29b
@@ -459,6 +459,7 @@ let fightPick = null; // BP-18b-1: the fought op's squad, { commander_id, sectio
 let hiredNote = false; // BP-18b-1: a squad hire landed; the Company screen says so until it closes
 let endOnHub = null;   // a Section-at-0 end of run waiting for the hub, so it never cuts an AAR (Reviewer BP-11b-1 F1)
 let listOpen = false;   // the contracts list is showing
+let listBack = false;   // BP-40a-2b (R5): the list was opened over the base sheet, so its Close goes back to it
 let glowNode = null;    // BP-37b: the glow's own canvas over the map
 let glowRaf = 0;        // BP-37b: the pending glow frame (rAF only: a timer would count into timers_started)
 let glowLast = 0;       // BP-37b: performance.now() at the last loop paint
@@ -795,7 +796,7 @@ function refresh() {
     if (so && progress(so) < 1) shownSecs = secsLeft(so);
     if (baseOpen) {
       list.node.hidden = true;
-      renderBase(baseSheet, { base, banked, credits, out: Boolean(op), held: held(), rate, going: goingUp() }, justBuilt, justPaid);
+      renderBase(baseSheet, { base, banked, credits, out: Boolean(op), held: held(), rate, going: goingUp(), fight: Boolean(battleOf(op)) }, justBuilt, justPaid);
       justBuilt = null;
       justPaid = null;
       armBaseTick();
@@ -1093,20 +1094,37 @@ function closeBase() {
   refresh();
 }
 
+// BP-40a-2b (item 3): a building box's one button. The Radio Shack shows the map, the Grease Pit the contracts list
+// (whose Close comes back here, R5); the Tent, the Gunsmith, the Smelter and the Medbay open the Company screen through
+// the hub's own Your Company path, the last three with a card on top (R4).
+function baseTarget(id) {
+  if (id === 'radio_shack') return closeBase();
+  if (id === 'grease_pit') return openList();
+  openCompanyAt(id === 'gunsmith' ? 'section' : id === 'basic_smelter' ? 'crew' : id === 'hobbyist_benches' ? 'heal' : 'company');
+}
+
 // ── the contracts list (A2) ──────────────────────────────────────────────────
 // Missions opens the board's contracts, not the keeper list: a row hands off to its pin, so every
 // contract is walked to and fought on site.
+// BP-40a-2b (R5, R6): over the base sheet (the bar's Missions, the Grease Pit's box) the notes are kept: the sheet only
+// ever holds a landing's or a later body's, still unseen, and they show when the sheet closes (Reviewer BP-40a-2a r1 F1).
 function openList() {
+  listBack = baseOpen;
   listOpen = true;
   baseOpen = false;
   picker = false;
-  noDigOpen = false;
-  bankNote = null; crewNote = null; tripNote = null;
+  if (!listBack) {
+    noDigOpen = false;
+    bankNote = null; crewNote = null; tripNote = null;
+  }
   refresh();
 }
 
+// BP-40a-2b (R5): back to the sheet the list was opened over, its notes kept (never openBase(), which drops them).
 function closeList() {
   listOpen = false;
+  if (listBack) baseOpen = true;
+  listBack = false;
   refresh();
 }
 
@@ -2331,7 +2349,7 @@ export function mountOps(d) {
   // BP-40a-2a (R1): Continue on an entry reveal (sign-in, a 401's re-sign-in, a new run, a resume, a lost mission) owes
   // a landing; Continue on Your Company does not. Taken before the keeper's listener, so demo_company's flag still holds.
   deps.$('btn-continue').addEventListener('click', () => { if (!companyShown()) landBase = true; }, true);
-  baseSheet = createBase(sendBuild, closeBase, openSickbay); // BP-33: + the Medbay's button
+  baseSheet = createBase(sendBuild, closeBase, openSickbay, baseTarget); // BP-33: + the Medbay's button; BP-40a-2b: + the boxes'
   list = createList();
   // A13, BP-25: the Demo Shop screen (demo_shop.js) from the hub at any time (no ops call). Its Buy opens
   // today's checkout as before; leaving either returns to the hub.
