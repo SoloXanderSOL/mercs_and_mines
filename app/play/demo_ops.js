@@ -2169,6 +2169,18 @@ function sendBuy(ore, price, onDone) {
   send(opsPath(campaignId) + '/buy', { ore }, false, () => ore * price, undefined, onDone);
 }
 
+// BP-43b-2: sell one Trophy Shelf item at `price` (company.trade.loot[grade], read at the draw that built the confirm);
+// allowed with a team out (BP-43a). The item is named as equip names it, and the server sells the first equal entry.
+// Its spend is the proceeds, negative, as a sale of ore (Reviewer BP-43b-1), so a contract its body latches reports its
+// pay alone. Its 409 (the item has left the shelf) re-reads through send's REFUSAL.notOnShelf branch as kind 'gone',
+// and the Shop draws the line (target 'shop', which no Company card's noticeLine matches).
+function sendSellLoot(item, price, onDone) {
+  if (held() || !campaignId) return;
+  companyNotice = null;
+  companyAsk = { action: 'sell_loot', target: 'shop' };
+  send(opsPath(campaignId) + '/sell_loot', { item: { item_name: item.item_name, quality_grade: item.quality_grade } }, false, () => -price, undefined, onDone);
+}
+
 // ── the hub's re-entry and the end screen ─────────────────────────────────────
 // Both are seen through their `hidden` attribute, which main.js's show() sets, so no keeper code
 // calls in here. Back on the hub with an op out, one read latches a fought raid, ambush or
@@ -2357,7 +2369,9 @@ export function mountOps(d) {
   baseButton = el('button', 'btn btn-bar ops-base', BASE_COPY.button); // BP-40a-2a (item 4): in the bottom bar
   baseButton.type = 'button';
   baseButton.hidden = true;
-  baseButton.addEventListener('click', () => (baseOpen ? closeBase() : openBase()));
+  // BP-43b-2 (R-a; Reviewer BP-40a-2b F1): with the list open over the base sheet, the bar's Base goes back to that sheet
+  // through closeList(), which keeps the notes R6 kept, as the list's Close does; openBase() would drop them.
+  baseButton.addEventListener('click', () => (baseOpen ? closeBase() : listOpen && listBack ? closeList() : openBase()));
   // BP-40a-2a (R1): Continue on an entry reveal (sign-in, a 401's re-sign-in, a new run, a resume, a lost mission) owes
   // a landing; Continue on Your Company does not. Taken before the keeper's listener, so demo_company's flag still holds.
   deps.$('btn-continue').addEventListener('click', () => { if (!companyShown()) landBase = true; }, true);
@@ -2395,6 +2409,8 @@ export function mountOps(d) {
     clearNotice: () => { companyNotice = null; },
     sell: sendSell,
     buy: sendBuy,
+    trophies: () => company.trophies, // BP-43b-2: the shelf, as the Company view reads it
+    sellLoot: sendSellLoot, // BP-43b-2
   });
   endNote = el('p', 'end-ops');
   endNote.hidden = true;

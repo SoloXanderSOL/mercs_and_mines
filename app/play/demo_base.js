@@ -9,26 +9,28 @@
 import { bankedLine } from './demo_dig.js';
 
 // One row per building, in the order of the server's `base` keys.
+// BP-43b-2 (R-b; Director copy ruling 2026-11-11): `flavour` is the building's one line, verbatim, the same before and
+// after it stands, read by both the list card and the building's box (drawPick). The Tent's is in BOX.
 export const BASE = [
   { id: 'radio_shack', name: 'Radio Shack', cost: 50,
     effect: 'Raid risk 3% a drill, down from 5%.',
-    flavour: 'A scrap dish on a leaning pipe mast. It hears raiders coming.',
+    flavour: 'A scrap dish on a leaning pipe mast. It hears raiders coming - sometimes. Can be a bit hit and miss.',
     done: "Radio Shack operational. Raiders get heard before they're seen." },
   { id: 'hobbyist_benches', name: 'Medbay', cost: 120, // BP-33: the Benches renamed; the key stays
     effect: 'Patch up 20 credits a head, not 40.',
-    flavour: 'A field clinic with a strong stomach. Heals the wounded at half the price.',
+    flavour: 'The surgeon was a vet even before the previous war. He is confident. His patients less so.',
     done: 'Medbay open. Patch-ups at half price.' },
   { id: 'grease_pit', name: 'The Grease-Pit', cost: 80,
     effect: 'A lost ambush costs a quarter of the haul.',
-    flavour: 'Light vehicles, slow manual repairs. Armoured enough to argue with an ambush.',
+    flavour: 'Where vehicles go to be patched, parked and quietly blamed for the last convoy losing half its cargo.',
     done: 'Grease-Pit operational. Hauls ride armoured.' },
   { id: 'gunsmith', name: 'Gunsmith', cost: 100,
     effect: '+10 on every fight your mercs take.',
-    flavour: 'Slug-rifles, re-bored and re-blessed. The mercs hit harder.',
+    flavour: 'Turns steel into tools for ending arguments quickly and not diplomatically.',
     done: 'Gunsmith operational. The mercs hit harder.' },
   { id: 'basic_smelter', name: 'Basic Smelter', cost: 80,
     effect: 'Ore per drill up a quarter.',
-    flavour: 'A furnace, a chute and a man with tongs. More of every load comes out as ore.',
+    flavour: 'Rock goes in, money comes out. After the G.U.N. has taken its cut, of course.',
     done: 'Smelter operational. Every drill yields more.' },
 ];
 
@@ -86,15 +88,15 @@ const SPRITE = {
 // the painting: [left, top, width, height] in % of the band (Wiki-measured on base_plot_band.jpg: canvas and sandbags).
 const TENT = 'tent';
 const TENT_BOX = [38.2, 3.3, 23.8, 20.5];
-// Each building's tag over its pad, its box's line and the box's one button (demo_ops.js's onTarget sends it on).
-// Lines: Wiki's, from the tech tree's click-text where it fits (the Director's script pass may reword).
+// Each building's tag over its pad and its box's one button (demo_ops.js's onTarget sends it on). BP-43b-2 (R-b): the
+// box's line is the building's BASE flavour; the Tent, which has no list card, keeps its name and its line here.
 const BOX = {
-  tent: { name: 'Operations Tent', tag: 'COMPANY', button: 'Your Company', line: 'Every permit on this base was signed here. The stamp is broken.' },
-  radio_shack: { tag: 'INTEL', button: 'World Map', line: 'Range: three hexes. The operator hears Sector 7 anyway.' },
-  hobbyist_benches: { tag: 'MEDBAY', button: 'Heal', line: 'The surgeon was a vet before the war. He is confident.' },
-  grease_pit: { tag: 'MISSIONS', button: 'Missions', line: 'Where vehicles go to be patched, parked and quietly blamed for the last convoy.' },
-  gunsmith: { tag: 'MERCS', button: 'Sections', line: 'Turns steel into arguments that end quickly.' },
-  basic_smelter: { tag: 'CREW', button: 'Crew', line: 'Rock goes in, money comes out. The Trust is unimpressed.' },
+  tent: { name: 'Operations Tent', tag: 'COMPANY', button: 'Your Company', flavour: 'Every permit on this base was signed and stamped here. The stamp is now broken. The paperwork continues unabated, just messier.' },
+  radio_shack: { tag: 'INTEL', button: 'World Map' },
+  hobbyist_benches: { tag: 'MEDBAY', button: 'Heal' },
+  grease_pit: { tag: 'MISSIONS', button: 'Missions' },
+  gunsmith: { tag: 'MERCS', button: 'Sections' },
+  basic_smelter: { tag: 'CREW', button: 'Crew' },
 };
 
 export const BASE_CSS = `
@@ -178,7 +180,7 @@ function drawPick(v) {
   c.node.hidden = !open;
   c.node.classList.toggle('top', Boolean(s) && SPRITE[v.pick][1] > 45);
   c.name.textContent = open ? (s ? s.b.name : box.name) : '';
-  c.flavour.textContent = open ? box.line : '';
+  c.flavour.textContent = open ? (s ? s.b.flavour : box.flavour) : ''; // BP-43b-2 (R-b): one source
   c.effect.textContent = s ? s.b.effect : '';
   c.effect.hidden = !s;
   c.build.textContent = open && !up ? s.button.textContent : '';
