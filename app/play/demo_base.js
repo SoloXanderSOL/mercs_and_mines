@@ -5,6 +5,8 @@
 // board, the bank and every POST. The server sends which buildings stand (`base`, five bools) and
 // the one going up (`construction`, BP-21b); the costs and the copy live here, and the harness pins the costs to the server's
 // (Reviewer BP-10a CF1). Every string goes in through textContent.
+// BP-40b: the plot pinch-zooms and drags inside its frame, like the map; the zoom is the sheet's own view state, kept
+// across refreshes and reset to 1x whenever the sheet closes or the hub hides or returns.
 
 import { bankedLine } from './demo_dig.js';
 
@@ -88,6 +90,12 @@ const SPRITE = {
 // the painting: [left, top, width, height] in % of the band (Wiki-measured on base_plot_band.jpg: canvas and sandbags).
 const TENT = 'tent';
 const TENT_BOX = [38.2, 3.3, 23.8, 20.5];
+// BP-40b (Director ruling 2026-11-09): pinch-zoom and drag on the plot, like the map. The frame stays put; the ground,
+// the Tent and the sprites zoom in one layer (.base-plot-zoom), and the tags and the box stay outside it, full size.
+// The view is { s, tx, ty }: a scale from 1 (the whole plot) to MAX_ZOOM and a pan in % of the plot. TAP_SLOP is
+// hexmap.js's. MAX_ZOOM: the art is about 1:1 at DPR 3, so every zoom is an upscale (spec check 4; a device line).
+const TAP_SLOP = 8;
+const MAX_ZOOM = 2.5;
 // Each building's tag over its pad and its box's one button (demo_ops.js's onTarget sends it on). BP-43b-2 (R-b): the
 // box's line is the building's BASE flavour; the Tent, which has no list card, keeps its name and its line here.
 const BOX = {
@@ -124,8 +132,12 @@ export const BASE_CSS = `
 .base-flavour { margin: 0; font-size: 3.1cqw; line-height: 1.25; color: var(--muted); }
 .base-build, .base-open { width: auto; max-width: none; min-height: 8.5cqw; margin-top: 0.8cqw; padding: 0 2.5cqw; font-size: 3.6cqw; align-self: flex-start; }
 .base-close { width: auto; max-width: none; min-height: 8.5cqw; padding: 0 3cqw; font-size: 3.6cqw; }
-.base-plot { position: relative; flex: none; }
-.base-plot-img { display: block; width: 100%; height: auto; aspect-ratio: 1008 / 1050; border-radius: 1.5cqw; }
+.base-plot { position: relative; flex: none; overflow: hidden; border-radius: 1.5cqw; } /* BP-40b: the frame; the radius moved here from the ground */
+.base-plot-img { display: block; width: 100%; height: auto; aspect-ratio: 1008 / 1050; }
+/* BP-40b: the layer that zooms, in flow, so the ground still sets the plot's height. touch-action: none makes every
+   finger on the art ours: one pans (or scrolls the sheet at 1x), two pinch (spec check 2 (b)). */
+.base-plot-zoom { position: relative; transform-origin: 0 0; touch-action: none; }
+.base-plot-zoom img { -webkit-user-drag: none; }
 .base-plot-sprite { position: absolute; height: auto; cursor: pointer; } /* BP-40a-2b: built or not, a tap opens its box */
 .base-plot-sprite[hidden] { display: none; }
 .base-plot-sprite.dim { filter: grayscale(1); opacity: 0.35; pointer-events: auto; cursor: pointer; } /* BP-35: an empty pad shows its building, dimmed; tap it to build */
@@ -165,6 +177,104 @@ function replay(node, className) {
   node.classList.remove(className);
   void node.offsetWidth;
   node.classList.add(className);
+}
+
+// BP-40b: the art always covers the frame: s in [1, MAX_ZOOM], the pan in [100 - 100 s, 0] % on each axis.
+function clampZoom(z) {
+  z.s = Math.min(MAX_ZOOM, Math.max(1, z.s));
+  const lo = 100 - 100 * z.s;
+  z.tx = Math.min(0, Math.max(lo, z.tx));
+  z.ty = Math.min(0, Math.max(lo, z.ty));
+}
+
+// BP-40b: writes the view: the layer's transform (none at 1x, as before the brick) and each tag over its building at
+// full size, so text is never enlarged. At 1x every tag gets back the exact % it was built with.
+function applyZoom(z) {
+  const at1 = z.s === 1 && !z.tx && !z.ty;
+  z.node.style.transform = at1 ? '' : `translate(${z.tx}%, ${z.ty}%) scale(${z.s})`;
+  for (const t of z.tags) {
+    t.node.style.left = `${z.tx + t.x * z.s}%`;
+    t.node.style.top = `${z.ty + t.y * z.s}%`;
+  }
+}
+
+// One frame queued at most, drawn only while a pointer moves (hexmap.js's requestFrame).
+function frameZoom(z) {
+  if (!z.frame) z.frame = requestAnimationFrame(() => { z.frame = 0; applyZoom(z); });
+}
+
+// Back to 1x with no gesture held. Writes nothing when the view is already at 1x with no frame pending.
+function resetZoom(z) {
+  const dirty = Boolean(z.frame) || z.s !== 1 || Boolean(z.tx) || Boolean(z.ty);
+  if (z.frame) cancelAnimationFrame(z.frame);
+  Object.assign(z, { s: 1, tx: 0, ty: 0, g: null, moved: false, swallow: false, frame: 0 });
+  z.pts.clear();
+  if (dirty) applyZoom(z);
+}
+
+// hexmap.js's gestureMove in % of the plot. One finger pans once zoomed; at 1x it scrolls the sheet instead, since the
+// layer's touch-action takes the browser's own scroll away. Two fingers pinch about their midpoint.
+function moveZoom(z, plot, sheet) {
+  const g = z.g;
+  const r = plot.getBoundingClientRect();
+  if (!g || !r.width || !r.height) return;
+  const pts = [...z.pts.values()];
+  if (pts.length === 1 && g.pts.length === 1) {
+    const dx = pts[0].x - g.pts[0].x, dy = pts[0].y - g.pts[0].y;
+    if (g.s === 1) { sheet.scrollTop = g.top - dy; return; } // at 1x a finger on the art scrolls the sheet
+    z.tx = g.tx + dx / r.width * 100;
+    z.ty = g.ty + dy / r.height * 100;
+  } else if (pts.length >= 2 && g.pts.length >= 2) {
+    const d0 = Math.hypot(g.pts[0].x - g.pts[1].x, g.pts[0].y - g.pts[1].y) || 1;
+    const d1 = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+    // keep the plot point under the starting midpoint under the current midpoint
+    const m0x = ((g.pts[0].x + g.pts[1].x) / 2 - r.left) / r.width * 100, m0y = ((g.pts[0].y + g.pts[1].y) / 2 - r.top) / r.height * 100;
+    const m1x = ((pts[0].x + pts[1].x) / 2 - r.left) / r.width * 100, m1y = ((pts[0].y + pts[1].y) / 2 - r.top) / r.height * 100;
+    z.s = Math.min(MAX_ZOOM, Math.max(1, g.s * d1 / d0));
+    z.tx = m1x - (m0x - g.tx) / g.s * z.s;
+    z.ty = m1y - (m0y - g.ty) / g.s * z.s;
+  } else return;
+  clampZoom(z);
+  frameZoom(z);
+}
+
+// BP-40b: the plot's gestures. No pointer capture: a captured mouse click is retargeted off the sprite (spec check H1).
+// The gesture re-anchors whenever the finger count changes, so 2 -> 1 fingers pans on without a jump. A gesture that
+// moved past TAP_SLOP or had two fingers down eats the next real click in the layer (a mouse drag still clicks); a
+// touch drag clicks nothing, so every pointerdown clears it (H3). A click from el.click() or a key (detail 0) is never
+// eaten.
+function bindZoom(z, plot, sheet) {
+  const layer = z.node;
+  const start = () => {
+    z.g = { pts: [...z.pts.values()].map(p => ({ ...p })), s: z.s, tx: z.tx, ty: z.ty, top: sheet.scrollTop };
+  };
+  const end = e => {
+    if (!z.pts.delete(e.pointerId)) return;
+    if (z.moved) z.swallow = true;
+    start();
+  };
+  layer.addEventListener('pointerdown', e => {
+    z.pts.delete(e.pointerId); // a pointer we still hold lost its up (a mouse released outside the plot)
+    if (!z.pts.size) { z.moved = false; z.down = { x: e.clientX, y: e.clientY }; }
+    z.swallow = false; // H3: cleared at every press
+    z.pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (z.pts.size > 1) z.moved = true;
+    start();
+  });
+  layer.addEventListener('pointermove', e => {
+    if ((e.pointerType === 'mouse' && !e.buttons) || !z.pts.has(e.pointerId)) return;
+    z.pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (!z.moved && Math.hypot(e.clientX - z.down.x, e.clientY - z.down.y) > TAP_SLOP) z.moved = true;
+    moveZoom(z, plot, sheet);
+  });
+  layer.addEventListener('pointerup', end);
+  layer.addEventListener('pointercancel', end);
+  layer.addEventListener('click', e => {
+    if (!z.swallow || e.detail === 0) return;
+    z.swallow = false;
+    e.stopPropagation();
+    e.preventDefault();
+  }, true);
 }
 
 // BP-35, BP-40a-2b: draws the box for v.pick: the name, its line, its effect, Build while the building isn't standing
@@ -225,11 +335,13 @@ export function createBase(onBuild, onClose, onMedbay, onTarget) {
     return { b, slot, stamp, button, open };
   });
   const plot = el('div', 'base-plot');
+  const layer = el('div', 'base-plot-zoom'); // BP-40b: what zooms; the tags and the box stay on the plot
   const ground = el('img', 'base-plot-img');
   ground.alt = '';
   ground.addEventListener('error', () => plot.remove());
   ground.src = PLOT;
-  plot.append(ground);
+  layer.append(ground);
+  plot.append(layer);
   // BP-40a-2b (R1): the Tent's clear button goes in before the sprites, so a building keeps its own tap where their
   // boxes overlap (the Radio Shack's and the Medbay's; spec check §5).
   const tent = el('button', 'base-plot-tent');
@@ -240,7 +352,7 @@ export function createBase(onBuild, onClose, onMedbay, onTarget) {
   tent.style.width = `${TENT_BOX[2]}%`;
   tent.style.height = `${TENT_BOX[3]}%`;
   tent.addEventListener('click', () => { v.pick = TENT; drawPick(v); });
-  plot.append(tent);
+  layer.append(tent);
   const sprites = {};
   for (const b of BASE) {
     const img = el('img', 'base-plot-sprite');
@@ -251,16 +363,32 @@ export function createBase(onBuild, onClose, onMedbay, onTarget) {
     img.style.left = `${left}%`;
     img.style.top = `${top}%`;
     img.style.width = `${width}%`;
-    img.addEventListener('error', () => img.remove());
-    img.addEventListener('click', () => { // BP-35, BP-40a-2b: every pad takes a tap and opens its box, built or not
+    img.addEventListener('error', () => { // BP-40b (Reviewer BP-40a-2b F3): its tag goes with it
+      img.remove();
+      const tag = plot.querySelector(`.base-tag[data-building="${b.id}"]`);
+      if (tag) tag.remove();
+    });
+    const pick = () => { // BP-35, BP-40a-2b: every pad takes a tap and opens its box, built or not
       v.pick = b.id;
       drawPick(v);
+    };
+    img.addEventListener('click', pick);
+    // BP-40b (Reviewer BP-40a-2b F4): a pad is a button to a keyboard too. Enter and Space pick it directly, never
+    // through img.click(), so no gesture can eat a key.
+    img.tabIndex = 0;
+    img.setAttribute('role', 'button');
+    img.setAttribute('aria-label', b.name);
+    img.addEventListener('keydown', e => {
+      if (e.key !== 'Enter' && e.key !== ' ') return;
+      e.preventDefault();
+      pick();
     });
     img.src = b.id === MEDBAY ? 'assets/art/building_medbay_t1.png' : `assets/art/building_${b.id}.png`; // BP-33b
-    plot.append(img);
+    layer.append(img);
     sprites[b.id] = img;
   }
   // BP-40a-2b (item 2): a one-word tag over every building, the Tent's on its roof; under the box, never taking a tap.
+  const tags = []; // BP-40b: each tag's place at 1x, in % of the plot, for applyZoom
   for (const id of [TENT, ...BASE.map(b => b.id)]) {
     const tag = el('span', id === TENT ? 'base-tag in' : 'base-tag', BOX[id].tag);
     tag.dataset.building = id;
@@ -268,7 +396,11 @@ export function createBase(onBuild, onClose, onMedbay, onTarget) {
     tag.style.left = `${left + width / 2}%`;
     tag.style.top = `${top}%`;
     plot.append(tag);
+    tags.push({ node: tag, x: left + width / 2, y: top });
   }
+  // BP-40b: the view, bound once; renderBase never touches it, so a refresh in the middle of a gesture keeps the zoom.
+  const zoom = { node: layer, tags, s: 1, tx: 0, ty: 0, pts: new Map(), g: null, down: { x: 0, y: 0 }, moved: false, swallow: false, frame: 0 };
+  bindZoom(zoom, plot, node);
   // BP-35, BP-40a-2b (item 3): the building's box. Its Build sends the same onBuild as the list's; its one button drops
   // the box first, so a return to the base never finds it open (R7), then goes; its close only drops the pick.
   const card = el('div', 'base-pick');
@@ -297,7 +429,7 @@ export function createBase(onBuild, onClose, onMedbay, onTarget) {
   card.append(cardName, cardFlavour, cardEffect, cardRow);
   plot.append(card);
   node.append(head, bankedEl, pop, note, plot, ...slots.map(s => s.slot));
-  const v = { node, bankedEl, pop, note, slots, sprites, pick: null, fight: false, card: { node: card, name: cardName, flavour: cardFlavour, effect: cardEffect, build: cardBuild, go: cardGo } };
+  const v = { node, bankedEl, pop, note, slots, sprites, zoom, pick: null, fight: false, card: { node: card, name: cardName, flavour: cardFlavour, effect: cardEffect, build: cardBuild, go: cardGo } };
   return v;
 }
 
@@ -350,6 +482,7 @@ export function quietBase(v) {
   v.pop.classList.remove('shown');
   for (const { slot } of v.slots) slot.classList.remove('just');
   for (const img of Object.values(v.sprites)) img.classList.remove('just');
+  resetZoom(v.zoom); // BP-40b: the hub hides or returns at 1x
 }
 
 export function hideBase(v) {
@@ -361,4 +494,5 @@ export function hideBase(v) {
   for (const img of Object.values(v.sprites)) img.classList.remove('just'); // BP-35: as BP-21b F1
   v.pick = null; // BP-35: a reopen starts with no card
   drawPick(v);
+  resetZoom(v.zoom); // BP-40b: and at 1x
 }
