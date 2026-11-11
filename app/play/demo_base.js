@@ -132,12 +132,13 @@ export const BASE_CSS = `
 .base-flavour { margin: 0; font-size: 3.1cqw; line-height: 1.25; color: var(--muted); }
 .base-build, .base-open { width: auto; max-width: none; min-height: 8.5cqw; margin-top: 0.8cqw; padding: 0 2.5cqw; font-size: 3.6cqw; align-self: flex-start; }
 .base-close { width: auto; max-width: none; min-height: 8.5cqw; padding: 0 3cqw; font-size: 3.6cqw; }
-.base-plot { position: relative; flex: none; overflow: hidden; border-radius: 1.5cqw; } /* BP-40b: the frame; the radius moved here from the ground */
+.base-plot { position: relative; flex: none; overflow: clip; border-radius: 1.5cqw; } /* BP-40b: the frame; the radius moved here from the ground */
+/* BP-27b (Reviewer BP-40b F1): clip, not hidden, so the frame is no scroll container and a focus move can't shift the zoomed view. */
 .base-plot-img { display: block; width: 100%; height: auto; aspect-ratio: 1008 / 1050; }
 /* BP-40b: the layer that zooms, in flow, so the ground still sets the plot's height. touch-action: none makes every
    finger on the art ours: one pans (or scrolls the sheet at 1x), two pinch (spec check 2 (b)). */
 .base-plot-zoom { position: relative; transform-origin: 0 0; touch-action: none; }
-.base-plot-zoom img { -webkit-user-drag: none; }
+.base-plot-zoom img { -webkit-user-drag: none; -webkit-touch-callout: none; user-select: none; } /* BP-27b: no long-press menu (Reviewer BP-40b F3) */
 .base-plot-sprite { position: absolute; height: auto; cursor: pointer; } /* BP-40a-2b: built or not, a tap opens its box */
 .base-plot-sprite[hidden] { display: none; }
 .base-plot-sprite.dim { filter: grayscale(1); opacity: 0.35; pointer-events: auto; cursor: pointer; } /* BP-35: an empty pad shows its building, dimmed; tap it to build */
@@ -357,7 +358,7 @@ export function createBase(onBuild, onClose, onMedbay, onTarget) {
   for (const b of BASE) {
     const img = el('img', 'base-plot-sprite');
     const [left, top, width] = SPRITE[b.id];
-    img.alt = '';
+    img.alt = b.name; // BP-27b (Reviewer BP-40b F2): an img with a role needs a non-empty alt
     img.hidden = true;
     img.dataset.building = b.id;
     img.style.left = `${left}%`;
@@ -376,8 +377,7 @@ export function createBase(onBuild, onClose, onMedbay, onTarget) {
     // BP-40b (Reviewer BP-40a-2b F4): a pad is a button to a keyboard too. Enter and Space pick it directly, never
     // through img.click(), so no gesture can eat a key.
     img.tabIndex = 0;
-    img.setAttribute('role', 'button');
-    img.setAttribute('aria-label', b.name);
+    img.setAttribute('role', 'button'); // named by its alt (BP-27b)
     img.addEventListener('keydown', e => {
       if (e.key !== 'Enter' && e.key !== ' ') return;
       e.preventDefault();
