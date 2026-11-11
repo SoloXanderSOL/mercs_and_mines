@@ -29,7 +29,6 @@ export function healPrice(base) {
 }
 export const REPLACE_MERC_CREDITS = 120;  // demo_ops.rs DEMO_REPLACE_MERC_CREDITS
 export const REPLACE_MINER_CREDITS = 80;  // demo_ops.rs DEMO_REPLACE_MINER_CREDITS
-export const SELL_ORE_CREDITS = 2;      // demo_ops.rs DEMO_ORE_SELL_CREDITS (BP-28a); harness sl cases hold their own copy
 
 // A7: what a rank really changes in this build (since B5, each rank above 1 is also +2 on every roll).
 const RANK_LINES = {
@@ -149,15 +148,6 @@ const COMPANY_COPY = {
   kit: 'Kit: standard issue.',
   kitHeld: 'Kit: {item} ({grade}), +{p} on the roll.', // BP-23b: p is company.kit's points, the server's own
   kitOff: 'Take off',
-  // BP-28b (Wiki copy): selling banked ore. The bank line is demo_dig.js's bankedLine, as on the hub chip.
-  sell: 'Sell ore',
-  sellAsk: 'Sell {o} ore for {c} credits?',
-  sellLess: '-10',
-  sellMore: '+10',
-  sellGo: 'Sell',
-  sellCancel: 'Cancel',
-  sold: 'Sold {o} ore for {c} credits. Command thanks you for your liquidity.',
-  oreShort: 'There is less ore in the bank than that. The figures are up to date now.',
   heal: 'Patch up {n} · {cost} credits',
   healNote: '{each} credits a soldier. Back on their feet at once.',
   short: 'Not enough banked credits. {each} each.',
@@ -296,8 +286,6 @@ let traitsLine = null; // the briefing's trait lines, created on the first brief
 let shown = null;     // the card on screen: { kind, index }, or null
 let tick = null;      // the heal countdown's display timer (no network call)
 let drawnKey = null;  // the open card's drawn state, the countdown left out (Reviewer BP-12b F1)
-let selling = null;   // BP-28b: the open Sell row: { key, ore }, the amount Sell will post
-let sold = null;      // BP-28b: the last sale's line, on the card that made it: { key, ore }
 let hireBox = null;   // BP-18b-1: the squad hire block on the Company screen
 let companyNext = null; // BP-33, BP-40a-2b: the reveal about to render was asked for by the base: 'company', 'section', 'crew' or 'heal'
 
@@ -602,8 +590,6 @@ function hideCard() {
   stopTick();
   shown = null;
   drawnKey = null;
-  selling = null; // BP-28b: a closed card forgets its Sell row and its sold line
-  sold = null;
   if (card) card.node.hidden = true;
 }
 
@@ -652,34 +638,10 @@ function replaceRows(target, id, h, each, label, note) {
   return rows.concat(texts.map(t => line(t)));
 }
 
-// BP-28b: the bank line and Sell ore, on the Section and the Crew card alike (`key` names the card's row). Closed: one
-// Sell ore button while ore is banked. Open: the ask with its price, -10 / +10 (1 to all banked, starting at all; no
-// text box, so no phone keyboard) and Sell / Cancel. Sell closes the row: a 200 draws the sold line, a 409 the oreShort
-// line after send's re-read. A sale is allowed with a team out (BP-28a: nothing holds banked ore), so no out-guard.
-function bankRows(key) {
-  const ore = Math.max(0, Number(view.ore()) || 0);
-  const rows = [line(bankedLine(ore, view.credits()))];
-  const redraw = () => { if (shown) openCard(shown.kind, shown.index); };
-  if (selling && (selling.key !== key || ore === 0)) selling = null;
-  if (selling) selling.ore = Math.min(Math.max(1, selling.ore), ore);
-  const isHeld = view.held();
-  if (!selling) {
-    if (ore > 0) rows.push(act(COMPANY_COPY.sell, isHeld, () => { selling = { key, ore }; sold = null; view.clearNotice(); redraw(); }));
-  } else {
-    const o = selling.ore;
-    const step = d => () => { if (selling) selling.ore = Math.min(ore, Math.max(1, selling.ore + d)); redraw(); };
-    rows.push(line(fill(COMPANY_COPY.sellAsk, { o, c: o * SELL_ORE_CREDITS })));
-    const steps = el('div', 'company-equip');
-    steps.append(act(COMPANY_COPY.sellLess, isHeld || o <= 1, step(-10)), act(COMPANY_COPY.sellMore, isHeld || o >= ore, step(10)));
-    const go = el('div', 'company-equip');
-    go.append(act(COMPANY_COPY.sellGo, isHeld, () => { selling = null; view.sell(o, () => { sold = { key, ore: o }; renderCompany(); }); }),
-      act(COMPANY_COPY.sellCancel, false, () => { selling = null; redraw(); }));
-    rows.push(steps, go);
-  }
-  if (sold && sold.key === key) rows.push(line(fill(COMPANY_COPY.sold, { o: sold.ore, c: sold.ore * SELL_ORE_CREDITS })));
-  const n = view.notice();
-  if (n && n.action === 'sell' && n.kind === 'ore') rows.push(line(COMPANY_COPY.oreShort));
-  return rows;
+// BP-28b: the bank line, on the Section and the Crew card alike. BP-43b-1: Sell ore moved to the Shop's Trading Post
+// (BP-43 scope item 1); the cards keep the line.
+function bankRows() {
+  return [line(bankedLine(Math.max(0, Number(view.ore()) || 0), view.credits()))];
 }
 
 // The Section card once an ops body is adopted: bunks, sickbay, the leader, kit, the bank, Heal, Replace.
@@ -726,7 +688,7 @@ function sectionRows(s) {
   } else {
     rows.push(line(COMPANY_COPY.kit, true));
   }
-  rows.push(...bankRows('section:' + s.section_id)); // BP-28b
+  rows.push(...bankRows()); // BP-28b
   if (b.wounded > 0 && b.healing === 0) {
     const p = healPrice(view.base());
     const cost = b.wounded * p.each;
@@ -765,7 +727,7 @@ function crewRows(w, r) {
   const f = Array.isArray(r.foremen) ? r.foremen[0] : null;
   if (f) rows.push(...foremanRows(f)); // BP-19c
   if (!view || !view.adopted()) return rows;
-  rows.push(...bankRows('crew:' + w.crew_id)); // BP-28b
+  rows.push(...bankRows()); // BP-28b
   const h = Math.min(8, Math.max(0, Number(w.headcount) || 0));
   return rows.concat(replaceRows('crew', w.crew_id, h, REPLACE_MINER_CREDITS, COMPANY_COPY.hire, COMPANY_COPY.hireNote));
 }
@@ -801,7 +763,7 @@ function shelfRows() {
 function openCard(kind, index) {
   const r = roster();
   if (!r) return;
-  if (!shown || shown.kind !== kind || shown.index !== index) { view.clearNotice(); selling = null; sold = null; } // BP-28b: + the Sell row
+  if (!shown || shown.kind !== kind || shown.index !== index) view.clearNotice();
   stopTick();
   let rows = [];
   let title = '';
@@ -921,7 +883,7 @@ export function dressBriefing() {
 
 // `d`: demo_ops.js's deps (main.js's $, getRoster, ...); `v`: demo_ops.js's view of its state
 // (adopted, credits, ore, out, sectionOut, leaderOf, freeLead, fightSection, company, hired, clearHired, hire, held, serverNow,
-// bay, bayOf, squadOf, trophies, notice, clearNotice, heal, replace, sell).
+// bay, bayOf, squadOf, trophies, notice, clearNotice, heal, replace, kit, equip).
 export function mountCompany(d, v) {
   deps = d;
   view = v;

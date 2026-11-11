@@ -46,9 +46,9 @@ import { onMapCreated } from './hexmap.js';
 import { setAarNote, setBeforeOffer, setSquadSize, setDeployExtra, setStill, setFightSquad } from './battle.js';
 import { mountStory, writeAar } from './demo_story.js';
 import { showCard, cardSeen } from './demo_card.js';
-import { mountShop, openShop } from './demo_shop.js'; // BP-25
+import { mountShop, openShop, redrawShop } from './demo_shop.js'; // BP-25; BP-43b-1: + redrawShop
 import { mountReview, countContract } from './demo_review.js'; // BP-27
-import { mountCompany, dressBriefing, renderCompany, redrawCompany, healPrice, wageLine, SELL_ORE_CREDITS, openSickbay, openCompanyAt, companyShown } from './demo_company.js';
+import { mountCompany, dressBriefing, renderCompany, redrawCompany, healPrice, wageLine, openSickbay, openCompanyAt, companyShown } from './demo_company.js';
 import { DIG_COPY, DIG_CSS, createDigPanel, renderDig, hideDig, quietDig, homewardLines, flash, bankedLine, crewFightLine, crewCard } from './demo_dig.js';
 import { BASE_COPY, BASE_CSS, createBase, renderBase, hideBase, quietBase } from './demo_base.js';
 import { mountMore } from './demo_more.js'; // BP-29b
@@ -775,6 +775,7 @@ function hideStrip() {
 function refresh() {
   if (!strip) return;
   renderCompany(); // the Company card's buttons follow held() and the last body (BP-12b, H3)
+  redrawShop(); // BP-43b-1 (spec check F2): an open Shop's Trading Post follows held() and the last body too
   glow(); // BP-37b: the glow follows a sheet, a dig going out or coming home, and a new board
   // While a raid or an ambush waits, the hub's own GUARD_DUTY would count as its fight
   // (Reviewer BP-8b-2 F1), so the mission list is shut until the dig's fight is fought.
@@ -2147,14 +2148,25 @@ function sendHire() {
   });
 }
 
-// BP-28b: sell `ore` of the banked ore (the card's Sell); allowed with a team out (BP-28a). Its spend is the sale's
-// proceeds, negative (spec check F-B), so a contract its body latches reports its pay, not pay plus the sale. `onSold`
-// runs once the 200's body is adopted. A 409 re-reads through send's ask block; any other 4xx is the error screen.
-function sendSell(ore, onSold) {
+// BP-28b, moved to the Shop's Trading Post at BP-43b-1: sell `ore` of the banked ore at `price` a unit (the body's
+// company.trade.ore_sell, read at the tap); allowed with a team out (BP-28a). Its spend is the sale's proceeds, negative
+// (BP-28b F-B), so a contract its body latches reports its pay, not pay plus the sale. `onDone` runs once the 200's
+// body is adopted. A 409 re-reads through send's ask block; any other 4xx is the error screen.
+function sendSell(ore, price, onDone) {
   if (held() || !campaignId) return;
   companyNotice = null;
-  companyAsk = { action: 'sell', target: 'bank' };
-  send(opsPath(campaignId) + '/sell', { ore }, false, () => -(ore * SELL_ORE_CREDITS), undefined, onSold);
+  companyAsk = { action: 'sell', target: 'shop' };
+  send(opsPath(campaignId) + '/sell', { ore }, false, () => -(ore * price), undefined, onDone);
+}
+
+// BP-43b-1: buy `ore` at `price` a unit (company.trade.ore_buy, read at the tap); allowed with a team out (BP-43a). Its
+// spend is the cost, positive, as hire's is. Its 409 (not enough banked credits) re-reads through send's REFUSAL.short
+// branch, and the Shop draws the line (target 'shop', which no Company card's noticeLine matches).
+function sendBuy(ore, price, onDone) {
+  if (held() || !campaignId) return;
+  companyNotice = null;
+  companyAsk = { action: 'buy', target: 'shop' };
+  send(opsPath(campaignId) + '/buy', { ore }, false, () => ore * price, undefined, onDone);
 }
 
 // ── the hub's re-entry and the end screen ─────────────────────────────────────
@@ -2372,7 +2384,18 @@ export function mountOps(d) {
   deps.$('hub-map').after(glowNode);
   deps.$('screen-hub').append(strip, bankChip, recentre, baseSheet.node, list.node, crewCardNode);
   deps.$('screen-hub').querySelector('.hub-bottom').append(baseButton, shopButton); // BP-40a-2a (item 4): after Company and Missions
-  mountShop(deps); // BP-25
+  // BP-25; BP-43b-1 (spec check F1): the Trading Post's view of this file's state and requests.
+  mountShop(deps, {
+    adopted: () => Boolean(campaignId) && adoptedFor === campaignId && Boolean(store.campaign()) && store.campaign().campaign_id === campaignId,
+    ore: () => banked,
+    credits: () => credits,
+    held,
+    trade: () => (company && company.trade) || null,
+    notice: () => companyNotice,
+    clearNotice: () => { companyNotice = null; },
+    sell: sendSell,
+    buy: sendBuy,
+  });
   endNote = el('p', 'end-ops');
   endNote.hidden = true;
   deps.$('btn-new-run').before(endNote);
@@ -2409,7 +2432,6 @@ export function mountOps(d) {
     notice: () => companyNotice,
     clearNotice: () => { companyNotice = null; },
     heal: sendHeal,
-    sell: sendSell, // BP-28b
     replace: sendReplace,
     kit: id => (company.kit || []).find(k => k.section_id === id) || null, // BP-23b
     equip: sendEquip,
