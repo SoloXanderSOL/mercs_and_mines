@@ -227,6 +227,16 @@ impl KitGrade {
             Self::Elite => 12,
         }
     }
+
+    /// Every grade, lowest first (BP-43a: the published loot prices, `company.trade.loot`).
+    pub const ALL: [Self; 5] = [Self::Basic, Self::Standard, Self::Specialized, Self::Superior, Self::Elite];
+
+    /// What one Trophy Shelf item of this grade sells for at the Trading Post (BP-43a, Wiki
+    /// ruling on Linux's spec check): 40, 60, 100, 160, 250 by grade. The roll never reads it, so
+    /// it changes no fight (no R7).
+    pub fn sell_credits(self) -> u32 {
+        match self { Self::Basic => 40, Self::Standard => 60, Self::Specialized => 100, Self::Superior => 160, Self::Elite => 250 }
+    }
 }
 
 /// The record Commander's roll inputs as they were at fight time (BP-14a), logged in
@@ -376,6 +386,14 @@ mod tests {
 
     fn rows(m: &[RollModifier]) -> Vec<(&str, i32)> {
         m.iter().map(|r| (r.key.as_str(), r.points)).collect()
+    }
+
+    /// BP-43a K1: the Trading Post's loot prices and the grade order, as literals (Wiki ruling on
+    /// Linux's spec check), never read from the table under test.
+    #[test]
+    fn kit_grade_sell_credits() {
+        assert_eq!(KitGrade::ALL.map(KitGrade::sell_credits), [40, 60, 100, 160, 250]);
+        assert_eq!(KitGrade::ALL.map(KitGrade::as_str), ["Basic", "Standard", "Specialized", "Superior", "Elite"]);
     }
 
     #[test]

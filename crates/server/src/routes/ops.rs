@@ -45,6 +45,8 @@ use crate::demo_ops::{
 use crate::commander_gen::generate_commander;
 use crate::demo_ops::{HireHold, HireRefusal, DEMO_HIRE_CAP, DEMO_HIRE_CREDITS, DEMO_WAGE_CREDITS_PER_MIN};
 use crate::demo_ops::SellRefusal;
+use crate::demo_ops::{BuyRefusal, SellLootRefusal, DEMO_ORE_BUY_CREDITS, DEMO_ORE_SELL_CREDITS};
+use crate::demo_roll::KitGrade;
 use crate::demo_ops::{RouteKind, RoutePath};
 use crate::demo_ops::{hazard_warning, EquipRefusal, HazardDue, Trophy, TripReport};
 use crate::repository::section::starter_section;
@@ -58,7 +60,7 @@ use super::{
 };
 
 /// Request body cap for `ops/start`, `ops/next`, `ops/build`, `ops/heal`, `ops/replace`,
-/// `ops/equip`, `ops/name` and `ops/sell` (the eight routes that read a body), layered on each route: the overflow reaches the handler
+/// `ops/equip`, `ops/name`, `ops/sell`, `ops/buy` and `ops/sell_loot` (the ten routes that read a body), layered on each route: the overflow reaches the handler
 /// as a `JsonRejection` after the limiters, so it is counted (`413`).
 pub const OPS_BODY_LIMIT: usize = 1024;
 
@@ -78,6 +80,8 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/campaign/:campaign_id/ops/equip", post(post_ops_equip).layer(DefaultBodyLimit::max(OPS_BODY_LIMIT)))
         .route("/api/campaign/:campaign_id/ops/name", post(post_ops_name).layer(DefaultBodyLimit::max(OPS_BODY_LIMIT)))
         .route("/api/campaign/:campaign_id/ops/sell", post(post_ops_sell).layer(DefaultBodyLimit::max(OPS_BODY_LIMIT)))
+        .route("/api/campaign/:campaign_id/ops/buy", post(post_ops_buy).layer(DefaultBodyLimit::max(OPS_BODY_LIMIT)))
+        .route("/api/campaign/:campaign_id/ops/sell_loot", post(post_ops_sell_loot).layer(DefaultBodyLimit::max(OPS_BODY_LIMIT)))
 }
 
 /// The ops state as the client sees it, from every route. `now` is the server's clock, so the
@@ -161,6 +165,7 @@ pub struct CompanyBody {
     pub store: CompanyView,
     pub wages: WagesView,
     pub hire: HireView,
+    pub trade: TradeView,
 }
 
 /// The wage line (BP-18a-2): what the squads cost a minute, and how many there are.
@@ -177,10 +182,22 @@ pub struct HireView {
     pub cap: usize,
 }
 
+/// The Trading Post's prices (BP-43a), published so the client pins none: credits per ore sold
+/// (`ops/sell`) and bought (`ops/buy`), and per Trophy Shelf item sold (`ops/sell_loot`) by its
+/// grade's canon name.
+#[derive(Serialize)]
+pub struct TradeView {
+    pub ore_sell: u32,
+    pub ore_buy: u32,
+    pub loot: std::collections::BTreeMap<&'static str, u32>,
+}
+
 impl CompanyBody {
     fn new(store: CompanyView, squads: u8) -> Self {
         let wages = WagesView { per_minute: DEMO_WAGE_CREDITS_PER_MIN * u32::from(squads), squads };
-        Self { store, wages, hire: HireView { credits: DEMO_HIRE_CREDITS, cap: DEMO_HIRE_CAP } }
+        let loot = KitGrade::ALL.into_iter().map(|g| (g.as_str(), g.sell_credits())).collect();
+        let trade = TradeView { ore_sell: DEMO_ORE_SELL_CREDITS, ore_buy: DEMO_ORE_BUY_CREDITS, loot };
+        Self { store, wages, hire: HireView { credits: DEMO_HIRE_CREDITS, cap: DEMO_HIRE_CAP }, trade }
     }
 }
 
@@ -252,6 +269,20 @@ pub struct OpsNameRequest {
 #[derive(Deserialize)]
 pub struct OpsSellRequest {
     pub ore: u32,
+}
+
+/// `ops/buy`'s body (BP-43a): `ore` a `u32`, so a negative, fractional, string or missing
+/// amount is axum's `422`; zero reaches the handler and is our `400`.
+#[derive(Deserialize)]
+pub struct OpsBuyRequest {
+    pub ore: u32,
+}
+
+/// `ops/sell_loot`'s body (BP-43a): the Trophy Shelf item as `ops/equip` names it, both fields.
+/// Required: a missing or `null` item, or an unknown grade, is axum's `422`.
+#[derive(Deserialize)]
+pub struct OpsSellLootRequest {
+    pub item: OpsEquipItem,
 }
 
 /// `ops/replace`'s body (BP-12a-2): exactly one of `section_id` / `crew_id`, strings parsed after
@@ -1618,6 +1649,93 @@ async fn post_ops_sell(
     match state.demo_ops.store.sell_op(campaign_id, req.ore, now) {
         Ok(()) => {}
         Err(SellRefusal::NotEnoughOre) => return Err(conflict("not enough banked ore")),
+    }
+    settle_leaders(&state, campaign_id, &wallet, now).await;
+    Ok(ops_response(&state, campaign_id, gw, &board, now))
+}
+
+/// Buys ore for banked credits, `POST /api/campaign/:campaign_id/ops/buy {ore}` (BP-43a,
+/// demo-only, the Trading Post), at `DEMO_ORE_BUY_CREDITS` credits per ore. Order: `401` →
+/// `429` `ops_ip` → `429` `ops_wallet` → axum's body rejection, counted (`413` over
+/// `OPS_BODY_LIMIT`; `400`, `415`, `422`) → `404` → `403` → `409` not `Active` (entry dropped)
+/// → `409` no gateway → the board → a pending battle latched → `400` buy at least 1 ore →
+/// `409` not enough banked credits (also no entry, and a cost past `u32`) → `200`, the whole
+/// state.
+/// - Allowed while the team is out: nothing holds banked credits for an op.
+/// - Abuse bound: memory only, no DB write, so no launch lock; the shared ops limiter (40/min
+///   per wallet, 400 per address). The one await after the store's change is `settle_leaders`,
+///   a spawned task, so a dropped handler loses nothing.
+async fn post_ops_buy(
+    AuthSession(token): AuthSession,
+    State(state): State<Arc<AppState>>,
+    ci: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    Path(campaign_id): Path<Uuid>,
+    body: Result<Json<OpsBuyRequest>, JsonRejection>,
+) -> Result<Response, AppError> {
+    if let Some(r) = ops_limits(&state, &token, ci, &headers)? {
+        return Ok(r);
+    }
+    let Json(buy) = match body {
+        Ok(j) => j,
+        Err(rej) => return Ok(rej.into_response()),
+    };
+    let now = Utc::now();
+    let (campaign, gateway, wallet) = ops_member(&state, &token, campaign_id, "post_ops_buy").await?;
+    let Some(gw) = gateway else {
+        return Err(conflict("no gateway assigned"));
+    };
+    let board = load_board(&state, &campaign, gw, now, false, "post_ops_buy").await?;
+    latch_pending_raid(&state, campaign_id, now, "post_ops_buy").await?;
+    if buy.ore == 0 {
+        return Err(bad_request("buy at least 1 ore"));
+    }
+    match state.demo_ops.store.buy_op(campaign_id, buy.ore, now) {
+        Ok(()) => {}
+        Err(BuyRefusal::NotEnoughCredits) => return Err(conflict("not enough banked credits")),
+    }
+    settle_leaders(&state, campaign_id, &wallet, now).await;
+    Ok(ops_response(&state, campaign_id, gw, &board, now))
+}
+
+/// Sells one Trophy Shelf item for credits, `POST /api/campaign/:campaign_id/ops/sell_loot
+/// {item: {item_name, quality_grade}}` (BP-43a, demo-only, the Trading Post), at its grade's
+/// `KitGrade::sell_credits`. Order: `401` → `429` `ops_ip` → `429` `ops_wallet` → axum's body
+/// rejection, counted (`413` over `OPS_BODY_LIMIT`; `400`, `415`, `422`) → `404` → `403` → `409`
+/// not `Active` (entry dropped) → `409` no gateway → the board → a pending battle latched →
+/// `409` that item isn't on the Trophy Shelf (equip's text; also no entry, and equipped kit) →
+/// `200`, the whole state.
+/// - The item is named as `ops/equip` names it; the first equal entry goes.
+/// - Allowed while the team is out: the shelf feeds nothing an op holds.
+/// - Abuse bound: memory only, no DB write, so no launch lock; the shared ops limiter (40/min
+///   per wallet, 400 per address). The one await after the store's change is `settle_leaders`,
+///   a spawned task, so a dropped handler loses nothing.
+async fn post_ops_sell_loot(
+    AuthSession(token): AuthSession,
+    State(state): State<Arc<AppState>>,
+    ci: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    Path(campaign_id): Path<Uuid>,
+    body: Result<Json<OpsSellLootRequest>, JsonRejection>,
+) -> Result<Response, AppError> {
+    if let Some(r) = ops_limits(&state, &token, ci, &headers)? {
+        return Ok(r);
+    }
+    let Json(req) = match body {
+        Ok(j) => j,
+        Err(rej) => return Ok(rej.into_response()),
+    };
+    let now = Utc::now();
+    let (campaign, gateway, wallet) = ops_member(&state, &token, campaign_id, "post_ops_sell_loot").await?;
+    let Some(gw) = gateway else {
+        return Err(conflict("no gateway assigned"));
+    };
+    let board = load_board(&state, &campaign, gw, now, false, "post_ops_sell_loot").await?;
+    latch_pending_raid(&state, campaign_id, now, "post_ops_sell_loot").await?;
+    let item = Trophy { quality_grade: req.item.quality_grade, item_name: req.item.item_name };
+    match state.demo_ops.store.sell_loot_op(campaign_id, &item, now) {
+        Ok(()) => {}
+        Err(SellLootRefusal::NotOnShelf) => return Err(conflict("that item isn't on the Trophy Shelf")),
     }
     settle_leaders(&state, campaign_id, &wallet, now).await;
     Ok(ops_response(&state, campaign_id, gw, &board, now))
@@ -3395,6 +3513,183 @@ mod tests {
         assert_eq!((body["ore_banked"].as_u64(), body["credits_banked"].as_u64()), (Some(0), Some(420)));
     }
 
+    /// A won contract's fight (SUCCESS_SEED, pay 400, one trophy) logged and not yet latched.
+    async fn won_fight_pending(state: &Arc<AppState>) -> Uuid {
+        let cc = campaign_with(state, WALLET, true, Some(GATEWAY)).await;
+        seed_commander(state, cc.campaign_id).await;
+        let (c, _, _) = contract_on_site(state, &cc).await;
+        fight_logged(state, c, SUCCESS_SEED, None).await;
+        c
+    }
+
+    fn store_credits(state: &AppState, c: Uuid) -> u32 {
+        state.demo_ops.store.ops_state(c, Utc::now()).credits_banked
+    }
+
+    /// Reviewer BP-28a F1 (fold): `ops/sell` latches before its refusals. With a won fight
+    /// pending and 10 ore set, a zero sale is `400` and an over-banked one `409`, and the store
+    /// (never a latching `GET`) holds the fight's 400 after each.
+    #[tokio::test]
+    async fn ops_sell_refusals_latch_first() {
+        let state = Arc::new(session_state());
+        let c = won_fight_pending(&state).await;
+        state.demo_ops.store.set_ore(c, 10);
+        let (status, body, _) = sell(&state, c, r#"{"ore":0}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(store_credits(&state, c), 400);
+        let (status, body, _) = sell(&state, c, r#"{"ore":11}"#).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(store_credits(&state, c), 400);
+    }
+
+    async fn buy(state: &Arc<AppState>, campaign: Uuid, body: &str) -> (StatusCode, serde_json::Value, Vec<u8>) {
+        post(state, campaign, "buy", Some(body)).await
+    }
+
+    /// BP-43a R1: 10 ore for 6 each out of 100 credits; the answer is the whole state, sell's
+    /// key set.
+    #[tokio::test]
+    async fn ops_buy_route_answers_the_whole_state() {
+        let state = Arc::new(session_state());
+        let c = name_campaign(&state).await;
+        state.demo_ops.store.set_credits(c, 100);
+        let (status, body, _) = buy(&state, c, r#"{"ore":10}"#).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!((body["ore_banked"].as_u64(), body["credits_banked"].as_u64()), (Some(10), Some(40)));
+        let keys: std::collections::BTreeSet<&str> = body.as_object().expect("an object").keys().map(|k| k.as_str()).collect();
+        assert_eq!(keys, ["active_op", "base", "campaign_id", "company", "credits_banked", "gateway", "now", "ore_banked", "sites"].into_iter().collect());
+    }
+
+    /// BP-43a R2: zero is our `400`; 17 ore (102) on 100 credits and a cost past `u32` are our
+    /// `409`; a missing amount is axum's `422`; none moves anything. A non-member is `403` and
+    /// adds no entry.
+    #[tokio::test]
+    async fn ops_buy_route_refusals_and_a_non_member() {
+        let state = Arc::new(session_state());
+        let c = name_campaign(&state).await;
+        state.demo_ops.store.set_credits(c, 100);
+        let (status, body, _) = buy(&state, c, r#"{"ore":0}"#).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::BAD_REQUEST, Some("buy at least 1 ore")));
+        let (status, body, _) = buy(&state, c, r#"{"ore":17}"#).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("not enough banked credits")));
+        let (status, body, _) = buy(&state, c, r#"{"ore":4294967295}"#).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("not enough banked credits")));
+        let (status, _, bytes) = buy(&state, c, "{}").await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{}", String::from_utf8_lossy(&bytes));
+        let (status, body) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!((body["ore_banked"].as_u64(), body["credits_banked"].as_u64()), (Some(0), Some(100)));
+        let other = campaign_with(&state, OTHER, true, Some(GATEWAY)).await;
+        seed_sector(&state, &other).await;
+        let (status, body, _) = buy(&state, other.campaign_id, r#"{"ore":1}"#).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(state.demo_ops.store.len(), 1, "no entry for OTHER's campaign");
+    }
+
+    /// BP-43a R3: the 15th latcher. Credits are 0 until the pending fight's 400 lands, and only
+    /// this route's latch can land it before the check: 50 ore (300) leaves 100.
+    #[tokio::test]
+    async fn ops_buy_latches_a_pending_battle() {
+        let state = Arc::new(session_state());
+        let c = won_fight_pending(&state).await;
+        let (status, body, _) = buy(&state, c, r#"{"ore":50}"#).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!((body["ore_banked"].as_u64(), body["credits_banked"].as_u64()), (Some(50), Some(100)));
+    }
+
+    /// BP-43a F-b: `ops/buy` latches before its zero refusal: the store holds the fight's 400
+    /// after the `400`.
+    #[tokio::test]
+    async fn ops_buy_refusals_latch_first() {
+        let state = Arc::new(session_state());
+        let c = won_fight_pending(&state).await;
+        let (status, body, _) = buy(&state, c, r#"{"ore":0}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(store_credits(&state, c), 400);
+    }
+
+    async fn sell_loot(state: &Arc<AppState>, campaign: Uuid, grade: &str, name: &str) -> (StatusCode, serde_json::Value, Vec<u8>) {
+        let body = serde_json::json!({ "item": { "item_name": name, "quality_grade": grade } });
+        post(state, campaign, "sell_loot", Some(&body.to_string())).await
+    }
+
+    /// BP-43a R4: a Superior sells for 160; the shelf empties; the whole state answers.
+    #[tokio::test]
+    async fn ops_sell_loot_route_answers_the_whole_state() {
+        let state = Arc::new(session_state());
+        let c = name_campaign(&state).await;
+        let shard = "Dark-Core Ore Shard";
+        state.demo_ops.store.set_trophies(c, vec![Trophy { quality_grade: QualityGrade::Superior, item_name: shard.into() }]);
+        let (status, body, _) = sell_loot(&state, c, "Superior", shard).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["credits_banked"], 160);
+        assert_eq!(body["company"]["trophies"], serde_json::json!([]));
+        let keys: std::collections::BTreeSet<&str> = body.as_object().expect("an object").keys().map(|k| k.as_str()).collect();
+        assert_eq!(keys, ["active_op", "base", "campaign_id", "company", "credits_banked", "gateway", "now", "ore_banked", "sites"].into_iter().collect());
+    }
+
+    /// BP-43a R5: an item of the shelf item's grade with another name is equip's `409`; a
+    /// missing or `null` item and an unknown grade are axum's `422`; nothing moves. A
+    /// non-member is `403` and adds no entry.
+    #[tokio::test]
+    async fn ops_sell_loot_route_refusals_and_a_non_member() {
+        let state = Arc::new(session_state());
+        let c = name_campaign(&state).await;
+        let plating = Trophy { quality_grade: QualityGrade::Basic, item_name: "Scrap Plating".into() };
+        state.demo_ops.store.set_trophies(c, vec![plating]);
+        let (status, body, _) = sell_loot(&state, c, "Basic", "Dented Flak Vest").await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("that item isn't on the Trophy Shelf")));
+        for bad in ["{}", r#"{"item":null}"#, r#"{"item":{"item_name":"Scrap Plating","quality_grade":"Legendary"}}"#] {
+            let (status, _, bytes) = post(&state, c, "sell_loot", Some(bad)).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{bad}: {}", String::from_utf8_lossy(&bytes));
+        }
+        let (status, body) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["credits_banked"], 0);
+        assert_eq!(body["company"]["trophies"], serde_json::json!([{ "quality_grade": "Basic", "item_name": "Scrap Plating" }]));
+        let other = campaign_with(&state, OTHER, true, Some(GATEWAY)).await;
+        seed_sector(&state, &other).await;
+        let (status, body, _) = sell_loot(&state, other.campaign_id, "Basic", "Scrap Plating").await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(state.demo_ops.store.len(), 1, "no entry for OTHER's campaign");
+    }
+
+    /// BP-43a R6: the 16th latcher. A Basic set on the shelf sells for 40 on top of the pending
+    /// fight's 400, which only this route's latch lands on this path.
+    #[tokio::test]
+    async fn ops_sell_loot_latches_a_pending_battle() {
+        let state = Arc::new(session_state());
+        let c = won_fight_pending(&state).await;
+        let plating = Trophy { quality_grade: QualityGrade::Basic, item_name: "Scrap Plating".into() };
+        state.demo_ops.store.set_trophies(c, vec![plating]);
+        let (status, body, _) = sell_loot(&state, c, "Basic", "Scrap Plating").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(store_credits(&state, c), 440);
+    }
+
+    /// BP-43a F-c: `ops/sell_loot` latches before its refusal. The shelf is empty before the
+    /// latch, which shelves the fight's one drop (a Standard, measured); the item named is an
+    /// Elite no pool holds, so it is refused under any match, and the store holds the 400.
+    #[tokio::test]
+    async fn ops_sell_loot_refusals_latch_first() {
+        let state = Arc::new(session_state());
+        let c = won_fight_pending(&state).await;
+        let (status, body, _) = sell_loot(&state, c, "Elite", "No Such Item").await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("that item isn't on the Trophy Shelf")));
+        assert_eq!(store_credits(&state, c), 400);
+    }
+
+    /// BP-43a R7: the Trading Post's prices, published whole (literals).
+    #[tokio::test]
+    async fn ops_company_publishes_the_trade_prices() {
+        let state = Arc::new(session_state());
+        let c = name_campaign(&state).await;
+        let (status, body) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let want = serde_json::json!({ "ore_sell": 2, "ore_buy": 6, "loot": { "Basic": 40, "Standard": 60, "Specialized": 100, "Superior": 160, "Elite": 250 } });
+        assert_eq!(body["company"]["trade"], want);
+    }
+
     /// BP-23a test 9: only the leading Section's kit counts. Kit on S1 only; a fight sent
     /// `[S2, S1]` has no armoury row and logs no `armoury` key.
     #[tokio::test]
@@ -5084,7 +5379,7 @@ mod tests {
         assert_eq!(body["company"]["wages"], serde_json::json!({ "per_minute": 10, "squads": 2 }));
         assert_eq!(body["company"]["hire"], serde_json::json!({ "credits": 600, "cap": 2 }));
         let keys: std::collections::BTreeSet<&str> = body["company"].as_object().expect("company").keys().map(|k| k.as_str()).collect();
-        assert_eq!(keys, ["hire", "sections", "trophies", "wages"].into_iter().collect());
+        assert_eq!(keys, ["hire", "sections", "trophies", "trade", "wages"].into_iter().collect());
     }
 
     /// A5: with the first squad on a contract, the hire lands (a hire reports at base) and a start

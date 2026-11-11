@@ -101,6 +101,10 @@ pub const DEMO_WAGE_CREDITS_PER_MIN: u32 = 5;
 /// player whose fights have stopped paying. Two, so one careful 3-drill dig (120 ore) buys back
 /// a merc with room for wage minutes, and a tier-1 dig never out-earns a won contract.
 pub const DEMO_ORE_SELL_CREDITS: u32 = 2;
+/// Credits per ore bought (BP-43a, demo-only, the Trading Post): three times the sell rate
+/// (Director ruling 2026-11-09), so buying is a rescue, not a strategy. Replacing a careful
+/// tier-1 dig (120 ore) costs 720, more than a won Guard Duty pays; mining stays the way to ore.
+pub const DEMO_ORE_BUY_CREDITS: u32 = 6;
 /// Drill *n* adds a seeded heat from `DEMO_HEAT_MIN` to `DEMO_HEAT_TOP_BASE + DEMO_HEAT_TOP_PER_DRILL × n`
 /// inclusive (§4e B1, BP-13: drill 1 10–20, drill 2 10–25, …); the site melts down at the threshold.
 pub const DEMO_HEAT_MIN: u32 = 10;
@@ -1368,6 +1372,22 @@ pub enum HealRefusal {
 pub enum SellRefusal {
     /// More ore than is banked (also a campaign with no entry, which has banked nothing).
     NotEnoughOre,
+}
+
+/// Why `buy_op` refused (BP-43a). Zero is the route's `400`, never the store's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BuyRefusal {
+    /// Fewer banked credits than the ore costs at `DEMO_ORE_BUY_CREDITS` (also a campaign with
+    /// no entry, and an amount whose cost overflows a `u32`).
+    NotEnoughCredits,
+}
+
+/// Why `sell_loot_op` refused (BP-43a).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SellLootRefusal {
+    /// The item is not on the Trophy Shelf (also a campaign with no entry; equipped kit is off
+    /// the shelf, so it lands here too).
+    NotOnShelf,
 }
 
 /// Why `begin_replace` refused (BP-12a-2), in the order it checks.
@@ -3437,6 +3457,54 @@ impl DemoOpsStore {
         Ok(())
     }
 
+    /// Buys `ore` for `DEMO_ORE_BUY_CREDITS` credits each (BP-43a, the Trading Post). Order:
+    /// settle → refuse → move. The settle comes first, so wages already due leave before the
+    /// check. The debit goes through `debit_credits`, as heal, replace and hire do; a cost that
+    /// overflows a `u32` is refused the same way. Allowed while the team is out: nothing holds
+    /// banked credits for an op, and `credits_in_flight` is untouched. Writes `moved_at` (the
+    /// reaper's keep check). Joins the keep list: no (a buy leaves `ore_banked` ≥ 1). Refusal:
+    /// `NotEnoughCredits` (also no entry). Check and move are one critical section, no await.
+    pub fn buy_op(&self, campaign_id: Uuid, ore: u32, now: DateTime<Utc>) -> Result<(), BuyRefusal> {
+        let mut inner = self.lock();
+        let Some(e) = inner.get_mut(&campaign_id) else {
+            return Err(BuyRefusal::NotEnoughCredits);
+        };
+        e.settle_arrival(now); // buy_op: wages leave before the check
+        let Some(cost) = ore.checked_mul(DEMO_ORE_BUY_CREDITS) else {
+            return Err(BuyRefusal::NotEnoughCredits);
+        };
+        if !e.debit_credits(cost) {
+            return Err(BuyRefusal::NotEnoughCredits);
+        }
+        e.ore_banked = e.ore_banked.saturating_add(ore);
+        e.moved_at = Some(now);
+        e.touched = now;
+        Ok(())
+    }
+
+    /// Sells one Trophy Shelf `item` for its grade's price (`KitGrade::sell_credits`, BP-43a,
+    /// the Trading Post). The item is named as `equip_op` names it: the whole `Trophy`, the first
+    /// equal entry (equal entries are interchangeable). Equipped kit is off the shelf, so it
+    /// can't be sold. Order: settle → refuse → move; the settle comes first so wages already
+    /// due leave before the price is added. Settle-before-refuse is documented-only: a settle
+    /// never writes the shelf. Writes `moved_at`. Joins the keep list: no (a sale leaves
+    /// `credits_banked` ≥ 40). Refusal: `NotOnShelf` (also no entry). One critical section.
+    pub fn sell_loot_op(&self, campaign_id: Uuid, item: &Trophy, now: DateTime<Utc>) -> Result<(), SellLootRefusal> {
+        let mut inner = self.lock();
+        let Some(e) = inner.get_mut(&campaign_id) else {
+            return Err(SellLootRefusal::NotOnShelf);
+        };
+        e.settle_arrival(now);
+        let Some(i) = e.trophies.iter().position(|s| s == item) else {
+            return Err(SellLootRefusal::NotOnShelf);
+        };
+        e.trophies.remove(i);
+        e.credits_banked = e.credits_banked.saturating_add(KitGrade::from_quality(&item.quality_grade).sell_credits());
+        e.moved_at = Some(now);
+        e.touched = now;
+        Ok(())
+    }
+
     /// Debits `cost` for a replace (BP-12a-2) and holds it in flight, so `make_room` keeps the
     /// entry until `finish_replace`. Settles first, so a team that has just come home can replace
     /// on the same call. Writes `moved_at` (the keep list). Refusals in order: `OpOut` →
@@ -5004,6 +5072,7 @@ mod tests {
         assert_eq!(store.sell_op(a, 121, at(31)), Err(SellRefusal::NotEnoughOre));
         let s = store.ops_state(a, at(31));
         assert_eq!((s.ore_banked, s.credits_banked), (120, 0));
+        assert!(!store.moved_since(a, at(31), at(32)));
     }
 
     /// BP-28a S4: seed 2's haul arrives at 30 s and nothing reads it before the sale, so only the
@@ -5028,6 +5097,135 @@ mod tests {
         assert_eq!(store.sell_op(a, 120, at(150)), Ok(()));
         assert_eq!(store.ops_state(a, at(150)).credits_banked, 240);
         assert_eq!(store.ops_state(a, at(180)).credits_banked, 235);
+    }
+
+    fn trophy(grade: QualityGrade, name: &str) -> Trophy {
+        Trophy { quality_grade: grade, item_name: name.into() }
+    }
+
+    /// BP-43a B1: 10 ore for 6 each out of 100 banked credits. Nothing is due at 31 s (the entry
+    /// was made at 0 s). A buy counts as movement (the keep check).
+    #[test]
+    fn buy_op_moves_credits_to_ore_at_six() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        banked_120(&store, a);
+        store.set_credits(a, 100);
+        assert_eq!(store.buy_op(a, 10, at(31)), Ok(()));
+        let s = store.ops_state(a, at(31));
+        assert_eq!((s.ore_banked, s.credits_banked), (130, 40));
+        assert!(store.moved_since(a, at(31), at(32)), "the buy");
+    }
+
+    /// BP-43a B2: buying exactly what the credits afford is allowed and leaves 0 (the `<` / `<=`
+    /// deciding case).
+    #[test]
+    fn buy_op_allows_exactly_what_the_credits_afford() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        banked_120(&store, a);
+        store.set_credits(a, 60);
+        assert_eq!(store.buy_op(a, 10, at(31)), Ok(()));
+        let s = store.ops_state(a, at(31));
+        assert_eq!((s.ore_banked, s.credits_banked), (130, 0));
+    }
+
+    /// BP-43a B3: no entry has no credits; one credit short is refused and moves nothing (ore,
+    /// credits, `moved_at`); an amount whose cost overflows a `u32` is refused without a panic.
+    #[test]
+    fn buy_op_refuses_too_few_credits_and_moves_nothing() {
+        let store = DemoOpsStore::new(2);
+        let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        assert_eq!(store.buy_op(b, 1, at(0)), Err(BuyRefusal::NotEnoughCredits), "no entry");
+        banked_120(&store, a);
+        store.set_credits(a, 59);
+        assert_eq!(store.buy_op(a, 10, at(31)), Err(BuyRefusal::NotEnoughCredits));
+        assert_eq!(store.buy_op(a, u32::MAX, at(31)), Err(BuyRefusal::NotEnoughCredits), "cost past u32");
+        let s = store.ops_state(a, at(31));
+        assert_eq!((s.ore_banked, s.credits_banked), (120, 59));
+        assert!(!store.moved_since(a, at(31), at(32)));
+    }
+
+    /// BP-43a B4: settle before the check. 60 credits would buy 10 ore, but at 61 s one wage
+    /// minute (5) is due first, so 55 is short and nothing moves. Read through the store.
+    #[test]
+    fn buy_op_takes_due_wages_before_the_check() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        banked_120(&store, a);
+        store.set_credits(a, 60);
+        assert_eq!(store.buy_op(a, 10, at(61)), Err(BuyRefusal::NotEnoughCredits));
+        let s = store.ops_state(a, at(61));
+        assert_eq!((s.ore_banked, s.credits_banked), (120, 55));
+    }
+
+    /// BP-43a L1: each grade sells for its price (literals: 40, 60, 100, 160, 250); the shelf
+    /// ends empty.
+    #[test]
+    fn sell_loot_op_pays_by_grade() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        banked_120(&store, a);
+        let items = [
+            trophy(QualityGrade::Basic, "Scrap Plating"),
+            trophy(QualityGrade::Standard, "Signal Jammer Module"),
+            trophy(QualityGrade::Specialized, "Cogsmith's Multi-Tool"),
+            trophy(QualityGrade::Superior, "Dark-Core Ore Shard"),
+            trophy(QualityGrade::Elite, "Sunspear Laser Rifle Mk.V"),
+        ];
+        store.set_trophies(a, items.to_vec());
+        let mut credits = Vec::new();
+        for t in &items {
+            assert_eq!(store.sell_loot_op(a, t, at(31)), Ok(()), "{t:?}");
+            credits.push(store.ops_state(a, at(31)).credits_banked);
+        }
+        assert_eq!(credits, vec![40, 100, 200, 360, 610]);
+        assert!(store.ops_state(a, at(31)).company.trophies.is_empty());
+    }
+
+    /// BP-43a L2: no entry; the right name with the wrong grade; the right grade with the wrong
+    /// name; an item equipped into the armoury. Each is `NotOnShelf` and moves nothing.
+    #[test]
+    fn sell_loot_op_refuses_an_item_not_on_the_shelf_and_moves_nothing() {
+        let store = DemoOpsStore::new(2);
+        let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let plating = trophy(QualityGrade::Basic, "Scrap Plating");
+        let rifle = trophy(QualityGrade::Elite, "Sunspear Laser Rifle Mk.V");
+        assert_eq!(store.sell_loot_op(b, &plating, at(0)), Err(SellLootRefusal::NotOnShelf), "no entry");
+        banked_120(&store, a);
+        store.set_trophies(a, vec![plating.clone(), rifle.clone()]);
+        assert_eq!(store.equip_op(a, Uuid::from_u128(77), Some(rifle.clone()), at(31)), Ok(()));
+        for t in [trophy(QualityGrade::Standard, "Scrap Plating"), trophy(QualityGrade::Basic, "Dented Flak Vest"), rifle] {
+            assert_eq!(store.sell_loot_op(a, &t, at(31)), Err(SellLootRefusal::NotOnShelf), "{t:?}");
+        }
+        let s = store.ops_state(a, at(31));
+        assert_eq!((s.company.trophies, s.credits_banked), (vec![plating], 0));
+        assert!(!store.moved_since(a, at(31), at(32)));
+    }
+
+    /// BP-43a L3: settle before the price is added. At 61 s one wage minute is due on an empty
+    /// bank (forgiven), so the Basic's 40 stands; adding first would leave 35.
+    #[test]
+    fn sell_loot_op_takes_due_wages_before_it_adds() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        banked_120(&store, a);
+        let plating = trophy(QualityGrade::Basic, "Scrap Plating");
+        store.set_trophies(a, vec![plating.clone()]);
+        assert_eq!(store.sell_loot_op(a, &plating, at(61)), Ok(()));
+        assert_eq!(store.ops_state(a, at(61)).credits_banked, 40);
+    }
+
+    /// BP-43a L4: of two equal items one is sold and one stays (the shelf only, no credits).
+    #[test]
+    fn sell_loot_op_sells_one_of_two_equal_items() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        banked_120(&store, a);
+        let plating = trophy(QualityGrade::Basic, "Scrap Plating");
+        store.set_trophies(a, vec![plating.clone(), plating.clone()]);
+        assert_eq!(store.sell_loot_op(a, &plating, at(31)), Ok(()));
+        assert_eq!(store.ops_state(a, at(31)).company.trophies, vec![plating]);
     }
 
     /// BP-21: a build is pending until its `done_at` and stands at it, not a second before; the
