@@ -151,6 +151,36 @@ pub const DEMO_HAZARD_MORALE: u32 = 5;
 /// nearest other streams (the Crew fight's ahead, the ambush's behind) are 2²⁹ draws away; a
 /// trip reads twice its way's hazards here, every other stream at most 26.
 pub const DEMO_HAZARD_SEED_OFFSET: u32 = 0x2000_0000;
+/// BP-38b-2a (ODQ-87 (e), demo-only): each Scorched Desert hex crossed rolls a breakdown, then heat, each at its
+/// own percentage, on its own stream. Canon is 10 % and 1 %; the demo scales the numbers only.
+pub const DEMO_DESERT_BREAKDOWN_PCT: u32 = 50;
+pub const DEMO_DESERT_HEAT_PCT: u32 = 50;
+pub const DEMO_DESERT_SEED_OFFSET: u32 = 0x6000_0000;
+pub const DEMO_DESERT_HEAT_STRESS: u32 = 5;
+/// One desert hex's travel time (`travel_secs(1, ScorchedDesert)`), canon's "loses one hex of travel time".
+pub const DEMO_DESERT_BREAKDOWN_SECS: u32 = 2;
+
+/// BP-38b-2a: rolled once at the start. Out in path order, then home reversed (as `hazard_hits`); per desert
+/// hex, breakdown then heat. Returns the hits and each leg's breakdown seconds.
+fn desert_roll(op_seed: u32, breakdown_pct: u32, heat_pct: u32, payer: HazardPayer, out: &[Hazard], home: &[Hazard]) -> (Vec<HazardHit>, u32, u32) {
+    let mut rng = Rng::new(op_seed.wrapping_add(DEMO_DESERT_SEED_OFFSET));
+    let mut hits = Vec::new();
+    let (mut out_secs, mut home_secs) = (0u32, 0u32);
+    let legs = out.iter().map(|h| (HazardLeg::Out, *h)).chain(home.iter().rev().map(|h| (HazardLeg::Home, *h)));
+    for (leg, _) in legs.filter(|(_, h)| *h == Hazard::Heat) {
+        for (kind, pct) in [(Hazard::Breakdown, breakdown_pct), (Hazard::Heat, heat_pct)] {
+            if rng.roll_d100() <= pct {
+                let hit = hazard_cost(kind, payer, leg, 0);
+                match leg {
+                    HazardLeg::Out => out_secs += hit.secs,
+                    HazardLeg::Home => home_secs += hit.secs,
+                }
+                hits.push(hit);
+            }
+        }
+    }
+    (hits, out_secs, home_secs)
+}
 /// BP-20a-2: the leg a hazard hit came on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -169,6 +199,13 @@ pub struct HazardHit {
     pub stress: u32,
     pub wounded: u32,
     pub morale: u32,
+    /// BP-38b-2a: seconds a breakdown added to its leg; absent from the body when 0.
+    #[serde(skip_serializing_if = "secs_is_zero")]
+    pub secs: u32,
+}
+
+fn secs_is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// A landed trip that crossed a hazard (BP-20a-2): its hits in travel order, none when it went
@@ -179,6 +216,9 @@ pub struct TripReport {
     pub site_id: String,
     pub route: RouteKind,
     pub hits: Vec<HazardHit>,
+    /// BP-38b-2a: the trip crossed Scorched Desert (the client's clean-crossing line keys on it); absent when false.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub desert: bool,
 }
 
 /// BP-20a-2 (W1): who a trip's hazards hit. A contract's fall on its Section and Commander; a
@@ -194,12 +234,14 @@ pub enum HazardPayer {
 /// stress and its morale; a crust that gives tips a quarter of the cart, on the way home only
 /// (nothing rides out).
 fn hazard_cost(hazard: Hazard, payer: HazardPayer, leg: HazardLeg, carried: u32) -> HazardHit {
-    let mut hit = HazardHit { hazard, leg, ore: 0, stress: 0, wounded: 0, morale: 0 };
+    let mut hit = HazardHit { hazard, leg, ore: 0, stress: 0, wounded: 0, morale: 0, secs: 0 };
     match (payer, hazard) {
         (HazardPayer::Section, Hazard::Gas) => (hit.stress, hit.wounded) = (DEMO_HAZARD_GAS_STRESS, 1),
         (HazardPayer::Section, Hazard::Crust | Hazard::Ruins) => hit.wounded = 1,
         (HazardPayer::Crew, Hazard::Gas) => (hit.stress, hit.morale) = (DEMO_HAZARD_GAS_STRESS, DEMO_HAZARD_MORALE),
         (HazardPayer::Crew, Hazard::Ruins) => (hit.stress, hit.morale) = (DEMO_HAZARD_RUINS_STRESS, DEMO_HAZARD_MORALE),
+        (_, Hazard::Heat) => hit.stress = DEMO_DESERT_HEAT_STRESS,
+        (_, Hazard::Breakdown) => hit.secs = DEMO_DESERT_BREAKDOWN_SECS,
         (HazardPayer::Crew, Hazard::Crust) => {
             if leg == HazardLeg::Home {
                 hit.ore = carried / 4;
@@ -215,6 +257,11 @@ fn hazard_cost(hazard: Hazard, payer: HazardPayer, leg: HazardLeg, carried: u32)
 /// list is a clean trip. `carried` is what the cart holds at the landing; each crust hit on the
 /// way home takes a quarter of what is still on it.
 fn hazard_hits(op_seed: u32, pct: u32, payer: HazardPayer, out: &[Hazard], home: &[Hazard], carried: u32) -> Option<Vec<HazardHit>> {
+    // BP-38b-2a: the desert rolls on its own stream (`desert_roll`), so it takes no draw here.
+    let not_desert = |h: &&Hazard| !matches!(h, Hazard::Heat | Hazard::Breakdown);
+    let out: Vec<Hazard> = out.iter().filter(not_desert).copied().collect();
+    let home: Vec<Hazard> = home.iter().filter(not_desert).copied().collect();
+    let (out, home) = (&out[..], &home[..]);
     if pct == 0 || (out.is_empty() && home.is_empty()) {
         return None;
     }
@@ -241,6 +288,8 @@ pub fn hazard_warning(kinds: &[Hazard]) -> Option<String> {
             Hazard::Gas => "gas",
             Hazard::Crust => "soft crust",
             Hazard::Ruins => "ruins",
+            Hazard::Heat => "heat",
+            Hazard::Breakdown => continue,
         };
         if !words.contains(&w) {
             words.push(w);
@@ -370,6 +419,10 @@ pub enum Hazard {
     Gas,
     Crust,
     Ruins,
+    /// BP-38b-2a: Scorched Desert's class (ODQ-87 (e)) and its heat hit (+5 stress, no wounds).
+    Heat,
+    /// BP-38b-2a: a desert breakdown hit (extra seconds on its leg). Never a terrain class.
+    Breakdown,
 }
 
 /// BP-20a-2: a terrain's hazard, the one classifier (`is_hazard` reads it). Exhaustive on purpose
@@ -379,8 +432,8 @@ pub fn hazard_of(t: &HexTerrain) -> Option<Hazard> {
         HexTerrain::ToxicZone => Some(Hazard::Gas),
         HexTerrain::CooledMagma => Some(Hazard::Crust),
         HexTerrain::RuinedCity => Some(Hazard::Ruins),
+        HexTerrain::ScorchedDesert => Some(Hazard::Heat),
         HexTerrain::AshenPlains
-        | HexTerrain::ScorchedDesert
         | HexTerrain::CityState
         | HexTerrain::GunOutpost
         | HexTerrain::MagmaFlow
@@ -1486,6 +1539,21 @@ struct OpHazards {
     out: Vec<Hazard>,
     home: Vec<Hazard>,
     pct: u32,
+    /// BP-38b-2a: the desert's hits, rolled at the start, reported and charged at the landing.
+    desert: Vec<HazardHit>,
+    crossed_desert: bool,
+    /// Breakdown seconds: the outbound into `arrive_at` at the start; the homeward at each homeward write.
+    /// `travel_secs` is never touched (the escort and the drawn guard read it).
+    out_extra_secs: u32,
+    home_extra_secs: u32,
+}
+
+impl OpHazards {
+    fn with_desert(out: Vec<Hazard>, home: Vec<Hazard>, pct: u32, op_seed: u32, pcts: (u32, u32), payer: HazardPayer) -> Self {
+        let (desert, out_extra_secs, home_extra_secs) = desert_roll(op_seed, pcts.0, pcts.1, payer, &out, &home);
+        let crossed_desert = out.iter().chain(home.iter()).any(|h| *h == Hazard::Heat);
+        Self { out, home, pct, desert, crossed_desert, out_extra_secs, home_extra_secs }
+    }
 }
 
 /// BP-20a-2: who pays the op's hazards (block C's `HazardPayer`).
@@ -2023,9 +2091,15 @@ impl OpsEntry {
     /// Returns what still rides on the cart. No hazard crossed, or the knob at 0: no report.
     fn land_hazards(&mut self, op: &ActiveOp, carried: u32) -> u32 {
         let payer = hazard_payer(op);
-        let Some(hits) = hazard_hits(op.op_seed, op.hazards.pct, payer, &op.hazards.out, &op.hazards.home, carried) else {
+        // BP-38b-2a: a trip that crossed desert always reports, so a clean crossing gets its line. Gas hits come
+        // first, then the desert's. An op removed without landing (`next`, a Wipeout, a dig wipe) reports and
+        // charges nothing, as gas; its outbound breakdown seconds were already spent in `arrive_at`.
+        let gas_hits = hazard_hits(op.op_seed, op.hazards.pct, payer, &op.hazards.out, &op.hazards.home, carried);
+        if gas_hits.is_none() && !op.hazards.crossed_desert {
             return carried;
-        };
+        }
+        let mut hits = gas_hits.unwrap_or_default();
+        hits.extend(op.hazards.desert.iter().cloned());
         let sum = |f: fn(&HazardHit) -> u32| hits.iter().fold(0u32, |acc, h| acc.saturating_add(f(h)));
         let (ore, stress, wounded, morale) = (sum(|h| h.ore), sum(|h| h.stress), sum(|h| h.wounded), sum(|h| h.morale));
         let mut trip = HazardDue::default();
@@ -2048,7 +2122,7 @@ impl OpsEntry {
         }
         self.hazard_due.add(&trip);
         self.trip_seq += 1;
-        self.trip_reports.push(TripReport { seq: self.trip_seq, site_id: op.site_id.clone(), route: op.route, hits });
+        self.trip_reports.push(TripReport { seq: self.trip_seq, site_id: op.site_id.clone(), route: op.route, hits, desert: op.hazards.crossed_desert });
         if self.trip_reports.len() > TRIP_REPORTS_KEPT {
             self.trip_reports.remove(0);
         }
@@ -2280,7 +2354,7 @@ fn new_op(site: &OpsSite, op_seed: u32, dig: Option<DigStart>, contract: Option<
         kind: site.kind,
         leg: OpLeg::Outbound,
         depart_at: now,
-        arrive_at: now + Duration::seconds(i64::from(leg_secs)),
+        arrive_at: now + Duration::seconds(i64::from(leg_secs + hazards.out_extra_secs)),
         travel_secs: site.travel_secs + detour_secs,
         route,
         detour_secs,
@@ -2381,6 +2455,7 @@ pub struct DemoOpsStore {
     /// Every store starts at 0, so no test rolls unless it asks; production sets its own once,
     /// in `main.rs`, before the state is shared.
     hazard_pct: u32,
+    desert_pcts: (u32, u32),
 }
 
 impl Default for DemoOpsStore {
@@ -2391,12 +2466,17 @@ impl Default for DemoOpsStore {
 
 impl DemoOpsStore {
     pub fn new(cap: usize) -> Self {
-        Self { inner: Mutex::new(HashMap::new()), cap, evict_warn: RateWarn::new(), hazard_pct: 0 }
+        Self { inner: Mutex::new(HashMap::new()), cap, evict_warn: RateWarn::new(), hazard_pct: 0, desert_pcts: (0, 0) }
     }
 
     /// Sets the hazard chance (BP-20a-2) for the ops started from now on.
     pub fn set_hazard_pct(&mut self, pct: u32) {
         self.hazard_pct = pct;
+    }
+
+    /// BP-38b-2a: the desert's breakdown and heat percentages (0 and 0 in every store until set).
+    pub fn set_desert_pcts(&mut self, breakdown: u32, heat: u32) {
+        self.desert_pcts = (breakdown, heat);
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, OpsEntry>> {
@@ -2547,7 +2627,8 @@ impl DemoOpsStore {
             Some(w) => w.fast_kinds.clone(),
             None => Vec::new(),
         };
-        let hazards = OpHazards { out: kinds.clone(), home: kinds, pct: self.hazard_pct };
+        let payer = if contract.is_some() { HazardPayer::Section } else { HazardPayer::Crew };
+        let hazards = OpHazards::with_desert(kinds.clone(), kinds, self.hazard_pct, op_seed, self.desert_pcts, payer);
         let op = new_op(site, op_seed, dig, contract, route, detour_secs, hazards, leg_secs, now);
         let key = slot_of(&op);
         let taken = op.contract.as_ref().is_some_and(|c| e.mission_held(c.mission_id, None)) || (key != SlotKey::Dig && e.slot(key).is_some());
@@ -2605,7 +2686,7 @@ impl DemoOpsStore {
         }
         op.leg = OpLeg::Homeward;
         op.depart_at = now;
-        op.arrive_at = now + Duration::seconds(i64::from(op.travel_secs));
+        op.arrive_at = now + Duration::seconds(i64::from(op.travel_secs + op.hazards.home_extra_secs)); // home leg: return
         e.moved_at = Some(now);
         e.touched = now;
         Ok(())
@@ -2702,7 +2783,8 @@ impl DemoOpsStore {
         }
         // BP-20a-2 (W4): the hop crosses nothing; home is the target's Fast way.
         let home = e.board.routes.get(&(site.q, site.r)).map_or_else(Vec::new, |w| w.fast_kinds.clone());
-        let hazards = OpHazards { out: Vec::new(), home, pct: self.hazard_pct };
+        let payer = if contract.is_some() { HazardPayer::Section } else { HazardPayer::Crew };
+        let hazards = OpHazards::with_desert(Vec::new(), home, self.hazard_pct, op_seed, self.desert_pcts, payer);
         let next = new_op(site, op_seed, dig, contract, RouteKind::Fast, 0, hazards, leg_secs, now);
         let target = slot_of(&next);
         if target == SlotKey::Dig && e.dig.is_some() && key != SlotKey::Dig {
@@ -2780,7 +2862,7 @@ impl DemoOpsStore {
             dig.ended_by = Some(OpEnd::Meltdown);
             op.leg = OpLeg::Homeward;
             op.depart_at = now;
-            op.arrive_at = now + Duration::seconds(i64::from(op.travel_secs));
+            op.arrive_at = now + Duration::seconds(i64::from(op.travel_secs + op.hazards.home_extra_secs)); // home leg: meltdown
             dig.crew_heads_lost = dig.crew_heads_lost.saturating_add(heads);
             return Ok(DrillOutcome::Meltdown { crew_id: dig.crew_id, heads: heads as i16 });
         }
@@ -2798,7 +2880,7 @@ impl DemoOpsStore {
                 dig.ended_by = Some(OpEnd::Retreat);
                 op.leg = OpLeg::Homeward;
                 op.depart_at = now;
-                op.arrive_at = now + Duration::seconds(i64::from(op.travel_secs));
+                op.arrive_at = now + Duration::seconds(i64::from(op.travel_secs + op.hazards.home_extra_secs)); // home leg: Crew retreat
             }
             RaidResult::Wiped => {
                 let due = dig.settlement(DigClose::CrewWiped, dig.carried);
@@ -2850,9 +2932,9 @@ impl DemoOpsStore {
         dig.ended_by = Some(OpEnd::Pulled);
         op.leg = OpLeg::Homeward;
         op.depart_at = now;
-        op.arrive_at = now + Duration::seconds(i64::from(op.travel_secs));
+        op.arrive_at = now + Duration::seconds(i64::from(op.travel_secs + op.hazards.home_extra_secs)); // home leg: pull
         if ambush_d100(op.op_seed) <= (base.haul_ambush_pct(load) + op.detour_secs * DEMO_AMBUSH_PCT_PER_DETOUR_SEC).min(DEMO_AMBUSH_CAP_PCT) {
-            dig.ambush_at = Some(now + Duration::milliseconds(i64::from(op.travel_secs) * 500));
+            dig.ambush_at = Some(now + Duration::milliseconds(i64::from(op.travel_secs + op.hazards.home_extra_secs) * 500)); // home leg: ambush midpoint
         }
         e.moved_at = Some(now);
         e.touched = now;
@@ -2952,7 +3034,7 @@ impl DemoOpsStore {
                     dig.ended_by = Some(OpEnd::Retreat);
                     op.leg = OpLeg::Homeward;
                     op.depart_at = now;
-                    op.arrive_at = now + Duration::seconds(i64::from(op.travel_secs));
+                    op.arrive_at = now + Duration::seconds(i64::from(op.travel_secs + op.hazards.home_extra_secs)); // home leg: raid retreat
                 }
                 // `Contract` never reaches this match (it latches above); it is named only to
                 // keep the match exhaustive without a catch-all.
@@ -6739,7 +6821,7 @@ mod tests {
     }
 
     fn hit(hazard: Hazard, leg: HazardLeg, ore: u32, stress: u32, wounded: u32, morale: u32) -> HazardHit {
-        HazardHit { hazard, leg, ore, stress, wounded, morale }
+        HazardHit { hazard, leg, ore, stress, wounded, morale, secs: 0 }
     }
 
     /// T2 (F-J): seed 1's hazard draws are 21, 7, 17, 51 (measured with a Python port of `rng.rs`):
@@ -6832,6 +6914,7 @@ mod tests {
                 site_id: site.site_id.clone(),
                 route: RouteKind::Fast,
                 hits: vec![hit(Crust, Out, 0, 0, 0, 0), hit(Gas, Out, 0, 10, 0, 5), hit(Gas, Home, 0, 10, 0, 5), hit(Crust, Home, 5, 0, 0, 0)],
+                desert: false,
             }]
         );
     }
@@ -6908,5 +6991,253 @@ mod tests {
         assert_eq!(store.start_op(b, (5, 0), board(), &site(), 7, None, Some(LEAD), at(1)), Err(StartRefusal::Full));
         assert_eq!(store.take_leader_claim(a, at(2)).hazards.morale, BTreeMap::from([(CREW, 5)]));
         assert_eq!(store.start_op(b, (5, 0), board(), &site(), 7, None, Some(LEAD), at(3)), Ok(()));
+    }
+
+    // ---- BP-38b-2a: Scorched Desert (ODQ-87 (e)). Draws are the desert stream's
+    // (`DEMO_DESERT_SEED_OFFSET`), measured with Linux's Python port of `rng.rs` (BP-38b-2 spec check).
+
+    /// A desert breakdown hit: 2 s on its leg, no stress.
+    fn bd(leg: HazardLeg) -> HazardHit {
+        HazardHit { hazard: Hazard::Breakdown, leg, ore: 0, stress: 0, wounded: 0, morale: 0, secs: 2 }
+    }
+
+    /// A desert heat hit: +5 stress to the trip's leader, no wounds.
+    fn ht(leg: HazardLeg) -> HazardHit {
+        HazardHit { hazard: Hazard::Heat, leg, ore: 0, stress: 5, wounded: 0, morale: 0, secs: 0 }
+    }
+
+    /// T1: the gas stream skips desert kinds, so adding Heat changes no gas draw (T2's pair).
+    #[test]
+    fn desert_kinds_take_no_hazard_draw() {
+        use Hazard::{Gas, Heat, Ruins};
+        let with = hazard_hits(1, 20, HazardPayer::Crew, &[Gas, Heat, Ruins], &[Gas, Heat, Ruins], 0);
+        let without = hazard_hits(1, 20, HazardPayer::Crew, &[Gas, Ruins], &[Gas, Ruins], 0);
+        assert_eq!(with, without);
+        assert!(without.is_some_and(|h| !h.is_empty()));
+    }
+
+    /// T2: seed 2, draws 20 · 97 | 53 · 34: out breaks down, home heats.
+    #[test]
+    fn desert_roll_seed_2_breaks_down_out_heats_home() {
+        use HazardLeg::{Home, Out};
+        assert_eq!(desert_roll(2, 50, 50, HazardPayer::Section, &[Hazard::Heat], &[Hazard::Heat]), (vec![bd(Out), ht(Home)], 2, 0));
+    }
+
+    /// T3: seed 16, draws 5 · 9 | 11 · 78: out breaks down and heats, home breaks down.
+    #[test]
+    fn desert_roll_seed_16_both_legs() {
+        use HazardLeg::{Home, Out};
+        assert_eq!(desert_roll(16, 50, 50, HazardPayer::Crew, &[Hazard::Heat], &[Hazard::Heat]), (vec![bd(Out), ht(Out), bd(Home)], 2, 2));
+    }
+
+    /// T4: seed 17, draws 98 · 55 | 54 · 57, all miss; and at 0 and 0 nothing hits.
+    #[test]
+    fn desert_roll_seed_17_all_clear() {
+        assert_eq!(desert_roll(17, 50, 50, HazardPayer::Crew, &[Hazard::Heat], &[Hazard::Heat]), (vec![], 0, 0));
+        assert_eq!(desert_roll(16, 0, 0, HazardPayer::Crew, &[Hazard::Heat], &[Hazard::Heat]), (vec![], 0, 0));
+    }
+
+    /// A store at cap 2, gas knob `gas`, desert at 50 and 50.
+    fn desert_store(gas: u32) -> DemoOpsStore {
+        let mut store = hazard_store(gas);
+        store.set_desert_pcts(50, 50);
+        store
+    }
+
+    /// A Crew-alone `dig(1)` over `kinds` on seed `seed`, walked home and landed (the probe's rewind
+    /// walk); returns the landed reports.
+    fn desert_landed(store: &DemoOpsStore, kinds: Vec<Hazard>, seed: u32) -> Vec<TripReport> {
+        let a = Uuid::from_u128(1);
+        let site = dig(1);
+        let crew = DigStart { crew_id: CREW, commander_id: COMMANDER, threshold: 100, section_id: None, escort: false };
+        store.start_op(a, (5, 0), hazard_board(vec![site.clone()], (9, 1), kinds), &site, seed, Some(crew), None, at(0)).expect("start");
+        store.rewind_op(a, 40);
+        assert_eq!(store.return_op(a, at(0)), Ok(()));
+        store.rewind_op(a, 40);
+        store.take_leader_claim(a, at(0));
+        store.ops_body(a, at(1)).3
+    }
+
+    fn desert_report(site_id: &str, hits: Vec<HazardHit>) -> Vec<TripReport> {
+        vec![TripReport { seq: 1, site_id: site_id.to_string(), route: RouteKind::Fast, hits, desert: true }]
+    }
+
+    /// S1 (P1): a contract over one desert hex, seed 2, gas knob 0: the outbound breakdown moves the
+    /// arrival 10 → 12 s; the homeward heat lands on the Commander at 23 s.
+    #[test]
+    fn desert_contract_breaks_down_out_and_heats_home() {
+        use HazardLeg::{Home, Out};
+        let store = desert_store(0);
+        let a = Uuid::from_u128(1);
+        let lead = ContractStart { commander_id: COMMANDER, section_id: Some(SECTION) };
+        store.start_op(a, (5, 0), hazard_board(vec![site()], (8, 0), vec![Hazard::Heat]), &site(), 2, None, Some(lead), at(0)).expect("start");
+        let t10 = RaidTrigger { trigger_at: at(10), mission_id: "GUARD_DUTY", kind: BattleKind::Contract };
+        assert!(!store.latch_raid(a, &t10, RaidResult::Held, FightPay::credits(0), at(12)), "not there at 10 s");
+        let t12 = RaidTrigger { trigger_at: at(12), mission_id: "GUARD_DUTY", kind: BattleKind::Contract };
+        assert!(store.latch_raid(a, &t12, RaidResult::Held, FightPay::credits(0), at(12)));
+        store.return_op(a, at(13)).expect("return");
+        assert_eq!(store.take_leader_claim(a, at(22)).hazards, HazardDue::default(), "still on the road");
+        assert_eq!(store.take_leader_claim(a, at(23)).hazards, HazardDue { stress: BTreeMap::from([(COMMANDER, 5)]), ..HazardDue::default() });
+        assert_eq!(store.ops_body(a, at(24)).3, desert_report("contract:GUARD_DUTY", vec![bd(Out), ht(Home)]));
+    }
+
+    /// S2 (P2): a Crew-alone dig over one desert hex, seed 16, against a twin at 0 and 0: on site at
+    /// 12 s, home at 24 s, the Foreman owes 5 more; the twin's clean crossing still reports.
+    #[test]
+    fn desert_dig_crew_heat_lands_on_the_foreman() {
+        use HazardLeg::{Home, Out};
+        let a = Uuid::from_u128(1);
+        let site = dig(1);
+        let crew = DigStart { crew_id: CREW, commander_id: COMMANDER, threshold: 100, section_id: None, escort: false };
+        let (hot, twin) = (desert_store(0), hazard_store(0));
+        for store in [&hot, &twin] {
+            store.start_op(a, (5, 0), hazard_board(vec![site.clone()], (9, 1), vec![Hazard::Heat]), &site, 16, Some(crew), None, at(0)).expect("start");
+        }
+        assert_eq!(hot.return_op(a, at(10)), Err(ReturnRefusal::NotArrived));
+        assert_eq!(hot.return_op(a, at(12)), Ok(()));
+        assert_eq!(hot.op_view(a, at(12)).expect("op").arrive_at, ops_time(at(24)));
+        assert_eq!(twin.return_op(a, at(10)), Ok(()));
+        let (hot_claim, twin_claim) = (hot.take_leader_claim(a, at(30)), twin.take_leader_claim(a, at(30)));
+        assert_eq!(hot_claim.due.stress, twin_claim.due.stress + 5);
+        assert_eq!(hot.ops_body(a, at(30)).3, desert_report("dig:9,1", vec![bd(Out), ht(Out), bd(Home)]));
+        assert_eq!(twin.ops_body(a, at(30)).3, desert_report("dig:9,1", vec![]));
+    }
+
+    /// S3 (P3): seed 17's desert draws all miss; the crossing still reports, with no hits.
+    #[test]
+    fn desert_clean_crossing_still_reports() {
+        assert_eq!(desert_landed(&desert_store(0), vec![Hazard::Heat], 17), desert_report("dig:9,1", vec![]));
+    }
+
+    /// S4 (P4): gas then desert, seed 17, gas knob 20 (gas draws 21 · 75 miss): both clean, the
+    /// report says desert.
+    #[test]
+    fn desert_and_gas_both_clean_report_desert() {
+        assert_eq!(desert_landed(&desert_store(20), vec![Hazard::Gas, Hazard::Heat], 17), desert_report("dig:9,1", vec![]));
+    }
+
+    /// S5 (P5): the same at gas knob 100: the gas hits both legs, the desert is clean.
+    #[test]
+    fn desert_clean_gas_hit_reports_the_gas() {
+        use HazardLeg::{Home, Out};
+        assert_eq!(
+            desert_landed(&desert_store(100), vec![Hazard::Gas, Hazard::Heat], 17),
+            desert_report("dig:9,1", vec![hit(Hazard::Gas, Out, 0, 10, 0, 5), hit(Hazard::Gas, Home, 0, 10, 0, 5)])
+        );
+    }
+
+    /// S6 (P6): two desert hexes, seed 2: out 20 · 97, 53 · 34; home 28 · 52, 60 · 64.
+    #[test]
+    fn desert_two_hexes_report_in_draw_order() {
+        use HazardLeg::{Home, Out};
+        assert_eq!(desert_landed(&desert_store(0), vec![Hazard::Heat, Hazard::Heat], 2), desert_report("dig:9,1", vec![bd(Out), ht(Out), bd(Home)]));
+    }
+
+    /// S7 (P9): an escorted dig at `dig(1)` hops to `dig(3)` (desert home): the hop is unchanged
+    /// (14 s); next seed 16 (5 · 9) breaks down and heats the way home, 14 → 26 s.
+    #[test]
+    fn desert_next_rolls_the_home_leg() {
+        use HazardLeg::Home;
+        let store = desert_store(0);
+        let a = Uuid::from_u128(1);
+        let (from, to) = (dig(1), dig(3));
+        let crew = DigStart { crew_id: CREW, commander_id: COMMANDER, threshold: 100, section_id: None, escort: true };
+        store.start_op(a, (5, 0), hazard_board(vec![from.clone(), to.clone()], (9, 3), vec![Hazard::Heat]), &from, 2, Some(crew), None, at(0)).expect("start");
+        assert_eq!(store.next_op(a, &to, 16, Some(crew), None, at(10)), Ok(()));
+        assert_eq!(store.op_view(a, at(10)).expect("op").arrive_at, ops_time(at(14)));
+        assert_eq!(store.return_op(a, at(14)), Ok(()));
+        assert_eq!(store.op_view(a, at(14)).expect("op").arrive_at, ops_time(at(26)));
+        assert_eq!(store.ops_body(a, at(40)).3, desert_report("dig:9,3", vec![bd(Home), ht(Home)]));
+    }
+
+    /// The six homeward sites (RULE-033): a store whose every desert breakdown hits and no heat does.
+    fn breakdown_store() -> DemoOpsStore {
+        let mut store = DemoOpsStore::new(2);
+        store.set_desert_pcts(100, 0);
+        store
+    }
+
+    /// `on_site` over one desert hex both ways: the outbound breakdown puts it on site at 12 s, not 10.
+    fn on_desert_site(store: &DemoOpsStore, a: Uuid, threshold: u32, seed: u32, escort: bool) {
+        let crew = DigStart { crew_id: CREW, commander_id: COMMANDER, threshold, section_id: None, escort };
+        let site = dig(1);
+        store.start_op(a, (5, 0), hazard_board(vec![site.clone()], (9, 1), vec![Hazard::Heat]), &site, seed, Some(crew), None, at(0)).expect("start");
+        assert_eq!(store.op_view(a, at(1)).expect("op").arrive_at, ops_time(at(12)), "the outbound breakdown");
+    }
+
+    /// `ops_store_return_from_a_dig_walks_away`, 2 s later: walked away at 15 s, home at 27 s.
+    #[test]
+    fn desert_home_return() {
+        let store = breakdown_store();
+        let a = Uuid::from_u128(1);
+        on_desert_site(&store, a, 100, 2, true);
+        store.drill_op(a, at(13)).expect("drill");
+        store.drill_op(a, at(14)).expect("drill");
+        assert_eq!(store.return_op(a, at(15)), Ok(()));
+        assert_eq!(store.op_view(a, at(16)).expect("op").arrive_at, ops_time(at(27)));
+    }
+
+    /// `ops_store_meltdown_on_the_6th_drill_at_exactly_100`, 2 s later: melts at 22 s, home at 34 s.
+    #[test]
+    fn desert_home_meltdown() {
+        let store = breakdown_store();
+        let a = Uuid::from_u128(1);
+        on_desert_site(&store, a, 100, 57, true);
+        for i in 1..=5 {
+            assert_eq!(store.drill_op(a, at(12 + i)), Ok(DrillOutcome::Drilled), "drill {i}");
+        }
+        assert_eq!(store.drill_op(a, at(22)), Ok(DrillOutcome::Meltdown { crew_id: CREW, heads: 2 }));
+        assert_eq!(store.op_view(a, at(23)).expect("op").arrive_at, ops_time(at(34)));
+    }
+
+    /// `foreman_due_retreat_home`, 2 s later: seed 45 alone, the Crew falls back at 13 s, home at 25 s.
+    #[test]
+    fn desert_home_crew_retreat() {
+        let store = breakdown_store();
+        let a = Uuid::from_u128(1);
+        on_desert_site(&store, a, 1000, 45, false);
+        assert_eq!(store.drill_op(a, at(13)), Ok(DrillOutcome::CrewFight { crew_id: CREW, heads: 2 }));
+        assert_eq!(store.op_view(a, at(14)).expect("op").arrive_at, ops_time(at(25)));
+    }
+
+    /// `ops_store_pull_loads_the_ore_and_heads_home`, 2 s later: seed 2, three drills, pulled at 22 s,
+    /// home at 34 s. The arrival only (the midpoint is `desert_home_ambush_midpoint`'s).
+    #[test]
+    fn desert_home_pull() {
+        let store = breakdown_store();
+        let a = Uuid::from_u128(1);
+        on_desert_site(&store, a, 100, 2, true);
+        for i in 1..=3 {
+            assert_eq!(store.drill_op(a, at(12 + i)), Ok(DrillOutcome::Drilled), "drill {i}");
+        }
+        assert_eq!(store.pull_op(a, at(22)), Ok(()));
+        assert_eq!(store.op_view(a, at(23)).expect("op").arrive_at, ops_time(at(34)));
+    }
+
+    /// `ops_store_ambush_is_hidden_until_its_midpoint`, 2 s later: seed 14, two drills, pulled at 22 s;
+    /// the midpoint is 22 + 12 × 500 ms = 28 s. The ambush only (the arrival is `desert_home_pull`'s).
+    #[test]
+    fn desert_home_ambush_midpoint() {
+        let store = breakdown_store();
+        let a = Uuid::from_u128(1);
+        on_desert_site(&store, a, 100, 14, true);
+        for i in 1..=2 {
+            assert_eq!(store.drill_op(a, at(12 + i)), Ok(DrillOutcome::Drilled), "drill {i}");
+        }
+        assert_eq!(store.pull_op(a, at(22)), Ok(()));
+        assert_eq!(store.pending_raid(a, at(27)), None);
+        assert_eq!(store.pending_raid(a, at(28)).map(|p| p.trigger), Some(ambush_trigger(28)));
+    }
+
+    /// `ops_store_retreat_banks_what_it_carried`, 2 s later: seed 7 raids on drill 1 at 13 s, latched
+    /// as a retreat at 22 s, home at 34 s.
+    #[test]
+    fn desert_home_raid_retreat() {
+        let store = breakdown_store();
+        let a = Uuid::from_u128(1);
+        on_desert_site(&store, a, 100, 7, true);
+        store.drill_op(a, at(13)).expect("drill");
+        assert!(store.latch_raid(a, &trigger(13), RaidResult::Retreat, FightPay::credits(0), at(22)));
+        assert_eq!(store.op_view(a, at(23)).expect("op").arrive_at, ops_time(at(34)));
     }
 }

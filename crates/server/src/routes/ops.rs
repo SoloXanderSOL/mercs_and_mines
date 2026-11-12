@@ -2451,7 +2451,8 @@ mod tests {
     }
 
     /// BP-20a-1: map 42 from gateway (5, −3). `dig:13,-9`'s Fast way crosses a ToxicZone in
-    /// 16 s and its Safe way none in 17 s; `dig:9,-7`'s Fast way is clean (one way only).
+    /// 16 s and its Safe way crosses nothing in 20 s; `dig:9,-7`'s Fast way crosses Scorched
+    /// Desert in 9 s and its Safe way crosses nothing in 16 s (BP-38b-2a: desert is a hazard).
     const ROUTE_GATEWAY: (i32, i32) = (5, -3);
     const TWO_WAY_DIG: &str = "dig:13,-9";
     const ONE_WAY_DIG: &str = "dig:9,-7";
@@ -2488,14 +2489,14 @@ mod tests {
         let routes = site["routes"].as_array().expect("routes");
         assert_eq!(routes.len(), 2, "{site}");
         assert_eq!((routes[0]["route"].as_str(), routes[0]["secs"].as_u64()), (Some("fast"), Some(16)));
-        assert_eq!((routes[1]["route"].as_str(), routes[1]["secs"].as_u64()), (Some("safe"), Some(17)));
+        assert_eq!((routes[1]["route"].as_str(), routes[1]["secs"].as_u64()), (Some("safe"), Some(20)));
         for r in routes {
             assert_eq!(r["path"].as_array().expect("a path").last(), Some(&serde_json::json!([13, -9])), "{r}");
         }
         let (status, body, _) = start_on(&state, c, TWO_WAY_DIG, "safe").await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let op = &body["active_op"];
-        assert_eq!(secs_between(op), 17);
+        assert_eq!(secs_between(op), 20);
         assert_eq!(op["route"], "safe");
     }
 
@@ -2505,7 +2506,11 @@ mod tests {
         let c = route_campaign(&state).await;
         let (status, body, _) = start_on(&state, c, TWO_WAY_DIG, "scenic").await;
         assert_eq!((status, body["error"].as_str()), (StatusCode::BAD_REQUEST, Some("unknown route")));
-        let (status, body, _) = start_on(&state, c, ONE_WAY_DIG, "safe").await;
+        // BP-38b-2a: `ONE_WAY_DIG` gained a Safe way when desert became a hazard; `dig:11,-4` from
+        // `GATEWAY` (5, 0) keeps none. A fresh state, so the second campaign is the wallet's only one.
+        let state = Arc::new(session_state());
+        let (c, _) = dig_campaign(&state, false).await;
+        let (status, body, _) = start_on(&state, c, "dig:11,-4", "safe").await;
         assert_eq!((status, body["error"].as_str()), (StatusCode::BAD_REQUEST, Some("no safe route to that site")));
     }
 
@@ -5818,6 +5823,22 @@ mod tests {
         let routes = site["routes"].as_array().expect("routes");
         assert_eq!((routes[0]["route"].as_str(), routes[0]["warning"].as_str()), (Some("fast"), Some("gas")), "{site}");
         assert_eq!(routes[1]["route"], "safe");
+        assert!(routes[1].get("warning").is_none(), "{site}");
+    }
+
+    /// BP-38b-2a: `ONE_WAY_DIG`'s Fast way crosses Scorched Desert in 9 s and carries `heat`; its
+    /// Safe way goes round in 16 s and carries no warning.
+    #[tokio::test]
+    async fn ops_board_warns_heat_on_a_desert_way() {
+        let state = Arc::new(session_state());
+        let c = route_campaign(&state).await;
+        let (status, body) = get(&state, Some("t"), c).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let site = body["sites"].as_array().expect("sites").iter().find(|s| s["site_id"] == ONE_WAY_DIG).expect("the dig").clone();
+        let routes = site["routes"].as_array().expect("routes");
+        assert_eq!(routes.len(), 2, "{site}");
+        assert_eq!((routes[0]["route"].as_str(), routes[0]["secs"].as_u64(), routes[0]["warning"].as_str()), (Some("fast"), Some(9), Some("heat")), "{site}");
+        assert_eq!((routes[1]["route"].as_str(), routes[1]["secs"].as_u64()), (Some("safe"), Some(16)), "{site}");
         assert!(routes[1].get("warning").is_none(), "{site}");
     }
 
