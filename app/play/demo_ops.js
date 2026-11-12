@@ -101,6 +101,7 @@ const COPY = {
   aarLost: 'Lost: {names}.',
   aarDead: '{name} ({status})',
   aarNone: 'No losses for a change. HR is pleasantly surprised.',
+  aarHurt: 'Nobody died. Not everyone came back in one piece.', // BP-39: wounded and nobody dead; aarWounded still gives the count
   aarSection: '{name}: {a} → {b}',
   shop: 'Shop', // BP-40a-2a: the bottom bar's label
   // BP-12b (Wiki copy)
@@ -223,7 +224,7 @@ const COLOUR = { dig: '#ff8c2a', ring: '#ffd27a', contract: '#6fd3ff', edge: '#0
 // the demo doesn't simulate is left out. No line makes a richness-by-distance claim (ODQ-72 is open).
 const TERRAIN = {
   AshenPlains: 'Ashen Plains: open ground. Teams cross it at the usual pace.',
-  ScorchedDesert: 'Scorched Desert: flat, dry and hot. Engines choke and crews cook; Safe ways go round it.',
+  ScorchedDesert: 'Scorched Desert: flat, dry and hot. Engines choke and crews cook; the Safe way dodges what hazards it can - though that\'s not always an option.',
   RuinedCity: 'Ruined City: slow going. Falling ruins can wound a squad, or shake a Crew and its Foreman.',
   CityState: 'City-State: a living city with good roads. Teams cross it twice as fast.',
   GunOutpost: 'G.U.N. Outpost: G.U.N. keeps these roads clear. Teams cross it twice as fast.',
@@ -1398,15 +1399,15 @@ function aarNote({ report, section }) {
   const before = fightHead;
   fightHead = null;
   const dead = (report && report.unit_results || []).filter(u => u.final_status === 'KIA' || u.final_status === 'MIA');
+  // BP-12b: the wounded go to the sickbay when the fight latches. BP-39: counted before line 0, which says "No losses" only when nobody was hurt.
+  const wounded = (report && report.unit_results || []).filter(u => u.final_status === 'Wounded').length;
   const lines = [dead.length
     ? fill(COPY.aarLost, { names: dead.map(u => fill(COPY.aarDead, { name: u.unit_name, status: u.final_status })).join(', ') })
-    : COPY.aarNone];
+    : wounded > 0 ? COPY.aarHurt : COPY.aarNone];
   // The count before the fight is the one taken when it was opened: a read that latched the fight
   // in the meantime would already have lowered the roster's (Reviewer BP-11b-1 F1).
   const a = before ?? (section && section.headcount);
   if (section) lines.push(fill(COPY.aarSection, { name: section.name, a, b: Math.max(0, a - dead.length) }));
-  // BP-12b: the wounded go to the sickbay when the fight latches.
-  const wounded = (report && report.unit_results || []).filter(u => u.final_status === 'Wounded').length;
   if (wounded > 0) lines.push(fill(COPY.aarWounded, { n: wounded }));
   // BP-18b-1 (R3): the fought Commander is dead or Shattered (battle.js has patched the roster) and another can
   // lead: the next is battle.js's nextUsable pick, the first usable in roster order.
