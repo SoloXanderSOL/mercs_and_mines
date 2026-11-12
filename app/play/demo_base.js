@@ -56,7 +56,7 @@ export const BASE_COPY = {
   medbay: 'Open the Medbay', // BP-33: a built Medbay's button
   endBase: 'Banked ore and credits do not transfer. The base stays on the old books.',
   endBaseOut: 'Banked ore and credits do not transfer. The base stays on the old books; ore on site and in transit is written off.',
-  endBaseOnly: 'Banked ore and credits do not transfer. The base stays on the old books.',
+  endBaseOnly: 'The base stays on the old books.',
 };
 
 // List art (BP-10b): line drawings in the accent colour, one per building, kept as the list's thumbnails.
@@ -133,7 +133,7 @@ export const BASE_CSS = `
 .base-build, .base-open { width: auto; max-width: none; min-height: 8.5cqw; margin-top: 0.8cqw; padding: 0 2.5cqw; font-size: 3.6cqw; align-self: flex-start; }
 .base-close { width: auto; max-width: none; min-height: 8.5cqw; padding: 0 3cqw; font-size: 3.6cqw; }
 .base-plot { position: relative; flex: none; overflow: hidden; overflow: clip; border-radius: 1.5cqw; } /* BP-40b: the frame; the radius moved here from the ground */
-/* BP-27b (Reviewer BP-40b F1): clip, not hidden, so the frame is no scroll container and a focus move can't shift the zoomed view. */
+/* BP-27b (Reviewer BP-40b F1), BP-45 (Reviewer BP-38a F3): clip keeps the frame from being a scroll container, so a focus move can't shift the zoomed view; hidden is the fallback for engines without clip, where a focus move can scroll the frame. */
 .base-plot-img { display: block; width: 100%; height: auto; aspect-ratio: 1008 / 1050; }
 /* BP-40b: the layer that zooms, in flow, so the ground still sets the plot's height. touch-action: none makes every
    finger on the art ours: one pans (or scrolls the sheet at 1x), two pinch (spec check 2 (b)). */

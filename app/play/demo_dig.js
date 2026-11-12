@@ -47,8 +47,8 @@ export const DIG_COPY = {
   popHeat: '+{n} HEAT', // BP-37c (item 6): the heat that drill added, never the total
   raidWait: 'Raiders at {title}. Fight to resume drilling.',
   ambushWait: 'Ambushed on the road. Fight to bring the haul home.',
-  raidLead: 'Claim jumpers at {title}: raccoons on dirt bikes, very interested in your drill. Drilling halts until the site is secured. They cannot read the Keep Out sign. Explain it to them.',
-  ambushLead: 'Your haul has been intercepted on the road home. {carried} ore is at stake, and the raccoons on the ridge have already started dividing it up. Get it back on the truck.',
+  raidLead: 'Claim jumpers at {title}: raccoons on dirt bikes, they seem very interested in your drill. Drilling halts until the site is secured. They cannot read the Keep Out sign. Explain it to them - forcefully.',
+  ambushLead: 'Your haul has been intercepted on the road home. {carried} ore is at stake, and the raccoons on the ridge have already started arguing about how they\'ll divide it up. Get it back on the truck.',
   incident: 'INCIDENT REPORT',
   meltdown: 'Thermal breach at {title}. Ore on site written off.',
   meltdownHome: 'Casualties logged against your Crew. Heading home. {n} s',

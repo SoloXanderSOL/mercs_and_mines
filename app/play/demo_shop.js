@@ -1,9 +1,8 @@
 // The Demo Shop for the Breakpoint demo (BP-25; demo-only (ODQ-74 (d)): never merged to dev; the port
 // deletes this file). The hub's Demo Shop button opens it. Buy enters today's checkout with the same call and
 // the same `then` as before BP-25 (Not now and Continue land on the hub), so checkout.js and its exits are
-// unchanged. BP-29a's small print, then GAP-90's line, sit under Buy. The Breakpoint Genesis Field Pass (ODQ-70) has no mint button until
-// BP-7. The Field Pass line reads the per-wallet Genesis answer that BP-3c-2 cached (a 200 only), and no answer
-// draws no line. The screen is outside main.js's SCREENS, so it closes itself whenever another stage screen shows
+// unchanged. BP-29a's small print, then GAP-90's line, sit under Buy. BP-45 (Director ruling 2026-11-11): the Field Pass,
+// Portraits and How-it-is-paid-for boxes are gone; the money model lives on the main website. The screen is outside main.js's SCREENS, so it closes itself whenever another stage screen shows
 // (a late read's show(), an error). Every string goes in through textContent.
 // BP-43b-1: the Trading Post (BP-43 scope items 1, 2, 4). Its own frame, below Back; the devnet checkout keeps its
 // own frame above it, so in-game credits and the test payment never share a frame or a button row. It reads
@@ -14,24 +13,15 @@
 // grade from company.trade.loot, with one confirm; equipped kit is never on the shelf, so it is never offered. A
 // trade whose prices aren't all positive integers is shut, ore and loot together (Reviewer BP-43b-1 F1).
 
-import { store } from './api.js';
 import { bankedLine } from './demo_dig.js'; // BP-43b-1: the bank line, the hub chip's own
 
 // Wiki copy (BP-25). Canon: Wiki/GDD/Soulbound_NFT_Policy.md §1, §2a; the Business Plan's money model.
 const COPY = {
   title: 'Demo Shop',
-  buy: 'Try a test payment', // BP-29a (Wiki copy, feedback item 38): nothing is sold here
+  buy: 'Test buying a campaign · $3.99 test USDC', // BP-29a (Wiki copy, feedback item 38): nothing is sold here
   buyNote: 'No real money. This uses test-network USDC so we can check the payment system works before launch.',
   wallet: "Your wallet will warn that it doesn't recognise this site. It's right: this demo runs on the test network and isn't in the dApp Store yet.",
   back: 'Back to the hub',
-  passLabel: 'Breakpoint Genesis Field Pass',
-  passBody: 'Free, one per Seeker Genesis Token. A soulbound NFT on the test network: welded to your wallet, never sold, never traded. It is not part of the Genesis Collection.',
-  passHolds: 'Your Seeker holds a Genesis Token. You qualify.',
-  passSoon: 'Minting opens soon. The clerk is still looking for the stamp.',
-  portraitsTitle: 'Portraits, in the full game',
-  portraits: 'Your G.U.N. personnel file has a photo. The standard one is free. The rare ones are soulbound 1-of-1 NFTs, one of each per Seeker Genesis Token, at a fixed price shown before you pay. They do nothing in a fight. They are there to be looked at.',
-  patronageTitle: 'How it is paid for',
-  patronage: 'With a Seeker Genesis Token the first campaign is free. Each one after costs $3.99. No subscriptions, no loot boxes, no ads, nothing to resell. The NFTs are patronage: if you like what we are building, here is something good to look at. Nothing more is promised, because nothing more exists.',
   // BP-43b-1 (Wiki copy; the Director's script pass may reword): the Trading Post. Sell's lines moved from the
   // Company card (BP-28b), unchanged.
   tradeTitle: 'Trading Post',
@@ -68,7 +58,6 @@ const CSS = `
 .shop-buy { flex-shrink: 0; } /* BP-29a: the column overflows the stage, so flex shrink squeezed Buy to its min-height and a wrapped label spilled */
 .shop-frame { width: 100%; border: 0.5cqw solid var(--accent); border-radius: 1.5cqw; background: var(--panel); padding: 4cqw; display: flex; flex-direction: column; gap: 2.5cqw; text-align: left; }
 .shop-label { margin: 0; font-family: var(--display); font-weight: 700; font-size: 5cqw; color: var(--accent); }
-.shop-h { margin: 0; width: 100%; font-family: var(--display); font-weight: 700; font-size: 5cqw; text-align: left; }
 .shop-body { margin: 0; width: 100%; font-size: 3.9cqw; line-height: 1.4; text-align: left; }
 .shop-body.muted { color: var(--muted); }
 .shop-act { width: 100%; max-width: none; margin-top: 0; min-height: 11cqw; font-size: 4.4cqw; }
@@ -206,23 +195,11 @@ export function redrawShop() {
   drawTrade();
 }
 
-// The Genesis answer cached for this tab's wallet (BP-3c-2: written from a 200 only). No wallet or no answer: false.
-function holdsGenesis() {
-  const s = store.session();
-  const w = s && s.wallet_address;
-  const g = w ? store.genesis(w) : null;
-  return Boolean(g && g.holds === true);
-}
-
 export function openShop() {
   const pic = el('img', 'shop-pic');
   pic.alt = '';
   pic.addEventListener('error', () => pic.remove()); // a failed picture leaves the text whole
   pic.src = 'assets/art/scene_shop_banner.jpg';
-  const frame = el('div', 'shop-frame shop-pass'); // BP-43b-1: + shop-pass, so a reader can tell it from the other frames
-  frame.append(el('h2', 'shop-label', COPY.passLabel), el('p', 'shop-body', COPY.passBody));
-  if (holdsGenesis()) frame.append(el('p', 'shop-body shop-holds', COPY.passHolds));
-  frame.append(el('p', 'shop-body', COPY.passSoon));
   const buy = button('btn btn-primary shop-buy', COPY.buy, () => { close(); deps.offerCheckout(() => deps.enterHub()); });
   const back = button('btn shop-back', COPY.back, () => { close(); deps.enterHub(); });
   // BP-43b-1 (scope item 4; spec check F3, belowBackFirst): the checkout in its own frame, then Back, then the Trading Post.
@@ -234,9 +211,7 @@ export function openShop() {
   if (view) view.clearNotice();
   drawTrade();
   for (const s of document.querySelectorAll('#stage > .screen')) s.hidden = s !== section;
-  section.replaceChildren(pic, el('h1', 'shop-title', COPY.title), pay, back, tradeBox, frame,
-    el('h2', 'shop-h', COPY.portraitsTitle), el('p', 'shop-body', COPY.portraits),
-    el('h2', 'shop-h', COPY.patronageTitle), el('p', 'shop-body', COPY.patronage));
+  section.replaceChildren(pic, el('h1', 'shop-title', COPY.title), pay, back, tradeBox);
   section.scrollTop = 0;
 }
 

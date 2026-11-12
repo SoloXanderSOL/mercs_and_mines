@@ -14,15 +14,15 @@ const CARD = {
   body: [
     ['It is a pre-collapse device called a ', { b: 'Seeker' }, '. It still turns on.'],
     ['Inside is a wallet holding an ancient hoard of a digital currency called ', { b: 'SOL' }, '. According to the ledger, you are now its only owner. Of all of it. Anywhere.'],
-    ['There are stories on it too. They tell of a mythical city called ', { b: 'London' }, ', and of a legendary gathering held there called ', { b: 'Breakpoint' }, '. One speaker is recorded in detail: a man with a calamitous blonde haircut, whose name has been lost to time. He spent his slot shuffling through his notes, losing his place, and talking at length about someone called Peppa Pig. Strangest of all, he talks exactly like a Science Ape.'],
-    ['Nobody else on Gunmetal speaks the way the Apes do. Nobody knows where the accent comes from, and the Apes have always refused to say.'],
-    ['The Ape has gone very quiet. It keeps murmuring "London" to itself, and for the first time, it sounds homesick.'],
+    ['There are stories on it too. They tell of a mythical city called ', { b: 'London' }, ', and of a legendary gathering held there called ', { b: 'Breakpoint' }, '. One speaker is recorded in detail: an unkempt looking man with a calamitous blonde haircut, whose name has been lost to time. He spent his slot shuffling through his notes in a state of disorganised confusion, repeatedly losing his place, and talking at length about someone called Peppa Pig. Strangest of all, he talks exactly like a British Science Ape.'],
+    ['Nobody else on Gunmetal speaks the way the Apes do. Nobody knows where the accent comes from or what the word British even means, and the Apes have always refused to say.'],
+    ['The Ape has gone very quiet. It keeps murmuring "London" to itself, and there is an unfamiliar tone to its voice - it sounds homesick.'],
   ],
   continue: 'Continue',
   options: [
-    { label: 'Hand it to G.U.N.', sub: 'Declare it. Claim the tax rebate.', outcome: 'G.U.N. thanks you for your honesty and confiscates the device. Your rebate comes to 4¢, less the 25% Corruption Tax. You receive 3¢, plus a receipt that is worth slightly more.' },
-    { label: 'Give it to The Trust', sub: 'Blue Blood and brownie points.', outcome: 'A zeppelin collects it within the hour. The Trust files the Seeker in the Great Archive, sends you a canister of Blue Blood and adds one point to your standing. The point arrives with a note correcting the spelling in your covering letter.' },
-    { label: 'Keep it', sub: 'Ditch $GCN. Bring back SOL.', outcome: 'You call a meeting to announce that SOL is the future and $GCN is finished. Attendance: you, and the Ape, who came for the biscuits. Nobody else owns any SOL. You point out that this makes you very early.' },
+    { label: 'Hand it to G.U.N.', sub: 'Declare it. Claim the tax rebate.', outcome: 'G.U.N. thanks you for your honesty and confiscates the device. Your rebate comes to 4¢, minus the 25% Corruption Tax. You receive 3¢, plus a receipt that is probably actually worth slightly more than the reward.' },
+    { label: 'Give it to The Trust', sub: 'The Trust\'s Science Apes will appreciate this. Exchange it for their fuel.', outcome: 'A white-hulled Trust zeppelin, crewed by impeccably uniformed Science Apes in leather flight jackets, collects it within the hour. The Trust files the Seeker in the Great Archive, sends you a canister of Blue Blood fuel and adds one point to your standing. The point arrives with a note attached correcting the spelling error in the covering letter you sent them.' },
+    { label: 'Keep it', sub: 'Ditch $GCN. Bring back SOL!', outcome: 'You call a meeting of all the nearby merc and mine corps to announce that SOL is the future and $GCN is finished, and that they should buy in before it\'s too late. Attendance: you, and the Ape, who came for the complimentary biscuits. Nobody else owns any SOL. You point out that this just means you\'re ahead of the curve.' },
   ],
 };
 

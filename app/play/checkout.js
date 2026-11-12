@@ -31,8 +31,8 @@ const nextPoll = ms => new Promise(r => setTimeout(r, ms)); // the checkout poll
 
 // Booth copy, verbatim from the BP-3c-2b prompt.
 const COPY = {
-  checkoutTitle: 'Buy your next campaign',
-  checkoutOfferBody: "A campaign runs up to 60 days and costs $3.99. Here it's paid in test USDC on the Solana test network: the payment is real, the money isn't.",
+  checkoutTitle: 'Test our "buy your next campaign" button',
+  checkoutOfferBody: "At launch, a campaign will run up to 60 days and cost $3.99. Here it's paid in test USDC on the Solana test network: by helping us test the devnet rails, you help us know it works as planned. The payment technology is real, the money isn't.",
   checkoutPay: 'Pay $3.99 (test USDC)',
   checkoutNotNow: 'Not now',
   checkoutWorking: 'Drawing up the invoice...',
@@ -41,7 +41,7 @@ const COPY = {
   checkoutCheckingLast: 'Checking your last payment...',
   checkoutLapsed: 'Your last payment never went through, so nothing was charged. You can pay now.',
   checkoutLastPendingBody: "Still checking whether your last payment went out. Nothing more will be charged. Check again in a moment.",
-  checkoutPaidTitle: 'Paid. Your next campaign is booked.',
+  checkoutPaidTitle: 'Paid. The rails work. Thanks for testing them.',
   checkoutPaidBody: '{amount} test USDC, paid on the Solana test network.',
   checkoutContinue: 'Continue',
   checkoutPendingBody: "The test network hasn't confirmed your payment yet. Nothing more will be charged. Check again in a moment.",
@@ -58,7 +58,7 @@ const COPY = {
   checkoutUnavailable: "Checkout isn't open right now. Your campaign carries on regardless.",
   checkoutCheckFailed: "Couldn't check the payment just now. Nothing more will be charged.",
   walkthroughTitle: "This is where you'd pay.",
-  walkthroughBody: "On a Solana Seeker, this screen takes $3.99 for your next campaign. At the booth, it's on us.",
+  walkthroughBody: "On a Seeker with a devnet wallet, this is where you'd pay us test USDC, to test our payment rails. At launch, a 60-day campaign will cost $3.99. If you have a Seeker, your Genesis Token puts the first campaign on the house.",
 };
 
 const fill = (text, values) => text.replace(/\{(\w+)\}/g, (m, k) => (k in values ? String(values[k]) : m));

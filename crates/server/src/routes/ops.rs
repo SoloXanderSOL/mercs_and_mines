@@ -3416,7 +3416,7 @@ mod tests {
             (long.as_str(), "a company name is 1 to 24 characters"),
             ("Acme \u{1F525}", "letters, numbers, spaces and - ' . & only"),
             ("2026", "a company name needs at least one letter"),
-            ("Bigfuckco", "Compliance has rejected that name. Pick another."),
+            ("Bigfuckco", "HR did not appreciate that name. What did I just say about being nice?"),
         ] {
             assert_eq!(error(&name(&state, c, sent).await), (StatusCode::BAD_REQUEST, Some(want.to_string())), "{sent}");
             assert_eq!(get(&state, Some("t"), c).await.1["company"]["name"], "Acme", "{sent} stored nothing");

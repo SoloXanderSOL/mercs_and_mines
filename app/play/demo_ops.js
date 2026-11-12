@@ -100,7 +100,7 @@ const COPY = {
   briefingTag: 'Difficulty: {word}', // BP-29a: on a contract's briefing (never the raid's or the ambush's)
   aarLost: 'Lost: {names}.',
   aarDead: '{name} ({status})',
-  aarNone: 'No losses. Command notes the anomaly.',
+  aarNone: 'No losses for a change. HR is pleasantly surprised.',
   aarSection: '{name}: {a} → {b}',
   shop: 'Shop', // BP-40a-2a: the bottom bar's label
   // BP-12b (Wiki copy)
@@ -166,7 +166,7 @@ const REFUSAL = {
 const RELIC = {
   mission_id: 'CRASHED_SHIP_RAID',
   name: 'Relic Dig: Crashed Frigate',
-  lead: 'A pre-collapse frigate went into the dirt in Sector 6 before anyone now alive was born. The hold is under three metres of soil and a great deal of competitive interest. Dig it out, see off whoever else turns up, and bring back anything that still hums.',
+  lead: 'A pre-collapse space frigate crashed into the dirt in Sector 6 before anyone now alive was born. The hold is under three metres of soil and a great deal of competitive interest. Dig it out, see off whoever else turns up, and bring back anything that still hums.',
 };
 const RELIC_SITE = 'contract:CRASHED_SHIP_RAID';
 // BP-29a (Wiki, feedback item 9): each contract's difficulty word, by mission type, set from the spec check's 7,200-fight
@@ -178,8 +178,8 @@ const relicWon = o => Boolean(o && o.site_id === RELIC_SITE && o.fought === 'won
 // B4 briefings (BP-15a, Wiki copy): a contract's own briefing over the server's flavour text. The relic keeps
 // RELIC.lead; the raid and the ambush keep DIG_COPY's leads, which carry the site and the ore at stake.
 const BRIEFING = {
-  GUARD_DUTY: 'A Capitalist Bloc drill rig needs minding while it chews through the slag. The dust on the horizon is raiders, and they are not here to talk. Hold the line and the Bloc pays in full. Lose the rig and the Bloc remembers your name, which is worse.',
-  SUPPLY_RAID: 'A Socialist Union supply convoy has stopped for the night outside a depot. A Capitalist Bloc procurement office wants the cargo and would rather not have been involved. Get in, get the crates, get paid. The guard is on his fourth coffee and has not looked up once.',
+  GUARD_DUTY: 'A Capitalist Bloc drill rig needs guarding while it chews through the slag. The dust on the horizon is raiders, and they are not here to talk. Hold the line and the Bloc pays in full. Lose the rig and the Bloc remembers your name, which is worse for you than the loss of your troops. They\'re expendable, your reputation is not.',
+  SUPPLY_RAID: 'A Socialist Union supply convoy has stopped for the night outside a depot. A Capitalist Bloc procurement office wants the cargo, and would rather not have their involvement in its disappearance known. Get in, get the crates, get paid. The guard is on his fourth coffee and has not looked up once.',
   BLACK_SITE_RAID: 'Nobody is supposed to know this facility exists, so the client paid extra not to be named. The guards were promised a quiet posting and are dug in behind a great deal of concrete to keep it that way. Bring back the files. Do not read the files.',
 };
 // B4 scenes (BP-15a): one briefing and one fight picture per family, a defeat and a wipeout. A win keeps the keeper's
@@ -203,7 +203,7 @@ const sceneFor = (phase, { report }) => {
 
 // The end of run when the server says nobody is left to send (BP-11b-1).
 const END = {
-  soldiers: { title: 'No soldiers left', body: 'Every Section is gone to the last Rookie. Command has closed the file and opened a new one.' },
+  soldiers: { title: 'No soldiers left', body: 'Every Section is gone to the last Rookie. Congratulations, you ran the meat grinder with great efficiency. Command has filed for bankruptcy and is already planning their next venture.' },
   commander: { title: 'No one left to lead', body: 'There is no Commander left to sign the orders. The Company is already hiring.' },
 };
 const NO_SOLDIERS = 'no soldiers left to send: start a new run';
@@ -330,7 +330,7 @@ const APPROACH_CONFIRM = 'Confirm'; // BP-31: the button that starts the fight
 const VERDICT = {
   good: 'Good call: {p} on the odds.',
   bad: 'Bad call: {p} on the odds.',
-  even: 'The enemy hardly noticed your approach.',
+  even: 'The enemy almost didn\'t notice your approach. Almost.',
 };
 let pendingApproach = null; // set only inside Confirm's click dispatch (deploy() builds its body synchronously) // BP-31
 let sentApproach = null;    // what the last mission POST carried, recorded where the body is built

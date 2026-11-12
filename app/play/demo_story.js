@@ -18,42 +18,42 @@ const MAX_LINES = 8; // the opener, the grouped Ready line and the hurt units, t
 const STORY = {
   opener: {
     defence: [
-      'Dust on the horizon, then raiders on the wire.',
-      'The raiders come over the slag heap at a dead run.',
-      'First shot from the ridge. Then all of them.',
+      'First we saw the dust on the horizon, next thing we knew raiders were climbing over the barbed wire.',
+      'The raiders come over the slag heap, riding hell for leather.',
+      'First one shot came from over the ridge. Then a lot more than one.',
     ],
     assault: [
-      'In over the wall. Subtlety was not in the budget.',
-      'The gate was locked. It was a short argument.',
+      'Get in over the wall. The budget does not extend to subtlety.',
+      'The gate was locked, the lock tried to argue with the bolt cutters. It was a short argument.',
       'The Section goes in through the front, loudly.',
     ],
     expedition: [
-      'The frigate is still ticking as the Section climbs in.',
-      'Somebody else wants the wreck too, and brought guns.',
-      'The hold opens with a crowbar and a short prayer.',
+      'The frigate\'s engine is still humming faintly as the Section makes its approach.',
+      'Somebody else wants the wreck too, and they brought guns. Thankfully so did we.',
+      'The hold opens with a crowbar and a short prayer to the gods of breaking and entering.',
     ],
     ambush: [
-      'The raccoons come off the ridge on dirt bikes.',
-      'The truck stops. The raccoons do not.',
-      'Ambush on the road home. Of course it is.',
+      'The raccoons come over the ridge, doing stunt jumps midair on their dirt bikes.',
+      'The truck slams on the brakes. The raccoons do not. One goes careening head first into the back of the truck. One of his packmates cut his brakes, and seems to be laughing at his expense.',
+      'Ambush on the road home. Of course it had to happen to us.',
     ],
     none: [
       'Contact. Everyone remembers their training, roughly.',
-      'Contact front. The paperwork can wait.',
-      'The shooting starts. Nobody is surprised.',
+      'Contact front. Lock and load, the paperwork can wait.',
+      'The shooting starts. Nobody is surprised. Just another Tuesday on Gunmetal.',
     ],
   },
-  ready: ['Not a scratch on {names}.', '{names}: unhurt, and smug about it.', 'The enemy misses {names} entirely.'],
+  ready: ['Not a scratch on {names}.', '{names}: unhurt, and being smug about it.', 'The enemy misses {names} entirely.'],
   wounded: [
-    '{name} takes a hit: {hp} HP lost. Still up.',
-    '{name} is clipped for {hp} HP and says so loudly.',
-    '{name} catches one, {hp} HP lost, keeps firing.',
+    '{name} takes a hit: {hp} HP lost. Still up and fighting.',
+    '{name} is clipped for {hp} HP and lets everyone know - loudly.',
+    '{name} catches a bullet, {hp} HP lost, keeps firing.',
   ],
   kia: ['{name} goes down and stays down.', '{name} does not get up.', '{name} is killed in action.'],
   woundedPair: [
     '{a} and {b} are hit: {ha} and {hb} HP lost.',
     '{a} loses {ha} HP, {b} loses {hb}. Both still up.',
-    '{a} and {b} are hit, {ha} and {hb} HP. They complain in harmony.',
+    '{a} and {b} are hit, {ha} and {hb} HP. They complain loudly in harmony.',
   ],
   kiaPair: ['{a} and {b} go down together.', '{a} and {b} do not get up.', '{a} and {b} are killed in action.'],
   mixedPair: [
@@ -65,9 +65,9 @@ const STORY = {
 // One line per outcome, true after every family and on both sides of the roll. None repeats the banner,
 // mentions pay or claims nobody was hurt (the pay box and the loss lines say those).
 const WRITEUP = {
-  Success: 'Objective taken. The survivors are already improving the story.',
-  Defeat: 'It did not go to plan. The enemy will be telling this one for years.',
-  Wipeout: 'The paperwork for this one will be very short.',
+  Success: 'Objective taken. The survivors are already debating how to make the mission sound more difficult so they can ask for a bonus cheque.',
+  Defeat: 'It did not go to plan. The enemy will be rubbing our nose in this embarrassment for years.',
+  Wipeout: 'On the bright side, the paperwork for this one will be very short.',
 };
 // BP-36 (§4f P2; Wiki copy): the leading Commander's own line, in place of the write-up, keyed on the outcome
 // and the sign of the server's approach row (good / bad / even; the verdict reads the same row). Two lines per

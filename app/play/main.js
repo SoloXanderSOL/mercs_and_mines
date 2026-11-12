@@ -27,7 +27,7 @@ import { mountOps } from './demo_ops.js'; // demo-only (BP-9a)
 // copy lives in battle.js).
 const COPY = {
   start: 'Report for duty',
-  tagline: 'Expendability is a career path.',
+  tagline: 'Expendability is a viable career path. Just a short one.',
   bootWorking: 'Checking your credentials...',
   signinButton: 'Sign in with your Seeker',
   signinExplainer: 'One fingerprint signs you in. Your wallet will say "authorize". This only proves the Seeker is yours: nothing is spent, nothing moves.',
@@ -41,7 +41,7 @@ const COPY = {
   genesisWorking: 'Checking your wallet for a Genesis Token...',
   genesisBadge: 'Genesis Charter',
   genesisHoldsTitle: 'Your Seeker came with a campaign attached.',
-  genesisHoldsBody: 'Genesis Token verified. Your first campaign is on the house, and the house would like that remembered.',
+  genesisHoldsBody: 'Hey there, Seeker owner. When Mercs & Mines launches, your first campaign is on the house, courtesy of your Genesis Token.',
   genesisNoneTitle: 'No Genesis Token on this wallet.',
   genesisNoneBody: 'Command has issued you a courtesy campaign anyway. Try not to make it awkward.',
   genesisUnknownTitle: "Command couldn't check your papers just now.",

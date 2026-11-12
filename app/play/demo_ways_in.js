@@ -26,12 +26,12 @@ const THROWAWAY_KEY = 'mm.throwaway.key';
 // Booth copy (BP-3c-2; BP-26 drafts, the Director's script pass may change them).
 const COPY = {
   waySeeker: 'Sign in on your Solana Seeker',
-  wayExplainer: 'Your wallet will ask you to authorize. That only proves the wallet is yours: nothing is spent, nothing moves.',
+  wayExplainer: 'Mercs & Mines launches on the Solana Seeker, and this demo tests its sign-in. No Seeker? Any phone plays with a throwaway wallet. Signing in spends nothing.',
   wayThrowaway: 'Just try it (no wallet needed)',
-  wayThrowawayNote: "We'll make a throwaway wallet on this phone. It holds nothing. Come back on the same phone and you'll sign in as the same wallet.",
+  wayThrowawayNote: "We'll make a throwaway wallet on this phone. It holds nothing. Come back on the same phone within two days and your company should still be waiting.",
   throwawayUnsupported: "This browser can't make a throwaway wallet. Try Chrome, or Safari on iOS 17 or later.",
   genesisThrowawayTitle: 'A wallet made for the occasion.',
-  genesisThrowawayBody: 'It holds no Genesis Token, no funds and no grudges. It stays on this phone, so you can come back as the same wallet.',
+  genesisThrowawayBody: 'It holds no Genesis Token, no funds and no grudges. It stays on this phone, so your company should still be here when you get back.',
   startOver: 'Start over as a new player',
   startOverAsk: 'This phone forgets your current company. Start over?',
   startOverYes: 'Yes, start over',

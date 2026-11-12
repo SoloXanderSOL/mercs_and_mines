@@ -32,10 +32,10 @@ export const REPLACE_MINER_CREDITS = 80;  // demo_ops.rs DEMO_REPLACE_MINER_CRED
 
 // A7: what a rank really changes in this build (since B5, each rank above 1 is also +2 on every roll).
 const RANK_LINES = {
-  2: 'Rank 2. +2 on every roll. Cleared to command 4 Sections. The paperwork is very impressive.',
-  3: 'Rank 3. +4 on every roll. A death on the relic dig or the Black Site now goes down as glorious.',
-  4: 'Rank 4. +6 on every roll. Cleared for 64 Sections. Command admires the optimism.',
-  5: 'Rank 5. Top rank, +8 on every roll. Any death now goes down as glorious.',
+  2: 'Rank 2. +2 on every roll. Cleared to command 4 Sections. The paperwork is very impressive. The stamp even glows a bit.',
+  3: 'Rank 3. +4 on every roll. A death on the relic dig or the Black Site now goes down as glorious. Won\'t that be exciting!',
+  4: 'Rank 4. +6 on every roll. Cleared to lead 64 Sections. Logistics has some catching up to do. Command admires the optimism.',
+  5: 'Rank 5. Top rank, +8 on every roll. Any death now goes down as glorious. What more could any commander ask for?',
 };
 
 // BP-19c: what a Foreman's rank changes in this build: +2 on the dig's heat limit a rank above 1, none when Shattered
@@ -60,29 +60,29 @@ const FOREMAN_BAND_LINES = {
 // each line says where in words; the battle screen shows the server's points.
 const TRAITS = {
   "Trench-Sweeper": "Clears trenches with a shotgun and a short temper. Suits the Supply Raid and the Black Site.",
-  "Armor-Adept": "Talks to tanks. The tanks, reportedly, listen. Suits Guard Duty and holding the dig.",
+  "Armor-Adept": "Talks to tanks. The tanks, apparently, listen. Suits Guard Duty and holding the dig.",
   "Night-Stalker": "Prefers to work at night, in an ash-storm, or ideally both. Suits the relic dig.",
   "Cannoneer": "Believes most problems are solved by heavy artillery. Suits Guard Duty and holding the dig.",
-  "Marksman's Eye": "Trusts a sniper rifle more than people. Fair. Suits Guard Duty and holding the dig.",
-  "Breacher": "Loves a fortified door. Suits the Supply Raid and the Black Site.",
+  "Marksman's Eye": "Trusts a sniper rifle more than people. Which, honestly, is fair enough. Suits Guard Duty and holding the dig.",
+  "Breacher": "Loves a well fortified door. Appreciates the challenge. Suits the Supply Raid and the Black Site.",
   "Quartermaster's Ghost": "Haunts the stores. Nothing leaves without a signature. Suits the relic dig.",
   "Corpseman's Touch": "A field medic at heart. Carries more bandages than ammunition. Suits the relic dig.",
-  "Suppression Doctrine": "Keeps the enemy's heads down. Suits the Supply Raid and the Black Site.",
-  "Veteran's Instinct": "Has seen worse, and mentions it often. Suits the relic dig.",
-  "Anti-Armor Adept": "Hates vehicles. Carries something for every one of them. Suits the Supply Raid and the Black Site.",
-  "Battlefield Engineer": "Can dig a fortification out of anything. Suits Guard Duty and holding the dig.",
-  "Embezzler": "Sold the good ammo. Every fight starts a little behind.",
-  "Bloodthirsty": "Treats the Retreat order as a suggestion. Better on an Assault, worse dug in.",
-  "Cowardly": "Superb at logistics. Better dug in, worse on an Assault.",
-  "Paranoid": "Always watching. Better dug in, and refuses to split the squad for a Flank.",
-  "Cult of Bob": "Devoted to Bob. Stops to bless the rifles before every fight.",
-  "The Informant": "Someone else pays them a retainer. The other side always seems to know we're coming.",
-  "Glory Hound": "Writes their own after-action reports. Shines on hard contracts, coasts on easy ones.",
+  "Suppression Doctrine": "Keeps the enemy's heads down. SUPPRESSING FIIIIIRE! Suits the Supply Raid and the Black Site.",
+  "Veteran's Instinct": "Has seen worse, and likes to remind everyone of the fact. Suits the relic dig.",
+  "Anti-Armor Adept": "Has an irrational hatred of vehicles. Carries an explosive for every one of them. Suits the Supply Raid and the Black Site.",
+  "Battlefield Engineer": "Can dig a fortification out of anything. Except a mine field. Suits Guard Duty and holding the dig.",
+  "Embezzler": "Sold the good ammo. They regret that now. If they survive the mission they will do it again regardless. Every fight starts a little behind.",
+  "Bloodthirsty": "Treats the Retreat order as a suggestion. They're not done killing yet. Better on an Assault, worse dug in.",
+  "Cowardly": "Superb at logistics, especially at getting gear and manpower away from the frontline. Better dug in, worse on an Assault.",
+  "Paranoid": "It's only paranoia if they're not actually out to get you. Better dug in, and refuses to split the squad for a Flank.",
+  "Cult of Bob": "Devoted to Bob, homeless Emperor of the Universe. Stops to bless the rifles before every fight.",
+  "The Informant": "Someone else pays them a retainer. On an unrelated note, the enemy always seems to know we're coming.",
+  "Glory Hound": "Writes their own after-action reports. They contain a lot of action movie one liners. Shines on hard contracts, coasts on easy ones.",
   "The Gambler": "Bets on every call. A good call pays double. So does a bad one.",
   "Chrome-Chaser": "Buys their own augmentations. Do not ask where from. They help, mostly.",
-  "Martinet": "Drills the Section to a mirror shine. Better dug in, worse on a Flank.",
-  "Squeak-Touched": "Leaves offerings at the Hamster Shrines. The hamsters send word before every fight.",
-  "Doomsayer": "Announces everyone's death at every muster. The Section believes it, a little.",
+  "Martinet": "Drills the Section into a disciplined machine, until it stabs them in the back. Better dug in, worse on a Flank.",
+  "Squeak-Touched": "Leaves biscuit offerings at the psychic Hamster Shrines. The hamsters send thoughts of encouragement before every fight.",
+  "Doomsayer": "Announces everyone's imminent death at every muster. The Section believes it, a little.",
 };
 
 // A11: the keeper's labels (battle.js:45) → where each factor comes from. The server's modifier rows (BP-14a) keep
@@ -99,23 +99,23 @@ const SCORE_LABELS = {
 };
 // BP-24b: ops/name's four 400 texts (demo_name.rs:51-54), shown as sent; any other refusal shows askBad.
 const NAME_REFUSALS = new Set(['a company name is 1 to 24 characters', "letters, numbers, spaces and - ' . & only",
-  'a company name needs at least one letter', 'Compliance has rejected that name. Pick another.']);
+  'a company name needs at least one letter', 'HR did not appreciate that name. What did I just say about being nice?']);
 
 const COMPANY_COPY = {
   hubButton: 'Company', // BP-40a-2a: four bar buttons at 88 px; 'Your Company' wrapped
   heading: 'Your Company',
   // BP-24b (Wiki copy): the name ask on the reveal after a new run's join (a 201), and its answers.
-  askLine: 'Name your company. Compliance will read it.',
+  askLine: 'Name your company. HR will read it, so be nice.',
   askPlaceholder: 'Your Company',
   askName: 'Name it',
   askSkip: 'Not now',
-  askDone: 'Registered with Compliance:',
+  askDone: 'Company Registered:',
   askBad: 'That name did not go through. Try another.',
-  askClosed: 'Compliance is closed. The company stays Your Company this run.',
+  askClosed: 'HR is closed. The company stays Your Company this run.',
   xpNext: '{xp} / {next} to Rank {r}',
   xpTop: '{xp} · top rank',
   stress: '{n} / 100',
-  stressNote: 'At 100 they crack. The run ends there.',
+  stressNote: 'At 100 stress your commander cracks. The run ends there.',
   // BP-19c (Wiki copy): the band words, the bench, and the Foreman on the Crew card.
   stressBand: '{n} / 100 · {band}',
   restNote: 'Rest at base sheds stress, a little every minute. The figure catches up at the next report.',
@@ -154,6 +154,7 @@ const COMPANY_COPY = {
   requisition: 'Requisition {n} · {cost} credits',
   requisitionNote: '{each} credits a Rookie. They arrive with no history and no complaints yet.',
   hire: 'Hire {n} miners · {cost} credits',
+  hireOne: 'Hire 1 miner · {cost} credits', // BP-45 (Wiki copy): one miner, singular
   hireNote: '{each} credits a miner. Morale stays where it is.',
   out: 'A squad is out. Miners sign on when every squad is home.',
   // BP-18b-1 (Wiki copy)
@@ -189,11 +190,11 @@ const healSecs = (b, now) => Math.max(0, Math.ceil((Date.parse(b.healed_at) - no
 
 // A5: one line per item the loot roll can produce (loot_roller.rs:20-47, byte for byte). The line is flavour: an equipped item's points are the server's (company.kit, BP-23b).
 const TROPHY_LINES = new Map([
-  ["Salvaged Ammo Cache", "Half of it fits our rifles. The other half is evidence."],
+  ["Salvaged Ammo Cache", "Half of it fits our rifles. The other half is catalogued as evidence of your enemies' crimes."],
   ["Dented Flak Vest", "The dent is where it worked. The previous owner was unavailable for comment."],
   ["Cracked Visor Helmet", "Visibility reduced to a vague sense of optimism."],
-  ["Busted Stimpack", "Empty. Someone needed it more, and briefly."],
-  ["Scrap Plating", "Logistics lists it as armour. Logistics has never been shot."],
+  ["Busted Stimpack", "Someone needed it previously and was disappointed when it didn't work. Maybe you'll have better luck?"],
+  ["Scrap Plating", "Logistics with undeserved optimism describes it as armour. Logistics has never been shot at."],
   ["Low-Grade Ore Sample", "Assayed at low grade. Kept for morale, which is also low grade."],
   ["Refurbished Laser Pistol", "Refurbished means it fired once in testing. Twice would be a record."],
   ["Corporate Assault Vest", "Branded on the front, so the enemy knows who to invoice."],
@@ -205,21 +206,22 @@ const TROPHY_LINES = new Map([
   ["Void-Treated Combat Plate", "Hums at night. The Rookies have stopped asking why."],
   ["Cogsmith's Multi-Tool", "Forty functions. The manual covers three of them."],
   ["Psionic Dampener Helm", "Keeps the whispers out. Results vary by whisper."],
-  ["Star-Silt Ore Sample", "Glitters in the dark. Do not lick it. There is a form about that."],
+  ["Star-Silt Ore Sample", "Glitters in the dark. Do not lick it. There is a health and safety video explaining why we don't do that any more."],
   ["Encrypted Corpo Datapad", "Password protected. The password is not 'password'. We tried."],
-  ["Pre-Severance Plasma Cutter", "Cuts through hull plate, bedrock and the safety briefing."],
+  ["Pre-Severance Plasma Cutter", "Cuts through hull plate, bedrock and the safety briefing we had for the mission."],
   ['Exo-Frame Shoulder Guard "Bastion"', "One shoulder of a very expensive suit. The rest is still on its owner, somewhere."],
   ["Experimental Breach Charge", "Experimental. The last experiment is now a crater with a name."],
-  ["Dark-Core Ore Shard", "Heavier than it looks, darker than it should be. Insured separately."],
+  ["Dark-Core Ore Shard", "Heavier than it looks, darker than it should be, expensive and insured. Not that we don't trust you with it."],
   ['Tactical HUD "Ironveil Mk.IV"', "Shows ammo, heading and a performance review. You are underperforming."],
-  ["Rogue AI Comms Module", "It says it is not rogue. It says so a lot."],
-  ["Sunspear Laser Rifle Mk.V", "Mark Five. Nobody lasted long enough to file feedback on the first four."],
-  ['Void-Weave Exosuit "Relic"', "Woven from something that should not take thread. It fits everyone, which is the worrying part."],
-  ["Emperor's Ore Pendant (smells faintly of bin chicken)", "Possibly holy. Certainly fragrant. Kept in a sealed bag, for everyone's sake."],
-  ["Pre-Severance Jump Drive Fragment", "A piece of a ship that went somewhere fast. The rest of it is still going."],
+  ["Rogue AI Comms Module", "It says it is not rogue. It insists. Don't ask why the missiles are switching themselves on."],
+  ["Sunspear Laser Rifle Mk.V", "Mark Five. Nobody lasted long enough to file feedback on the first four iterations."],
+  ['Void-Weave Exosuit "Relic"', "Woven from something that should not be weavable. It fits everyone, which you feel uncomfortable thinking about."],
+  ["Emperor Bob's Bin Chicken Pendant", "Possibly holy. Certainly fragrant. Kept in a sealed bag, for everyone's sake."],
+  ["Emperor's Ore Pendant (smells faintly of bin chicken)", "Possibly holy. Certainly fragrant. Kept in a sealed bag, for everyone's sake."], // BP-45: the pre-rename name, for a .prev rollback's shelf
+  ["Pre-Severance Jump Drive Fragment", "A piece of a ship that once went somewhere fast. The rest of it presumably is still going there, just much more slowly."],
   ["Squeaker's Signed Biscuit (DO NOT EAT)", "Signed in what we hope is icing. Under armed guard. Do not eat."],
 ]);
-const TROPHY_UNKNOWN = "Catalogued. Nobody is sure what it does.";
+const TROPHY_UNKNOWN = "Catalogued. Nobody is sure what it does. Which makes you suspicious of it.";
 
 const CSS = `
 .company-trait { grid-column: 1 / -1; margin: -0.6cqw 0 0.6cqw 30cqw; font-size: 3.5cqw; line-height: 1.3; color: var(--muted); }
@@ -627,7 +629,8 @@ function replaceRows(target, id, h, each, label, note) {
   }
   const out = target === 'section' ? view.sectionOut(id) : view.out(); // BP-18b-1: a Section is out only while an op holds it; a Crew never hires with any op out
   const isHeld = view.held();
-  const btn = act(fill(label, { n: offer.n, cost: offer.n * each }), false, () => view.replace(target, id, offer.n, each));
+  const hireLabel = target === 'crew' && offer.n === 1 ? COMPANY_COPY.hireOne : label; // BP-45: "Hire 1 miner"; Sections keep their own label
+  const btn = act(fill(hireLabel, { n: offer.n, cost: offer.n * each }), false, () => view.replace(target, id, offer.n, each));
   btn.disabled = !offer.afford || out || isHeld;
   const rows = [btn, line(fill(note, { each }), true)];
   const texts = [];

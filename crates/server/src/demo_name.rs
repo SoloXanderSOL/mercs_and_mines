@@ -51,7 +51,7 @@ impl NameRefusal {
             NameRefusal::Length => "a company name is 1 to 24 characters",
             NameRefusal::Charset => "letters, numbers, spaces and - ' . & only",
             NameRefusal::NoLetter => "a company name needs at least one letter",
-            NameRefusal::Rude => "Compliance has rejected that name. Pick another.",
+            NameRefusal::Rude => "HR did not appreciate that name. What did I just say about being nice?",
         }
     }
 }
@@ -207,6 +207,6 @@ mod tests {
         assert_eq!(NameRefusal::Length.text(), "a company name is 1 to 24 characters");
         assert_eq!(NameRefusal::Charset.text(), "letters, numbers, spaces and - ' . & only");
         assert_eq!(NameRefusal::NoLetter.text(), "a company name needs at least one letter");
-        assert_eq!(NameRefusal::Rude.text(), "Compliance has rejected that name. Pick another.");
+        assert_eq!(NameRefusal::Rude.text(), "HR did not appreciate that name. What did I just say about being nice?");
     }
 }

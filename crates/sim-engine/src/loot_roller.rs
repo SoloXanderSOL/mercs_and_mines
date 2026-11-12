@@ -41,7 +41,7 @@ const POOL_SUPERIOR: &[&str] = &[
 
 const POOL_ELITE: &[&str] = &[
     "Sunspear Laser Rifle Mk.V", "Void-Weave Exosuit \"Relic\"",
-    "Emperor's Ore Pendant (smells faintly of bin chicken)",
+    "Emperor Bob's Bin Chicken Pendant",
     "Pre-Severance Jump Drive Fragment",
     "Squeaker's Signed Biscuit (DO NOT EAT)", // don't eat it
 ];
@@ -110,4 +110,17 @@ pub fn roll_loot(rng: &mut Rng, total_loot_bonus: u32, mission_difficulty: u8, c
         quality_grade: grade,
         item_name,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // BP-45: the pendant's new name (Director, 2026-11-11); no pool still carries the old one.
+    #[test]
+    fn elite_pool_carries_the_bin_chicken_pendant() {
+        assert_eq!(POOL_ELITE[2], "Emperor Bob's Bin Chicken Pendant");
+        let pools = [POOL_BASIC, POOL_STANDARD, POOL_SPECIALIZED, POOL_SUPERIOR, POOL_ELITE];
+        assert!(pools.iter().all(|p| !p.iter().any(|n| n.contains("Ore Pendant"))));
+    }
 }
