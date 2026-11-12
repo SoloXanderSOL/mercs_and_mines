@@ -257,7 +257,7 @@ const CSS = `
 .briefing-tag[hidden] { display: none; }
 /* BP-40a-2a (item 4): .ops-shop is a .btn-bar button in the hub's bottom bar (play.css), no longer in the title bar */
 #screen-briefing .briefing-stance[hidden], #screen-briefing #btn-deploy[hidden] { display: none; }
-#screen-briefing { gap: 2cqw; }
+#screen-briefing { gap: 2cqw; overflow-y: auto; scrollbar-width: none; } /* BP-38b-1 (R-e): the briefing scrolls inside the stage, so Back and Confirm can always be reached; no scrollbar width, so nothing at rest moves */
 #screen-briefing .still { height: 24cqw; }
 #screen-briefing .briefing-text { font-size: 3.9cqw; line-height: 1.3; }
 #screen-briefing .briefing-line { font-size: 3.9cqw; }
