@@ -134,9 +134,11 @@ const COPY = {
   way: '{way} · {s} s',
   wayWarn: '{way} · {s} s · {warning}',
   tripClean: '{title}: the trip went clean. Nobody is sure who to thank.',
+  tripDesert: '{title}: the desert let you through. This time.', // BP-38b-2b: a desert crossing with no hits (TripReport.desert)
   tripHit: '{title}: {what}. {cost}.',
   tripHarmless: 'No harm done',
-  hazard: { gas: 'toxic gas', crust: 'the crust gave way', ruins: 'falling masonry' },
+  hazard: { gas: 'toxic gas', crust: 'the crust gave way', ruins: 'falling masonry', heat: 'the heat got to them', breakdown: 'sand in the intakes' },
+  costTime: '{n} s lost digging the engine out',
   costWounded: '{n} wounded',
   costStress: '{who} stress up {n}',
   costMorale: 'Crew morale down {n}',
@@ -221,7 +223,7 @@ const COLOUR = { dig: '#ff8c2a', ring: '#ffd27a', contract: '#6fd3ff', edge: '#0
 // the demo doesn't simulate is left out. No line makes a richness-by-distance claim (ODQ-72 is open).
 const TERRAIN = {
   AshenPlains: 'Ashen Plains: open ground. Teams cross it at the usual pace.',
-  ScorchedDesert: 'Scorched Desert: flat and dry. Teams cross it at the usual pace.',
+  ScorchedDesert: 'Scorched Desert: flat, dry and hot. Engines choke and crews cook; Safe ways go round it.',
   RuinedCity: 'Ruined City: slow going. Falling ruins can wound a squad, or shake a Crew and its Foreman.',
   CityState: 'City-State: a living city with good roads. Teams cross it twice as fast.',
   GunOutpost: 'G.U.N. Outpost: G.U.N. keeps these roads clear. Teams cross it twice as fast.',
@@ -693,7 +695,7 @@ function loadTripSeen(id) {
 function tripLine(r) {
   const title = opTitle(r);
   const hits = Array.isArray(r.hits) ? r.hits : [];
-  if (hits.length === 0) return fill(COPY.tripClean, { title });
+  if (hits.length === 0) return fill(r.desert ? COPY.tripDesert : COPY.tripClean, { title });
   const what = [];
   for (const h of hits) {
     const word = COPY.hazard[h.hazard] || h.hazard;
@@ -702,6 +704,7 @@ function tripLine(r) {
   const sum = k => hits.reduce((n, h) => n + (Number(h[k]) || 0), 0);
   const who = r.site_id.startsWith('dig:') ? COPY.whoForeman : COPY.whoCommander;
   const cost = [];
+  if (sum('secs') > 0) cost.push(fill(COPY.costTime, { n: sum('secs') }));
   if (sum('wounded') > 0) cost.push(fill(COPY.costWounded, { n: sum('wounded') }));
   if (sum('stress') > 0) cost.push(fill(COPY.costStress, { who, n: sum('stress') }));
   if (sum('morale') > 0) cost.push(fill(COPY.costMorale, { n: sum('morale') }));
@@ -2226,7 +2229,8 @@ function watch() {
   const briefing = deps.$('screen-briefing');
   // Reviewer BP-29a F1: a briefing shown off a demo fight keeps no contract's difficulty line. Not in dressApproach,
   // which dressFight calls last.
-  new MutationObserver(() => { if (briefing.hidden) clearFitTimer(); else if (opFight) dressFight(); else { if (tagNote) tagNote.hidden = true; dressApproach(); } }).observe(briefing, { attributes: true, attributeFilter: ['hidden'] });
+  // Reviewer BP-38b-1 F2: a briefing opens at its top. redress()'s visible re-render toggles no hidden, so it keeps the player's scroll.
+  new MutationObserver(() => { if (briefing.hidden) clearFitTimer(); else { briefing.scrollTop = 0; if (opFight) dressFight(); else { if (tagNote) tagNote.hidden = true; dressApproach(); } } }).observe(briefing, { attributes: true, attributeFilter: ['hidden'] });
 }
 
 // New run starts a new campaign, and ore, credits and buildings belong to the campaign: the end

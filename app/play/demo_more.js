@@ -9,7 +9,7 @@
 // Recomputed, once per frame, on: the box's scroll, its content changing, an image in it loading, any `hidden`
 // written in the stage (a screen, sheet, card or row shown or hidden), and a window resize.
 
-const BOXES = ['.screen-shop', '.screen-card', '.base-sheet', '#reveal-content', '#aar-units', '.company-card-lines'];
+const BOXES = ['.screen-shop', '.screen-card', '.base-sheet', '#reveal-content', '#aar-units', '.company-card-lines', '#screen-briefing'];
 const SLACK = 4; // px
 
 const CSS = `
