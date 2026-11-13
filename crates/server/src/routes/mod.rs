@@ -611,7 +611,7 @@ async fn post_mission_resolve(
     // The sim sees no Commander (§4g item 3); the record Commander and the approach count
     // through the roll's rows (BP-14a, demo-only).
     let squad = Squad { units: req.squad.units, commander: None };
-    let modifiers: Vec<RollModifier> = crate::demo_roll::roll_modifiers(Some(&roll_inputs), req.approach, mission);
+    let modifiers: Vec<RollModifier> = crate::demo_roll::roll_modifiers(Some(&roll_inputs), req.approach, mission, squad.units.len());
     let cfg = &state.config.sim;
     let mut report = resolve_mission_with_modifiers(&squad, mission, &modifiers, &timestamp, Some(seed), cfg);
 

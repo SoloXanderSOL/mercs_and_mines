@@ -483,7 +483,7 @@ async fn replay_report(state: &AppState, dep: &DeploymentRecord, route: &str) ->
             internal_error(format!("{}: session_start roll_inputs are off the roster", at()))
         })?),
     };
-    let modifiers = crate::demo_roll::roll_modifiers(inputs.as_ref(), req.approach, mission);
+    let modifiers = crate::demo_roll::roll_modifiers(inputs.as_ref(), req.approach, mission, req.squad.units.len());
     let squad = Squad { units: req.squad.units, commander: None };
     let report = resolve_mission_with_modifiers(&squad, mission, &modifiers, &timestamp, Some(config.seed as u32), &state.config.sim);
     Ok((report, section_id))
@@ -3136,7 +3136,7 @@ mod tests {
             .iter()
             .map(|m| (m["key"].as_str().expect("key").to_string(), m["points"].as_i64().expect("points")))
             .collect();
-        let want: Vec<(String, i64)> = [("approach", -15), ("commander_rank", 4), ("specialization", 5), ("fatal_flaw", -10)]
+        let want: Vec<(String, i64)> = [("opposition", -6), ("approach", -15), ("commander_rank", 4), ("specialization", 5), ("fatal_flaw", -10)]
             .iter()
             .map(|(k, p)| (k.to_string(), *p))
             .collect();
@@ -3146,6 +3146,54 @@ mod tests {
             entries[0].payload["roll_inputs"],
             serde_json::json!({ "rank": 3, "specialization": "Cannoneer", "fatal_flaw": "Paranoid" })
         );
+    }
+
+    /// BP-39b: six Rookies through the mission route: the opposition and Under strength rows lead, and the latch's replay rebuilds the same report (both sites pass the logged squad's length).
+    #[tokio::test]
+    async fn mission_route_under_strength_row_replays() {
+        let state = Arc::new(session_state());
+        let c = campaign_with(&state, WALLET, true, Some(GATEWAY)).await;
+        let mut commander = crate::commander_gen::generate_commander(WALLET.to_vec(), c.campaign_id, 42);
+        commander.rank = 3;
+        let commander_id = commander.commander_id;
+        state.commander_repo.create_commander(commander).await.expect("create_commander");
+        let section = member_section(&state, c.campaign_id).await;
+        let body = serde_json::json!({
+            "squad": { "units": rookies(6) },
+            "mission_id": "GUARD_DUTY",
+            "commander_id": commander_id,
+            "section_ids": [section],
+            "approach": "Flank",
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/mission/resolve")
+            .header("authorization", "Bearer t")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = with_test_peer(crate::routes::router(Arc::clone(&state)), TEST_PEER).oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let mut response: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON");
+        assert_eq!(status, StatusCode::OK, "{response}");
+        let rows: Vec<(String, i64)> = response["report"]["score_breakdown"]["modifiers"]
+            .as_array()
+            .expect("modifiers")
+            .iter()
+            .map(|m| (m["key"].as_str().expect("key").to_string(), m["points"].as_i64().expect("points")))
+            .collect();
+        let want: Vec<(String, i64)> = [("opposition", -6), ("under_strength", -10), ("approach", -15), ("commander_rank", 4), ("specialization", 5), ("fatal_flaw", -10)]
+            .iter()
+            .map(|(k, p)| (k.to_string(), *p))
+            .collect();
+        assert_eq!(rows, want);
+        let deps = state.commander_repo.list_deployments_by_commander(commander_id).await.expect("deployments");
+        assert_eq!(deps.len(), 1);
+        let (report, fought) = replay_report(&state, &deps[0], "test").await.expect("replay_report");
+        assert_eq!(fought, section);
+        response["report"]["commander_name"] = serde_json::Value::Null;
+        assert_eq!(serde_json::to_value(&report).unwrap(), response["report"]);
     }
 
     /// BP-16: with the Gunsmith standing, the mission route adds its +10 row last and logs
@@ -3188,7 +3236,7 @@ mod tests {
             .iter()
             .map(|m| (m["key"].as_str().expect("key").to_string(), m["points"].as_i64().expect("points")))
             .collect();
-        let want: Vec<(String, i64)> = [("approach", -15), ("commander_rank", 4), ("specialization", 5), ("fatal_flaw", -10), ("gunsmith", 10)]
+        let want: Vec<(String, i64)> = [("opposition", -6), ("approach", -15), ("commander_rank", 4), ("specialization", 5), ("fatal_flaw", -10), ("gunsmith", 10)]
             .iter()
             .map(|(k, p)| (k.to_string(), *p))
             .collect();
@@ -3206,12 +3254,13 @@ mod tests {
         assert_eq!(serde_json::to_value(&report).unwrap(), response["report"]);
     }
 
-    /// BP-16 (Linux's spec check, on the real resolver): the Gunsmith's +10 alone flips seed 13
-    /// on `GUARD_DUTY` with 4 Rookies and the seed-42 Commander at rank 1 (one Specialisation
-    /// row). The roll's own draw stays 57; the total moves 56 → 66, Defeat → Success. The rows
-    /// come from `roll_modifiers`. `report_id` moves with the outcome, so it is not pinned.
+    /// BP-16 (Linux's spec check, on the real resolver): the Gunsmith's +10 alone flips seed 60
+    /// on `GUARD_DUTY` with 4 Rookies and the seed-42 Commander at rank 1. BP-39b's totals: 30 =
+    /// 56 − 6 (the opposition) − 20 (Under strength, 4 short), so the roll's own draw, 32, misses;
+    /// the Gunsmith's +10 makes 40, Defeat → Success. The rows come from `roll_modifiers`.
+    /// `report_id` moves with the outcome, so it is not pinned.
     #[test]
-    fn gunsmith_alone_flips_seed_13() {
+    fn gunsmith_alone_flips_seed_60() {
         use sim_engine::roster::{CommanderFlaw, CommanderSpecialization};
         let mission = missions().get("GUARD_DUTY").expect("GUARD_DUTY");
         let squad = Squad { units: rookies(4), commander: None };
@@ -3220,19 +3269,19 @@ mod tests {
             .into_iter()
             .map(|gunsmith| {
                 let i = crate::demo_roll::RollInputs { rank: 1, specialization: CommanderSpecialization::Cannoneer, fatal_flaw: CommanderFlaw::Paranoid, gunsmith, stress: 0, armoury: None };
-                let rows = crate::demo_roll::roll_modifiers(Some(&i), None, mission);
-                let r = resolve_mission_with_modifiers(&squad, mission, &rows, "2026-11-02T00:00:00Z", Some(13), &config.sim);
+                let rows = crate::demo_roll::roll_modifiers(Some(&i), None, mission, 4);
+                let r = resolve_mission_with_modifiers(&squad, mission, &rows, "2026-11-02T00:00:00Z", Some(60), &config.sim);
                 (r.score_breakdown.raw_roll, r.score_breakdown.total_score, format!("{:?}", r.outcome))
             })
             .collect();
-        assert_eq!(got, vec![(57, 56, "Defeat".to_string()), (57, 66, "Success".to_string())]);
+        assert_eq!(got, vec![(32, 30, "Defeat".to_string()), (32, 40, "Success".to_string())]);
     }
 
-    /// BP-23a test 6, on `gunsmith_alone_flips_seed_13`'s fixture: no kit, 57 / 56, Defeat; Basic
-    /// kit (+4), 57 / 60, Success; Elite kit (+12), 57 / 68, Success. The roll's own draw stays
-    /// 57; `report_id` moves with the outcome, so it is not pinned.
+    /// BP-23a test 6, on `gunsmith_alone_flips_seed_60`'s fixture (BP-39b's totals): no kit,
+    /// 32 / 30, Defeat; Basic kit (+4), 32 / 34, Success; Elite kit (+12), 32 / 42, Success. The
+    /// roll's own draw stays 32; `report_id` moves with the outcome, so it is not pinned.
     #[test]
-    fn armoury_flips_seed_13() {
+    fn armoury_flips_seed_60() {
         use crate::demo_roll::KitGrade;
         use sim_engine::roster::{CommanderFlaw, CommanderSpecialization};
         let mission = missions().get("GUARD_DUTY").expect("GUARD_DUTY");
@@ -3242,12 +3291,39 @@ mod tests {
             .into_iter()
             .map(|armoury| {
                 let i = crate::demo_roll::RollInputs { rank: 1, specialization: CommanderSpecialization::Cannoneer, fatal_flaw: CommanderFlaw::Paranoid, gunsmith: false, stress: 0, armoury };
-                let rows = crate::demo_roll::roll_modifiers(Some(&i), None, mission);
-                let r = resolve_mission_with_modifiers(&squad, mission, &rows, "2026-11-02T00:00:00Z", Some(13), &config.sim);
+                let rows = crate::demo_roll::roll_modifiers(Some(&i), None, mission, 4);
+                let r = resolve_mission_with_modifiers(&squad, mission, &rows, "2026-11-02T00:00:00Z", Some(60), &config.sim);
                 (r.score_breakdown.raw_roll, r.score_breakdown.total_score, format!("{:?}", r.outcome))
             })
             .collect();
-        assert_eq!(got, vec![(57, 56, "Defeat".to_string()), (57, 60, "Success".to_string()), (57, 68, "Success".to_string())]);
+        assert_eq!(got, vec![(32, 30, "Defeat".to_string()), (32, 34, "Success".to_string()), (32, 42, "Success".to_string())]);
+    }
+
+    /// BP-39b point 1: at the baseline (rank 1, Rested, a Specialisation that doesn't suit the
+    /// job, The Gambler (0 at the 0-point approach), no kit, no Gunsmith, 8 Rookies, the approach
+    /// that scores 0 there) the only row is the opposition's, and the chance is the tag's: Easy 80,
+    /// Risky 50, Brutal 30. The Relic Dig's 117 − 67 is inside the clamp.
+    #[test]
+    fn opposition_cut_brings_each_job_to_its_tag() {
+        use crate::demo_roll::MissionApproach as A;
+        use sim_engine::roster::{CommanderFlaw, CommanderSpecialization as S};
+        let squad = Squad { units: rookies(8), commander: None };
+        let config = Config::default();
+        let jobs = [
+            ("GUARD_DUTY", A::Assault, S::Breacher, -6, 80),
+            ("SUPPLY_RAID", A::Flank, S::Cannoneer, -21, 50),
+            ("CRASHED_SHIP_RAID", A::Flank, S::Cannoneer, -67, 50),
+            ("BLACK_SITE_RAID", A::DigIn, S::Cannoneer, -21, 30),
+        ];
+        for (id, approach, specialization, cut, want) in jobs {
+            let mission = missions().get(id).expect(id);
+            let i = crate::demo_roll::RollInputs { rank: 1, specialization, fatal_flaw: CommanderFlaw::TheGambler, gunsmith: false, stress: 0, armoury: None };
+            let rows = crate::demo_roll::roll_modifiers(Some(&i), Some(approach), mission, 8);
+            let got: Vec<(&str, i32)> = rows.iter().map(|r| (r.key.as_str(), r.points)).collect();
+            assert_eq!(got, [("opposition", cut)], "{id}");
+            let r = resolve_mission_with_modifiers(&squad, mission, &rows, "2026-11-13T00:00:00Z", Some(1), &config.sim);
+            assert_eq!(r.score_breakdown.total_score, want, "{id}");
+        }
     }
 
     /// BP-23a: `ops/equip` with `body`.

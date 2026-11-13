@@ -172,10 +172,10 @@ const RELIC = {
   lead: 'A pre-collapse space frigate crashed into the dirt in Sector 6 before anyone now alive was born. The hold is under three metres of soil and a great deal of competitive interest. Dig it out, see off whoever else turns up, and bring back anything that still hums.',
 };
 const RELIC_SITE = 'contract:CRASHED_SHIP_RAID';
-// BP-29a (Wiki, feedback item 9): each contract's difficulty word, by mission type, set from the spec check's 7,200-fight
-// runs on the starter roster (wins and casualties both). Crashed Ship wins 95% (GhostWire's Extraction bonus) but wounds
-// like a raid: Risky, not Brutal. Never the server's difficulty number, which misleads here; a table, so no fetch and no
-// field the store can lose.
+// BP-29a (Wiki, feedback item 9): each contract's difficulty word, by mission type. BP-39b: the server's per-mission
+// cut (`demo_roll.rs` `opposition_points`) sets a full Section's starting odds to the word: Easy 80 %, Risky 50 %,
+// Brutal 30 %; a retune changes both in the same commit. Never the server's difficulty number, which misleads here; a
+// table, so no fetch and no field the store can lose.
 const DIFFICULTY = { GUARD_DUTY: 'Easy', SUPPLY_RAID: 'Risky', CRASHED_SHIP_RAID: 'Risky', BLACK_SITE_RAID: 'Brutal' };
 const relicWon = o => Boolean(o && o.site_id === RELIC_SITE && o.fought === 'won');
 // B4 briefings (BP-15a, Wiki copy): a contract's own briefing over the server's flavour text. The relic keeps
@@ -314,7 +314,7 @@ const STANCE_LINES = {
 };
 const APPROACH_RULE = 'Pick the approach that beats their posture.'; // BP-31 (item 10): was the rock-paper-scissors line
 const APPROACHES = [['Assault', 'Assault'], ['Flank', 'Flank'], ['DigIn', 'Dig in']]; // [wire value, button label]
-const APPROACH_ICON = { Assault: 'icon_approach_assault.png', Flank: 'icon_approach_flank.png', DigIn: 'icon_approach_dig_in.png' }; // BP-22
+const APPROACH_ICON = { Assault: 'icon_approach_assault_256.png', Flank: 'icon_approach_flank_256.png', DigIn: 'icon_approach_dig_in_256.png' }; // BP-22; BP-39b: 256 px, new names (no Cache-Control on /assets/art)
 // BP-31: the signs of demo_roll.rs approach_points (approach x stance), never its points. A retune of the
 // square changes this table in the same commit.
 const MATCH = {
