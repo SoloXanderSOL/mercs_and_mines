@@ -8394,7 +8394,7 @@ async fn reaper_retires_a_campaign_idle_since_its_last_mission() {
     let store = PostgresReaperStore::new(pool.clone());
 
     // Collect. BP-42: the mission at T0 makes it played. At cutoff T0 + 15 min its played line
-    // is T0 − 171,000 s, so it is kept; at cutoff T0 + 172,801 s the played line is T0 + 901 s,
+    // is T0 − 168,300 s, so it is kept; at cutoff T0 + 172,801 s the played line is T0 + 3,601 s,
     // so it is retired. The single-cutoff list (flat) still lists it at T0 + 15 min.
     let listed = store.list_idle_campaigns(reap_cutoff(), 10_000).await;
     let _ = reap_once(&state, &store, reap_cutoff(), &mut ReaperWarns::new()).await;

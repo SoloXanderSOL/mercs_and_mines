@@ -165,6 +165,7 @@ export function createCheckout(deps) {
   let running = -1;  // the generation with a flow in flight (one tap at a time)
   let then = null;   // where Continue and Not now go
   let walletOpen = 0; // wallet sessions open in this tab: while one is, nothing is declared dead
+  let waiting = null; // BP-46 F1: { g, reference } while a handed-over payment waits on the wallet
 
   const alive = g => g === gen && !$('screen-checkout').hidden;
 
@@ -356,6 +357,21 @@ export function createCheckout(deps) {
     }
   }
 
+  // BP-46 F1: back in the tab while a handed-over payment still waits on the wallet (Home at
+  // Processing: the wallet's promise may never settle). Leave that attempt (the bump makes its
+  // late answer a no-op) and ask the server at once: recheck() GETs now, shows the receipt if the
+  // payment landed, and otherwise waits in lapse(), which never says "Payment sent". Once per
+  // hand-off; nothing when the checkout isn't on show (Not now) or the tab is going hidden.
+  function backFromWallet() {
+    if (document.visibilityState !== 'visible' || !waiting || !alive(waiting.g)) return;
+    const { reference } = waiting;
+    waiting = null;
+    gen += 1; // leaves the hung attempt, so start() runs this check
+    working(COPY.checkoutCheckingLast, true);
+    start(g => recheck(g, reference));
+  }
+  document.addEventListener('visibilitychange', backFromWallet);
+
   // Pay and Try again.
   async function attempt(g) {
     working(COPY.checkoutWorking, true);
@@ -419,6 +435,7 @@ export function createCheckout(deps) {
         if (!alive(g)) return null;
         store.setCheckoutRef({ reference: body.reference, wallet }); // stored at the handover: nothing before it went out
         handed = true;
+        waiting = { g, reference: body.reference }; // BP-46 F1
         return tx;
       });
     } catch (e) {
@@ -426,6 +443,7 @@ export function createCheckout(deps) {
       throw e;
     } finally {
       walletOpen -= 1;
+      if (waiting && waiting.g === g) waiting = null; // BP-46 F1
       if (handed) { // the session is over: no blockhash this wallet signed is newer than this height
         try { store.setCheckoutEnd(body.reference, await conn.getBlockHeight('confirmed')); } catch (e) { deps.note(e); }
       }

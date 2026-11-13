@@ -119,7 +119,7 @@ async fn main() {
         move || mercs_server::auth::run_auth_sweep_task(Arc::clone(&sweep_state)),
     ));
 
-    // BP-3c-1b-1 (demo-only): archives demo campaigns idle for 15 minutes (ODQ-67 (b)).
+    // BP-3c-1b-1 (demo-only): archives idle demo campaigns: unplayed after 60 minutes (BP-46), played after 48 hours (BP-42; ODQ-67 (b)).
     let reaper_state = Arc::clone(&state);
     tokio::spawn(supervise(
         "demo_reaper",

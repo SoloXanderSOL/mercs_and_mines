@@ -91,7 +91,7 @@ const COPY = {
   listSub: 'Pick a dig or a contract. The team walks there first.', // BP-30
   listOut: 'A squad is out.',
   listMeta: '{n} hexes · {s} s',
-  outOfReach: 'Out of reach: your crews work veins near the gateway.', // BP-30: a tap on a vein that is not on the board
+  outOfReach: 'Out of reach: your crews work the veins nearest the gateway.', // BP-30: a tap on a vein that is not on the board; BP-46: the Director's wording
   labelDig: 'Dig',     // BP-30: over a dig pin
   labelFight: 'Fight', // BP-30: over a contract pin
   labelBase: 'Base',               // BP-37b (item 3): over the home hex, in the Dig/Fight labels' style
@@ -1083,6 +1083,7 @@ function openBase() {
   picker = false;
   noDigOpen = false;
   bankNote = null; crewNote = null; tripNote = null;
+  notice = ''; // BP-46 F4: a map note (terrain, out of reach, the Crew's refusals) never follows the player into the base
   refresh();
 }
 
@@ -1699,6 +1700,21 @@ function pick(x, y) {
   return best;
 }
 
+// BP-46 F3: a finger on the map's home hex opens the base on pointerup, and the same touch's click then
+// lands on whatever the sheet put under the finger (a building's box). Eat that one click. A click with
+// detail 0 (a keyboard, element.click()) is never eaten; the next pointerdown disarms it.
+function openBaseFromMap() {
+  const eat = e => {
+    if (e.type === 'click' && e.detail === 0) return;
+    document.removeEventListener('click', eat, true);
+    document.removeEventListener('pointerdown', eat, true);
+    if (e.type === 'click') { e.stopPropagation(); e.preventDefault(); }
+  };
+  document.addEventListener('click', eat, true);
+  document.addEventListener('pointerdown', eat, true);
+  openBase();
+}
+
 function tap(x, y) {
   if (baseOpen || listOpen) return; // a sheet covers the map
   // BP-37b (item 3, F2): the home hex opens the base, before the nearest-pin search (a 2-hex dig is in its reach).
@@ -1708,10 +1724,10 @@ function tap(x, y) {
   const home = Boolean(hex && gateway && !exact && hex.q === gateway.q && hex.r === gateway.r);
   if (shownOp()) { // the strip stays while the team is out; Next mission's pick takes a pin
     if (picking && !confirming) choose(pick(x, y));
-    else if (home) openBase();
+    else if (home) openBaseFromMap();
     return;
   }
-  if (home) return openBase();
+  if (home) return openBaseFromMap();
   selected = pick(x, y);
   if (map) map.requestFrame(); // BP-20b: the sheet's way on the map
   picker = false;

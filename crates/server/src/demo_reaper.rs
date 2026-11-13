@@ -19,7 +19,7 @@
 //!
 //! **Two idle lines (BP-42, ODQ-67 (b) amended 2026-11-07).** A played campaign (a mission
 //! start, or a move the ops store has seen, `DemoOpsStore::last_moved`) is retired after 48
-//! hours idle; an unplayed one after 15 minutes, as before. Its idle time is the latest of its
+//! hours idle; an unplayed one after 60 minutes (BP-46; 15 before). Its idle time is the latest of its
 //! launch, its last mission start and its last ops move. The select chooses the line per
 //! campaign, with the ops moves passed in as arrays, so kept campaigns never fill the `LIMIT`;
 //! the retire re-checks with the move read under the launch lock. **The safety valve:** at
@@ -48,9 +48,11 @@ use crate::state::AppState;
 
 /// How often the reaper sweeps.
 pub const DEMO_REAP_INTERVAL: Duration = Duration::from_secs(300);
-/// An unplayed campaign is idle once its launch is this old; under pressure, every campaign is
-/// idle once its latest activity is this old.
-pub const DEMO_REAP_IDLE_AFTER_SECS: i64 = 900;
+/// An unplayed campaign is idle once its launch is this old (60 minutes; BP-46, was 15).
+pub const DEMO_REAP_IDLE_AFTER_SECS: i64 = 3600;
+/// BP-46: under pressure, every campaign is idle once its latest activity is this old (15
+/// minutes, the valve's line as before; it no longer follows `DEMO_REAP_IDLE_AFTER_SECS`).
+pub const DEMO_REAP_PRESSURE_IDLE_SECS: i64 = 900;
 /// BP-42: a played campaign is idle once its latest activity is this old (48 hours).
 pub const DEMO_REAP_IDLE_PLAYED_SECS: i64 = 172_800;
 /// BP-42: at this many live campaigns (80% of `DEMO_LIVE_CAMPAIGN_CAP`), the 15-minute line
@@ -72,7 +74,7 @@ pub struct ReapCutoffs {
 }
 
 impl ReapCutoffs {
-    /// The normal pass: `unplayed` is the 15-minute line, and the played line sits
+    /// The normal pass: `unplayed` is the 60-minute line, and the played line sits
     /// `DEMO_REAP_IDLE_PLAYED_SECS - DEMO_REAP_IDLE_AFTER_SECS` before it, so both measure
     /// from the same `now`.
     pub fn normal(unplayed: DateTime<Utc>) -> Self {
@@ -338,9 +340,10 @@ async fn prune_ops(state: &AppState, warns: &mut ReaperWarns) {
     }
 }
 
-/// One sweep. Returns how many campaigns it archived. `cutoff` is the 15-minute line (now less
+/// One sweep. Returns how many campaigns it archived. `cutoff` is the unplayed line (now less
 /// `DEMO_REAP_IDLE_AFTER_SECS` in production); the played line comes from it
-/// (`ReapCutoffs::normal`), and the valve uses it for everyone (`ReapCutoffs::flat`).
+/// (`ReapCutoffs::normal`). The valve's line, for everyone (`ReapCutoffs::flat`), sits
+/// `DEMO_REAP_IDLE_AFTER_SECS - DEMO_REAP_PRESSURE_IDLE_SECS` after it (BP-46).
 pub async fn reap_once(state: &AppState, store: &dyn ReaperStore, cutoff: DateTime<Utc>, warns: &mut ReaperWarns) -> usize {
     reap_once_with_seam(state, store, cutoff, warns, None).await
 }
@@ -371,7 +374,8 @@ pub async fn reap_once_with_seam(
             0
         }
     };
-    let (normal, flat) = (ReapCutoffs::normal(cutoff), ReapCutoffs::flat(cutoff));
+    let valve = cutoff + chrono::Duration::seconds(DEMO_REAP_IDLE_AFTER_SECS - DEMO_REAP_PRESSURE_IDLE_SECS); // BP-46
+    let (normal, flat) = (ReapCutoffs::normal(cutoff), ReapCutoffs::flat(valve));
     let listing = if under_pressure(live, 0) { flat } else { normal };
     let (ops_ids, ops_at) = state.demo_ops.store.moved_list(Utc::now());
     let idle = match store.list_idle(listing, &ops_ids, &ops_at, DEMO_REAP_MAX_PER_SWEEP).await {
@@ -507,7 +511,8 @@ mod tests {
     #[test]
     fn reaper_numbers_are_odq_67s() {
         assert_eq!(DEMO_REAP_INTERVAL, Duration::from_secs(300), "every 5 minutes");
-        assert_eq!(DEMO_REAP_IDLE_AFTER_SECS, 900, "idle after 15 minutes");
+        assert_eq!(DEMO_REAP_IDLE_AFTER_SECS, 3600, "an unplayed campaign: idle after 60 minutes (BP-46)");
+        assert_eq!(DEMO_REAP_PRESSURE_IDLE_SECS, 900, "the valve: idle after 15 minutes");
         assert_eq!(DEMO_REAP_MAX_PER_SWEEP, 200);
         assert_eq!(DEMO_REAP_IDLE_PLAYED_SECS, 172_800, "a played campaign: idle after 48 hours");
         assert_eq!(DEMO_REAP_PRESSURE_AT, 800, "the valve at 80% of 1,000");
@@ -694,7 +699,7 @@ mod tests {
     }
 
     /// BP-42: the same team parked on site with no drill since is kept. Its move, 1,000 s before
-    /// the 15-minute cutoff, makes the campaign played and lies inside the 48-hour line.
+    /// the cutoff, makes the campaign played and lies inside the 48-hour line.
     #[tokio::test]
     async fn reaper_keeps_a_team_parked_on_site_for_48_hours() {
         let state = state();
@@ -710,7 +715,7 @@ mod tests {
     }
 
     /// BP-42 L2: a team parked past the 48-hour line is retired. The cutoff is now + 49 h, so the
-    /// played line is cutoff − 171,900 s; the move at cutoff − 172,000 s (its arrival 10 s later,
+    /// played line is cutoff − 169,200 s; the move at cutoff − 172,000 s (its arrival 10 s later,
     /// at cutoff − 171,990 s) lies before it.
     #[tokio::test]
     async fn reaper_retires_a_team_parked_past_48_hours() {
@@ -797,6 +802,44 @@ mod tests {
         assert_eq!(reap_once(&state, &fixed(&state, 800), cutoff, &mut ReaperWarns::new()).await, 1);
         assert_eq!(lifecycle(&state, older).await, CampaignLifecycle::Archived, "the older goes");
         assert_eq!(lifecycle(&state, newer).await, CampaignLifecycle::Active, "back under 800: kept");
+    }
+
+    /// BP-46 V1: the valve keeps the 15-minute line while the unplayed line moves to 60. The cutoff
+    /// is production's (`DEMO_REAP_IDLE_AFTER_SECS` before "now"), with "now" `minutes_in` after
+    /// the launch. An unplayed campaign 30 minutes in is kept at 799 live and retired at 800; one
+    /// 10 minutes in is kept at 800. Decides the valve's offset at `reap_once`'s `flat`.
+    #[tokio::test]
+    async fn the_valve_keeps_15_minutes_for_an_unplayed_campaign() {
+        for (minutes_in, live, retired, after) in [
+            (30, 799, 0, CampaignLifecycle::Active),
+            (30, 800, 1, CampaignLifecycle::Archived),
+            (10, 800, 0, CampaignLifecycle::Active),
+        ] {
+            let state = state();
+            let (c, _) = campaign(&state, true).await;
+            let cutoff = Utc::now() + chrono::Duration::minutes(minutes_in) - chrono::Duration::seconds(DEMO_REAP_IDLE_AFTER_SECS);
+
+            assert_eq!(reap_once(&state, &fixed(&state, live), cutoff, &mut ReaperWarns::new()).await, retired, "{minutes_in} min in, at {live} live");
+            assert_eq!(lifecycle(&state, c).await, after, "{minutes_in} min in, at {live} live");
+        }
+    }
+
+    /// BP-46 V2: a played campaign whose last move was 2,000 s (33 minutes) before "now" is past
+    /// the valve's 15-minute line and inside the 48-hour line: retired at 800 live, kept at 799.
+    /// The move is an hour ahead of the launch, so it is the campaign's latest activity.
+    #[tokio::test]
+    async fn the_valve_retires_a_played_campaign_idle_33_minutes() {
+        let secs = chrono::Duration::seconds;
+        for (live, retired, after) in [(800, 1, CampaignLifecycle::Archived), (799, 0, CampaignLifecycle::Active)] {
+            let state = state();
+            let (c, _) = campaign(&state, true).await;
+            let moved = Utc::now() + chrono::Duration::hours(1);
+            state.demo_ops.store.start_op(c, (5, 0), ops_board(), &ops_dig(), 7, ops_crew(), None, moved).expect("start");
+            let cutoff = moved + secs(2000) - secs(DEMO_REAP_IDLE_AFTER_SECS);
+
+            assert_eq!(reap_once(&state, &fixed(&state, live), cutoff, &mut ReaperWarns::new()).await, retired, "at {live} live");
+            assert_eq!(lifecycle(&state, c).await, after, "at {live} live");
+        }
     }
 
     /// BP-42 L6: the mirror's live count is `Pending` + `Active` + `Ending`.
