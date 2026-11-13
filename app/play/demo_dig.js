@@ -12,7 +12,7 @@ export const DIG_COPY = {
   pull: 'Pull out',
   home: 'Head home',
   fight: 'Fight',
-  status: 'Drills {n} · {ore} ore on site · Heat {heat}/{threshold}',
+  status: '{n} drill{s} done · {ore} ore to haul · Heat {heat}/{threshold}', // BP-47: drills done; the pile at the dig, not yet hauled home
   range: 'Next drill: +{min}–{max} heat, +{ore} ore',
   risk: '{pct}% raid risk.',
   riskHot: '{pct}% raid risk. The drill might overheat.',
@@ -64,18 +64,20 @@ export const DIG_COPY = {
 
 // The bar runs from 0 to 1.2 × threshold, so the threshold tick sits at 1 / 1.2 of its width.
 const SCALE = 1.2;
-const HOT = 0.7; // the fill turns from amber to red at this share of the threshold
+const HOT = 0.7; // the fill turns from orange to red at this share of the threshold
 const TREMBLE = 0.5; // BP-37c (item 7): the heat number trembles from this share of the threshold
 
 export const DIG_CSS = `
 .dig-panel { position: relative; display: flex; flex-direction: column; gap: 1.2cqw; }
 .dig-panel[hidden], .dig-line[hidden], .ops-banked[hidden], .end-ops[hidden] { display: none; }
 .dig-heat { position: relative; height: 4cqw; background: var(--panel); border: 0.3cqw solid var(--panel-edge); border-radius: 1cqw; overflow: hidden; }
-.dig-heat-fill { position: absolute; left: 0; top: 0; bottom: 0; width: 0; background: var(--accent); transition: width 0.25s ease-out, background-color 0.25s ease-out; }
+.dig-heat-fill { position: absolute; left: 0; top: 0; bottom: 0; width: 0; background: #e0682c; transition: width 0.25s ease-out, background-color 0.25s ease-out; } /* BP-47: orange, never the ore's accent yellow */
 .dig-heat-fill.hot { background: var(--danger); }
 .dig-heat-tick { position: absolute; top: 0; bottom: 0; left: ${(100 / SCALE).toFixed(3)}%; width: 0.6cqw; margin-left: -0.3cqw; background: #fff; }
 .dig-heat-ghost, .dig-heat-over { position: absolute; top: 0; bottom: 0; left: 0; width: 0; pointer-events: none; }
-.dig-heat-ghost { background: var(--accent); opacity: 0.3; }
+.dig-heat-ghost { background: #e0682c; opacity: 0.3; } /* BP-47: the fill's orange */
+.dig-heat.drilling { animation: dig-tremble 0.125s linear infinite; } /* BP-47 (item 4): the tap's shake, until the answer */
+.ops-actions .btn.drill-press, .ops-actions .btn.drill-press:disabled { transform: scale(0.94); opacity: 1; } /* BP-47 (item 4): pressed in, not greyed, while the drill is out */
 .dig-heat-over { background: var(--danger); opacity: 0.55; }
 .dig-heat-over[hidden] { display: none; }
 .dig-line { margin: 0; font-size: 3.9cqw; line-height: 1.35; }
@@ -107,6 +109,7 @@ export const DIG_CSS = `
   .ops-strip.flash { animation: none; }
   .dig-pop.shown, .dig-pop-heat.shown { animation: dig-hold 2s steps(1, end); }
   .dig-pop-heat.shown.tremble .dig-shake, .dig-pop-heat.shown.rattle .dig-shake { animation: none; }
+  .dig-heat.drilling { animation: none; }
 }
 `;
 
@@ -155,7 +158,7 @@ export function createDigPanel() {
   for (const n of [pop, heatPop]) n.addEventListener('animationend', e => { if (e.target === n) n.classList.remove('shown'); }); // BP-37c F1: a finished beat leaves no class to replay
   node.append(heat, status, range, risk, crew, guard, crewFight, pops);
   node.hidden = true;
-  return { node, bar, ghost, over, status, range, risk, crew, guard, crewFight, pop, heatPop, shake, lastOre: null, lastHeat: null };
+  return { node, heat, bar, ghost, over, status, range, risk, crew, guard, crewFight, pop, heatPop, shake, lastOre: null, lastHeat: null };
 }
 
 // The Crew and Foreman the dig start picked: the roster's first of each (same listers, same order).
@@ -194,7 +197,7 @@ export function renderDig(p, dig, roster, extra = {}) {
   const share = scale > 0 ? Math.min(1, dig.heat / scale) : 0;
   p.bar.style.width = (share * 100).toFixed(2) + '%';
   p.bar.classList.toggle('hot', dig.heat >= dig.threshold * HOT);
-  p.status.textContent = fill(DIG_COPY.status, { n: dig.drills, ore: dig.ore_on_site, heat: dig.heat, threshold: dig.threshold });
+  p.status.textContent = fill(DIG_COPY.status, { n: dig.drills, s: dig.drills === 1 ? '' : 's', ore: dig.ore_on_site, heat: dig.heat, threshold: dig.threshold });
   // BP-13: the next drill's range from the body (absent on an older server: no range, no ghost).
   const live = Number.isFinite(dig.next_heat_max) && dig.next_heat_max > 0 && !dig.raid;
   const hot = live && dig.might_overheat === true;
@@ -249,6 +252,7 @@ export function renderDig(p, dig, roster, extra = {}) {
 // BP-37a-2 (Reviewer BP-37c rework F1, RULE-114): clears the dig's beat, so nothing replays when the panel or the hub shows again.
 export function quietDig(p) {
   for (const n of [p.pop, p.heatPop]) n.classList.remove('shown');
+  p.heat.classList.remove('drilling'); // BP-47 (item 4)
 }
 
 export function hideDig(p) {

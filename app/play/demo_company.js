@@ -255,7 +255,7 @@ const CSS = `
 .reveal-heading.company-heading { overflow-wrap: anywhere; }
 .name-ask { display: flex; flex-direction: column; gap: 2cqw; text-align: left; }
 .name-ask-line { margin: 0; font-size: 4.2cqw; line-height: 1.4; color: var(--accent); }
-.name-ask-input { width: 100%; min-height: 13cqw; padding: 2.5cqw 3cqw; font-family: var(--body); font-size: 5cqw; text-transform: none; color: var(--text); background: var(--panel); border: 0.5cqw solid var(--panel-edge); border-radius: 1.5cqw; }
+.name-ask-input { width: calc(100% - 2.4cqw); margin-inline: 1.2cqw; /* BP-47: room for the 0.8cqw ring */ min-height: 13cqw; padding: 2.5cqw 3cqw; font-family: var(--body); font-size: 5cqw; text-transform: none; color: var(--text); background: var(--panel); border: 0.5cqw solid var(--panel-edge); border-radius: 1.5cqw; }
 .name-ask-input:focus-visible { outline: 0.6cqw solid var(--text); outline-offset: 0.4cqw; }
 /* BP-29a: a yellow caret, and a yellow pulse while the box is empty (focused or not: the ask focuses it), so the box is found */
 /* whether or not the phone opens its keyboard. box-shadow, so the :focus-visible outline above is left alone; steady when reduced. */

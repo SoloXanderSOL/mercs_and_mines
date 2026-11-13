@@ -270,10 +270,10 @@ const CSS = `
 #screen-briefing .briefing-stance { margin: 0; font-family: var(--display); font-weight: 700; font-size: 4.6cqw; line-height: 1.25; color: var(--accent); }
 #screen-briefing .briefing-rule { margin: 0; font-size: 3.5cqw; line-height: 1.3; color: var(--muted); }
 #screen-briefing .briefing-rule[data-picked] { color: var(--text); } /* BP-31: the pick's line */
-#screen-briefing .briefing-approaches { display: flex; gap: 2cqw; width: 100%; max-width: 84cqw; }
-#screen-briefing .briefing-approaches .btn { flex: 1; width: auto; max-width: none; min-height: 13cqw; padding: 0 2cqw; font-size: 4.8cqw; display: inline-flex; align-items: center; justify-content: center; gap: 1cqw; } /* BP-31: was 11cqw / 4.4cqw */
-#screen-briefing .briefing-approaches .briefing-icon { flex: none; width: 6.5cqw; height: 6.5cqw; } /* BP-31: was 5cqw */
-#screen-briefing .briefing-approaches .briefing-approach[aria-pressed="true"] { box-shadow: 0 0 0 0.8cqw var(--text), 0 0 4cqw var(--accent); } /* BP-31: the pick glows */
+#screen-briefing .briefing-approaches { display: flex; gap: 1.5cqw; width: 100%; max-width: 88cqw; } /* BP-47: was 2cqw / 84cqw */
+#screen-briefing .briefing-approaches .btn { flex: 1; width: auto; max-width: none; min-height: 13cqw; padding: 0 1cqw; font-size: 4.8cqw; display: inline-flex; align-items: center; justify-content: center; gap: 0.5cqw; white-space: nowrap; } /* BP-47: padding 2cqw, gap 1cqw before */
+#screen-briefing .briefing-approaches .briefing-icon { flex: none; width: 13cqw; height: 13cqw; } /* BP-47: was 6.5cqw */
+#screen-briefing .briefing-approaches .briefing-approach[aria-pressed="true"] { box-shadow: 0 0 0 0.6cqw var(--bg), 0 0 0 1.4cqw var(--accent), 0 0 4cqw var(--accent); } /* BP-47: the game's accent outline (a dark gap first, the fill is accent too) and a little glow; was a white ring */
 #screen-briefing .briefing-pair { display: flex; gap: 2cqw; width: 100%; max-width: 84cqw; } /* BP-31: Back | Confirm */
 #screen-briefing .briefing-pair .btn { flex: 1; width: auto; max-width: none; }
 #screen-battle .still { height: 24cqw; }
@@ -2089,8 +2089,19 @@ function sendReturn() {
   send(opsPath(campaignId) + '/return' + query, undefined);
 }
 
-function sendDrill() {
-  send(opsPath(campaignId) + '/drill', undefined);
+// BP-47 (item 4): the tap answers at once. The button presses in and the heat bar shakes until the
+// server answers; a 200 brings the numbers (renderDig's pops), an error brings none. Every answer
+// ends both: send() settles on every path (FETCH_DEADLINE_MS at worst).
+async function sendDrill() {
+  const tapped = !held() && Boolean(campaignId);
+  if (tapped) drillBeat(true);
+  await send(opsPath(campaignId) + '/drill', undefined);
+  if (tapped) drillBeat(false);
+}
+
+function drillBeat(on) {
+  buttons[0].classList.toggle('drill-press', on);
+  dig.heat.classList.toggle('drilling', on);
 }
 
 function sendPull() {

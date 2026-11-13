@@ -1,6 +1,6 @@
 // B4's fight log and outcome write-ups (BP-15b, §4e rank 5; Wiki copy). Demo-only (ODQ-69).
 // The server makes one roll; the log retells it from the mission response alone: who stood, who was hurt
-// and by how much (`hp_lost`), who fell (`final_status`). It adds no hit, no damage and no death, and it
+// (`hp_lost` > 0; BP-47: the lines say "was injured", never a number), who fell (`final_status`). It adds no hit, no damage and no death, and it
 // never shows `status_note`, `unit_type` or `emoji`. Flavour is picked by a hash of `report_id`, so one
 // report always reads the same; nothing here draws a random number. The log runs in battle.js's
 // setBeforeOutcome step, between the roll and the banner, and never states the outcome: the banner does,
@@ -45,21 +45,21 @@ const STORY = {
   },
   ready: ['Not a scratch on {names}.', '{names}: unhurt, and being smug about it.', 'The enemy misses {names} entirely.'],
   wounded: [
-    '{name} takes a hit: {hp} HP lost. Still up and fighting.',
-    '{name} is clipped for {hp} HP and lets everyone know - loudly.',
-    '{name} catches a bullet, {hp} HP lost, keeps firing.',
+    '{name} was injured. Still up and fighting.',
+    '{name} was injured and lets everyone know - loudly.',
+    '{name} was injured, keeps firing.',
   ],
   kia: ['{name} goes down and stays down.', '{name} does not get up.', '{name} is killed in action.'],
   woundedPair: [
-    '{a} and {b} are hit: {ha} and {hb} HP lost.',
-    '{a} loses {ha} HP, {b} loses {hb}. Both still up.',
-    '{a} and {b} are hit, {ha} and {hb} HP. They complain loudly in harmony.',
+    '{a} and {b} were injured.',
+    '{a} and {b} were injured. Both still up.',
+    '{a} and {b} were injured. They complain loudly in harmony.',
   ],
   kiaPair: ['{a} and {b} go down together.', '{a} and {b} do not get up.', '{a} and {b} are killed in action.'],
   mixedPair: [
-    '{a} is hit for {ha} HP. {b} does not get up.',
-    '{a} loses {ha} HP. {b} goes down and stays down.',
-    '{a} takes {ha} HP. {b} is killed in action.',
+    '{a} was injured. {b} does not get up.',
+    '{a} was injured. {b} goes down and stays down.',
+    '{a} was injured. {b} is killed in action.',
   ],
 };
 // One line per outcome, true after every family and on both sides of the roll. None repeats the banner,
@@ -126,7 +126,7 @@ const fill = (text, values) => text.replace(/\{(\w+)\}/g, (m, k) => (k in values
 const nameList = names => (names.length < 2 ? names.join('') : `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`);
 const isHurt = u => u.hp_lost > 0; // one filter: the Ready units are its complement, so every unit is on exactly one line
 const dead = u => u.final_status === 'KIA'; // the demo has no MIA path (resolver.rs)
-const lost = u => u.hp_lost; // what a line shows and stamps: the AAR row says the same number
+const lost = u => u.hp_lost; // what a line stamps (data-hp, never shown since BP-47)
 
 // The log's lines for one report: [{ kind, text, units, hp }]. Pure: the same report gives the same lines.
 // The hurt units run Wounded first, then KIA, each in squad order; past the budget the last ones pair up

@@ -23,6 +23,7 @@ const LAPSE_TICK_MS = 5000;     // the no-signature check (BP-3c-5): a height re
 const GET_EVERY = 3;            // a server GET every third read,
 const LAPSE_WINDOW_MS = 120000; // for at most 2 minutes, then Check again
 const SETTLE_GAP_MS = 3000;     // past the server's 2 s check cache before the last GET
+const RETURN_GRACE_MS = 1500;   // BP-47 R-f: the tab's return waits this long for the wallet's own answer
 const BLOCKS_VALID = 150;       // a blockhash's life in blocks
 const MARGIN_BLOCKS = 64;       // the wallet's or the server's RPC lagging ours (~16 s on devnet)
 const RPC_DEADLINE_MS = 15000;  // every test-network call gives up after this, like every server call
@@ -322,6 +323,10 @@ export function createCheckout(deps) {
     const deadline = performance.now() + LAPSE_WINDOW_MS;
     for (let tick = 1; ; tick += 1) {
       if (walletOpen === 0) {
+        // BP-47 R-f (Reviewer BP-46 F2): the reference is gone only by the attempt's NOT_SIGNED clear while a
+        // lapse runs (no other clear can meet a live lapse), so nothing went out: offer Try again.
+        const rec = store.checkoutRef();
+        if (!rec || rec.reference !== reference) return retryable(COPY.checkoutRefused);
         let dead;
         try {
           dead = await pastLastBlock(conn, reference);
@@ -362,13 +367,21 @@ export function createCheckout(deps) {
   // late answer a no-op) and ask the server at once: recheck() GETs now, shows the receipt if the
   // payment landed, and otherwise waits in lapse(), which never says "Payment sent". Once per
   // hand-off; nothing when the checkout isn't on show (Not now) or the tab is going hidden.
+  // BP-47 R-f (Reviewer BP-46 F1): it waits RETURN_GRACE_MS first, so a plain approve's answer, landing
+  // just after the return, clears `waiting` in the attempt's finally and goes through poll() as before.
+  // One timer: every visibility change clears it, and a visible one re-arms it.
+  let graceTimer = 0;
   function backFromWallet() {
+    clearTimeout(graceTimer);
     if (document.visibilityState !== 'visible' || !waiting || !alive(waiting.g)) return;
-    const { reference } = waiting;
-    waiting = null;
-    gen += 1; // leaves the hung attempt, so start() runs this check
-    working(COPY.checkoutCheckingLast, true);
-    start(g => recheck(g, reference));
+    const w = waiting;
+    graceTimer = setTimeout(() => {
+      if (document.visibilityState !== 'visible' || waiting !== w || !alive(w.g)) return;
+      waiting = null;
+      gen += 1; // leaves the hung attempt, so start() runs this check
+      working(COPY.checkoutCheckingLast, true);
+      start(g => recheck(g, w.reference));
+    }, RETURN_GRACE_MS);
   }
   document.addEventListener('visibilitychange', backFromWallet);
 

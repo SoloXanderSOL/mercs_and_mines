@@ -63,7 +63,7 @@ const COPY = {
   aarTitle: 'After-action report',
   aarUnits: '1st Section',
   unitName: 'Rookie {n}',
-  unitStatus: { Ready: 'Unscathed', Wounded: 'Wounded, {n} HP lost', KIA: 'Killed in action' },
+  unitStatus: { Ready: 'Unscathed', Wounded: 'Wounded', KIA: 'Killed in action' }, // BP-47: no HP count
   aarRewards: 'Pay',
   aarNoRewards: 'No pay. Command does not reward effort.',
   aarLoot: 'Recovered: {item}',
