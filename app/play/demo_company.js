@@ -240,6 +240,10 @@ const CSS = `
 .company-card .btn { margin-top: 1.5cqw; }
 .company-card-lines { display: flex; flex-direction: column; gap: 2cqw; max-height: 100cqw; overflow-y: auto; }
 .company-card-lines[hidden], .company-card-line[hidden], .company-act[hidden], .company-trophy[hidden] { display: none; }
+.company-art[hidden] { display: none; }
+.company-art { display: block; width: calc(100% + 8cqw); max-width: none; height: auto; aspect-ratio: 1074 / 600; margin: -4cqw -4cqw 0; border-radius: 1.6cqw 1.6cqw 0 0; } /* BP-49a: the card's scene, edge to edge inside the border */
+.company-card.has-art { top: 4cqw; } /* BP-49a (F1): a card with its scene starts near the top, so Close stays on the stage */
+.company-card.has-art .company-card-lines { max-height: 88cqw; }
 .company-bunks { font-size: 5cqw; letter-spacing: 0.6cqw; }
 .company-card .company-act { width: 100%; max-width: none; margin-top: 0; min-height: 11cqw; font-size: 4.4cqw; }
 .company-trophy { display: flex; flex-direction: column; gap: 0.6cqw; padding: 1.6cqw 0; border-top: 0.3cqw solid var(--panel-edge); }
@@ -362,6 +366,9 @@ const PORTRAITS = {
   Bearocrat: 'portrait_bearocrat.jpg',
   'Science Ape': 'portrait_science_ape.jpg',
 };
+
+// BP-49a: the Director's scene at the head of the Section and Crew cards; the Trophy Shelf has none.
+const CARD_ART = { section: 'scene_card_section.jpg', crew: 'scene_card_crew.jpg' };
 
 function dressPortrait(cardNode) {
   const box = cardNode.querySelector('.portrait');
@@ -579,8 +586,12 @@ function createCard() {
   const close = el('button', 'btn', COMPANY_COPY.close);
   close.type = 'button';
   close.addEventListener('click', hideCard);
-  node.append(title, lines, close);
-  return { node, title, lines };
+  const art = el('img', 'company-art'); // BP-49a: openCard sets its src, so the Company screen itself loads no new bytes
+  art.alt = '';
+  art.hidden = true;
+  art.addEventListener('error', () => { art.dataset.bad = '1'; art.hidden = true; node.classList.remove('has-art'); }); // a failed picture leaves the text whole
+  node.append(art, title, lines, close);
+  return { node, art, title, lines };
 }
 
 function stopTick() {
@@ -807,6 +818,14 @@ function openCard(kind, index) {
     card.lines.replaceChildren(...rows);
     drawnKey = key;
   }
+  const pic = Object.prototype.hasOwnProperty.call(CARD_ART, kind) ? CARD_ART[kind] : '';
+  if (pic && card.art.dataset.pic !== pic) {
+    card.art.dataset.pic = pic;
+    delete card.art.dataset.bad;
+    card.art.src = `assets/art/${pic}`;
+  }
+  card.art.hidden = !pic || card.art.dataset.bad === '1';
+  card.node.classList.toggle('has-art', !card.art.hidden);
   card.node.hidden = false;
   shown = { kind, index };
   if (ticking) tick = setTimeout(() => { tick = null; if (shown) openCard(shown.kind, shown.index); }, 1000);

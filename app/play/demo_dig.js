@@ -66,10 +66,13 @@ export const DIG_COPY = {
 const SCALE = 1.2;
 const HOT = 0.7; // the fill turns from orange to red at this share of the threshold
 const TREMBLE = 0.5; // BP-37c (item 7): the heat number trembles from this share of the threshold
+const DIG_ART = 'scene_dig_before.jpg'; // BP-49a: the dig's scene while the Crew is at the site
 
 export const DIG_CSS = `
 .dig-panel { position: relative; display: flex; flex-direction: column; gap: 1.2cqw; }
 .dig-panel[hidden], .dig-line[hidden], .ops-banked[hidden], .end-ops[hidden] { display: none; }
+.dig-art { display: block; width: 100%; height: auto; aspect-ratio: 1050 / 586; border-radius: 1cqw; } /* BP-49a: the dig's scene, above the vein title */
+.dig-art[hidden] { display: none; }
 .dig-heat { position: relative; height: 4cqw; background: var(--panel); border: 0.3cqw solid var(--panel-edge); border-radius: 1cqw; overflow: hidden; }
 .dig-heat-fill { position: absolute; left: 0; top: 0; bottom: 0; width: 0; background: #e0682c; transition: width 0.25s ease-out, background-color 0.25s ease-out; } /* BP-47: orange, never the ore's accent yellow */
 .dig-heat-fill.hot { background: var(--danger); }
@@ -158,7 +161,12 @@ export function createDigPanel() {
   for (const n of [pop, heatPop]) n.addEventListener('animationend', e => { if (e.target === n) n.classList.remove('shown'); }); // BP-37c F1: a finished beat leaves no class to replay
   node.append(heat, status, range, risk, crew, guard, crewFight, pops);
   node.hidden = true;
-  return { node, heat, bar, ghost, over, status, range, risk, crew, guard, crewFight, pop, heatPop, shake, lastOre: null, lastHeat: null };
+  const art = el('img', 'dig-art'); // BP-49a: demo_ops.js puts it at the top of the strip; it shows and hides with the panel
+  art.alt = '';
+  art.hidden = true;
+  const p = { node, art, artBad: false, heat, bar, ghost, over, status, range, risk, crew, guard, crewFight, pop, heatPop, shake, lastOre: null, lastHeat: null };
+  art.addEventListener('error', () => { p.artBad = true; art.hidden = true; }); // a failed picture leaves the strip whole
+  return p;
 }
 
 // The Crew and Foreman the dig start picked: the roster's first of each (same listers, same order).
@@ -246,6 +254,8 @@ export function renderDig(p, dig, roster, extra = {}) {
     replay(p.heatPop, 'shown');
   }
   p.lastHeat = dig.heat;
+  if (!p.art.getAttribute('src')) p.art.src = `assets/art/${DIG_ART}`; // set at the first dig shown, so boot loads no new bytes
+  p.art.hidden = p.artBad;
   p.node.hidden = false;
 }
 
@@ -256,6 +266,7 @@ export function quietDig(p) {
 }
 
 export function hideDig(p) {
+  p.art.hidden = true; // BP-49a
   p.node.hidden = true;
   p.lastOre = null;
   p.lastHeat = null;

@@ -2398,7 +2398,7 @@ export function mountOps(d) {
     b.addEventListener('click', () => { way = b.dataset.route === 'safe' ? 'safe' : 'fast'; refresh(); if (map) map.requestFrame(); });
     waysRow.append(b);
   });
-  strip.append(titleNode, dig.node, ...lineNodes, outNode, waysRow, actions);
+  strip.append(dig.art, titleNode, dig.node, ...lineNodes, outNode, waysRow, actions); // BP-49a: the dig's scene heads the strip
   bankChip = el('div', 'ops-banked');
   bankChip.hidden = true;
   baseButton = el('button', 'btn btn-bar ops-base', BASE_COPY.button); // BP-40a-2a (item 4): in the bottom bar
