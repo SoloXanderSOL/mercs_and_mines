@@ -50,8 +50,15 @@ export const DIG_COPY = {
   raidLead: 'Claim jumpers at {title}: raccoons on dirt bikes, they seem very interested in your drill. Drilling halts until the site is secured. They cannot read the Keep Out sign. Explain it to them - forcefully.',
   ambushLead: 'Your haul has been intercepted on the road home. {carried} ore is at stake, and the raccoons on the ridge have already started arguing about how they\'ll divide it up. Get it back on the truck.',
   incident: 'INCIDENT REPORT',
-  meltdown: 'Thermal breach at {title}. Ore on site written off.',
-  meltdownHome: 'Casualties logged against your Crew. Heading home. {n} s',
+  // BP-49b (Director-approved copy, 2026-11-13): the held meltdown's report, then its leg home after Return to base.
+  melt: 'MELTDOWN!',
+  meltdown: 'The crew kept drilling at {title} long after the gauge said stop. The bit melted into the vein and took the dig with it.',
+  writtenOff: 'Ore on site: written off.',
+  lost: '{n} miners lost. Replacements can be hired at base.',
+  lostOne: '1 miner lost. Replacements can be hired at base.',
+  cause: 'Cause of incident, per the Foreman: "The gauge was taped over."',
+  back: 'Return to base',
+  meltdownHome: 'Heading home. {n} s',
   walkedAway: 'Site abandoned. The ore stays in the ground. {n} s',
   retreat: 'Fell back with {carried} ore. The rest is a write-off. {n} s',
   pulled: 'Hauling {carried} ore home. {n} s',
@@ -67,12 +74,16 @@ const SCALE = 1.2;
 const HOT = 0.7; // the fill turns from orange to red at this share of the threshold
 const TREMBLE = 0.5; // BP-37c (item 7): the heat number trembles from this share of the threshold
 const DIG_ART = 'scene_dig_before.jpg'; // BP-49a: the dig's scene while the Crew is at the site
+const DIG_ART_AFTER = 'scene_dig_after.jpg'; // BP-49b: the held meltdown's report
 
 export const DIG_CSS = `
 .dig-panel { position: relative; display: flex; flex-direction: column; gap: 1.2cqw; }
 .dig-panel[hidden], .dig-line[hidden], .ops-banked[hidden], .end-ops[hidden] { display: none; }
 .dig-art { display: block; width: 100%; height: auto; aspect-ratio: 1050 / 586; border-radius: 1cqw; } /* BP-49a: the dig's scene, above the vein title */
 .dig-art[hidden] { display: none; }
+.dig-melt { position: absolute; left: 0; right: 0; bottom: calc(100% + 12.8cqw); margin: 0; text-align: center; font-family: var(--display); font-weight: 800; font-size: 7cqw; line-height: 1.1; color: var(--danger); text-shadow: 0 0 1.5cqw #000; pointer-events: none; } /* BP-49b: MELTDOWN!, where the pops were */
+.dig-melt[hidden], .dig-report-head[hidden] { display: none; }
+.dig-report-head { margin: 0; font-family: var(--display); font-weight: 800; font-size: 4.6cqw; line-height: 1.2; letter-spacing: 0.04em; color: var(--danger); } /* BP-49b: INCIDENT REPORT */
 .dig-heat { position: relative; height: 4cqw; background: var(--panel); border: 0.3cqw solid var(--panel-edge); border-radius: 1cqw; overflow: hidden; }
 .dig-heat-fill { position: absolute; left: 0; top: 0; bottom: 0; width: 0; background: #e0682c; transition: width 0.25s ease-out, background-color 0.25s ease-out; } /* BP-47: orange, never the ore's accent yellow */
 .dig-heat-fill.hot { background: var(--danger); }
@@ -152,6 +163,13 @@ export function createDigPanel() {
   const crew = el('p', 'dig-line dig-crew');
   const guard = el('p', 'dig-line dig-guard');           // BP-17b: who guards the dig
   const crewFight = el('p', 'dig-line dig-crew-fight');  // BP-17b: the Crew's own fight
+  const melt = el('p', 'dig-melt');                       // BP-49b: MELTDOWN!, where the pops were
+  melt.textContent = DIG_COPY.melt;
+  melt.hidden = true;
+  const reportHead = el('p', 'dig-report-head');          // BP-49b: INCIDENT REPORT
+  reportHead.textContent = DIG_COPY.incident;
+  reportHead.hidden = true;
+  const report = [0, 1, 2, 3].map(() => { const n = el('p', 'dig-line dig-report'); n.hidden = true; return n; }); // BP-49b: its four lines
   const pops = el('div', 'dig-pops');      // BP-37c: "+N ORE" and "+N HEAT", one line above the strip
   const pop = el('span', 'dig-pop');
   const heatPop = el('span', 'dig-pop-heat');
@@ -159,12 +177,12 @@ export function createDigPanel() {
   heatPop.append(shake);
   pops.append(pop, heatPop);
   for (const n of [pop, heatPop]) n.addEventListener('animationend', e => { if (e.target === n) n.classList.remove('shown'); }); // BP-37c F1: a finished beat leaves no class to replay
-  node.append(heat, status, range, risk, crew, guard, crewFight, pops);
+  node.append(heat, status, range, risk, crew, guard, crewFight, reportHead, ...report, pops, melt);
   node.hidden = true;
   const art = el('img', 'dig-art'); // BP-49a: demo_ops.js puts it at the top of the strip; it shows and hides with the panel
   art.alt = '';
   art.hidden = true;
-  const p = { node, art, artBad: false, heat, bar, ghost, over, status, range, risk, crew, guard, crewFight, pop, heatPop, shake, lastOre: null, lastHeat: null };
+  const p = { node, art, artBad: false, heat, bar, ghost, over, status, range, risk, crew, guard, crewFight, melt, reportHead, report, pop, heatPop, shake, lastOre: null, lastHeat: null };
   art.addEventListener('error', () => { p.artBad = true; art.hidden = true; }); // a failed picture leaves the strip whole
   return p;
 }
@@ -254,7 +272,43 @@ export function renderDig(p, dig, roster, extra = {}) {
     replay(p.heatPop, 'shown');
   }
   p.lastHeat = dig.heat;
-  if (!p.art.getAttribute('src')) p.art.src = `assets/art/${DIG_ART}`; // set at the first dig shown, so boot loads no new bytes
+  p.melt.hidden = true; // BP-49b: the report's nodes stay down on a live dig
+  p.reportHead.hidden = true;
+  for (const n of p.report) n.hidden = true;
+  setArt(p, DIG_ART); // set at the first dig shown, so boot loads no new bytes
+  p.art.hidden = p.artBad;
+  p.node.hidden = false;
+}
+
+// BP-49b (Reviewer BP-49a CF2, F4): the scene is chosen on every show, never only at the first, so the report's "after"
+// and the next dig's "before" each take their turn. A new src clears a failure: one dropped fetch costs that picture, not
+// the session.
+function setArt(p, name) {
+  const src = `assets/art/${name}`;
+  if (p.art.getAttribute('src') === src) return;
+  p.artBad = false;
+  p.art.src = src;
+}
+
+// BP-49b: the held meltdown's incident report, in the live panel's place: the "after" scene, MELTDOWN! where the pops
+// were, the bar full and red, the heading and the four lines. The count is the server's meltdown_heads (the actual loss);
+// an absent count (an older server) drops that line rather than guess. demo_ops.js sets the strip's title and its button.
+export function renderReport(p, dig, title) {
+  quietDig(p);
+  p.bar.style.width = '100%';
+  p.bar.classList.add('hot');
+  p.ghost.style.width = '0%';
+  p.over.hidden = true;
+  for (const n of [p.status, p.range, p.risk, p.crew, p.guard, p.crewFight]) { n.textContent = ''; n.hidden = true; }
+  const n = dig.meltdown_heads;
+  const lost = Number.isInteger(n) ? fill(n === 1 ? DIG_COPY.lostOne : DIG_COPY.lost, { n }) : '';
+  const lines = [fill(DIG_COPY.meltdown, { title }), DIG_COPY.writtenOff, lost, DIG_COPY.cause];
+  p.report.forEach((node, i) => { node.textContent = lines[i]; node.hidden = !lines[i]; });
+  p.reportHead.hidden = false;
+  p.melt.hidden = false;
+  p.lastOre = dig.ore_on_site;
+  p.lastHeat = dig.heat;
+  setArt(p, DIG_ART_AFTER);
   p.art.hidden = p.artBad;
   p.node.hidden = false;
 }
@@ -267,6 +321,7 @@ export function quietDig(p) {
 
 export function hideDig(p) {
   p.art.hidden = true; // BP-49a
+  if (p.artBad) { p.artBad = false; p.art.removeAttribute('src'); } // BP-49b (Reviewer BP-49a F4): the next show retries
   p.node.hidden = true;
   p.lastOre = null;
   p.lastHeat = null;
@@ -276,7 +331,7 @@ export function hideDig(p) {
 // The strip on a dig's homeward leg, by how the dig ended; null on a contract's leg.
 export function homewardLines(dig, title, n) {
   switch (dig ? dig.ended_by : null) {
-    case 'meltdown': return { title: DIG_COPY.incident, danger: true, lines: [fill(DIG_COPY.meltdown, { title }), fill(DIG_COPY.meltdownHome, { n })] };
+    case 'meltdown': return { title: '', danger: false, lines: [fill(DIG_COPY.meltdownHome, { n })] }; // BP-49b (F2): the report was read at the site
     case 'walked_away': return { title: '', danger: false, lines: [fill(DIG_COPY.walkedAway, { n })] };
     case 'retreat': return { title: '', danger: false, lines: [fill(DIG_COPY.retreat, { carried: dig.carried, n })] };
     case 'pulled': return { title: '', danger: false, lines: [fill(DIG_COPY.pulled, { carried: dig.carried, n })] };

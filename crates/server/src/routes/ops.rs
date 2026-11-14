@@ -1224,6 +1224,7 @@ async fn post_ops_next(
         Err(NextRefusal::AlreadyHomeward) => return Err(conflict("already heading home")),
         Err(NextRefusal::NotArrived) => return Err(conflict("still travelling")),
         Err(NextRefusal::RaidPending) => return Err(conflict("raiders at the site")),
+        Err(NextRefusal::MeltedDown) => return Err(conflict("the drill has melted: return to base first")),
         Err(NextRefusal::GuardNotHere) => return Err(conflict("the guard hasn't reached the dig")),
         Err(NextRefusal::SameSite) => return Err(conflict("already there")),
         Err(NextRefusal::SayWhich) => return Err(bad_request("say which squad")),
@@ -1271,10 +1272,16 @@ async fn post_ops_drill(
     match state.demo_ops.store.drill_op(campaign_id, now) {
         Ok(DrillOutcome::Drilled) => {}
         Ok(DrillOutcome::Meltdown { crew_id, heads }) => {
+            // BP-49b: the miners the Crew had, read under the launch lock held since before the drill, so the
+            // report counts the actual loss; a failed read leaves the drill's roll (a named residual).
+            let before = state.crew_repo.get_crew(crew_id).await.ok().flatten().map(|c| c.headcount);
             if let Err(e) = state.crew_loss.meltdown_loss(crew_id, heads, DEMO_MELTDOWN_MORALE_LOSS).await {
                 return Err(internal_error(format!(
                     "post_ops_drill: meltdown_loss({heads}, {DEMO_MELTDOWN_MORALE_LOSS}) failed for crew {crew_id} of campaign {campaign_id}: {e}"
                 )));
+            }
+            if let Some(b) = before {
+                state.demo_ops.store.set_meltdown_heads(campaign_id, u32::from(heads.min(b).max(0).unsigned_abs()));
             }
         }
         Ok(DrillOutcome::CrewFight { crew_id, heads }) => {
@@ -1291,6 +1298,7 @@ async fn post_ops_drill(
         Err(DrillRefusal::AlreadyHomeward) => return Err(conflict("already heading home")),
         Err(DrillRefusal::NotArrived) => return Err(conflict("still travelling")),
         Err(DrillRefusal::RaidPending) => return Err(conflict("raiders at the site")),
+        Err(DrillRefusal::MeltedDown) => return Err(conflict("the drill has melted")),
     }
     drop(launch);
     settle_leaders(&state, campaign_id, &wallet, now).await;
@@ -1374,6 +1382,7 @@ async fn post_ops_escort(
         Err(EscortRefusal::AlreadyEscorted) => return Err(conflict("already guarded")),
         Err(EscortRefusal::SectionBusy) => return Err(conflict("that squad is out")),
         Err(EscortRefusal::CommanderBusy) => return Err(conflict("every Commander is out")),
+        Err(EscortRefusal::MeltedDown) => return Err(conflict("nothing left to guard: the drill has melted")),
     }
     settle_leaders(&state, campaign_id, &wallet, now).await;
     Ok(ops_response(&state, campaign_id, gw, &board, now))
@@ -2574,15 +2583,15 @@ mod tests {
         let (status, body, _) = drill(&state, c).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let op = &body["active_op"];
-        assert_eq!(op["leg"], "homeward");
-        assert_eq!(op["depart_at"], body["now"]);
+        assert_eq!(op["leg"], "outbound", "BP-49b: held at the site");
         assert_eq!((op["dig"]["heat"].as_u64(), op["dig"]["ore_on_site"].as_u64()), (Some(100), Some(0)));
         assert_eq!(op["dig"]["ended_by"], "meltdown");
+        assert_eq!(op["dig"]["meltdown_heads"], 2);
         assert_eq!(headcount(&state, crew).await, 6);
         assert_eq!(state.crew_repo.get_crew(crew).await.unwrap().expect("the Crew").morale, 50, "60 − 10 (BP-11a-1)");
         assert_eq!(state.launch_locks.len(), 0, "the launch lock is released");
         let (status, body, _) = drill(&state, c).await;
-        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("already heading home")));
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("the drill has melted")));
         assert_eq!(headcount(&state, crew).await, 6, "the heads are lost once");
     }
 
@@ -2665,10 +2674,69 @@ mod tests {
         let (status, body, _) = drill(&state, c).await; // seed 2's 6th drill melts at 116 (BP-13)
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
         let op = state.demo_ops.store.op_view(c, chrono::Utc::now()).expect("op");
-        assert_eq!(op.leg, crate::demo_ops::OpLeg::Homeward);
-        assert_eq!(op.dig.expect("a dig").ended_by, Some(crate::demo_ops::OpEnd::Meltdown));
+        assert_eq!(op.leg, crate::demo_ops::OpLeg::Outbound, "BP-49b: held at the site");
+        let d = op.dig.expect("a dig");
+        assert_eq!(d.ended_by, Some(crate::demo_ops::OpEnd::Meltdown));
+        assert_eq!(d.meltdown_heads, Some(1), "BP-49b residual (b): the roll stays (seed 2's 6th drill rolls 1, `ops_drill_roll_is_a_function_of_the_seed_and_the_drill`)");
         assert_eq!(headcount(&state, crew).await, 8);
         assert_eq!(state.launch_locks.len(), 0);
+    }
+
+    /// BP-49b T7: a held meltdown on a Crew-alone dig (`alone_on_site`, seed 57: no raid in drills
+    /// 1–5) refuses a drill and a guard with their own texts; the return then takes the team home
+    /// keeping the meltdown and its count.
+    #[tokio::test]
+    async fn ops_held_meltdown_refusals_say_why() {
+        let state = Arc::new(session_state());
+        let (c, _) = dig_campaign(&state, false).await;
+        alone_on_site(&state, c, 57).await;
+        for i in 1..=6 {
+            let (status, body, _) = drill(&state, c).await;
+            assert_eq!(status, StatusCode::OK, "drill {i}: {body}");
+        }
+        let (status, body, _) = drill(&state, c).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("the drill has melted")));
+        let (status, body, _) = escort(&state, c).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("nothing left to guard: the drill has melted")));
+        let (status, body, _) = post(&state, c, "return", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let op = &body["active_op"];
+        assert_eq!((op["leg"].as_str(), op["dig"]["ended_by"].as_str(), op["dig"]["meltdown_heads"].as_u64()), (Some("homeward"), Some("meltdown"), Some(2)));
+    }
+
+    /// BP-49b T8: a guarded dig (`dig_on_site`: the guard stands from the start), melted, refuses
+    /// next with its own text, and the team stays at the dig.
+    #[tokio::test]
+    async fn ops_held_meltdown_refuses_next_on_a_guarded_dig() {
+        let state = Arc::new(session_state());
+        let (c, _) = dig_campaign(&state, false).await;
+        dig_on_site(&state, c, 57).await;
+        for i in 1..=6 {
+            let (status, body, _) = drill(&state, c).await;
+            assert_eq!(status, StatusCode::OK, "drill {i}: {body}");
+        }
+        let (status, body, _) = next(&state, c, SITE).await;
+        assert_eq!((status, body["error"].as_str()), (StatusCode::CONFLICT, Some("the drill has melted: return to base first")));
+        assert_eq!(state.demo_ops.store.op_view(c, chrono::Utc::now()).expect("op").site_id, DIG);
+    }
+
+    /// BP-49b T9: a meltdown rolling 2 on a Crew of 1 reports the actual loss, 1, and the Crew ends at 0.
+    #[tokio::test]
+    async fn ops_meltdown_heads_is_the_actual_loss_on_a_short_crew() {
+        let state = Arc::new(session_state());
+        let (c, crew) = dig_campaign(&state, false).await;
+        dig_on_site(&state, c, 57).await;
+        state.crew_loss.meltdown_loss(crew, 7, 0).await.expect("meltdown_loss");
+        assert_eq!(headcount(&state, crew).await, 1);
+        let mut last = serde_json::Value::Null;
+        for i in 1..=6 {
+            let (status, body, _) = drill(&state, c).await;
+            assert_eq!(status, StatusCode::OK, "drill {i}: {body}");
+            last = body;
+        }
+        assert_eq!(last["active_op"]["dig"]["ended_by"], "meltdown");
+        assert_eq!(last["active_op"]["dig"]["meltdown_heads"], 1);
+        assert_eq!(headcount(&state, crew).await, 0);
     }
 
     /// F6 through the route: a return after two drills walks away from the ore on site.

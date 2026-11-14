@@ -49,7 +49,7 @@ import { showCard, cardSeen } from './demo_card.js';
 import { mountShop, openShop, redrawShop } from './demo_shop.js'; // BP-25; BP-43b-1: + redrawShop
 import { mountReview, countContract } from './demo_review.js'; // BP-27
 import { mountCompany, dressBriefing, renderCompany, redrawCompany, healPrice, wageLine, openSickbay, openCompanyAt, companyShown } from './demo_company.js';
-import { DIG_COPY, DIG_CSS, createDigPanel, renderDig, hideDig, quietDig, homewardLines, flash, bankedLine, crewFightLine, crewCard } from './demo_dig.js';
+import { DIG_COPY, DIG_CSS, createDigPanel, renderDig, renderReport, hideDig, quietDig, homewardLines, flash, bankedLine, crewFightLine, crewCard } from './demo_dig.js';
 import { BASE_COPY, BASE_CSS, createBase, renderBase, hideBase, quietBase } from './demo_base.js';
 import { mountMore } from './demo_more.js'; // BP-29b
 
@@ -493,14 +493,17 @@ const hubShown = () => !deps.$('screen-hub').hidden;
 const held = () => busy || Date.now() < throttleUntil;
 const battleOf = o => (o && o.dig && (o.dig.raid || o.dig.ambush)) || null;
 const battleKey = o => (!battleOf(o) ? null : (o.dig.raid ? 'raid:' : 'ambush:') + o.site_id);
+// BP-49b: a meltdown held at the site on its report. It waits on Return to base, so it offers no Next mission and no
+// guard (spec check F5; canNext also drives the picker).
+const heldMelt = o => Boolean(o && o.leg === 'outbound' && o.dig && o.dig.ended_by === 'meltdown');
 // Next: an outbound, arrived op with no battle pending; a contract only once fought (Reviewer BP-11a-4 F1/F2).
 // BP-17b: a dig only once its guard stands (spec check F5).
-const canNext = o => Boolean(o && o.leg === 'outbound' && progress(o) >= 1 && !battleOf(o) && (o.kind === 'dig' ? guardStands(o) : o.fought));
+const canNext = o => Boolean(o && o.leg === 'outbound' && progress(o) >= 1 && !battleOf(o) && !heldMelt(o) && (o.kind === 'dig' ? guardStands(o) : o.fought));
 // BP-17b, the escort: escort_at null = the Crew is alone; the guard stands once the server's clock reaches it.
 // Reviewer BP-17b F1: an absent escort_at (a body from before BP-17a) is guarded.
 const guardStands = o => Boolean(o && o.dig && (o.dig.escort_at === undefined || (o.dig.escort_at !== null && serverNow() >= Date.parse(o.dig.escort_at))));
 // "Go guard the dig": outbound and unguarded, and never with the Section a bare escort sends at 0 (spec check F6).
-const canGuard = o => Boolean(o && o.leg === 'outbound' && o.dig && o.dig.escort_at === null && guardHead() !== 0);
+const canGuard = o => Boolean(o && o.leg === 'outbound' && o.dig && o.dig.escort_at === null && guardHead() !== 0 && !heldMelt(o));
 // BP-34 (item 18): a guard sent after the Crew is walking out until escort_at. Outbound only: a haul heading home
 // with its guard still walking draws no guard (the server still counts it for the ambush).
 const guardWalking = o => Boolean(o && o.leg === 'outbound' && o.dig && o.dig.escort_at && serverNow() < Date.parse(o.dig.escort_at));
@@ -749,6 +752,18 @@ function el(tag, className, text) {
 
 // `lines`: up to four strings (BP-18b-2b: a sheet's Leads line is the fourth node); `acts`: up to four
 // [text, onClick, disabled] buttons. The out line follows the lines (outLine decides when, BP-18b-2a/2b).
+// BP-49b (W3, spec check F1): the held meltdown's flash plays once per visit, a reload included. The key is the campaign
+// and the outbound leg's departure, which the hold never moves (only the tap's return writes depart_at). Taken where the
+// flash plays (RULE-134); without sessionStorage the page's own `before` still keeps it to one per page.
+function meltFlashOwed(o) {
+  const key = `mm.melt.${campaignId}.${o.depart_at}`;
+  try {
+    if (sessionStorage.getItem(key)) return false;
+    sessionStorage.setItem(key, '1');
+  } catch { /* memory only */ }
+  return true;
+}
+
 function setStrip(title, lines, acts, danger, choice) {
   titleNode.hidden = !title;
   titleNode.textContent = title || '';
@@ -877,6 +892,10 @@ function showDig(o) {
   const title = opTitle(o);
   const rate = Date.now() < throttleUntil ? fill(DIG_COPY.rate, { n: throttleSecs }) : notice;
   shownPhase = phaseOf(o, 1);
+  if (heldMelt(o)) { // BP-49b: the held meltdown's report, until Return to base
+    renderReport(dig, o.dig, title);
+    return setStrip(title, [rate], [[DIG_COPY.back, sendReturn]]);
+  }
   renderDig(dig, o.dig, store.roster(campaignId), { guard: guardLine(o), crewFight: crewShown(o) });
   armGuard(o);
   // The third slot: Send the guard while the dig is unguarded, else Next mission wherever canNext allows it.
@@ -1860,7 +1879,7 @@ function adopt(body, built, spent = 0) {
   for (const k of [...wonBy.keys()]) if (!nowMap.has(k)) wonBy.delete(k);
   const endedNow = op && op.dig ? op.dig.ended_by : null;
   const endedBefore = before && before.dig ? before.dig.ended_by : null;
-  const melted = endedNow === 'meltdown' && endedBefore !== 'meltdown';
+  const melted = endedNow === 'meltdown' && endedBefore !== 'meltdown' && op.leg === 'outbound'; // BP-49b (F1): never on a leg home
   // A raid or an ambush opens its briefing on the response that first shows it, never again
   // after Back: the strip's Fight stays until the fight is fought.
   const battle = battleKey(op);
@@ -1870,7 +1889,7 @@ function adopt(body, built, spent = 0) {
   if (map) map.requestFrame();
   refresh();
   if (crewCardNew) showCrewCard(crewFight, digBefore, body.now); // BP-34
-  if (melted) { flash(strip); rereadRoster(); }
+  if (melted) { if (meltFlashOwed(op)) flash(strip); rereadRoster(); } // BP-49b (W3): once per visit, a reload included
   if (raidLatched || latched.length > 0 || crewLoss) rereadRoster();
   const owed = digLeft || rosterDue || tripNew; // BP-19c: once per held → empty, per campaign entry, per hub return after an AAR; BP-20b: per new trip report
   rosterDue = false;

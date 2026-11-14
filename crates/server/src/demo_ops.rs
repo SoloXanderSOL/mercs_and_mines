@@ -881,6 +881,9 @@ struct DigState {
     escort_at: Option<DateTime<Utc>>,
     /// The nominal heads the Crew's rolls took on this dig (BP-19a), for its Foreman's stress.
     crew_heads_lost: u32,
+    /// BP-49b: the miners this dig's meltdown took, `None` until it melts. The drill writes the roll;
+    /// the route then clamps it to the miners the Crew had (`set_meltdown_heads`).
+    meltdown_heads: Option<u32>,
 }
 
 impl DigState {
@@ -932,6 +935,9 @@ pub struct DigView {
     /// When the Section stands guard (BP-17a): the start for an escorted dig, a later arrival
     /// for a guard sent by `ops/escort`, `null` while the Crew is alone.
     pub escort_at: Option<String>,
+    /// BP-49b: the miners this dig's meltdown took (the actual loss), `null` until it melts; never
+    /// `crew_heads_lost`, which counts the raids' losses too.
+    pub meltdown_heads: Option<u32>,
 }
 
 /// A Foreman's heat-threshold cut while Strained (BP-19a): Command Presence at half.
@@ -1643,6 +1649,8 @@ pub enum DrillRefusal {
     NotArrived,
     /// Raiders are at the site: the raid must be fought first (BP-8b-1b).
     RaidPending,
+    /// The drill melted (BP-49b): the Crew waits at the site until the return.
+    MeltedDown,
 }
 
 /// What a drill did. A meltdown names the Crew and the heads it loses, for the route to write.
@@ -1693,6 +1701,8 @@ pub enum NextRefusal {
     /// Another slot's contract has the target's mission, or another contract slot already holds
     /// the new op's key (BP-18a-1b-1; Reviewer BP-18a-1a F1).
     Taken,
+    /// The dig melted (BP-49b): the team waits at the site until the return.
+    MeltedDown,
 }
 
 /// Why `pull_op` refused (BP-8b-2).
@@ -1727,6 +1737,8 @@ pub enum EscortRefusal {
     SectionBusy,
     /// The Commander sent is busy: it leads a contract (BP-18a-1b-1).
     CommanderBusy,
+    /// The dig melted (BP-49b): nothing is left to guard.
+    MeltedDown,
 }
 
 /// Why `build_op` refused (BP-10a).
@@ -2227,14 +2239,15 @@ impl OpsEntry {
                 arrive_at: ops_time(op.arrive_at),
                 arrived: now >= op.arrive_at && op.dig.as_ref().is_none_or(|d| d.ambush_at.is_none()),
                 dig: op.dig.as_ref().map(|d| {
-                    let out = op.leg == OpLeg::Outbound;
+                    // BP-49b: a held meltdown is outbound but drills no more, so it offers no next drill.
+                    let out = op.leg == OpLeg::Outbound && d.ended_by.is_none();
                     let (lo, hi) = if out { self.base.heat_range(d.drills + 1) } else { (0, 0) };
                     DigView {
                         drills: d.drills,
                         heat: d.heat,
                         threshold: d.threshold,
                         ore_on_site: d.ore_on_site,
-                        next_ore: if op.leg == OpLeg::Homeward { 0 } else { self.base.ore(d.drills + 1, d.tier) },
+                        next_ore: if !out { 0 } else { self.base.ore(d.drills + 1, d.tier) },
                         next_heat_min: lo,
                         next_heat_max: hi,
                         might_overheat: out && d.heat + hi >= d.threshold,
@@ -2248,6 +2261,7 @@ impl OpsEntry {
                         ambush: d.raid.filter(|r| r.kind == BattleKind::Ambush).map(|r| RaidView { mission_id: r.mission_id }),
                         carried: d.carried,
                         escort_at: d.escort_at.map(ops_time),
+                        meltdown_heads: d.meltdown_heads,
                     }
                 }),
                 fought: op.contract.as_ref().and_then(|c| match c.result {
@@ -2374,6 +2388,7 @@ fn new_op(site: &OpsSite, op_seed: u32, dig: Option<DigStart>, contract: Option<
             ambush_at: None,
             escort_at: d.escort.then_some(now),
             crew_heads_lost: 0,
+            meltdown_heads: None,
         }),
         contract: contract.and_then(|c| site.mission_id.map(|mission_id| ContractState { mission_id, commander_id: c.commander_id, section_id: c.section_id, result: None })),
         hazards,
@@ -2682,7 +2697,9 @@ impl DemoOpsStore {
         }
         if let Some(d) = op.dig.as_mut() {
             d.ore_on_site = 0;
-            d.ended_by = Some(OpEnd::WalkedAway);
+            if d.ended_by != Some(OpEnd::Meltdown) { // BP-49b: the tap on a held meltdown's report keeps its end
+                d.ended_by = Some(OpEnd::WalkedAway);
+            }
         }
         op.leg = OpLeg::Homeward;
         op.depart_at = now;
@@ -2695,7 +2712,7 @@ impl DemoOpsStore {
     /// Moves the team from the site it stands on straight to `site` (BP-11a-4), as a new op
     /// (`new_op`). It accepts what `return_op` accepts, except a dig whose guard does not stand.
     /// Refusals in order: `NoOp` → `AlreadyHomeward` → `NotArrived` → `RaidPending` (a dig's
-    /// raid) → `GuardNotHere` (a dig whose guard does not stand yet, BP-18a-1a) → `SameSite` (the
+    /// raid) → `MeltedDown` (BP-49b) → `GuardNotHere` (a dig whose guard does not stand yet, BP-18a-1a) → `SameSite` (the
     /// target's hex is the team's `at`; hexes, not site ids, since a refreshed contract keeps its
     /// id).
     /// - `next_op_for` with no squad named: it acts on the one op out (`SayWhich` with two).
@@ -2763,6 +2780,9 @@ impl DemoOpsStore {
         if op.dig.as_ref().is_some_and(|d| d.raid.is_some()) {
             return Err(NextRefusal::RaidPending);
         }
+        if op.dig.as_ref().is_some_and(|d| d.ended_by == Some(OpEnd::Meltdown)) { // BP-49b: before GuardNotHere, so a held Crew-alone dig says why
+            return Err(NextRefusal::MeltedDown);
+        }
         if op.dig.as_ref().is_some_and(|d| !d.guarded(now)) {
             return Err(NextRefusal::GuardNotHere);
         }
@@ -2807,13 +2827,24 @@ impl DemoOpsStore {
         Ok(())
     }
 
+    /// BP-49b: the route's clamp of a meltdown's count to the miners the Crew had, read under the launch
+    /// lock. Writes only a held meltdown's count; an op gone or ended another way is left as it is.
+    pub fn set_meltdown_heads(&self, campaign_id: Uuid, heads: u32) {
+        let mut inner = self.lock();
+        if let Some(d) = inner.get_mut(&campaign_id).and_then(|e| e.dig.as_mut()).and_then(|op| op.dig.as_mut()) {
+            if d.ended_by == Some(OpEnd::Meltdown) { // BP-49b: a held meltdown only
+                d.meltdown_heads = Some(heads);
+            }
+        }
+    }
+
     /// One drill on an arrived dig: drill `n` adds a seeded heat in the base's range (`drill_heat` over `OpsBase::heat_range`); at
-    /// the threshold the site melts down (the ore on site is lost, the homeward leg starts at once
-    /// and the Crew's heads are returned for the route to write), otherwise it adds the base's ore
+    /// the threshold the site melts down (the ore on site is lost, the Crew waits at the site until the
+    /// return (BP-49b) and the Crew's heads are returned for the route to write), otherwise it adds the base's ore
     /// (`OpsBase::ore`) and, when the first roll is at most the base's raid chance
     /// (`OpsBase::raid_pct`), sets the raid trigger (a meltdown rolls no raid). Writes `moved_at` (the keep list). Refusals in order: `NoOp`
-    /// → `Contract` → `AlreadyHomeward` → `NotArrived` → `RaidPending`. The meltdown is committed
-    /// here, before the route's write, so a second drill sees `AlreadyHomeward` and the heads
+    /// → `Contract` → `AlreadyHomeward` → `MeltedDown` → `NotArrived` → `RaidPending`. The meltdown is committed
+    /// here, before the route's write, so a second drill sees `MeltedDown` and the heads
     /// can't be lost twice.
     /// BP-17a: raiders the guard is not there for (`DigState::guarded` at `now`) are the Crew's,
     /// fought here from the Crew stream and applied at once (no trigger): Held drills on,
@@ -2836,6 +2867,9 @@ impl DemoOpsStore {
         };
         if op.leg == OpLeg::Homeward {
             return Err(DrillRefusal::AlreadyHomeward);
+        }
+        if dig.ended_by == Some(OpEnd::Meltdown) { // BP-49b: held at the site until the return
+            return Err(DrillRefusal::MeltedDown);
         }
         if now < op.arrive_at {
             return Err(DrillRefusal::NotArrived);
@@ -2860,9 +2894,8 @@ impl DemoOpsStore {
         if melts {
             dig.ore_on_site = 0;
             dig.ended_by = Some(OpEnd::Meltdown);
-            op.leg = OpLeg::Homeward;
-            op.depart_at = now;
-            op.arrive_at = now + Duration::seconds(i64::from(op.travel_secs + op.hazards.home_extra_secs)); // home leg: meltdown
+            // BP-49b: the Crew waits at the site on its report; `return_op` starts the leg home at the tap.
+            dig.meltdown_heads = Some(heads);
             dig.crew_heads_lost = dig.crew_heads_lost.saturating_add(heads);
             return Ok(DrillOutcome::Meltdown { crew_id: dig.crew_id, heads: heads as i16 });
         }
@@ -3401,6 +3434,9 @@ impl DemoOpsStore {
         };
         if op.leg == OpLeg::Homeward {
             return Err(EscortRefusal::AlreadyHomeward);
+        }
+        if dig.ended_by == Some(OpEnd::Meltdown) { // BP-49b: nothing left to guard
+            return Err(EscortRefusal::MeltedDown);
         }
         if dig.escort_at.is_some() {
             return Err(EscortRefusal::AlreadyEscorted);
@@ -4279,11 +4315,107 @@ mod tests {
         }
         assert_eq!(store.drill_op(a, at(20)), Ok(DrillOutcome::Meltdown { crew_id: CREW, heads: 2 }));
         let op = store.op_view(a, at(21)).expect("op");
-        assert_eq!(op.leg, OpLeg::Homeward);
-        assert_eq!((op.depart_at, op.arrive_at), (ops_time(at(20)), ops_time(at(30))));
+        assert_eq!(op.leg, OpLeg::Outbound, "BP-49b: held at the site");
+        assert_eq!((op.depart_at, op.arrive_at), (ops_time(at(0)), ops_time(at(10))), "BP-49b: the outbound leg's, unmoved");
         let d = op.dig.expect("a dig");
         assert_eq!((d.drills, d.heat, d.ore_on_site, d.next_ore, d.ended_by), (6, 100, 0, 0, Some(OpEnd::Meltdown)));
-        assert_eq!(store.drill_op(a, at(22)), Err(DrillRefusal::AlreadyHomeward));
+        assert_eq!(store.drill_op(a, at(22)), Err(DrillRefusal::MeltedDown));
+    }
+
+    /// BP-49b: seed 57 on `on_site` (guarded), its 6th drill melting at `at(20)`.
+    fn melted(store: &DemoOpsStore, a: Uuid) {
+        on_site(store, a, 1, 100, 57);
+        for i in 1..=5 {
+            assert_eq!(store.drill_op(a, at(10 + i)), Ok(DrillOutcome::Drilled), "drill {i}");
+        }
+        assert_eq!(store.drill_op(a, at(20)), Ok(DrillOutcome::Meltdown { crew_id: CREW, heads: 2 }));
+    }
+
+    /// BP-49b T1: a meltdown holds the Crew at the site, and the held view offers no next drill, at
+    /// once and long after the outbound leg's arrival.
+    #[test]
+    fn ops_store_meltdown_holds_the_crew_at_the_site() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        melted(&store, a);
+        for t in [21, 500] {
+            let op = store.op_view(a, at(t)).expect("op");
+            assert_eq!(op.leg, OpLeg::Outbound, "at {t}");
+            assert_eq!((op.depart_at, op.arrive_at), (ops_time(at(0)), ops_time(at(10))), "at {t}");
+            let d = op.dig.expect("a dig");
+            assert_eq!((d.ended_by, d.meltdown_heads, d.next_ore), (Some(OpEnd::Meltdown), Some(2), 0), "at {t}");
+            assert_eq!((d.next_heat_min, d.next_heat_max, d.might_overheat, d.next_raid_pct), (0, 0, false, None), "at {t}");
+        }
+    }
+
+    /// BP-49b T2: a held meltdown refuses a drill and drills nothing.
+    #[test]
+    fn ops_store_held_meltdown_refuses_a_drill() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        melted(&store, a);
+        assert_eq!(store.drill_op(a, at(22)), Err(DrillRefusal::MeltedDown));
+        let d = dig_view(&store, a, at(23));
+        assert_eq!((d.drills, d.heat), (6, 100));
+    }
+
+    /// BP-49b T3: on a guarded dig (the guard stands from the start), a held meltdown refuses next
+    /// and the team stays at its site.
+    #[test]
+    fn ops_store_held_meltdown_refuses_next_on_a_guarded_dig() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        melted(&store, a);
+        assert_eq!(store.next_op(a, &site(), 3, None, None, at(21)), Err(NextRefusal::MeltedDown));
+        assert_eq!(store.op_view(a, at(22)).expect("op").site_id, "dig:9,1");
+    }
+
+    /// BP-49b T4: on a Crew-alone dig, a held meltdown refuses a guard and none is sent.
+    #[test]
+    fn ops_store_held_meltdown_refuses_escort_on_a_crew_alone_dig() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        let crew = DigStart { crew_id: CREW, commander_id: COMMANDER, threshold: 100, section_id: None, escort: false };
+        store.start_op(a, (5, 0), board(), &dig(1), 57, Some(crew), None, at(0)).expect("start");
+        for i in 1..=5 {
+            assert_eq!(store.drill_op(a, at(10 + i)), Ok(DrillOutcome::Drilled), "drill {i}");
+        }
+        assert_eq!(store.drill_op(a, at(20)), Ok(DrillOutcome::Meltdown { crew_id: CREW, heads: 2 }));
+        assert_eq!(store.escort_op(a, COMMANDER, None, at(21)), Err(EscortRefusal::MeltedDown));
+        assert_eq!(dig_view(&store, a, at(22)).escort_at, None);
+    }
+
+    /// BP-49b T5: the tap (`return_op`) starts the leg home at the tap, the site's 10 s long, and
+    /// keeps the meltdown's end and count.
+    #[test]
+    fn ops_store_return_after_a_meltdown_departs_at_the_tap_and_keeps_meltdown() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        melted(&store, a);
+        assert_eq!(store.return_op(a, at(30)), Ok(()));
+        let op = store.op_view(a, at(31)).expect("op");
+        assert_eq!((op.leg, op.depart_at, op.arrive_at), (OpLeg::Homeward, ops_time(at(30)), ops_time(at(40))));
+        let d = op.dig.expect("a dig");
+        assert_eq!((d.ended_by, d.meltdown_heads), (Some(OpEnd::Meltdown), Some(2)));
+    }
+
+    /// BP-49b T6: the route's clamp writes only a held meltdown's count.
+    #[test]
+    fn ops_store_set_meltdown_heads_writes_only_a_held_meltdown() {
+        let store = DemoOpsStore::new(2);
+        let a = Uuid::from_u128(1);
+        on_site(&store, a, 1, 100, 57);
+        assert_eq!(store.drill_op(a, at(11)), Ok(DrillOutcome::Drilled));
+        store.set_meltdown_heads(a, 1);
+        assert_eq!(dig_view(&store, a, at(12)).meltdown_heads, None, "a live dig");
+        for i in 2..=5 {
+            assert_eq!(store.drill_op(a, at(10 + i)), Ok(DrillOutcome::Drilled), "drill {i}");
+        }
+        assert_eq!(store.drill_op(a, at(20)), Ok(DrillOutcome::Meltdown { crew_id: CREW, heads: 2 }));
+        store.set_meltdown_heads(a, 1);
+        assert_eq!(dig_view(&store, a, at(21)).meltdown_heads, Some(1));
+        store.set_meltdown_heads(Uuid::from_u128(99), 1);
+        assert!(store.op_view(Uuid::from_u128(99), at(21)).is_none(), "an unknown campaign: nothing");
     }
 
     /// §4d: a Coolant-Jockey's threshold is 115, so seed 57's 6th drill (heat 100) digs and the
@@ -4353,7 +4485,7 @@ mod tests {
         store.drill_op(a, at(11)).expect("drill");
         let v = serde_json::to_value(store.op_view(a, at(12)).expect("op")).unwrap();
         let keys: std::collections::BTreeSet<&str> = v["dig"].as_object().expect("dig").keys().map(|k| k.as_str()).collect();
-        let want = ["ambush", "carried", "drills", "ended_by", "escort_at", "heat", "might_overheat", "next_heat_max", "next_heat_min", "next_ore", "next_raid_pct", "ore_on_site", "raid", "threshold"];
+        let want = ["ambush", "carried", "drills", "ended_by", "escort_at", "heat", "meltdown_heads", "might_overheat", "next_heat_max", "next_heat_min", "next_ore", "next_raid_pct", "ore_on_site", "raid", "threshold"];
         assert_eq!(keys, want.into_iter().collect());
         assert_eq!(v["dig"]["raid"], serde_json::json!({"mission_id": "GUARD_DUTY"}));
         let text = v.to_string();
@@ -4711,6 +4843,7 @@ mod tests {
             store.drill_op(b, at(10 + i)).expect("drill");
         }
         assert_eq!(store.drill_op(b, at(20)), Ok(DrillOutcome::Meltdown { crew_id: CREW, heads: 2 }));
+        store.return_op(b, at(20)).expect("BP-49b: the tap on the report");
         assert_eq!(store.ops_snapshot(b, at(30)), (None, 0, OpsBase::default()));
         store.start_op(c, (5, 0), board(), &site(), 7, None, None, at(0)).expect("start");
         store.return_op(c, at(10)).expect("return");
@@ -6630,6 +6763,7 @@ mod tests {
             assert_eq!(store.drill_op(a, at(10 + i)), Ok(DrillOutcome::Drilled), "drill {i}");
         }
         assert_eq!(store.drill_op(a, at(20)), Ok(DrillOutcome::Meltdown { crew_id: CREW, heads: 2 }));
+        store.return_op(a, at(20)).expect("BP-49b: the tap on the report");
         assert_eq!(store.take_foreman_due(a, at(30)), due(10 + 3 * 7 + 5 * 2, 15));
     }
 
@@ -7187,6 +7321,7 @@ mod tests {
             assert_eq!(store.drill_op(a, at(12 + i)), Ok(DrillOutcome::Drilled), "drill {i}");
         }
         assert_eq!(store.drill_op(a, at(22)), Ok(DrillOutcome::Meltdown { crew_id: CREW, heads: 2 }));
+        store.return_op(a, at(22)).expect("BP-49b: the tap on the report");
         assert_eq!(store.op_view(a, at(23)).expect("op").arrive_at, ops_time(at(34)));
     }
 
