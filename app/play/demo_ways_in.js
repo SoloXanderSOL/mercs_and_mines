@@ -22,6 +22,9 @@ import { mountCard } from './demo_card.js';
 
 const WAY_KEY = 'mm.way_in';
 const THROWAWAY_KEY = 'mm.throwaway.key';
+const DESK_KEY = 'mm.demo.desk_note'; // BP-48 (R-j): per tab (sessionStorage), '1' once Carry on here was tapped
+const DESK_QUERY = '(pointer: fine) and (hover: hover) and (min-width: 900px)'; // a computer: never the user-agent
+const DESK_QR = 'assets/art/qr_play_mercsandmines.png';
 
 // Booth copy (BP-3c-2; BP-26 drafts, the Director's script pass may change them).
 const COPY = {
@@ -39,11 +42,24 @@ const COPY = {
   resumeWorking: 'Signing you back in...',
   resumeFailed: "We couldn't sign you back in. Choose a way in below.",
   signInAnother: 'Not you? Sign in another way',
+  // BP-48 (R-j; the Director's draft, tightened; the script pass may reword): the note for computers.
+  deskHeading: 'BUILT FOR THE FIELD',
+  deskLine: "You can play this on your computer, but the demo is laid out for a phone. If you can, we'd recommend playing on mobile.",
+  deskScan: 'Scan this with your phone to open the demo in its browser.',
+  deskType: 'Or type the address in yourself: mercsandmines.com/play',
+  deskCarryOn: 'Carry on here',
+  deskQrAlt: 'QR code: mercsandmines.com/play',
 };
 
 const CSS = `
 .way-link { background: none; border: none; padding: 0; margin: 0 0.5em; font: inherit; color: var(--accent); text-decoration: underline; cursor: pointer; }
 .way-link:disabled { opacity: 0.5; cursor: default; }
+/* BP-48 (R-j): the note for computers, a card over the title's content inside the stage */
+.desk-note { position: absolute; inset: 0; z-index: 2; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3.5cqw; padding: 8cqw 6cqw; text-align: center; background: var(--bg); }
+.desk-note[hidden] { display: none; }
+.desk-title { margin: 0; font-family: var(--display); font-weight: 800; font-size: 7cqw; line-height: 1.1; letter-spacing: 0.04em; color: var(--accent); }
+.desk-note .explainer { margin: 0; }
+.desk-qr { width: 44cqw; height: 44cqw; image-rendering: pixelated; background: #fff; }
 `;
 
 // ── per-tab storage (a failure leaves the value in memory only) ────────────
@@ -159,10 +175,47 @@ async function throwawaySignIn(key) {
 
 // ── the automatic resume (BP-26) ────────────────────────────────────────────
 let deps = null;      // mountWaysIn's { $, show, toSignIn, enterCampaign }
+let deskCard = null;  // BP-48: the note's card, built on its first show
+let deskShown = false; // BP-48: shown in this page load (so a storage failure still shows it once per load)
 let resumed = false;  // this tab's session came from the resume: the reveal offers another way in
 
 // boot() calls this when no session is held. True when a resume has started (it shows its own
 // screens); false when this phone remembers no throwaway, and boot shows the title as before.
+// BP-48 (R-j): the "built for phones" note for computers, a card inside #screen-title. main.js calls it at the
+// first-visit title only (no session, no remembered throwaway): never on a resume, an expired session, a stored
+// session or a return from the wallet or the checkout. It shows on a fine pointer that hovers in a wide window, once
+// per visit: Carry on here writes the key in its own handler. A storage failure shows it once per page load.
+export function deskNote() {
+  if (!deps || deskShown) return;
+  let seen = false;
+  try { seen = sessionStorage.getItem(DESK_KEY) === '1'; } catch { /* storage refused: once per page load */ }
+  if (seen || typeof matchMedia !== 'function' || !matchMedia(DESK_QUERY).matches) return;
+  if (!deskCard) deskCard = buildDeskNote();
+  deskCard.hidden = false;
+  deskShown = true;
+}
+
+function buildDeskNote() {
+  const card = element('div', 'desk-note', '');
+  card.id = 'desk-note';
+  card.hidden = true;
+  const qr = document.createElement('img');
+  qr.className = 'desk-qr';
+  qr.src = DESK_QR;
+  qr.alt = COPY.deskQrAlt;
+  const carry = element('button', 'btn btn-primary', COPY.deskCarryOn);
+  carry.type = 'button';
+  carry.id = 'btn-desk-carry';
+  carry.addEventListener('click', () => {
+    try { sessionStorage.setItem(DESK_KEY, '1'); } catch { /* not kept: the next page load asks again */ }
+    card.hidden = true;
+  });
+  card.append(element('p', 'desk-title', COPY.deskHeading), element('p', 'explainer', COPY.deskLine),
+    element('p', 'explainer', COPY.deskScan), qr, element('p', 'explainer', COPY.deskType), carry);
+  deps.$('screen-title').append(card);
+  return card;
+}
+
 export function resumeRemembered() {
   if (!deps || readKept(WAY_KEY) !== 'throwaway') return false;
   const raw = storedKey();

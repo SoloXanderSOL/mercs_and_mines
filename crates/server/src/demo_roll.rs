@@ -383,7 +383,7 @@ pub fn roll_modifiers(inputs: Option<&RollInputs>, approach: Option<MissionAppro
         let flaw = flaw_points(i.fatal_flaw, approach, approach_row, mission.difficulty);
         push("fatal_flaw", format!("{}: {}", i.fatal_flaw.as_str(), flaw_line(i.fatal_flaw, flaw)), flaw);
         let gunsmith = if i.gunsmith { DEMO_GUNSMITH_ROLL_POINTS } else { 0 };
-        push("gunsmith", "Gunsmith (your base)".to_string(), gunsmith);
+        push("gunsmith", "Mercs Armoury (your base)".to_string(), gunsmith);
         if let Some(k) = i.armoury {
             push("armoury", format!("Armoury kit ({})", k.as_str()), k.points());
         }
@@ -406,6 +406,12 @@ mod tests {
     use super::*;
     use CommanderFlaw as F;
     use MissionApproach as A;
+
+    // Reviewer BP-39b CF4: Under strength counts against the route's Section cap.
+    #[test]
+    fn demo_full_section_is_the_route_cap() {
+        assert_eq!(DEMO_FULL_SECTION, crate::routes::MAX_UNITS_PER_SECTION);
+    }
 
     fn mission(id: &str) -> &'static MissionDefinition {
         missions().get(id).expect("mission")
@@ -536,7 +542,7 @@ mod tests {
         ]);
         let g = roll_modifiers(Some(&RollInputs { gunsmith: true, ..i }), Some(A::Flank), mission("GUARD_DUTY"), 8);
         assert_eq!(rows(&g), [("opposition", -6), ("approach", -15), ("commander_rank", 4), ("specialization", 5), ("fatal_flaw", -10), ("gunsmith", 10)]);
-        assert_eq!(g[5].label, "Gunsmith (your base)");
+        assert_eq!(g[5].label, "Mercs Armoury (your base)");
 
         let i = RollInputs { rank: 1, specialization: CommanderSpecialization::Cannoneer, fatal_flaw: F::Embezzler, gunsmith: false, stress: 0, armoury: None };
         assert_eq!(rows(&roll_modifiers(Some(&i), None, mission("SUPPLY_RAID"), 8)), [("opposition", -21), ("fatal_flaw", -3)]);

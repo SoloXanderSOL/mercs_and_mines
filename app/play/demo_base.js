@@ -14,26 +14,26 @@ import { bankedLine } from './demo_dig.js';
 // BP-43b-2 (R-b; Director copy ruling 2026-11-11): `flavour` is the building's one line, verbatim, the same before and
 // after it stands, read by both the list card and the building's box (drawPick). The Tent's is in BOX.
 export const BASE = [
-  { id: 'radio_shack', name: 'Radio Shack', cost: 50,
+  { id: 'radio_shack', name: 'Intel Shack', cost: 50,
     effect: 'Raid risk 3% a drill, down from 5%.',
     flavour: 'A scrap dish on a leaning pipe mast. It hears raiders coming - sometimes. Can be a bit hit and miss.',
-    done: "Radio Shack operational. Raiders get heard before they're seen." },
+    done: "Intel Shack operational. Raiders get heard before they're seen." },
   { id: 'hobbyist_benches', name: 'Medbay', cost: 120, // BP-33: the Benches renamed; the key stays
     effect: 'Patch up 20 credits a head, not 40.',
     flavour: 'The surgeon was a vet even before the previous war. He is confident. His patients less so.',
     done: 'Medbay open. Patch-ups at half price.' },
-  { id: 'grease_pit', name: 'The Grease-Pit', cost: 80,
+  { id: 'grease_pit', name: 'Missions Motor Pool', cost: 80,
     effect: 'A lost ambush costs a quarter of the haul.',
     flavour: 'Where vehicles go to be patched, parked and quietly blamed for the last convoy losing half its cargo.',
-    done: 'Grease-Pit operational. Hauls ride armoured.' },
-  { id: 'gunsmith', name: 'Gunsmith', cost: 100,
+    done: 'Missions Motor Pool operational. Hauls ride armoured.' },
+  { id: 'gunsmith', name: 'Mercs Armoury', cost: 100,
     effect: '+10 on every fight your mercs take.',
     flavour: 'Turns steel into tools for ending arguments quickly and not diplomatically.',
-    done: 'Gunsmith operational. The mercs hit harder.' },
-  { id: 'basic_smelter', name: 'Basic Smelter', cost: 80,
+    done: 'Mercs Armoury operational. The mercs hit harder.' },
+  { id: 'basic_smelter', name: 'Crew Smelter', cost: 80,
     effect: 'Ore per drill up a quarter.',
     flavour: 'Rock goes in, money comes out. After the G.U.N. has taken its cut, of course.',
-    done: 'Smelter operational. Every drill yields more.' },
+    done: 'Crew Smelter operational. Every drill yields more.' },
 ];
 
 // Booth copy, verbatim from the BP-10b prompt.
@@ -99,7 +99,7 @@ const MAX_ZOOM = 2.5;
 // Each building's tag over its pad and its box's one button (demo_ops.js's onTarget sends it on). BP-43b-2 (R-b): the
 // box's line is the building's BASE flavour; the Tent, which has no list card, keeps its name and its line here.
 const BOX = {
-  tent: { name: 'Operations Tent', tag: 'COMPANY', button: 'Your Company', flavour: 'Every permit on this base was signed and stamped here. The stamp is now broken. The paperwork continues unabated, just messier.' },
+  tent: { name: 'Company HQ Tent', tag: 'COMPANY', button: 'Your Company', flavour: 'Every permit on this base was signed and stamped here. The stamp is now broken. The paperwork continues unabated, just messier.' },
   radio_shack: { tag: 'INTEL', button: 'World Map' },
   hobbyist_benches: { tag: 'MEDBAY', button: 'Heal' },
   grease_pit: { tag: 'MISSIONS', button: 'Missions' },

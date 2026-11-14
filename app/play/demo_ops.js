@@ -2095,8 +2095,11 @@ function sendReturn() {
 async function sendDrill() {
   const tapped = !held() && Boolean(campaignId);
   if (tapped) drillBeat(true);
-  await send(opsPath(campaignId) + '/drill', undefined);
-  if (tapped) drillBeat(false);
+  try {
+    await send(opsPath(campaignId) + '/drill', undefined);
+  } finally {
+    if (tapped) drillBeat(false); // RULE-164: the stop survives a render that throws
+  }
 }
 
 function drillBeat(on) {

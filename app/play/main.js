@@ -20,7 +20,7 @@ import { createCheckout } from './checkout.js';
 import { renderReveal } from './reveal.js';
 import { HexMap, PALETTE, TERRAIN_ORDER, OVERLAY } from './hexmap.js';
 import { createBattle } from './battle.js';
-import { mountWaysIn, resumeRemembered } from './demo_ways_in.js'; // demo-only (ODQ-69; resumeRemembered BP-26)
+import { mountWaysIn, resumeRemembered, deskNote } from './demo_ways_in.js'; // demo-only (ODQ-69; resumeRemembered BP-26; deskNote BP-48)
 import { mountOps } from './demo_ops.js'; // demo-only (BP-9a)
 
 // Booth copy, verbatim from the BP-3a-1, BP-3a-1b, BP-3a-2 and BP-3b-2 prompts (the battle's own
@@ -456,7 +456,11 @@ function buildLegend() {
 
 // ── boot ────────────────────────────────────────────────────────────────────
 async function boot() {
-  if (!store.session()) return resumeRemembered() || show('screen-title'); // demo-only (BP-26): a remembered throwaway signs itself back in
+  if (!store.session()) {
+    if (resumeRemembered()) return; // demo-only (BP-26): a remembered throwaway signs itself back in
+    show('screen-title');
+    return deskNote(); // demo-only (BP-48, R-j): the "built for phones" note, at the first-visit title only
+  }
   $('working-text').textContent = COPY.bootWorking;
   show('screen-working'); // never a blank stage while the session check is in flight
   try {
